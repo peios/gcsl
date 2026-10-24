@@ -299,7 +299,7 @@ use std::mem;
 use std::rc::Rc;
 
 use crate::ast::FnId;
-use crate::check::Slot;
+use crate::check::{Attribute, Slot};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::{FieldName, Quoted};
@@ -1568,6 +1568,11 @@ pub struct FnCode {
     /// For each slot of the body's frame, the name of the last variable
     /// assigned to it. For [`Ir::pretty`] only.
     pub slot_names: Box<[Name]>,
+    /// The function's attributes, in source order, if it is a function item
+    /// that has any (see [`crate::check::Attribute`]): what a host reads of
+    /// how to run it, through any of its closures
+    /// ([`crate::value::Closure::attributes`]).
+    pub attributes: Box<[Attribute]>,
 }
 
 /// A lowered program: an arena of [`IrNode`]s, the item pool, the string

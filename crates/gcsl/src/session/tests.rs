@@ -1732,3 +1732,30 @@ fn a_session_has_fs_and_owns_its_temporary_directories() {
     assert!(!std::path::Path::new(&*first).parent().unwrap().exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn attributes_and_def_type_defaults_reach_later_inputs() {
+    let mut session = Session::new();
+    value(
+        &mut session,
+        "#[attribute] type hermetic = {on: Bool = true}\n\
+         #[def_type] #[hermetic]\n\
+         def test(name: String, f: fn(): Int): fn(): Int { f }",
+    );
+    // An attribute declared by an earlier input, on a function of this one.
+    let shown = |value: &Value| -> Vec<String> {
+        let Value::Fn(closure) = value else {
+            panic!("{value} is no closure");
+        };
+        closure
+            .attributes()
+            .iter()
+            .map(|attribute| format!("{}{:?}", attribute.id.name(), attribute.args))
+            .collect()
+    };
+    let later = value(&mut session, "#[hermetic(false)] fn f(): Int { 1 }\nf");
+    assert_eq!(shown(&later), [r#"hermetic[("on", Bool(false))]"#]);
+    // A definition of an earlier input's def-type takes its attributes.
+    let definition = value(&mut session, "def test a() { 1 }\n(test a)()");
+    assert_eq!(shown(&definition), [r#"hermetic[("on", Bool(true))]"#]);
+}

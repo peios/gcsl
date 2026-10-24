@@ -877,7 +877,15 @@ impl<'a> Printer<'a> {
         // A call's, a function's, an index's `(` or `[`, or another.
         if matches!(n, K::LParen | K::LBracket) {
             let glued = if n == K::LParen {
-                matches!(p, K::Ident(_) | K::RParen | K::RBracket | K::Fn)
+                matches!(
+                    p,
+                    K::Ident(_)
+                        | K::RParen
+                        | K::RBracket
+                        | K::Fn
+                        | K::AttributeArgs(_)
+                        | K::InnerAttributeArgs(_)
+                )
             } else {
                 matches!(
                     p,
@@ -1168,6 +1176,20 @@ mod tests {
         for &(input, expected) in cases {
             assert_eq!(fmt(input), expected, "formatting {input:?}");
         }
+    }
+
+    #[test]
+    fn an_attribute_s_arguments_are_formatted_as_a_call_s() {
+        check(&[
+            (
+                "#[retry( 3 )]\nfn f(): Int { 1 }\n",
+                "#[retry(3)]\nfn f(): Int { 1 }\n",
+            ),
+            (
+                "#[device(name =\"kvm\" , count=2)]   #[retry (1)]\nfn f(): Int { 1 }\n",
+                "#[device(name = \"kvm\", count = 2)] #[retry(1)]\nfn f(): Int { 1 }\n",
+            ),
+        ]);
     }
 
     #[test]

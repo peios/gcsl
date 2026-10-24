@@ -1288,3 +1288,27 @@ fn a_rename_that_would_make_a_scan_error_is_refused() {
         "{refused}"
     );
 }
+
+#[test]
+fn an_attribute_s_uses_are_references_of_its_type() {
+    let text = "#[attribute] type hermetic = {on: Bool = true}\n\
+                #[hermetic] def a(): Int { 1 }\n\
+                #[hermetic(false)] def b(): Int { 2 }\n";
+    let files = [("app.gcsl", text)];
+    let all = places(
+        &files,
+        &[
+            ("app.gcsl", "type |hermetic"),
+            ("app.gcsl", "#[|hermetic]"),
+            ("app.gcsl", "#[|hermetic(false)"),
+        ],
+    );
+    assert_eq!(references(&files, ("app.gcsl", "#[|hermetic]"), true), all);
+    assert_eq!(
+        renamed(&files, ("app.gcsl", "type |hermetic"), "sealed"),
+        Ok(vec![(
+            "app.gcsl".to_owned(),
+            text.replace("hermetic", "sealed")
+        )])
+    );
+}

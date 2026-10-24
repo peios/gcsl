@@ -950,6 +950,7 @@ impl Lowerer<'_> {
                 name: None,
                 display: Box::from(""),
                 slot_names: Box::from([]),
+                attributes: Box::default(),
             });
         }
     }
@@ -2544,6 +2545,8 @@ impl Lowerer<'_> {
                 .map(|&(name, _)| name)
                 .collect::<Option<Box<[Name]>>>()
                 .unwrap_or_default(),
+            // A reference's function is no function item.
+            attributes: Box::default(),
         }));
         Ok(IrKind::MakeClosure { function, captures })
     }
@@ -2657,6 +2660,7 @@ impl Lowerer<'_> {
             name: resolution.callee,
             display,
             slot_names: resolution.slot_names.clone().into_boxed_slice(),
+            attributes: self.resolution.attributes(function).into(),
         };
         let Some(entry) = self.functions.get_mut(function.index()) else {
             return Err(InternalError {

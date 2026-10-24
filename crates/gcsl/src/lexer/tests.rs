@@ -2114,3 +2114,48 @@ fn a_number_glued_to_letters_that_name_no_unit_is_still_a_number() {
         assert_eq!(number_end(text.as_bytes(), 0), end, "{text}");
     }
 }
+
+#[test]
+fn an_attribute_with_arguments_opens_a_bracket_its_arguments_close() {
+    let (tokens, names, _) =
+        tokenize(&SourceFile::new("t", "#[device(\n  name = \"kvm\",\n)]\nfn").unwrap()).unwrap();
+    let kinds: Vec<String> = tokens
+        .iter()
+        .map(|token| match token.kind {
+            TokenKind::AttributeArgs(name) => format!("AttributeArgs({})", names.get(name)),
+            TokenKind::Ident(name) => format!("Ident({})", names.get(name)),
+            kind => format!("{kind:?}"),
+        })
+        .collect();
+    // No newline inside the brackets; the one after its `]` is an item's
+    // end as ever.
+    assert_eq!(
+        kinds[..],
+        [
+            "AttributeArgs(device)",
+            "LParen",
+            "Ident(name)",
+            "Eq",
+            "Str(StrId(0))",
+            "Comma",
+            "RParen",
+            "RBracket",
+            "Newline",
+            "Fn",
+            "Eof"
+        ]
+    );
+    // The token is its `#[` and name; spaces before the `(` are allowed.
+    assert_eq!(spans("#[retry (3)]")[0], (0, 7));
+    assert!(matches!(
+        kinds_of("#![x(1)]")[0],
+        TokenKind::InnerAttributeArgs(_)
+    ));
+    // Without `]` or `(` after its name, it is a comment, as before.
+    assert_eq!(kinds_of("#[retry 3]"), [TokenKind::Eof]);
+    assert_eq!(kinds_of("#[retry"), [TokenKind::Eof]);
+}
+
+fn kinds_of(text: &str) -> Vec<TokenKind> {
+    kinds(text)
+}

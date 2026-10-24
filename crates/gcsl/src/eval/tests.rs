@@ -2318,6 +2318,7 @@ fn a_future_that_depends_on_itself_is_an_error() {
         name: None,
         display: Box::from("Future<Int>"),
         slot_names: Box::default(),
+        attributes: Box::default(),
     }];
     builder.measure(root, &mut functions);
     let ir = Rc::new(builder.finish_program(root, (1, Vec::new()), functions, (0, 0)));

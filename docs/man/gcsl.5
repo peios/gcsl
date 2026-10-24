@@ -7,7 +7,7 @@ Newlines or semicolons separate items.
 A file can return a value or construct a record of public fields.
 All reachable source is checked before execution.
 .SH LEXICAL STRUCTURE
-A comment begins with # and continues to the end of the line, except for the attribute forms #[NAME] and #![NAME].
+A comment begins with # and continues to the end of the line, except for the attribute forms #[NAME], #[NAME(...)] and #![NAME].
 Identifiers begin with an ASCII letter or underscore and continue with ASCII letters, digits, underscores, and permitted internal hyphens.
 Write spaces around binary subtraction to distinguish it from a hyphenated identifier.
 Field names can also be plain quoted strings.
@@ -235,6 +235,17 @@ It is not valid on a REPL input.
 Mark a top-level def as a definition type.
 Its first parameter is String and its second is the function type of definitions it accepts.
 Additional parameters are invocation arguments.
+.TP
+.B #[attribute]
+Mark a top-level type as an attribute whose arguments are that record type.
+Its fields must hold only constants: Int, Float, Bool, String, Duration, Size, or lists and records of them.
+It is declared, imported and named like any type.
+.TP
+.B #[NAME] #[NAME(ARGUMENTS)]
+Apply an attribute to the following fn, def or definition.
+Arguments are constants, by name, or by position for an attribute of one field; fields left out take their defaults.
+Attributes on a definition type are defaults for its definitions, and a definition's own attribute of the same name replaces one.
+GCSL's own attributes are retry(times: Int) and timeout(limit: Duration), checked and recorded but not yet acted on.
 .SH DEFINITION TYPES AND METADATA
 A definition-type declaration is followed by definitions of this form:
 .PP

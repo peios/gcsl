@@ -5549,9 +5549,11 @@ fn attributes_mark_items_and_the_file() {
 #[test]
 fn misplaced_and_unknown_attributes_are_errors() {
     let placed = MISPLACED_SHADOWABLE.to_owned();
+    // An outer one that is none of the parser's is a use, which the
+    // checker resolves, and applies only to a function.
     assert_eq!(
         error("#[sorted] a = 1"),
-        ("unknown attribute `sorted`".to_owned(), Span::new(0, 9))
+        (MISPLACED_USE.to_owned(), Span::new(0, 9))
     );
     assert_eq!(
         error("#![sorted]"),
@@ -6790,11 +6792,11 @@ fn parse_still_gives_the_first_error() {
 
 #[test]
 fn attributes_and_misplaced_items_recover() {
-    // An unknown attribute makes the item after it an error item.
+    // A misplaced attribute makes the item after it an error item.
     assert_eq!(
         all_errors("#[bogus]\nx = 1\ny = 2 2"),
         errors_of(&[
-            ("unknown attribute `bogus`", "#[bogus]"),
+            (MISPLACED_USE, "#[bogus]"),
             ("expected end of item, found `2`", "2"),
         ])
     );
@@ -6829,4 +6831,86 @@ fn a_number_glued_to_a_name_that_is_no_unit_is_an_unknown_unit() {
     assert!(parse_text("import pkgs/7zip as zip\nx = zip.v").is_ok());
     // A quantity is a literal, negated as a number is.
     assert_eq!(shape("x = -1h30m"), "x = (-1h30m)");
+}
+
+#[test]
+fn attribute_uses_are_kept_on_the_function_items_they_apply_to() {
+    let text = "#[attribute] type hermetic = {on: Bool = true}\n\
+                #[hermetic] #[retry(3)]\nfn f(): Int { 1 }\n\
+                #[shadowable] #[timeout(30s)] def g(): Int {\n    #[retry(1)] fn h(): Int { 2 }\n    h()\n}\n\
+                #[hermetic(false)] def test x() { 1 }";
+    let ast = parse_text(text).unwrap();
+    let shown = ast.pretty().to_string();
+    assert!(shown.contains("#[attribute] (type hermetic"), "{shown}");
+    assert!(shown.contains("#[hermetic] #[retry(…)] (fn f"), "{shown}");
+    assert!(
+        shown.contains("#[shadowable] #[timeout(…)] (def g"),
+        "{shown}"
+    );
+    assert!(shown.contains("#[retry(…)] (fn h"), "{shown}");
+    assert!(shown.contains("#[hermetic(…)] (def-type-def"), "{shown}");
+    // Each use, by its item, a nested `fn` before the item around it, its
+    // name read as a type's.
+    let uses = ast.all_attribute_uses();
+    let named: Vec<&str> = uses.iter().map(|used| ast.names().get(used.name)).collect();
+    assert_eq!(named, ["hermetic", "retry", "retry", "timeout", "hermetic"]);
+    for used in uses {
+        assert_eq!(ast.type_expr(used.ty).span, used.name_span);
+        assert_eq!(
+            &text[used.name_span.start as usize..used.name_span.end as usize],
+            ast.names().get(used.name)
+        );
+    }
+}
+
+#[test]
+fn misplaced_and_malformed_attribute_uses_are_errors() {
+    assert_eq!(
+        all_errors("#[retry(3)]\ny = 1"),
+        errors_of(&[(MISPLACED_USE, "#[retry(3)]")])
+    );
+    assert_eq!(
+        all_errors("#[retry(3)] #[retry(4)]\nfn f(): Int { 1 }"),
+        errors_of(&[("`#[retry]` is written twice", "#[retry(4)]")])
+    );
+    assert_eq!(
+        all_errors("#[shadowable(1)]\nx = 1"),
+        errors_of(&[("`#[shadowable]` takes no arguments", "#[shadowable")])
+    );
+    assert_eq!(
+        all_errors("#![x(1)]\nx = 1"),
+        errors_of(&[("an inner attribute takes no arguments", "#![x")])
+    );
+    assert_eq!(
+        all_errors("#[retry(3) x]\nfn f(): Int { 1 }"),
+        errors_of(&[(
+            "expected `]` after the attribute's arguments, found `x`",
+            "x"
+        )])
+    );
+    assert_eq!(
+        all_errors("#[attribute] x = 1"),
+        errors_of(&[(MISPLACED_ATTRIBUTE, "#[attribute]")])
+    );
+    assert_eq!(
+        all_errors("#[retry(3)]"),
+        errors_of(&[("`#[retry]` is not followed by anything", "#[retry(3)]")])
+    );
+    // A malformed attribute makes the item after it an error item, and the
+    // next item is parsed as ever; one whose brackets do not balance leaves
+    // them open, as a list's would, so what follows is part of it.
+    assert_eq!(
+        all_errors("#[retry(3) x]\nfn f(): Int { 1 }\ny = 2 2"),
+        errors_of(&[
+            (
+                "expected `]` after the attribute's arguments, found `x`",
+                "x"
+            ),
+            ("expected end of item, found `2`", "2"),
+        ])
+    );
+    assert_eq!(
+        all_errors("#[retry(3]\nfn f(): Int { 1 }\ny = 2 2"),
+        errors_of(&[("expected `,` or `)`, found `]`", "]")])
+    );
 }

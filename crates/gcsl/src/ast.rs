@@ -270,6 +270,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU32;
+use std::rc::Rc;
 
 use crate::MAX_DEPTH;
 use crate::check::{Constant, written_constant};
@@ -300,6 +301,10 @@ impl ExprId {
 pub struct ItemId(u32);
 
 impl ItemId {
+    /// No item yet: what the parser's use of an attribute holds until the
+    /// item after it is parsed, which then gives it its own.
+    pub(crate) const PENDING: ItemId = ItemId(u32::MAX);
+
     /// The item numbered `number`. Ids are normally assigned by the parser;
     /// this is for finding items by number in tests.
     #[cfg(test)]
@@ -763,6 +768,29 @@ impl Element {
             None => value,
         }
     }
+}
+
+/// A use of an attribute that is none of the parser's built-in ones, `#[NAME]`
+/// or `#[NAME(ARGS)]`, on the item it applies to: a declared attribute,
+/// whose name the workspace resolves as a type's, or one of the checker's
+/// (see the parser's [Attributes](crate::parser#attributes)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttributeUse {
+    /// The item it applies to.
+    pub item: ItemId,
+    /// Its name.
+    pub name: Name,
+    /// Where it is written, from its `#` through its `]`.
+    pub span: Span,
+    /// Where its name is written.
+    pub name_span: Span,
+    /// Its arguments, if it is written with parentheses: as a call's are,
+    /// positional or named.
+    pub args: Option<ArgRange>,
+    /// Its name as a type, at its name: an attribute is a type marked
+    /// `#[attribute]`, which the workspace resolves and expands as it does
+    /// any type's name (see [Types](#types)).
+    pub ty: TypeExprId,
 }
 
 /// One parameter of a function expression, `NAME: TYPE`, or `NAME: TYPE =
@@ -2258,6 +2286,34 @@ pub struct TypeStoreMark {
     decls: usize,
 }
 
+/// What a host knows an attribute by (see the parser's
+/// [Attributes](crate::parser#attributes)): its declaration, by the module
+/// that declares it, the path of its file without `.gcsl`, and its name;
+/// or one of GCSL's own, `retry` and `timeout`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AttributeId {
+    /// A `type` marked `#[attribute]`.
+    Declared {
+        /// The module that declares it.
+        module: Rc<str>,
+        /// The name it declares.
+        name: Rc<str>,
+    },
+    /// One of GCSL's own, by its name.
+    Builtin(&'static str),
+}
+
+impl AttributeId {
+    /// Its name, as an attribute is written.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            AttributeId::Declared { name, .. } => name,
+            AttributeId::Builtin(name) => name,
+        }
+    }
+}
+
 /// The definitions of declared types, apart from any tree, so that a tree
 /// can be given the definition of a type another file declares, as if it
 /// were written there (see [Types](#types)): each declaration's definition
@@ -2275,6 +2331,9 @@ pub struct TypeStore {
     /// Each declaration's definition: the number of its first node, and its
     /// root, every node from the first to the root being its own.
     decls: Vec<(u32, TypeExprId)>,
+    /// The declarations marked `#[attribute]`, by their numbers, each with
+    /// what a host knows it by.
+    attributes: HashMap<u32, AttributeId>,
 }
 
 impl TypeStore {
@@ -2316,6 +2375,21 @@ impl TypeStore {
         self.arena.constants.truncate(mark.constants);
         self.heights.truncate(mark.exprs);
         self.decls.truncate(mark.decls);
+        let decls = u32::try_from(mark.decls).unwrap_or(u32::MAX);
+        self.attributes.retain(|&decl, _| decl < decls);
+    }
+
+    /// Records that the declaration numbered `decl` is marked
+    /// `#[attribute]`, known to a host as `id`.
+    pub fn mark_attribute(&mut self, decl: u32, id: AttributeId) {
+        self.attributes.insert(decl, id);
+    }
+
+    /// What a host knows the declaration numbered `decl` by, if it is
+    /// marked `#[attribute]`.
+    #[must_use]
+    pub fn attribute(&self, decl: u32) -> Option<&AttributeId> {
+        self.attributes.get(&decl)
     }
 
     /// Adds the declarations numbered from the store's length on, `count`
@@ -2473,6 +2547,8 @@ pub struct AstBuilder {
     import_members: Vec<ImportMember>,
     shadowable: Vec<ItemId>,
     def_type_marks: Vec<ItemId>,
+    attribute_marks: Vec<ItemId>,
+    attribute_uses: Vec<AttributeUse>,
     def_types: Vec<DefTypeUse>,
     no_prelude: Option<Span>,
     syntax: Syntax,
@@ -2794,6 +2870,26 @@ impl AstBuilder {
         }
     }
 
+    /// Marks the `type` item `id` `#[attribute]` (see the parser's
+    /// [Attributes](crate::parser#attributes)).
+    pub fn mark_attribute(&mut self, id: ItemId) {
+        let at = self
+            .attribute_marks
+            .partition_point(|&marked| marked.0 < id.0);
+        if self.attribute_marks.get(at) != Some(&id) {
+            self.attribute_marks.insert(at, id);
+        }
+    }
+
+    /// Records `used`, a use of an attribute that is none of the parser's,
+    /// on the item it applies to, after the item's earlier ones.
+    pub fn push_attribute_use(&mut self, used: AttributeUse) {
+        let at = self
+            .attribute_uses
+            .partition_point(|earlier| earlier.item.0 <= used.item.0);
+        self.attribute_uses.insert(at, used);
+    }
+
     /// Marks the item `id` `#[def_type]` (see [Attributes](#attributes)).
     pub fn mark_def_type(&mut self, id: ItemId) {
         let at = self
@@ -2899,6 +2995,8 @@ impl AstBuilder {
         let items = next_id(mark.items);
         self.shadowable.retain(|item| item.0 < items);
         self.def_type_marks.retain(|item| item.0 < items);
+        self.attribute_marks.retain(|item| item.0 < items);
+        self.attribute_uses.retain(|used| used.item.0 < items);
     }
 
     /// Returns the node `id`.
@@ -2968,6 +3066,8 @@ impl AstBuilder {
             import_members: self.import_members,
             shadowable: self.shadowable,
             def_type_marks: self.def_type_marks,
+            attribute_marks: self.attribute_marks,
+            attribute_uses: self.attribute_uses,
             def_types: self.def_types,
             no_prelude: self.no_prelude,
             syntax: self.syntax,
@@ -3002,6 +3102,11 @@ pub struct Ast {
     shadowable: Vec<ItemId>,
     /// The items marked `#[def_type]`, in id order.
     def_type_marks: Vec<ItemId>,
+    /// The `type` items marked `#[attribute]`, in id order.
+    attribute_marks: Vec<ItemId>,
+    /// The uses of attributes that are none of the parser's, by the items
+    /// they apply to, in id order, and on each item in source order.
+    attribute_uses: Vec<AttributeUse>,
     /// The def-type definitions and references, in the order they were
     /// parsed (see [Def-types](#def-types)).
     def_types: Vec<DefTypeUse>,
@@ -3454,6 +3559,37 @@ impl Ast {
         self.shadowable
             .binary_search_by_key(&id.0, |marked| marked.0)
             .is_ok()
+    }
+
+    /// Whether the `type` item `id` is marked `#[attribute]`: a declaration
+    /// of an attribute (see the parser's
+    /// [Attributes](crate::parser#attributes)).
+    #[must_use]
+    pub fn is_attribute(&self, id: ItemId) -> bool {
+        self.attribute_marks
+            .binary_search_by_key(&id.0, |marked| marked.0)
+            .is_ok()
+    }
+
+    /// The uses of attributes that are none of the parser's on the item
+    /// `id`, in source order (see the parser's
+    /// [Attributes](crate::parser#attributes)).
+    #[must_use]
+    pub fn attribute_uses(&self, id: ItemId) -> &[AttributeUse] {
+        let start = self
+            .attribute_uses
+            .partition_point(|used| used.item.0 < id.0);
+        let end = self
+            .attribute_uses
+            .partition_point(|used| used.item.0 <= id.0);
+        self.attribute_uses.get(start..end).unwrap_or_default()
+    }
+
+    /// Every use of an attribute that is none of the parser's, by the items
+    /// they apply to, in id order.
+    #[must_use]
+    pub fn all_attribute_uses(&self) -> &[AttributeUse] {
+        &self.attribute_uses
     }
 
     /// Whether the item `id` is marked `#[def_type]` (see
@@ -4141,10 +4277,11 @@ impl Annotate for NoAnnotation {
 /// followed by its function, of no parameters, with no `(ret ...)`, whose
 /// body is the block written, or for `defmeta DT PATH = EXPR` a block whose
 /// result is the expression.
-/// The file has no span. An item marked `#[shadowable]` or `#[def_type]` is
-/// preceded by the attribute, as in `#[shadowable] (field arch ...)` or
-/// `#[def_type] (def package ...)`, both `#[shadowable] #[def_type]` in that
-/// order, and a file marked `#![no_prelude]` has it after `file`, as in
+/// The file has no span. An item marked `#[shadowable]`, `#[def_type]` or
+/// `#[attribute]` is preceded by the attribute, as in `#[shadowable] (field
+/// arch ...)` or `#[def_type] (def package ...)`, several in that order,
+/// then each use of an attribute on it, in source order, its arguments, if
+/// it has any, shown as `(…)`, as in `#[retry(…)] (fn f ...)`; and a file marked `#![no_prelude]` has it after `file`, as in
 /// `(file #![no_prelude] ...)`; the implicit import a workspace gives a
 /// file is not printed (see [Attributes](crate::ast#attributes)). There is
 /// no trailing newline.
@@ -4199,20 +4336,34 @@ impl<A: Annotate> Pretty<'_, A> {
         Ok(())
     }
 
+    /// Writes the attributes of the item `id`, each followed by a space: the
+    /// parser's, then the uses of others, in source order.
+    fn attributes(&self, f: &mut fmt::Formatter<'_>, id: ItemId) -> fmt::Result {
+        let ast = self.ast;
+        let marks = [
+            (ast.is_shadowable(id), "#[shadowable] "),
+            (ast.is_def_type(id), "#[def_type] "),
+            (ast.is_attribute(id), "#[attribute] "),
+        ];
+        for (marked, text) in marks {
+            if marked {
+                f.write_str(text)?;
+            }
+        }
+        for used in ast.attribute_uses(id) {
+            let name = ast.names().get(used.name);
+            let args = if used.args.is_some() { "(…)" } else { "" };
+            write!(f, "#[{name}{args}] ")?;
+        }
+        Ok(())
+    }
+
     fn item(&self, f: &mut fmt::Formatter<'_>, id: ItemId, depth: usize) -> fmt::Result {
         let item = self.ast.item(id);
         let ast = self.ast;
-        let marked = if ast.is_shadowable(id) {
-            "#[shadowable] "
-        } else {
-            ""
-        };
-        let def_type = if ast.is_def_type(id) {
-            "#[def_type] "
-        } else {
-            ""
-        };
-        write!(f, "{:indent$}{marked}{def_type}(", "", indent = depth * 2)?;
+        write!(f, "{:indent$}", "", indent = depth * 2)?;
+        self.attributes(f, id)?;
+        f.write_str("(")?;
         let value = match item.kind {
             ItemKind::Let {
                 path,

@@ -11780,3 +11780,115 @@ fn failed_files_do_not_repeat_effects_or_run_dependents() {
     drop(workspace);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// The attributes of the closure that field `name` of `value`, a record,
+/// holds, each as its name and its arguments shown, `on = true`.
+fn attributes_of(value: &Value, name: &str) -> Vec<String> {
+    let Value::Record(record) = value else {
+        panic!("{value} is no record");
+    };
+    let at = record
+        .layout
+        .texts
+        .iter()
+        .position(|text| &**text == name)
+        .unwrap();
+    let Value::Fn(closure) = &record.values[at] else {
+        panic!("{name} is no closure");
+    };
+    closure
+        .attributes()
+        .iter()
+        .map(|attribute| {
+            let args: Vec<String> = attribute
+                .args
+                .iter()
+                .map(|(field, constant)| format!("{field} = {constant:?}"))
+                .collect();
+            let id = match &attribute.id {
+                crate::ast::AttributeId::Declared { module, name } => format!("{module}.{name}"),
+                crate::ast::AttributeId::Builtin(name) => (*name).to_owned(),
+            };
+            format!("{id}({})", args.join(", "))
+        })
+        .collect()
+}
+
+#[test]
+fn a_function_s_attributes_reach_its_closures_with_their_declarations() {
+    let files = [
+        (
+            "workspace.gcsl",
+            "#[attribute] type hermetic = {on: Bool = true}\n\
+             #[hermetic] #[retry(2)]\n\
+             def build(): Int { 1 }\n\
+             def plain(): Int { 2 }",
+        ),
+        (
+            "lib/attrs.gcsl",
+            "#[attribute] type scratch = {keep: Size = 1GiB}",
+        ),
+        (
+            "app/main.gcsl",
+            "import scratch from lib/attrs\n#[scratch(512MiB)] def go(): Int { 1 }",
+        ),
+    ];
+    let root = rooted_value(&files, "workspace.gcsl");
+    assert_eq!(
+        attributes_of(&root, "build"),
+        [
+            "workspace.hermetic(on = Bool(true))",
+            "retry(times = Int(2))"
+        ]
+    );
+    assert!(attributes_of(&root, "plain").is_empty());
+    // By the module that declares it, wherever it is used.
+    assert_eq!(
+        attributes_of(&rooted_value(&files, "app/main.gcsl"), "go"),
+        ["lib/attrs.scratch(keep = Quantity(Size, 536870912))"]
+    );
+    // One not imported is unknown there.
+    let files = [
+        files[0],
+        files[1],
+        ("app/main.gcsl", "#[scratch] def go(): Int { 1 }"),
+    ];
+    assert_eq!(rooted_messages(&files), ["unknown attribute `scratch`"]);
+}
+
+#[test]
+fn a_def_type_s_attributes_are_defaults_for_its_definitions() {
+    let files = [
+        (
+            "workspace.gcsl",
+            "#[attribute] type hermetic = {on: Bool = true}\n\
+             #[def_type] #[hermetic]\n\
+             def test(name: String, f: fn(): Int): fn(): Int { f }",
+        ),
+        (
+            "tests/t.gcsl",
+            "def test a() { 1 }\n\
+             #[hermetic(false)] def test b() { 2 }\n\
+             #[retry(3)] def test c() { 3 }\n\
+             ra = (test a)()\nrb = (test b)()\nrc = (test c)()",
+        ),
+    ];
+    let value = rooted_value(&files, "tests/t.gcsl");
+    assert_eq!(
+        attributes_of(&value, "ra"),
+        ["workspace.hermetic(on = Bool(true))"]
+    );
+    // Replaced whole by its own.
+    assert_eq!(
+        attributes_of(&value, "rb"),
+        ["workspace.hermetic(on = Bool(false))"]
+    );
+    // Its own others after the def-type's.
+    assert_eq!(
+        attributes_of(&value, "rc"),
+        [
+            "workspace.hermetic(on = Bool(true))",
+            "retry(times = Int(3))"
+        ]
+    );
+}

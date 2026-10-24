@@ -428,6 +428,14 @@
 //!   `#[shadowable]` import brings them as plain types, and the prelude
 //!   declares none. A type imported as a built-in type's name is "`Int` is a
 //!   built-in type".
+//! - A type marked `#[attribute]` is an attribute's declaration (see the
+//!   checker's [Attributes](crate::check#attributes)): the store records it
+//!   by its number, with what a host knows it by, its file's path without
+//!   `.gcsl` and its name ([`TypeStore::mark_attribute`]), so that a session's
+//!   later inputs know it too, but one named like a built-in attribute,
+//!   "`retry` is a built-in attribute". A use of an attribute is a name of a
+//!   type of the file's view, read as any is, and its file's checker asks
+//!   whether that type is one (`Context::attribute`).
 //! - A qualified name, `t.PackageDef` ([`Scan::qualified_type`]), names
 //!   through a whole import of the file (`import lib/types as t`) a type of
 //!   the module it names: "`t` has no type `Foo`", with a note listing its
@@ -888,13 +896,13 @@ use crate::Outcome;
 use crate::ast::{
     self, Arg, ArgKind, Ast, AstBuilder, DefTypeId, DefTypeRole, Expr, ExprKind, ImportDecl,
     ImportForm, ImportMember, Item, ItemId, ItemKind, Param, PathSegment, Syntax, TypeExprId,
-    TypeExprKind, TypeLink, TypeStore, TypeStoreMark,
+    TypeExprKind, TypeLink, TypeStore, TypeStoreMark, AttributeId,
 };
 #[cfg(test)]
 use crate::check::ViewRecord;
 use crate::check::{
-    BUILTIN_TYPE_NAMES, Builtin, CheckOutput, Checker, Fileroot, KnownParams, Place, Record, Scope,
-    Slot, Types, check_types,
+    BUILTIN_ATTRIBUTES, BUILTIN_TYPE_NAMES, Builtin, CheckOutput, Checker, Fileroot, KnownParams,
+    Place, Record, Scope, Slot, Types, check_types,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError, Severity};
 use crate::eval::{MemoTables, TempDirs};
@@ -5379,6 +5387,31 @@ fn declare_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
     }
     scan.poisoned_types = poisoned;
     scan.type_base = scan.type_store.reserve(types.len());
+    // Those marked `#[attribute]`, by their numbers, but one named like a
+    // built-in attribute.
+    for (at, decl) in (0u32..).zip(&types) {
+        let Some(file) = scan.files.get(decl.file as usize) else {
+            continue;
+        };
+        if !file.ast.is_attribute(decl.item) {
+            continue;
+        }
+        let name = scan.names.get(decl.name);
+        if BUILTIN_ATTRIBUTES.contains(&name) {
+            errors.push(
+                Diagnostic::error(format!("`{name}` is a built-in attribute"), decl.span)
+                    .in_input(decl.file),
+            );
+            continue;
+        }
+        let module = file.path.strip_suffix(".gcsl").unwrap_or(&file.path);
+        let id = AttributeId::Declared {
+            module: Rc::from(module),
+            name: Rc::from(name),
+        };
+        scan.type_store
+            .mark_attribute(scan.type_base.saturating_add(at), id);
+    }
     scan.types = types;
     scan.dir_types = dir_types;
 }
@@ -6215,7 +6248,44 @@ pub(crate) struct Context<'a> {
 /// for each `def`'s cell what a call of it needs to know of its parameters.
 type CellReads<'a> = (&'a [Slot], &'a [Option<Rc<KnownParams>>]);
 
+/// What a name read as an attribute's names in a file (see the parser's
+/// [Attributes](crate::parser#attributes)).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttributeLookup<'a> {
+    /// No type of the file's view.
+    Nothing,
+    /// A type of the file's view that is not marked `#[attribute]`.
+    NotAttribute,
+    /// A type marked `#[attribute]`, known to a host as this.
+    Attribute(&'a AttributeId),
+}
+
 impl<'a> Context<'a> {
+    /// What `name`, read as an attribute's, names in the file: a type of its
+    /// view of types, as a type's name is read (see [Types](#types)), and
+    /// whether it is marked `#[attribute]`.
+    pub(crate) fn attribute(&self, name: Name) -> AttributeLookup<'a> {
+        match self.file.type_view.get(&name) {
+            None => AttributeLookup::Nothing,
+            Some(&decl) => match self.scan.type_store.attribute(decl) {
+                Some(id) => AttributeLookup::Attribute(id),
+                None => AttributeLookup::NotAttribute,
+            },
+        }
+    }
+
+    /// The names of the attributes of the file's view of types, for
+    /// suggestions.
+    pub(crate) fn attribute_names(&self) -> Vec<Name> {
+        let store = &self.scan.type_store;
+        self.file
+            .type_view
+            .iter()
+            .filter(|&(_, &decl)| store.attribute(decl).is_some())
+            .map(|(&name, _)| name)
+            .collect()
+    }
+
     /// The context of file `index` of `scan`, where the scan located it
     /// ([`Scan::place`]).
     fn new(
@@ -7322,8 +7392,12 @@ fn computed_cells(scan: &Scan, index: u32, output: &CheckOutput) -> Vec<Computed
                     .and_then(|function| file?.mentions.functions.get(function as usize))
                     .filter(|function| function.name.is_none())
             {
-                let resolution = output.checked.resolution.function(function.function);
-                known = Some(KnownParams::of(resolution));
+                let resolution = &output.checked.resolution;
+                let attributes = resolution.attributes(function.function);
+                known = Some(KnownParams::of(
+                    resolution.function(function.function),
+                    attributes,
+                ));
             }
             // A poisoned cell is read as `Error` (see [Scan
             // errors](#scan-errors)).

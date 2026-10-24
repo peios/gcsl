@@ -888,6 +888,7 @@ fn a_dotted_update_is_two_levels_taller_for_each_step() {
         name: None,
         display: Box::from("fn(): {}"),
         slot_names: Box::default(),
+        attributes: Box::default(),
     };
     let mut functions = vec![code];
     builder.measure(update, &mut functions);

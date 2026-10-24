@@ -1280,6 +1280,57 @@
 //! from a pure function is the purity error. A record read whole through
 //! an import holds no namespace (`Checker::imported_record`).
 //!
+//! # Attributes
+//!
+//! An attribute says how to run a function, for the host that runs it or
+//! for GCSL: its arguments are a record of constants, and so an attribute
+//! is declared as the record type of its arguments, a `type` marked
+//! `#[attribute]` (see the parser's [Attributes](crate::parser#attributes)),
+//! `#[attribute] type hermetic = {on: Bool = true}`. Being a type, it is
+//! named, imported and reported in conflicts as any type is (see
+//! [`crate::workspace`], "Types"), and is usable as one. Its type must be a
+//! record type, with no rest-field, whose fields hold only constants:
+//! `Int`, `Float`, `Bool`, `String`, `Duration`, `Size`, or lists and
+//! records of them (`Checker::holds_constants`), "an attribute's arguments
+//! are a record of constants" otherwise, at its definition, noted with what
+//! a field may be; and it may not be named like a built-in attribute
+//! ([`BUILTIN_ATTRIBUTES`]), "`retry` is a built-in attribute".
+//!
+//! `retry`, `{times: Int}`, and `timeout`, `{limit: Duration}`, are the
+//! checker's own, known in every file, whatever its types.
+//!
+//! Each use on a function item (`Checker::check_attribute_uses`), checked
+//! before the file's body, names one of the checker's or a type of the
+//! file's view: "unknown attribute `x`" for none, with a suggestion among
+//! the attributes in view and the checker's, and "`PackageDef` is not an
+//! attribute", noted "an attribute is a `type` marked `#[attribute]`", for
+//! a type that is not marked. Its arguments fill its record's fields: one
+//! positional argument for an attribute of one field, and named ones for
+//! any, "`#[device]` takes its arguments by name, as in `#[device(name =
+//! ...)]`" for a positional one of another; "`#[retry]` takes one
+//! argument", "`#[retry]` has no argument `x`", "`times` is given twice"
+//! and "`#[retry]` takes no block" otherwise. Each must be a constant, by
+//! the rule for constant defaults, "an attribute's argument must be a
+//! constant", and is checked against its field's type as a constant
+//! default is, "expected by this attribute" labelling the attribute's
+//! name. A field given nothing takes its default, and one with none is
+//! "`#[device]` needs `name`". `#[hermetic()]` is `#[hermetic]`. What the
+//! arguments take of the frame's slots is given back: an attribute is never
+//! run.
+//!
+//! A function's attributes ([`Attribute`]), each what a host knows it by
+//! ([`AttributeId`]) and its arguments, every field by name with the
+//! constant given or its default, are recorded by its function, in source
+//! order ([`Resolution::attributes`]), for lowering to give its code
+//! ([`crate::ir::FnCode::attributes`]). A definition made with a def-type
+//! takes the def-type's attributes as defaults (`Checker::inherit_attributes`):
+//! the def-type's, each replaced whole by the definition's own of the same
+//! attribute, then the definition's others; a def-type of another file or
+//! of an earlier session input is known by what its cell or binding
+//! carries ([`KnownParams`]). Plain GCSL gives a host's attributes no
+//! meaning; `retry` and `timeout` are checked and carried, and run as yet as
+//! any function is.
+//!
 //! # Metas
 //!
 //! A function type may have a *meta*, written after its return type with a
@@ -2948,11 +2999,11 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::{
-    Annotate, ArgKind, ArgRange, Ast, BinaryOp, DefTypeId, DefTypeRole, Effect, Element,
-    ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind, FieldTyRange, FnDecl,
-    FnId, ForHead, ForId, Item, ItemId, ItemKind, ItemRange, Jump, Label, LabelId, MetaTy, Param,
-    PartRange, PathRange, PathSegment, SegmentKind, StrPart, Syntax, TypeExprId, TypeExprKind,
-    TypeProblem, UnaryOp, path_span, symbol_span,
+    Annotate, ArgKind, ArgRange, Ast, AttributeId, AttributeUse, BinaryOp, DefTypeId, DefTypeRole,
+    Effect, Element, ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind,
+    FieldTyRange, FnDecl, FnId, ForHead, ForId, Item, ItemId, ItemKind, ItemRange, Jump, Label,
+    LabelId, MetaTy, Param, PartRange, PathRange, PathSegment, SegmentKind, StrPart, Syntax,
+    TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::mentions::{self, FieldLeaf, FieldTree, Mentions, Need, Resolve, Schedule};
@@ -2962,7 +3013,7 @@ use crate::strings::FieldName;
 use crate::suggest;
 use crate::types::{AwaitKind, FnTy, Laziness, Meta, TyId, TyKind, TypeTable, ValueTest};
 use crate::value::{Quantity, ValueKind, int_to_float};
-use crate::workspace::{Context, Target};
+use crate::workspace::{AttributeLookup, Context, Target};
 
 /// The type of every expression in an [`Ast`], indexed by [`ExprId`].
 ///
@@ -3781,6 +3832,33 @@ pub enum ParamDefault {
     },
 }
 
+/// What the check gives lowering besides types and slots, as
+/// [`Resolution`] carries it.
+#[derive(Debug, Default)]
+struct ForLowering {
+    /// Each call that gives a parameter its default, by its id: see
+    /// [`Resolution::call_defaults`].
+    call_defaults: HashMap<ExprId, Box<[(u32, ParamDefault)]>>,
+    /// Each function item's attributes: see [`Resolution::attributes`].
+    fn_attributes: HashMap<FnId, Box<[Attribute]>>,
+    /// Each record literal given fields' defaults, by its id: see
+    /// [`Resolution::record_fills`].
+    record_fills: RecordFills,
+}
+
+/// One attribute of a function item, resolved (see [Attributes](#attributes)):
+/// what a host knows it by, and its arguments, every field of its record
+/// type by its name, in the type's order, each the constant given or its
+/// default. A constant record among them names its fields by the program's
+/// names, as every [`Constant`] does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attribute {
+    /// What a host knows it by.
+    pub id: AttributeId,
+    /// Its arguments, by field.
+    pub args: Box<[(Box<str>, Constant)]>,
+}
+
 /// The defaults of a function, for [`FnResolution::defaults`]: `constants`,
 /// each parameter's constant default, if it has one that checked, and
 /// `functions`, each parameter with a default function, in parameter order,
@@ -3825,19 +3903,23 @@ type RecordFills = HashMap<ExprId, Box<[(Name, Constant)]>>;
 /// a workspace, through its cell (see [Imports](#imports)). For each
 /// parameter, in order, whether its body measures it, which makes it
 /// present, for the call-site form of the implicit-await error, and its
-/// default, if it has one, which a call that leaves it unfilled is given.
+/// default, if it has one, which a call that leaves it unfilled is given;
+/// and its attributes, which a def-type gives its definitions (see
+/// [Attributes](#attributes)).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct KnownParams {
     /// For each parameter, whether the body measures it.
     measured: Box<[bool]>,
     /// For each parameter, its default, if it has one; empty if none has.
     defaults: Box<[Option<ParamDefault>]>,
+    /// The function's attributes, in source order.
+    attributes: Box<[Attribute]>,
 }
 
 impl KnownParams {
-    /// What a call of the function `resolution` describes needs to know of
-    /// its parameters.
-    pub(crate) fn of(resolution: &FnResolution) -> Rc<Self> {
+    /// What a call of the function `resolution` describes, whose attributes
+    /// are `attributes`, needs to know of its parameters.
+    pub(crate) fn of(resolution: &FnResolution, attributes: &[Attribute]) -> Rc<Self> {
         Rc::new(Self {
             measured: resolution
                 .param_demands
@@ -3845,6 +3927,7 @@ impl KnownParams {
                 .map(Option::is_some)
                 .collect(),
             defaults: resolution.defaults.iter().cloned().collect(),
+            attributes: attributes.into(),
         })
     }
 
@@ -4065,6 +4148,9 @@ pub struct Resolution {
     /// such parameter and its default, in parameter order (see
     /// [Calls](#calls)); only a program with one has entries.
     call_defaults: HashMap<ExprId, Box<[(u32, ParamDefault)]>>,
+    /// The attributes of each function item that has any, by its function,
+    /// in source order (see [Attributes](#attributes)).
+    fn_attributes: HashMap<FnId, Box<[Attribute]>>,
     /// Each record literal, a record block or `{}`, that the checker gave
     /// fields their defaults, by its id, with each such field and its
     /// default, in the order of
@@ -4155,6 +4241,16 @@ impl Resolution {
     #[must_use]
     pub fn call_defaults(&self, id: ExprId) -> &[(u32, ParamDefault)] {
         self.call_defaults.get(&id).map_or(&[], |defaults| defaults)
+    }
+
+    /// The attributes of function `function`, in source order: none for a
+    /// function that is no function item, or has none (see
+    /// [Attributes](#attributes)).
+    #[must_use]
+    pub fn attributes(&self, function: FnId) -> &[Attribute] {
+        self.fn_attributes
+            .get(&function)
+            .map_or(&[], |attributes| attributes)
     }
 
     /// The fields that the record literal `block`, a record block or `{}`,
@@ -4450,6 +4546,7 @@ impl Resolution {
             meta_reads: HashMap::new(),
             metas: Vec::new(),
             call_defaults: HashMap::new(),
+            fn_attributes: HashMap::new(),
             record_fills: HashMap::new(),
         }
     }
@@ -5641,6 +5738,59 @@ pub(crate) const BUILTIN_TYPE_NAMES: [&str; 9] = [
     "Int", "Float", "Bool", "String", "Duration", "Size", "List", "Future", "Present",
 ];
 
+/// The name of the checker's attribute that retries a call.
+const RETRY: &str = "retry";
+
+/// The name of the checker's attribute that limits a call's time.
+const TIMEOUT: &str = "timeout";
+
+/// The error for an `#[attribute]` type that is no record of constants.
+const NOT_CONSTANT_RECORD: &str = "an attribute's arguments are a record of constants";
+
+/// The note on [`NOT_CONSTANT_RECORD`].
+const CONSTANT_FIELDS_NOTE: &str = "each field must be an `Int`, `Float`, `Bool`, `String`, \
+     `Duration` or `Size`, or a list or record of them";
+
+/// The fields of an attribute's record, by name, in its order, each with
+/// its type and default, if it has one (see [Attributes](#attributes)).
+type AttributeFields = Vec<(Box<str>, TyId, Option<Constant>)>;
+
+/// The function of the item `item`, a function item that attributes apply
+/// to: a named `fn`, a `def` or a definition (see [Attributes](#attributes)).
+fn item_function(ast: &Ast, item: ItemId) -> Option<FnId> {
+    let (ItemKind::Let {
+        value,
+        function: true,
+        ..
+    }
+    | ItemKind::Field {
+        value,
+        function: true,
+        ..
+    }
+    | ItemKind::DefTypeDef { value, .. }) = ast.item(item).kind
+    else {
+        return None;
+    };
+    match ast.get(value).kind {
+        ExprKind::Fn(function) => Some(function),
+        _ => None,
+    }
+}
+
+/// The names of the built-in attributes: the parser's, `shadowable`,
+/// `def_type`, `attribute` and `no_prelude`, and the checker's, `retry`
+/// and `timeout` (see [Attributes](#attributes)). No `#[attribute]` type
+/// may be named like one: "`retry` is a built-in attribute".
+pub(crate) const BUILTIN_ATTRIBUTES: [&str; 6] = [
+    "shadowable",
+    "def_type",
+    "attribute",
+    "no_prelude",
+    "retry",
+    "timeout",
+];
+
 /// The type names every program can use, as `(name, type)` pairs. A name
 /// the program never mentions has no [`Name`].
 type BuiltinTypes = [(Option<Name>, TyId); 6];
@@ -5717,12 +5867,8 @@ pub struct Checker<'a> {
     /// For each binding of the scope the check started from, its entry of
     /// [`Scope`]'s `known`.
     scope_known: Vec<Option<Rc<KnownParams>>>,
-    /// Each call that gives a parameter its default, by its id: see
-    /// [`Resolution::call_defaults`].
-    call_defaults: HashMap<ExprId, Box<[(u32, ParamDefault)]>>,
-    /// Each record literal given fields' defaults, by its id: see
-    /// [`Resolution::record_fills`].
-    record_fills: RecordFills,
+    /// What the check gives lowering besides types and slots.
+    lowering: ForLowering,
     /// What the input's top-level items mention, and the groups of its
     /// top-level functions (see [`crate::mentions`]).
     mentions: Mentions,
@@ -6018,8 +6164,7 @@ impl<'a> Checker<'a> {
             unreached_path: false,
             bindings: scope.bindings,
             scope_known: scope.known,
-            call_defaults: HashMap::new(),
-            record_fills: HashMap::new(),
+            lowering: ForLowering::default(),
             mentions: Mentions::default(),
             workspace: None,
             imported_callees: HashMap::new(),
@@ -6136,9 +6281,7 @@ impl<'a> Checker<'a> {
         self.quiet.failed |= self.ast.syntax() != Syntax::Clean;
         // A workspace has checked the file's `type` items already, before
         // any file's check ([`check_types`]): they are resolved quietly.
-        let quiet = std::mem::replace(&mut self.quiet.types, self.workspace.is_some());
-        self.type_items();
-        self.quiet.types = quiet;
+        self.check_declarations();
         self.declare_top_fns();
         let ty = self.check_body(root, None);
         // Finalisation: an integer result with no context defaults to Int.
@@ -6220,8 +6363,9 @@ impl<'a> Checker<'a> {
                 tests: self.tests,
                 meta_reads: self.meta_reads,
                 metas: self.metas,
-                call_defaults: self.call_defaults,
-                record_fills: self.record_fills,
+                call_defaults: self.lowering.call_defaults,
+                fn_attributes: self.lowering.fn_attributes,
+                record_fills: self.lowering.record_fills,
             },
         };
         let mut warnings = self.warnings;
@@ -6712,6 +6856,15 @@ impl<'a> Checker<'a> {
             }
             let errors = self.errors.len();
             let resolved = self.resolve_type(ty, Bareness::Present);
+            if ast.is_attribute(id)
+                && resolved != TyId::ERROR
+                && !self.holds_constants(resolved, true)
+            {
+                self.errors.push(
+                    Diagnostic::error(NOT_CONSTANT_RECORD, ast.type_expr(ty).span)
+                        .with_note(CONSTANT_FIELDS_NOTE),
+                );
+            }
             if self.quiet.types && self.errors.len() > errors {
                 self.errors.truncate(errors);
                 self.quiet.failed = true;
@@ -7901,7 +8054,7 @@ impl<'a> Checker<'a> {
                 .into_iter()
                 .map(|(name, _, default)| (name, default))
                 .collect();
-            self.record_fills.insert(block, fills);
+            self.lowering.record_fills.insert(block, fills);
         }
         if missing.is_empty() {
             return false;
@@ -9124,9 +9277,14 @@ impl<'a> Checker<'a> {
         let mut known = std::mem::take(&mut self.scope_known);
         for binding in self.bindings.get(known.len()..).unwrap_or_default() {
             known.push(binding.function.and_then(|function| {
+                let attributes = self
+                    .lowering
+                    .fn_attributes
+                    .get(&function)
+                    .map_or(&[][..], |a| a);
                 self.fn_resolutions
                     .get(function.index())
-                    .map(KnownParams::of)
+                    .map(|resolution| KnownParams::of(resolution, attributes))
             }));
         }
         known
@@ -10447,10 +10605,65 @@ impl<'a> Checker<'a> {
         (self.next_slot, self.frame_size) = (0, 0);
         self.check_fn_body(&decl, base, (None, ty, span), sig.ret);
         self.fn_params.truncate(base);
+        self.inherit_attributes(function, use_.dt);
         // Its meta's cell, read as its body reads a top-level function.
         self.definition_meta(function, def, sig.meta);
         self.finish_function(decl.params.len(), None);
         ty
+    }
+
+    /// Gives the definition of function `function` the attributes of its
+    /// def-type, the function `dt` names, as defaults (see
+    /// [Attributes](#attributes)): the def-type's, in its order, each
+    /// replaced whole by the definition's own of the same attribute, then
+    /// the definition's others, in theirs. A def-type known by no tree of
+    /// this input is known by what its cell carries ([`KnownParams`]).
+    fn inherit_attributes(&mut self, function: FnId, dt: ExprId) {
+        let inherited: Vec<Attribute> = match self.known_callee(dt) {
+            Some(KnownCallee::Current(def_type)) => self
+                .lowering
+                .fn_attributes
+                .get(&def_type)
+                .map(|a| a.to_vec())
+                .unwrap_or_default(),
+            Some(KnownCallee::Earlier(index)) => self
+                .scope_known
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(|known| known.attributes.to_vec())
+                .unwrap_or_default(),
+            Some(KnownCallee::Imported(node)) => self
+                .workspace
+                .and_then(|workspace| workspace.known(node))
+                .map(|known| known.attributes.to_vec())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if inherited.is_empty() {
+            return;
+        }
+        let own = self
+            .lowering
+            .fn_attributes
+            .remove(&function)
+            .unwrap_or_default();
+        let mut merged: Vec<Attribute> = inherited
+            .into_iter()
+            .map(|default| {
+                own.iter()
+                    .find(|attribute| attribute.id == default.id)
+                    .cloned()
+                    .unwrap_or(default)
+            })
+            .collect();
+        for attribute in &own {
+            if !merged.iter().any(|kept| kept.id == attribute.id) {
+                merged.push(attribute.clone());
+            }
+        }
+        self.lowering
+            .fn_attributes
+            .insert(function, merged.into_boxed_slice());
     }
 
     /// Resolves the read of its meta of the definition `def` made with a
@@ -14648,6 +14861,252 @@ impl<'a> Checker<'a> {
         constants
     }
 
+    /// Checks what the file declares before its body is checked: its `type`
+    /// items, quietly in a workspace, which has checked them first
+    /// ([`check_types`]), and the uses of attributes on its functions.
+    fn check_declarations(&mut self) {
+        let quiet = std::mem::replace(&mut self.quiet.types, self.workspace.is_some());
+        self.type_items();
+        self.quiet.types = quiet;
+        self.check_attribute_uses();
+    }
+
+    /// Whether `ty` holds only constants, as an attribute's arguments must
+    /// (see [Attributes](#attributes)): an `Int`, `Float`, `Bool`, `String`,
+    /// `Duration` or `Size`, a list of such, or a record of such fields with
+    /// no rest-field; at the `top`, only such a record.
+    ///
+    /// Recurses once per level of list and record nesting in the type.
+    fn holds_constants(&self, ty: TyId, top: bool) -> bool {
+        match self.types.kind(ty) {
+            TyKind::Record(record) => {
+                record.rest().is_none()
+                    && record
+                        .fields
+                        .iter()
+                        .all(|&(_, field)| self.holds_constants(field, false))
+            }
+            _ if top => false,
+            TyKind::Int | TyKind::Float | TyKind::Bool | TyKind::String | TyKind::Quantity(_) => {
+                true
+            }
+            &TyKind::List(element) => self.holds_constants(element, false),
+            _ => false,
+        }
+    }
+
+    /// Checks every use of an attribute that is none of the parser's, on the
+    /// function items they apply to (see [Attributes](#attributes)), and
+    /// records each function's, in source order, as
+    /// [`Resolution::attributes`] gives them. Its arguments' constants take
+    /// no slot of the frame: what their checks allocate is given back.
+    fn check_attribute_uses(&mut self) {
+        let ast = self.ast;
+        let uses = ast.all_attribute_uses();
+        if uses.is_empty() {
+            return;
+        }
+        let outer = (self.next_slot, self.frame_size, self.slot_names.len());
+        let mut found: HashMap<FnId, Vec<Attribute>> = HashMap::new();
+        for used in uses {
+            let attribute = self.check_attribute_use(used);
+            if let (Some(attribute), Some(function)) = (attribute, item_function(ast, used.item)) {
+                found.entry(function).or_default().push(attribute);
+            }
+        }
+        (self.next_slot, self.frame_size) = (outer.0, outer.1);
+        self.slot_names.truncate(outer.2);
+        self.lowering.fn_attributes = found
+            .into_iter()
+            .map(|(function, attributes)| (function, attributes.into_boxed_slice()))
+            .collect();
+    }
+
+    /// The attribute `used` names, with its arguments, once checked (see
+    /// [Attributes](#attributes)): `retry` and `timeout` the checker's own,
+    /// any other name a type of the file's view marked `#[attribute]`,
+    /// whose record type its arguments are checked against. `None`, the
+    /// error reported, if it names none, or its arguments do not fit.
+    fn check_attribute_use(&mut self, used: &AttributeUse) -> Option<Attribute> {
+        let names = self.ast.names();
+        let text = names.get(used.name);
+        let (id, fields) = match text {
+            RETRY => (
+                AttributeId::Builtin(RETRY),
+                vec![(Box::from("times"), TyId::INT, None)],
+            ),
+            TIMEOUT => (
+                AttributeId::Builtin(TIMEOUT),
+                vec![(Box::from("limit"), TyId::DURATION, None)],
+            ),
+            _ => self.declared_attribute(used)?,
+        };
+        let given = self.attribute_args(used, &fields)?;
+        let mut args = Vec::with_capacity(fields.len());
+        let mut failed = false;
+        for ((field, ty, default), value) in fields.into_iter().zip(given) {
+            let constant = match value {
+                Some(value) => self.attribute_arg(value, ty, used.name_span),
+                None if default.is_some() => default,
+                None => {
+                    let message = format!("`#[{text}]` needs `{field}`");
+                    self.errors.push(Diagnostic::error(message, used.span));
+                    None
+                }
+            };
+            match constant {
+                Some(constant) => args.push((field, constant)),
+                None => failed = true,
+            }
+        }
+        (!failed).then(|| Attribute {
+            id,
+            args: args.into_boxed_slice(),
+        })
+    }
+
+    /// The attribute of the file's view of types that `used` names, and its
+    /// record type's fields, by name, in its order, each with its type and
+    /// default (see [Attributes](#attributes)). `None` for a name that
+    /// names none: "unknown attribute `x`", with a suggestion among the
+    /// attributes in view and the checker's, or "`T` is not an attribute"
+    /// for a type that is not marked `#[attribute]`; and, quietly, for one
+    /// whose type is erroneous, which its declaration reports.
+    fn declared_attribute(
+        &mut self,
+        used: &AttributeUse,
+    ) -> Option<(AttributeId, AttributeFields)> {
+        let names = self.ast.names();
+        let text = names.get(used.name);
+        let lookup = self
+            .workspace
+            .map_or(AttributeLookup::Nothing, |workspace| {
+                workspace.attribute(used.name)
+            });
+        let id = match lookup {
+            AttributeLookup::Attribute(id) => id.clone(),
+            AttributeLookup::NotAttribute => {
+                self.errors.push(
+                    Diagnostic::error(format!("`{text}` is not an attribute"), used.name_span)
+                        .with_note("an attribute is a `type` marked `#[attribute]`"),
+                );
+                return None;
+            }
+            AttributeLookup::Nothing => {
+                let declared = self
+                    .workspace
+                    .map(Context::attribute_names)
+                    .unwrap_or_default();
+                let candidates = declared
+                    .iter()
+                    .map(|&name| (names.get(name), 0))
+                    .chain([(RETRY, 1), (TIMEOUT, 1)]);
+                let suggestion =
+                    suggest::best(text, candidates).map(|best| (used.name_span, best.to_owned()));
+                self.errors.push(
+                    Diagnostic::error(format!("unknown attribute `{text}`"), used.name_span)
+                        .with_suggestion(suggestion),
+                );
+                return None;
+            }
+        };
+        let ty = self.resolve_type(used.ty, Bareness::Present);
+        let TyKind::Record(record) = self.types.kind(ty) else {
+            return None;
+        };
+        let fields = record
+            .fields
+            .iter()
+            .map(|&(name, field)| {
+                let default = record
+                    .defaults()
+                    .iter()
+                    .find(|&&(defaulted, _)| defaulted == name)
+                    .map(|(_, constant)| constant.clone());
+                (Box::from(names.get(name)), field, default)
+            })
+            .collect();
+        Some((id, fields))
+    }
+
+    /// The argument `used` gives each of `fields`, the fields of its
+    /// attribute's record, by name, in their order: one positional argument
+    /// for an attribute of one field, and named arguments for any. `None`,
+    /// the error reported, for a positional argument of an attribute of
+    /// another number of fields, a second positional one, a named one that
+    /// names no field or one named twice, or a trailing block.
+    fn attribute_args(
+        &mut self,
+        used: &AttributeUse,
+        fields: &AttributeFields,
+    ) -> Option<Vec<Option<ExprId>>> {
+        let ast = self.ast;
+        let text = ast.names().get(used.name);
+        let mut given: Vec<Option<ExprId>> = vec![None; fields.len()];
+        let mut failed = false;
+        for arg in used.args.map_or(&[][..], |args| ast.args(args)) {
+            let error = match arg.kind {
+                ArgKind::Positional if fields.len() != 1 => Some(format!(
+                    "`#[{text}]` takes its arguments by name, as in `#[{text}({} = ...)]`",
+                    fields.first().map_or("x", |(name, _, _)| name)
+                )),
+                ArgKind::Positional => match given.first_mut() {
+                    Some(slot @ None) => {
+                        *slot = Some(arg.value);
+                        None
+                    }
+                    _ => Some(format!("`#[{text}]` takes one argument")),
+                },
+                ArgKind::Named { name, .. } => {
+                    let field_name = ast.names().get(name);
+                    match fields
+                        .iter()
+                        .position(|(field, _, _)| &**field == field_name)
+                    {
+                        None => Some(format!("`#[{text}]` has no argument `{field_name}`")),
+                        Some(at) => match given.get_mut(at) {
+                            Some(slot @ None) => {
+                                *slot = Some(arg.value);
+                                None
+                            }
+                            _ => Some(format!("`{field_name}` is given twice")),
+                        },
+                    }
+                }
+                ArgKind::Trailing => Some(format!("`#[{text}]` takes no block")),
+            };
+            if let Some(message) = error {
+                self.errors.push(Diagnostic::error(message, arg.span(ast)));
+                failed = true;
+            }
+        }
+        (!failed).then_some(given)
+    }
+
+    /// The constant that `value`, an argument of an attribute named at
+    /// `name`, is, checked against its field's type `ty` as a parameter's
+    /// constant default is (see [Attributes](#attributes)): "an attribute's
+    /// argument must be a constant", noted with what a constant is, for one
+    /// that is not. `None`, the error reported, if it does not fit.
+    fn attribute_arg(&mut self, value: ExprId, ty: TyId, name: Span) -> Option<Constant> {
+        if !self.is_constant(value) {
+            self.errors.push(
+                Diagnostic::error(
+                    "an attribute's argument must be a constant",
+                    self.ast.get(value).span,
+                )
+                .with_note(CONSTANT_NOTE),
+            );
+            return None;
+        }
+        let errors = self.errors.len();
+        let found = self.check_expr_expecting(value, ty, name, "expected by this attribute");
+        if found == TyId::ERROR || self.errors.len() != errors {
+            return None;
+        }
+        self.constant(value)
+    }
+
     /// Whether the expression `id`, a parameter's or a field's default, is
     /// a constant (see [Calls](#calls)): [`is_constant`].
     fn is_constant(&self, id: ExprId) -> bool {
@@ -14661,7 +15120,11 @@ impl<'a> Checker<'a> {
     /// (see [Field defaults](#field-defaults)). `None` if it is not one
     /// after all.
     fn constant(&self, id: ExprId) -> Option<Constant> {
-        constant_of(self.ast, id, (&self.expr_types, &self.record_fills))
+        constant_of(
+            self.ast,
+            id,
+            (&self.expr_types, &self.lowering.record_fills),
+        )
     }
 
     /// The constant that `constant`, a field's default of a declared type as
@@ -15962,7 +16425,7 @@ impl<'a> Checker<'a> {
             }
         }
         if let Some(defaults) = defaults.filter(|defaults| !defaults.is_empty()) {
-            self.call_defaults.insert(id, defaults.into());
+            self.lowering.call_defaults.insert(id, defaults.into());
         }
     }
 

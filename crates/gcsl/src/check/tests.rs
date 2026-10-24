@@ -14090,3 +14090,52 @@ fn a_quantity_literal_is_a_constant_default() {
         "fn(r: {t: Duration = 1m30s}): {t: Duration = 1m30s}"
     );
 }
+
+// ----- Attributes -----
+
+#[test]
+fn the_checker_s_own_attributes_are_checked_without_a_workspace() {
+    let text = "#[retry(3)] #[timeout(1m)]\nfn f() -> Int { 1 }\nf()";
+    let (_, _, output) = check_prelude(text);
+    let output = output.unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(
+        output.checked.resolution.attributes(FnId::new(0)),
+        [
+            Attribute {
+                id: AttributeId::Builtin("retry"),
+                args: Box::new([(Box::from("times"), Constant::Int(3))]),
+            },
+            Attribute {
+                id: AttributeId::Builtin("timeout"),
+                args: Box::new([(
+                    Box::from("limit"),
+                    Constant::Quantity(Quantity::Duration, 60_000_000_000)
+                )]),
+            },
+        ]
+    );
+    let cases = [
+        ("#[retry]", "`#[retry]` needs `times`"),
+        ("#[retry(\"3\")]", "mismatched types"),
+        ("#[retry(3, 4)]", "`#[retry]` takes one argument"),
+        ("#[retry(tims = 3)]", "`#[retry]` has no argument `tims`"),
+        ("#[retry(times = 1, times = 2)]", "`times` is given twice"),
+        ("#[timeout(30)]", "mismatched types"),
+        ("#[rety(3)]", "unknown attribute `rety`"),
+        (
+            "#[retry(1 + 2)]",
+            "an attribute's argument must be a constant",
+        ),
+    ];
+    for (attribute, message) in cases {
+        let text = format!("{attribute}\nfn f() -> Int {{ 1 }}\nf()");
+        assert_eq!(messages(&text), [message], "{attribute}");
+    }
+    // A misspelt one is suggested, and a declared one is unknown without a
+    // workspace to declare it.
+    let found = diagnostics("#[rety(3)]\nfn f() -> Int { 1 }\nf()");
+    assert_eq!(
+        found[0].suggestion.as_ref().map(|s| s.replacement.as_str()),
+        Some("retry")
+    );
+}

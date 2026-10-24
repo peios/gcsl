@@ -240,6 +240,7 @@ fn one_function(display: &str) -> Rc<Ir> {
         name: None,
         display: Box::from(display),
         slot_names: Box::default(),
+        attributes: Box::default(),
     };
     Rc::new(builder.finish_program(root, (0, Vec::new()), vec![code], (0, 0)))
 }

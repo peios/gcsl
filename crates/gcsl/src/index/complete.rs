@@ -364,6 +364,8 @@ impl<'s> Tokens<'s> {
             | TokenKind::Label(_)
             | TokenKind::Attribute(_)
             | TokenKind::InnerAttribute(_)
+            | TokenKind::AttributeArgs(_)
+            | TokenKind::InnerAttributeArgs(_)
             | TokenKind::Int(_)
             | TokenKind::Float(_)
             | TokenKind::Duration(_)

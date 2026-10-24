@@ -416,6 +416,17 @@ impl Closure {
             .find_function(self.function)
             .map_or("", |code| &code.display)
     }
+
+    /// The attributes of the closure's function, in source order: what a
+    /// host reads of how to run a call of it (see the parser's
+    /// [Attributes](crate::parser#attributes)). Empty for a function that
+    /// is no function item, or has none.
+    #[must_use]
+    pub fn attributes(&self) -> &[crate::check::Attribute] {
+        self.code
+            .find_function(self.function)
+            .map_or(&[], |code| &code.attributes)
+    }
 }
 
 /// Shows the function and what it captured, not the IR it belongs to.

@@ -60,7 +60,9 @@
 //! An *attribute* is a token of its own (see the lexer's
 //! [Attributes](crate::lexer#attributes)): `#[NAME]` an outer one, which
 //! applies to the item after it, and `#![NAME]` an inner one, which applies
-//! to the whole file. There are three names, and no arguments:
+//! to the whole file. Four names are the parser's own, which take no
+//! arguments, "`#[shadowable]` takes no arguments" otherwise; three are
+//! these, and `#[attribute]` is below:
 //!
 //! - `#[shadowable]` marks a top-level field (a dotted one included), a
 //!   `def`, a definition made with a def-type or an `import` of any form, as
@@ -81,8 +83,8 @@
 //!   from prelude` ([`Ast::no_prelude`]). It must come before the file's
 //!   first item, comments and blank lines alone before it.
 //!
-//! The errors, each at the attribute: an unknown name is "unknown attribute
-//! `NAME`"; `#![shadowable]` is "`shadowable` applies to a declaration:
+//! The errors, each at the attribute: an unknown inner name is "unknown
+//! attribute `NAME`"; `#![shadowable]` is "`shadowable` applies to a declaration:
 //! write `#[shadowable]`" and `#[no_prelude]` "`no_prelude` applies to the
 //! whole file: write `#![no_prelude]`"; one written twice on one item is
 //! "`#[shadowable]` is written twice", and twice on the file "`#![no_prelude]`
@@ -101,6 +103,27 @@
 //! starts, or after an item on its line, is reported as any token is there.
 //! Whether a session's input may be marked `#![no_prelude]` is the
 //! workspace's to say: the parser does not know what it parses.
+//!
+//! `#[attribute]` marks a top-level `type` as an attribute's declaration
+//! ([`Ast::is_attribute`]), applying to the next item as `#[shadowable]`
+//! does; before anything else it is "`#[attribute]` applies only to a
+//! file's top-level `type`s".
+//!
+//! Any other outer name, `#[NAME]` or `#[NAME(ARGS)]`, is a *use* of an
+//! attribute, which the checker resolves (see the checker's
+//! [Attributes](crate::check#attributes)): its arguments are parsed as a
+//! call's are, positional or named, and its `]` must follow its `)`,
+//! "expected `]` after the attribute's arguments" otherwise. A use applies
+//! to the item after it, which must be a function item, a named `fn` at any
+//! level, a `def` or a definition made with a def-type: before anything
+//! else it is "attributes apply to functions: a `fn`, a `def` or a
+//! definition". One name used twice on an item is "`#[retry]` is written
+//! twice". The uses are kept by item, in source order
+//! ([`Ast::attribute_uses`]), each with its name read as a type's, a
+//! [`TypeExprKind::Named`] at the name, so that the workspace resolves and
+//! expands it as it does any type's. An attribute with arguments is consumed
+//! through its `]` whatever goes wrong in it; an inner one with arguments is
+//! "an inner attribute takes no arguments".
 //!
 //! # Def-types
 //!
@@ -946,11 +969,11 @@
 
 use crate::MAX_DEPTH;
 use crate::ast::{
-    Arg, ArgKind, Ast, AstBuilder, BinaryOp, BuilderMark, DefTypeRole, DefTypeUse, Effect, Element,
-    Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind, FnDecl, ForDecl, ForHead,
-    ImportDecl, ImportForm, ImportMember, ImportName, Item, ItemId, ItemKind, ItemRange, Jump,
-    Label, MetaTy, Param, ParamTy, PathRange, PathSegment, SegmentKind, StrPart, Syntax, TypeExpr,
-    TypeExprId, TypeExprKind, UnaryOp, path_span,
+    Arg, ArgKind, ArgRange, Ast, AstBuilder, AttributeUse, BinaryOp, BuilderMark, DefTypeRole,
+    DefTypeUse, Effect, Element, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind,
+    FnDecl, ForDecl, ForHead, ImportDecl, ImportForm, ImportMember, ImportName, Item, ItemId,
+    ItemKind, ItemRange, Jump, Label, MetaTy, Param, ParamTy, PathRange, PathSegment, SegmentKind,
+    StrPart, Syntax, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, MAX_ERRORS, Token, TokenKind, lex};
@@ -1028,6 +1051,15 @@ const DEF_TYPE: &str = "def_type";
 
 /// The error for `#[def_type]` before anything but a top-level `def`.
 const MISPLACED_DEF_TYPE: &str = "`#[def_type]` applies only to a file's top-level `def`s";
+
+/// The name of the outer attribute that makes a `type` an attribute.
+const ATTRIBUTE: &str = "attribute";
+
+/// The error for `#[attribute]` before anything but a top-level `type`.
+const MISPLACED_ATTRIBUTE: &str = "`#[attribute]` applies only to a file's top-level `type`s";
+
+/// The error for a use of an attribute before anything but a function item.
+const MISPLACED_USE: &str = "attributes apply to functions: a `fn`, a `def` or a definition";
 
 /// The error for a definition made with a def-type anywhere but in a file's
 /// outermost body.
@@ -1315,27 +1347,44 @@ impl PathShape {
 
 /// The outer attributes read before an item of a body, waiting for it (see
 /// [Attributes](#attributes)): where each is written, if it is.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Pending {
     /// `#[shadowable]`.
     shadowable: Option<Span>,
     /// `#[def_type]`.
     def_type: Option<Span>,
+    /// `#[attribute]`.
+    attribute: Option<Span>,
+    /// The uses of attributes that are none of the parser's, in source
+    /// order, each with the item it applies to left for the item to give.
+    uses: Vec<AttributeUse>,
 }
 
 impl Pending {
     /// Whether no attribute is waiting.
-    const fn is_empty(&self) -> bool {
-        self.shadowable.is_none() && self.def_type.is_none()
+    fn is_empty(&self) -> bool {
+        self.shadowable.is_none()
+            && self.def_type.is_none()
+            && self.attribute.is_none()
+            && self.uses.is_empty()
     }
 
     /// The first attribute written of those waiting, by its name and where
     /// it is written.
-    fn first(&self) -> Option<(&'static str, Span)> {
-        [(SHADOWABLE, self.shadowable), (DEF_TYPE, self.def_type)]
+    fn first(&self, names: &Names) -> Option<(String, Span)> {
+        let builtin = [
+            (SHADOWABLE, self.shadowable),
+            (DEF_TYPE, self.def_type),
+            (ATTRIBUTE, self.attribute),
+        ];
+        let builtin = builtin
             .into_iter()
-            .filter_map(|(name, span)| Some((name, span?)))
-            .min_by_key(|&(_, span)| span.start)
+            .filter_map(|(name, span)| Some((name.to_owned(), span?)));
+        let uses = self
+            .uses
+            .iter()
+            .map(|used| (names.get(used.name).to_owned(), used.span));
+        builtin.chain(uses).min_by_key(|&(_, span)| span.start)
     }
 }
 
@@ -1572,28 +1621,14 @@ impl Parser<'_> {
                 self.pos = self.tokens.len().max(self.pos);
                 break;
             }
-            match token.kind {
-                TokenKind::Attribute(name) => {
-                    if self.outer_attribute(token, name, &mut pending).is_err() {
-                        self.advance();
-                        poisoned = true;
-                    }
-                    continue;
-                }
-                TokenKind::InnerAttribute(name) => {
-                    let first =
-                        open.is_none() && self.item_stack.len() == base && pending.is_empty();
-                    if self.inner_attribute(token, name, first).is_err() {
-                        self.advance();
-                        poisoned = true;
-                    }
-                    continue;
-                }
-                _ => {}
+            let first = open.is_none() && self.item_stack.len() == base;
+            if let Some(failed) = self.body_attribute(token, &mut pending, first) {
+                poisoned |= failed;
+                continue;
             }
             match (token.kind, open) {
                 (TokenKind::Eof, None) | (TokenKind::RBrace, Some(_)) => {
-                    if !poisoned && let Some((written, attribute)) = pending.first() {
+                    if !poisoned && let Some((written, attribute)) = pending.first(self.names) {
                         self.error(
                             format!("`#[{written}]` is not followed by anything"),
                             attribute,
@@ -1623,7 +1658,7 @@ impl Parser<'_> {
             }
             let start = self.pos;
             let marks = self.marks();
-            let waiting = pending;
+            let waiting = pending.clone();
             let mut parsed = self.parse_body_item(token, open.is_some(), &mut pending);
             // Gone on to a line that is an item of its own: parsed again to
             // the end of its own line, and the next line left for the next
@@ -1663,6 +1698,43 @@ impl Parser<'_> {
         let range = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
         (range, height)
+    }
+
+    /// Takes `token`, at the start of an item of a body, if it is an
+    /// attribute: an outer one as an attribute of the item after it,
+    /// `pending`, and an inner one as the file's, if `first`, before the
+    /// file's first item and any outer attribute (see
+    /// [Attributes](#attributes)). Returns whether it failed, which makes
+    /// the item after it an error item; `None` if it is no attribute.
+    fn body_attribute(&mut self, token: Token, pending: &mut Pending, first: bool) -> Option<bool> {
+        let failed = match token.kind {
+            TokenKind::Attribute(name) => {
+                let failed = self.outer_attribute(token, name, pending).is_err();
+                if failed {
+                    self.advance();
+                }
+                failed
+            }
+            TokenKind::InnerAttribute(name) => {
+                let failed = self
+                    .inner_attribute(token, name, first && pending.is_empty())
+                    .is_err();
+                if failed {
+                    self.advance();
+                }
+                failed
+            }
+            TokenKind::AttributeArgs(name) => {
+                self.attribute_with_args(token, name, pending).is_err()
+            }
+            TokenKind::InnerAttributeArgs(_) => {
+                self.error("an inner attribute takes no arguments", token.span);
+                self.skip_attribute();
+                true
+            }
+            _ => return None,
+        };
+        Some(failed)
     }
 
     /// Parses the item of a body, a block's if `inner`, starting at
@@ -1706,14 +1778,21 @@ impl Parser<'_> {
         if let Some(attribute) = pending.def_type.take() {
             self.attach_def_type(attribute, item, !inner)?;
         }
+        if let Some(attribute) = pending.attribute.take() {
+            self.attach_attribute(attribute, item, !inner)?;
+        }
+        if !pending.uses.is_empty() {
+            self.attach_uses(std::mem::take(&mut pending.uses), item)?;
+        }
         self.expect_end_of_item()?;
         Ok((item, item_height))
     }
 
     /// Takes the outer attribute `token`, named `name`, at the start of an
     /// item of a body, as an attribute of the item after it, `pending` (see
-    /// [Attributes](#attributes)): `#[shadowable]` and `#[def_type]` are, each
-    /// once.
+    /// [Attributes](#attributes)): `#[shadowable]`, `#[def_type]` and
+    /// `#[attribute]` are the parser's, each once; any other name is a use,
+    /// once on an item, of an attribute the checker resolves.
     fn outer_attribute(
         &mut self,
         token: Token,
@@ -1724,13 +1803,185 @@ impl Parser<'_> {
         let slot = match text.as_str() {
             SHADOWABLE => &mut pending.shadowable,
             DEF_TYPE => &mut pending.def_type,
-            _ => return Err(self.misplaced_attribute(token)),
+            ATTRIBUTE => &mut pending.attribute,
+            NO_PRELUDE => return Err(self.misplaced_attribute(token)),
+            _ => {
+                let used = self.attribute_use(token, (name, &text), token.span, None);
+                self.pend_use(used, pending)?;
+                self.advance();
+                return Ok(());
+            }
         };
         if slot.is_some() {
             return Err(self.error(format!("`#[{text}]` is written twice"), token.span));
         }
         *slot = Some(token.span);
         self.advance();
+        Ok(())
+    }
+
+    /// The use of the attribute `token`, named `name`, spelt `text`, written
+    /// at `span` with the arguments `args`, for the item after it to take:
+    /// its name read as a type's, at the name, which is written after its
+    /// `#[` and any spaces or tabs.
+    fn attribute_use(
+        &mut self,
+        token: Token,
+        (name, text): (Name, &str),
+        span: Span,
+        args: Option<ArgRange>,
+    ) -> AttributeUse {
+        let written = self.source.slice(token.span);
+        let offset = written.find(text).unwrap_or_default();
+        let start = token.span.start + u32::try_from(offset).unwrap_or_default();
+        let name_span = Span::new(start, start + u32::try_from(text.len()).unwrap_or_default());
+        let ty = self.builder.alloc_type(TypeExpr {
+            kind: TypeExprKind::Named(name),
+            span: name_span,
+        });
+        AttributeUse {
+            item: ItemId::PENDING,
+            name,
+            span,
+            name_span,
+            args,
+            ty,
+        }
+    }
+
+    /// Takes the use `used` of an attribute that is none of the parser's
+    /// as one of `pending`: "`#[retry]` is written twice" if one of its name
+    /// is waiting already.
+    fn pend_use(&mut self, used: AttributeUse, pending: &mut Pending) -> ParseResult<()> {
+        if pending.uses.iter().any(|earlier| earlier.name == used.name) {
+            let text = self.names.get(used.name).to_owned();
+            return Err(self.error(format!("`#[{text}]` is written twice"), used.span));
+        }
+        pending.uses.push(used);
+        Ok(())
+    }
+
+    /// Takes the outer attribute with arguments `token`, `#[NAME(ARGS)]`,
+    /// named `name`, as [`Parser::outer_attribute`] takes one without: its
+    /// arguments parsed as a call's are, positional or named, and its `]`
+    /// after them. None of the parser's own takes arguments: "`#[shadowable]`
+    /// takes no arguments". The attribute is consumed through its `]`
+    /// whatever goes wrong, so the item after it is parsed as ever.
+    fn attribute_with_args(
+        &mut self,
+        token: Token,
+        name: Name,
+        pending: &mut Pending,
+    ) -> ParseResult<()> {
+        let text = self.names.get(name).to_owned();
+        if matches!(
+            text.as_str(),
+            SHADOWABLE | DEF_TYPE | ATTRIBUTE | NO_PRELUDE
+        ) {
+            let reported = self.error(format!("`#[{text}]` takes no arguments"), token.span);
+            self.skip_attribute();
+            return Err(reported);
+        }
+        self.advance();
+        let open = self.peek();
+        if open.kind != TokenKind::LParen {
+            let reported = self.error("expected `(`", open.span);
+            self.skip_attribute_rest();
+            return Err(reported);
+        }
+        self.advance();
+        let base = self.arg_stack.len();
+        let mut tallest = 0;
+        let outer = std::mem::replace(&mut self.braces, Braces::Free);
+        let closed = self.parse_arguments(open, &mut tallest);
+        self.braces = outer;
+        let args = self.builder.push_args(&self.arg_stack[base..]);
+        self.arg_stack.truncate(base);
+        let bracket = self.peek();
+        match closed {
+            Ok(Some(_)) if bracket.kind == TokenKind::RBracket => {
+                self.advance();
+                let span = Span::join(token.span, bracket.span);
+                let used = self.attribute_use(token, (name, &text), span, Some(args));
+                self.pend_use(used, pending)
+            }
+            Ok(Some(_)) => {
+                let found = self.describe(bracket);
+                let reported = self.error(
+                    format!("expected `]` after the attribute's arguments, found {found}"),
+                    bracket.span,
+                );
+                self.skip_attribute_rest();
+                Err(reported)
+            }
+            Ok(None) | Err(_) => {
+                self.skip_attribute_rest();
+                Err(closed.err().unwrap_or(Reported))
+            }
+        }
+    }
+
+    /// Skips the attribute with arguments at the current token, through the
+    /// `]` closing it.
+    fn skip_attribute(&mut self) {
+        self.advance();
+        self.skip_attribute_rest();
+    }
+
+    /// Skips the rest of an attribute with arguments whose `#[` is behind,
+    /// through the `]` closing it: brackets nested in its arguments are
+    /// matched, and the end of the input stops it.
+    fn skip_attribute_rest(&mut self) {
+        let mut depth = 0u32;
+        loop {
+            match self.peek().kind {
+                TokenKind::Eof => return,
+                TokenKind::LBracket | TokenKind::AttributeArgs(_) => depth += 1,
+                TokenKind::RBracket if depth == 0 => {
+                    self.advance();
+                    return;
+                }
+                TokenKind::RBracket => depth -= 1,
+                _ => {}
+            }
+            self.advance();
+        }
+    }
+
+    /// Marks `item`, an item of a body that is the file's if `top`, with the
+    /// `#[attribute]` written at `attribute` before it, if it is a top-level
+    /// `type`; else the error that it is not one (see
+    /// [Attributes](#attributes)).
+    fn attach_attribute(&mut self, attribute: Span, item: ItemId, top: bool) -> ParseResult<()> {
+        if top && matches!(self.builder.item(item).kind, ItemKind::Type { .. }) {
+            self.builder.mark_attribute(item);
+            return Ok(());
+        }
+        Err(self.error(MISPLACED_ATTRIBUTE, attribute))
+    }
+
+    /// Gives `item` the uses `uses` of attributes that are none of the
+    /// parser's, if it is a function item: a named `fn`, a `def` or a
+    /// definition made with a def-type, at any level; else the error, at the
+    /// first use, that attributes apply to functions (see
+    /// [Attributes](#attributes)).
+    fn attach_uses(&mut self, uses: Vec<AttributeUse>, item: ItemId) -> ParseResult<()> {
+        let function = matches!(
+            self.builder.item(item).kind,
+            ItemKind::Let { function: true, .. }
+                | ItemKind::Field { function: true, .. }
+                | ItemKind::DefTypeDef { .. }
+        );
+        if !function {
+            let at = uses
+                .first()
+                .map_or(self.builder.item(item).span, |used| used.span);
+            return Err(self.error(MISPLACED_USE, at));
+        }
+        for used in uses {
+            self.builder
+                .push_attribute_use(AttributeUse { item, ..used });
+        }
         Ok(())
     }
 
@@ -1754,13 +2005,13 @@ impl Parser<'_> {
     /// allowed there (see [Attributes](#attributes)).
     fn misplaced_attribute(&mut self, token: Token) -> Reported {
         let (inner, name) = match token.kind {
-            TokenKind::Attribute(name) => (false, name),
-            TokenKind::InnerAttribute(name) => (true, name),
+            TokenKind::Attribute(name) | TokenKind::AttributeArgs(name) => (false, name),
+            TokenKind::InnerAttribute(name) | TokenKind::InnerAttributeArgs(name) => (true, name),
             _ => return self.error("expected an attribute", token.span),
         };
         let text = self.names.get(name).to_owned();
         let message = match (text.as_str(), inner) {
-            (SHADOWABLE | DEF_TYPE, true) => {
+            (SHADOWABLE | DEF_TYPE | ATTRIBUTE, true) => {
                 format!("`{text}` applies to a declaration: write `#[{text}]`")
             }
             (NO_PRELUDE, false) => {
@@ -1768,8 +2019,11 @@ impl Parser<'_> {
             }
             (SHADOWABLE, false) => MISPLACED_SHADOWABLE.to_owned(),
             (DEF_TYPE, false) => MISPLACED_DEF_TYPE.to_owned(),
+            (ATTRIBUTE, false) => MISPLACED_ATTRIBUTE.to_owned(),
             (NO_PRELUDE, true) => MISPLACED_NO_PRELUDE.to_owned(),
-            _ => format!("unknown attribute `{text}`"),
+            // Any other outer one is a use, which applies to functions.
+            (_, false) => MISPLACED_USE.to_owned(),
+            (_, true) => format!("unknown attribute `{text}`"),
         };
         self.error(message, token.span)
     }
@@ -4314,6 +4568,8 @@ impl Parser<'_> {
             | TokenKind::Pipe
             | TokenKind::Attribute(_)
             | TokenKind::InnerAttribute(_)
+            | TokenKind::AttributeArgs(_)
+            | TokenKind::InnerAttributeArgs(_)
             | TokenKind::Newline
             | TokenKind::Eof => {
                 let found = self.describe(token);
@@ -5082,7 +5338,10 @@ impl Parser<'_> {
             // An attribute applies to no part of a header.
             if matches!(
                 token.kind,
-                TokenKind::Attribute(_) | TokenKind::InnerAttribute(_)
+                TokenKind::Attribute(_)
+                    | TokenKind::InnerAttribute(_)
+                    | TokenKind::AttributeArgs(_)
+                    | TokenKind::InnerAttributeArgs(_)
             ) {
                 return Err(self.misplaced_attribute(token));
             }
@@ -5816,6 +6075,8 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::Ident(_)
         | TokenKind::Attribute(_)
         | TokenKind::InnerAttribute(_)
+        | TokenKind::AttributeArgs(_)
+        | TokenKind::InnerAttributeArgs(_)
         | TokenKind::Let
         | TokenKind::Mut
         | TokenKind::If

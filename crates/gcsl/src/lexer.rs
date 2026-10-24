@@ -97,10 +97,16 @@
 //! [`TokenKind::Attribute`], which applies to the item after it, and
 //! `#![NAME]` an inner one, [`TokenKind::InnerAttribute`], which applies to
 //! the whole file (see the parser's [Attributes](crate::parser#attributes)).
-//! Every other `#` starts a comment to the end of its line, as it always
-//! has: so a shebang, `#!/usr/bin/env gcsl`, is a comment, and so is `#
-//! [x]`, with a space, and `#[x y]`, `#[` alone or `#[1]`, which are not of
-//! the shape. The scan of a string literal's interpolations (see [String
+//! The name followed, after optional spaces or tabs, by `(` instead of `]`
+//! is an attribute with arguments: one token through its name,
+//! [`TokenKind::AttributeArgs`] or [`TokenKind::InnerAttributeArgs`], whose
+//! `[` the lexer leaves open on its bracket stack, as a list's, so that
+//! newlines in its arguments are not significant and the `]` after them,
+//! an ordinary [`TokenKind::RBracket`], closes it; the arguments are
+//! ordinary tokens. Every other `#` starts a comment to the end of its line,
+//! as it always has: so a shebang, `#!/usr/bin/env gcsl`, is a comment, and
+//! so is `# [x]`, with a space, and `#[x y]`, `#[` alone, `#[x` or `#[1]`,
+//! which are not of the shape. The scan of a string literal's interpolations (see [String
 //! literals](#string-literals)) tells the two apart by the same rule
 //! (`attribute_at`), so the lexer and the scan always agree on where a
 //! comment ends.
@@ -327,6 +333,14 @@ pub enum TokenKind {
     /// An inner attribute, `#![NAME]`, holding its name (see
     /// [Attributes](#attributes)): it applies to the whole file.
     InnerAttribute(Name),
+    /// The start of an outer attribute with arguments, `#[NAME`, holding its
+    /// name, before the `(` of its arguments (see [Attributes](#attributes)).
+    /// Its `[` is open until the `]` after the arguments, an
+    /// [`TokenKind::RBracket`].
+    AttributeArgs(Name),
+    /// The start of an inner attribute with arguments, `#![NAME`, as
+    /// [`TokenKind::AttributeArgs`] is of an outer one.
+    InnerAttributeArgs(Name),
     /// The keyword `in`, between a `for`'s variable and what it iterates
     /// over.
     In,
@@ -493,6 +507,8 @@ impl TokenKind {
             | TokenKind::Label(_)
             | TokenKind::Attribute(_)
             | TokenKind::InnerAttribute(_)
+            | TokenKind::AttributeArgs(_)
+            | TokenKind::InnerAttributeArgs(_)
             | TokenKind::Newline
             | TokenKind::Error
             | TokenKind::Eof => None,
@@ -1173,19 +1189,26 @@ impl<'a> Lexer<'a> {
     /// Lexes the attribute starting at `start`, which holds a `#` that
     /// `skip_trivia` found starts one (see [Attributes](#attributes)): an
     /// [`TokenKind::Attribute`] or an [`TokenKind::InnerAttribute`], its name
-    /// interned as an identifier's is.
+    /// interned as an identifier's is; or, for one with arguments, an
+    /// [`TokenKind::AttributeArgs`] or [`TokenKind::InnerAttributeArgs`]
+    /// through its name, its `[` left open on the bracket stack, as a list's
+    /// is, for the `]` after its arguments to close.
     fn attribute(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
-        let Some((inner, (from, to), end)) = attribute_at(self.bytes, start) else {
+        let Some((inner, (from, to), args, end)) = attribute_at(self.bytes, start) else {
             return Err(self.unexpected_character());
         };
         let name = self
             .names
             .intern(self.text.get(from..to).unwrap_or_default());
         self.pos = end;
-        Ok(if inner {
-            TokenKind::InnerAttribute(name)
-        } else {
-            TokenKind::Attribute(name)
+        if args {
+            self.brackets.push(Bracket::Square);
+        }
+        Ok(match (inner, args) {
+            (false, false) => TokenKind::Attribute(name),
+            (true, false) => TokenKind::InnerAttribute(name),
+            (false, true) => TokenKind::AttributeArgs(name),
+            (true, true) => TokenKind::InnerAttributeArgs(name),
         })
     }
 
@@ -1639,7 +1662,7 @@ impl<'a> Lexer<'a> {
                     pos + 1
                 }
                 b'#' => attribute_at(self.bytes, pos)
-                    .map_or_else(|| end_of_line(self.bytes, pos), |(_, _, end)| end),
+                    .map_or_else(|| end_of_line(self.bytes, pos), |(_, _, _, end)| end),
                 b'{' => {
                     depth += 1;
                     pos + 1
@@ -2131,9 +2154,11 @@ fn end_of_line(bytes: &[u8], from: usize) -> usize {
 
 /// The attribute written at `from` (see [Attributes](#attributes)), if the
 /// `#` there starts one rather than a comment: whether it is an inner one,
-/// `#![`, where its name starts and ends, and the offset just after its
-/// `]`. Shared by the lexer and the scan, so they always agree.
-fn attribute_at(bytes: &[u8], from: usize) -> Option<(bool, (usize, usize), usize)> {
+/// `#![`, where its name starts and ends, whether it has arguments, a `(`
+/// after its name, and the offset just after its `]`, or, for one with
+/// arguments, just after its name, where its arguments' tokens start.
+/// Shared by the lexer and the scan, so they always agree.
+fn attribute_at(bytes: &[u8], from: usize) -> Option<(bool, (usize, usize), bool, usize)> {
     if bytes.get(from) != Some(&b'#') {
         return None;
     }
@@ -2148,7 +2173,11 @@ fn attribute_at(bytes: &[u8], from: usize) -> Option<(bool, (usize, usize), usiz
     }
     let end = identifier_end(bytes, start);
     let close = end + whitespace_len(bytes, end);
-    (bytes.get(close) == Some(&b']')).then_some((inner, (start, end), close + 1))
+    match bytes.get(close) {
+        Some(b']') => Some((inner, (start, end), false, close + 1)),
+        Some(b'(') => Some((inner, (start, end), true, end)),
+        _ => None,
+    }
 }
 
 /// The number of spaces and tabs starting at `from`.
