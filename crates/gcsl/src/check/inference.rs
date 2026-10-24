@@ -386,9 +386,9 @@ impl Checker<'_> {
                 blocks.push(block);
             }
             // A meta is kept as declared: only parameters are narrowed.
-            let ty = self
-                .types
-                .fn_type_with_meta(params, sig.ret, sig.effect, sig.meta);
+            let ty =
+                self.types
+                    .fn_type_with_rest(params, (sig.ret, sig.effect), sig.meta, sig.rest);
             if ty != declared {
                 if let Some(entry) = self.fn_params.get_mut(base + callback.param) {
                     entry.1 = ty;
@@ -396,9 +396,9 @@ impl Checker<'_> {
                 narrowed = true;
             }
             if blocks.iter().any(Option::is_some) {
-                let every = self
-                    .types
-                    .fn_type_with_meta(every, sig.ret, sig.effect, sig.meta);
+                let every =
+                    self.types
+                        .fn_type_with_rest(every, (sig.ret, sig.effect), sig.meta, sig.rest);
                 if unnarrowed.is_empty() {
                     unnarrowed.resize(count, None);
                 }

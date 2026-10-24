@@ -1,7 +1,7 @@
 //! Lowering calls: built-in functions, method calls, and the arguments of a
 //! call.
 
-use crate::ast::{ArgRange, ExprId, ExprKind};
+use crate::ast::{ArgKind, ArgRange, ExprId, ExprKind};
 use crate::check::{Builtin, ParamDefault};
 use crate::diagnostic::InternalError;
 use crate::ir::{ArgValue, IrId, IrKind, IrRange};
@@ -161,6 +161,12 @@ impl Lowerer<'_> {
         let params = resolution.arg_params(args);
         let base = self.item_stack.len();
         self.item_stack.extend(first);
+        let close = ast.get(id).close_span().unwrap_or(span);
+        // The rest parameter's arguments make one list, given it where the
+        // first of them is written, or after every other if none is.
+        let rest = resolution.call_rest(id);
+        let mut rest_items: Vec<IrId> = Vec::new();
+        let (mut rest_at, mut rest_span, mut spreads) = (None, close, false);
         for (arg, &param) in ast.args(args).iter().zip(params) {
             if param == u32::MAX {
                 return Err(InternalError {
@@ -168,13 +174,39 @@ impl Lowerer<'_> {
                     span,
                 });
             }
+            if Some(param) == rest {
+                if rest_at.is_none() {
+                    rest_at = Some(self.item_stack.len());
+                    rest_span = arg.span(ast);
+                } else {
+                    rest_span = Span::join(rest_span, arg.span(ast));
+                }
+                let item = if let ArgKind::Spread { .. } = arg.kind {
+                    spreads = true;
+                    let list = self.lower_operand(arg.value, ValueKind::List)?;
+                    self.builder.alloc(IrKind::Spread(list), arg.span(ast))
+                } else {
+                    self.lower_expr(arg.value)?
+                };
+                rest_items.push(item);
+                continue;
+            }
             let value = ArgValue::Node(self.lower_expr(arg.value)?);
             let node = self
                 .builder
                 .alloc(IrKind::Arg { param, value }, arg.span(ast));
             self.item_stack.push(node);
         }
-        let close = ast.get(id).close_span().unwrap_or(span);
+        if let Some(param) = rest {
+            let items = self.builder.push_item_list(&rest_items);
+            let list = self
+                .builder
+                .alloc(IrKind::MakeList { items, spreads }, rest_span);
+            let value = ArgValue::Node(list);
+            let node = self.builder.alloc(IrKind::Arg { param, value }, rest_span);
+            let at = rest_at.unwrap_or(self.item_stack.len());
+            self.item_stack.insert(at, node);
+        }
         for (param, default) in resolution.call_defaults(id) {
             let value = match default {
                 ParamDefault::Constant(constant) => {

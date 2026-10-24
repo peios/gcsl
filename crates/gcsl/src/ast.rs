@@ -910,6 +910,10 @@ pub struct Param {
     /// calls on its side of the call (see the parser's [Functions and
     /// calls](crate::parser::functions#functions-and-calls)).
     pub default_fn: Option<FnId>,
+    /// Whether it is the rest parameter, `...name: T`, which the positional
+    /// arguments from its position on fill, a `List<T>` in the body (see
+    /// the parser's [Functions and calls](crate::parser::functions#functions-and-calls)).
+    pub rest: bool,
 }
 
 /// What a function may do, as the marker before its return type declares
@@ -1011,6 +1015,12 @@ pub enum ArgKind {
     /// The block after the argument list, or in place of one, filling the
     /// last parameter. Always the call's last argument.
     Trailing,
+    /// `...EXPR`, a list whose elements fill the callee's rest parameter,
+    /// among the positional arguments that fill it one each.
+    Spread {
+        /// Where its `...` is written.
+        span: Span,
+    },
 }
 
 /// One argument of a call.
@@ -1024,12 +1034,13 @@ pub struct Arg {
 
 impl Arg {
     /// The span of the whole argument in `ast`: its name through its value
-    /// for a named argument, and its value otherwise.
+    /// for a named argument, its `...` through its value for a spread one,
+    /// and its value otherwise.
     #[must_use]
     pub fn span(&self, ast: &Ast) -> Span {
         let value = ast.get(self.value).span;
         match self.kind {
-            ArgKind::Named { span, .. } => Span::join(span, value),
+            ArgKind::Named { span, .. } | ArgKind::Spread { span } => Span::join(span, value),
             ArgKind::Positional | ArgKind::Trailing => value,
         }
     }
@@ -1040,8 +1051,10 @@ impl Arg {
 pub struct ParamTy {
     /// The parameter's name, if the type gives one.
     pub name: Option<Name>,
-    /// Its type.
+    /// Its type: for the rest parameter, its elements'.
     pub ty: TypeExprId,
+    /// Whether it is the rest parameter, `...words: String`.
+    pub rest: bool,
 }
 
 /// One segment of a path (see [Paths](crate::ast#paths)): a name, or, in

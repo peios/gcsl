@@ -66,7 +66,7 @@
 
 use crate::ast::{
     Effect, ExprId, FieldDefault, FieldTyKind, FieldTyRange, FnId, GenericOwner, MetaTy,
-    PathSegment, Syntax, TypeArgRange, TypeExprId, TypeExprKind, TypeProblem,
+    ParamTyRange, PathSegment, Syntax, TypeArgRange, TypeExprId, TypeExprKind, TypeProblem,
 };
 use crate::diagnostic::{Diagnostic, InternalError};
 use crate::names::Name;
@@ -302,28 +302,7 @@ impl Checker<'_> {
                 ret,
                 effect,
                 meta,
-            } => {
-                // A function type has its own rule, whatever surrounds it.
-                let (params_mode, ret_mode) = bareness_of(effect);
-                let base = self.fn_params.len();
-                for param in self.ast.param_tys(params) {
-                    // Resolving a nested function type uses `fn_params`
-                    // above this one's entries and truncates back.
-                    let param_ty = self.resolve_type(param.ty, params_mode);
-                    self.fn_params.push((param.name, param_ty));
-                }
-                let ret = self.resolve_type(ret, ret_mode);
-                let meta = meta.map(|meta| self.resolve_meta(meta));
-                // An erroneous meta makes the type erroneous.
-                let ret = if matches!(meta, Some(None)) {
-                    TyId::ERROR
-                } else {
-                    ret
-                };
-                let resolved = self.intern_fn_type_with_meta(base, ret, effect, meta.flatten());
-                self.fn_params.truncate(base);
-                resolved
-            }
+            } => self.resolve_fn_type(id, (params, ret), effect, meta),
             // A qualified name is made what it names by the expansion of
             // the file's types; checked alone, a file names no module.
             TypeExprKind::Path(path) | TypeExprKind::PathApplied { path, .. } => {
@@ -853,20 +832,22 @@ impl Checker<'_> {
         self.quiet.sees_broken || self.ast.syntax() != Syntax::Clean
     }
 
-    /// Interns the function type whose parameters are `fn_params[base..]`
-    /// and whose return type is `ret`, of effect `effect`, or returns
-    /// `Error` if any of them is erroneous, having been reported.
     /// The type of `function`, whose parameters' types are `fn_params[base..]`
-    /// and whose result is `ret`, of `effect`: [`Checker::intern_fn_type`]'s,
-    /// made generic if the function has type parameters (see
-    /// [Generics](crate::check::methods#generics)).
+    /// and whose result is `ret`, of `effect`, its rest parameter its own
+    /// ([`Checker::intern_fn_type_with_meta`]), made generic if the function
+    /// has type parameters (see [Generics](crate::check::methods#generics)).
     pub(super) fn function_type(
         &mut self,
         function: FnId,
         base: usize,
         (ret, effect): (TyId, Effect),
     ) -> TyId {
-        let ty = self.intern_fn_type(base, ret, effect);
+        let params = self.ast.params(self.ast.fn_decl(function).params);
+        let rest_param = params
+            .iter()
+            .position(|param| param.rest)
+            .and_then(|at| u8::try_from(at).ok());
+        let ty = self.intern_fn_type_with_meta(base, (ret, effect), None, rest_param);
         if ty == TyId::ERROR || self.ast.generics(function).is_none() {
             return ty;
         }
@@ -890,25 +871,82 @@ impl Checker<'_> {
         generic
     }
 
-    pub(super) fn intern_fn_type(&mut self, base: usize, ret: TyId, effect: Effect) -> TyId {
-        self.intern_fn_type_with_meta(base, ret, effect, None)
-    }
-
-    /// [`Checker::intern_fn_type`], the function type having the meta
-    /// `meta`, if it has one (see [Metas](crate::check::attributes#metas)).
+    /// Interns the function type whose parameters are `fn_params[base..]`
+    /// and whose return type is `ret`, of effect `effect`, with the meta
+    /// `meta`, if it has one (see [Metas](crate::check::attributes#metas)),
+    /// and its parameter at position `rest`, if any, its rest parameter; or
+    /// returns `Error` if any of them is erroneous, having been reported.
     pub(super) fn intern_fn_type_with_meta(
         &mut self,
         base: usize,
-        ret: TyId,
-        effect: Effect,
+        (ret, effect): (TyId, Effect),
         meta: Option<Meta>,
+        rest_param: Option<u8>,
     ) -> TyId {
         let params = self.fn_params.get(base..).unwrap_or_default();
         if ret == TyId::ERROR || params.iter().any(|&(_, ty)| ty == TyId::ERROR) {
             return TyId::ERROR;
         }
         self.types
-            .fn_type_with_meta(params.iter().copied(), ret, effect, meta)
+            .fn_type_with_rest(params.iter().copied(), (ret, effect), meta, rest_param)
+    }
+
+    /// The function type written as `id`, of the parameters `params` and
+    /// the result `ret`, of `effect`, with the meta `meta`, if it has one:
+    /// its parameters resolved by its own rule, whatever surrounds it, a
+    /// second rest parameter reported ([`Checker::rest_position`]), and an
+    /// erroneous meta making it erroneous.
+    pub(super) fn resolve_fn_type(
+        &mut self,
+        id: TypeExprId,
+        (params, ret): (ParamTyRange, TypeExprId),
+        effect: Effect,
+        meta: Option<MetaTy>,
+    ) -> TyId {
+        let (params_mode, ret_mode) = bareness_of(effect);
+        let base = self.fn_params.len();
+        let rest_param = self.rest_position(
+            self.ast.param_tys(params).iter().map(|param| param.rest),
+            self.ast.type_expr(id).span,
+        );
+        for param in self.ast.param_tys(params) {
+            // Resolving a nested function type uses `fn_params` above this
+            // one's entries and truncates back.
+            let param_ty = self.resolve_type(param.ty, params_mode);
+            self.fn_params.push((param.name, param_ty));
+        }
+        let ret = self.resolve_type(ret, ret_mode);
+        let meta = meta.map(|meta| self.resolve_meta(meta));
+        let ret = if matches!(meta, Some(None)) {
+            TyId::ERROR
+        } else {
+            ret
+        };
+        let resolved =
+            self.intern_fn_type_with_meta(base, (ret, effect), meta.flatten(), rest_param);
+        self.fn_params.truncate(base);
+        resolved
+    }
+
+    /// The position of the rest parameter among parameters that are rest
+    /// parameters as `rests` says, written at `span`, if one is: "a
+    /// function has one rest parameter at most" for a second.
+    pub(super) fn rest_position(
+        &mut self,
+        rests: impl Iterator<Item = bool>,
+        span: Span,
+    ) -> Option<u8> {
+        let positions: Vec<usize> = rests
+            .enumerate()
+            .filter_map(|(index, rest)| rest.then_some(index))
+            .collect();
+        if positions.len() > 1 {
+            self.errors.push(Diagnostic::error(
+                "a function has one rest parameter at most",
+                span,
+            ));
+        }
+        positions.first().and_then(|&rest| u8::try_from(rest).ok())
     }
 
     /// The meta the function type's meta written as `meta` denotes (see

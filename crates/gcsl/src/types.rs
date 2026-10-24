@@ -654,6 +654,36 @@ pub struct FnTy {
     /// [`TyKind::Param`]s of it in its parameters' and result's types stand
     /// for whatever each call binds them to (see [Generics](#generics)).
     pub generic: Option<GenericId>,
+    /// The position of its rest parameter, if it has one, `...words: T`,
+    /// whose type in `params` is its elements', `T`: the positional
+    /// arguments from that position on fill it, a `List<T>` in the body,
+    /// and the parameters after it are given by name only.
+    pub rest: Option<u8>,
+}
+
+impl FnTy {
+    /// The parameter the positional argument number `index` fills: its
+    /// own, or the rest parameter for one at or past its position; `None`
+    /// for one past every parameter.
+    #[must_use]
+    pub fn positional(&self, index: usize) -> Option<usize> {
+        match self.rest.map(usize::from) {
+            Some(rest) if index >= rest => Some(rest),
+            _ => (index < self.params.len()).then_some(index),
+        }
+    }
+
+    /// This signature without its first `offset` parameters, as a method's
+    /// is after its receiver: its rest parameter's position moved down.
+    #[must_use]
+    pub fn after(&self, offset: usize) -> FnTy {
+        let offset_u8 = u8::try_from(offset).unwrap_or(u8::MAX);
+        FnTy {
+            params: self.params.get(offset..).unwrap_or_default().into(),
+            rest: self.rest.and_then(|rest| rest.checked_sub(offset_u8)),
+            ..self.clone()
+        }
+    }
 }
 
 /// The meta of a function type, `META-> PackageMeta` in `fn(v: Version):
@@ -1082,12 +1112,26 @@ impl TypeTable {
         effect: Effect,
         meta: Option<Meta>,
     ) -> TyId {
+        self.fn_type_with_rest(params, (ret, effect), meta, None)
+    }
+
+    /// Returns the id of the function type [`TypeTable::fn_type_with_meta`]
+    /// makes, its parameter at position `rest`, if any, its rest parameter,
+    /// of elements of that parameter's type.
+    pub fn fn_type_with_rest(
+        &mut self,
+        params: impl IntoIterator<Item = (Option<Name>, TyId)>,
+        (ret, effect): (TyId, Effect),
+        meta: Option<Meta>,
+        rest_param: Option<u8>,
+    ) -> TyId {
         self.intern(TyKind::Fn(FnTy {
             params: params.into_iter().collect(),
             ret,
             effect,
             meta,
             generic: None,
+            rest: rest_param,
         }))
     }
 
@@ -1139,6 +1183,7 @@ impl TypeTable {
             }
             (TyKind::Fn(sig), TyKind::Fn(pattern)) => {
                 sig.params.len() == pattern.params.len()
+                    && sig.rest == pattern.rest
                     && self.may_receive(sig.ret, pattern.ret, Some(generic))
             }
             (_, TyKind::Union(members)) => members
@@ -1273,7 +1318,7 @@ impl TypeTable {
                     ty: self.substitute(meta.ty, generic, args),
                     ..meta
                 });
-                let made = self.fn_type_with_meta(params, ret, sig.effect, meta);
+                let made = self.fn_type_with_rest(params, (ret, sig.effect), meta, sig.rest);
                 match sig.generic {
                     Some(own) => self.generic_fn(made, own),
                     None => made,
@@ -1999,7 +2044,7 @@ impl TypeTable {
                     ty: self.settle(meta.ty, function, decisions),
                     ..meta
                 });
-                let settled = self.fn_type_with_meta(params, ret, sig.effect, meta);
+                let settled = self.fn_type_with_rest(params, (ret, sig.effect), meta, sig.rest);
                 match sig.generic {
                     Some(generic) => self.generic_fn(settled, generic),
                     None => settled,
@@ -2465,6 +2510,7 @@ impl TypeTable {
                     && metas
                     && self.same(a_sig.ret, b_sig.ret)
                     && a_sig.params.len() == b_sig.params.len()
+                    && a_sig.rest == b_sig.rest
                     && a_sig.params.iter().zip(&b_sig.params).all(
                         |(&(a_name, a_ty), &(b_name, b_ty))| {
                             a_name == b_name && self.same(a_ty, b_ty)
@@ -2654,7 +2700,10 @@ impl TypeTable {
                     offered.effect <= required.effect && self.is_subtype(offered.ty, required.ty)
                 }
             };
+            // A rest parameter, in the same place, of elements the offered
+            // accepts, as any parameter is.
             return offered.params.len() == required.params.len()
+                && offered.rest == required.rest
                 && offered.effect <= required.effect
                 && meta
                 && self.is_subtype(offered.ret, required.ret)
@@ -2866,31 +2915,32 @@ impl TypeTable {
         // which both functions accept: one of them, if it is a subtype of
         // the other. A copy, since joining the return types may intern new
         // types and so needs the table mutably.
-        let params: Option<Vec<(Option<Name>, TyId)>> = if a_sig.params.len() == b_sig.params.len()
-        {
-            a_sig
-                .params
-                .iter()
-                .zip(&b_sig.params)
-                .map(|(&(a_name, a_param), &(b_name, b_param))| {
-                    let param = if self.is_subtype(a_param, b_param) {
-                        a_param
-                    } else if self.is_subtype(b_param, a_param) {
-                        b_param
-                    } else {
-                        return None;
-                    };
-                    Some((a_name.filter(|_| a_name == b_name), param))
-                })
-                .collect()
-        } else {
-            None
-        };
+        let params: Option<Vec<(Option<Name>, TyId)>> =
+            if a_sig.params.len() == b_sig.params.len() && a_sig.rest == b_sig.rest {
+                a_sig
+                    .params
+                    .iter()
+                    .zip(&b_sig.params)
+                    .map(|(&(a_name, a_param), &(b_name, b_param))| {
+                        let param = if self.is_subtype(a_param, b_param) {
+                            a_param
+                        } else if self.is_subtype(b_param, a_param) {
+                            b_param
+                        } else {
+                            return None;
+                        };
+                        Some((a_name.filter(|_| a_name == b_name), param))
+                    })
+                    .collect()
+            } else {
+                None
+            };
         // Function types of two generics share no parameters to join.
         let Some(params) = params.filter(|_| generics.0 == generics.1) else {
             return (self.union([a, b]), true);
         };
         let (a_ret, b_ret, effect) = (a_sig.ret, b_sig.ret, a_sig.effect.max(b_sig.effect));
+        let rest_param = a_sig.rest;
         let metas = (a_sig.meta, b_sig.meta);
         let (ret, mut widened) = self.join(a_ret, b_ret);
         // Metas join as results do; one side's alone is forgotten (see
@@ -2906,7 +2956,7 @@ impl TypeTable {
             }
             _ => None,
         };
-        let joined = self.fn_type_with_meta(params, ret, effect, meta);
+        let joined = self.fn_type_with_rest(params, (ret, effect), meta, rest_param);
         let joined = match generics.0 {
             Some(generic) => self.generic_fn(joined, generic),
             None => joined,
@@ -3467,6 +3517,9 @@ impl fmt::Display for Display<'_> {
                 for (index, &(name, ty)) in sig.params.iter().enumerate() {
                     if index > 0 {
                         f.write_str(", ")?;
+                    }
+                    if sig.rest.map(usize::from) == Some(index) {
+                        f.write_str("...")?;
                     }
                     if let Some(name) = name {
                         write!(f, "{}: ", FieldName(self.names.get(name)))?;

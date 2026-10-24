@@ -355,6 +355,7 @@ impl Checker<'_> {
                     effect: sig.effect,
                     meta,
                     generic: None,
+                    rest: sig.rest,
                 }
             }
         };

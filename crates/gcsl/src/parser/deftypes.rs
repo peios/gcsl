@@ -694,6 +694,7 @@ impl Parser<'_> {
             ty,
             default: None,
             default_fn: None,
+            rest: false,
         });
         let separator = self.peek();
         Ok(self.list_separator(open)?.then_some(separator))

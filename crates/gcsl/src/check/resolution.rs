@@ -165,6 +165,11 @@ pub(super) struct ForLowering {
     /// one, which lowering marks as an operand, so that its failure is not
     /// the operation's (see [Secrets](crate::check::secrets#secrets)).
     pub(super) plain_operands: HashSet<ExprId>,
+    /// The number of the rest parameter of the callee of each call whose
+    /// callee has one, which lowering gives the list of the arguments that
+    /// fill it, the empty list if none does (see "Calls" under
+    /// [Functions](crate::check::functions#functions)).
+    pub(super) call_rests: HashMap<ExprId, u32>,
     /// The attributes of each function item that has any, by its function,
     /// in source order (see [Attributes](crate::check::attributes#attributes)).
     pub(super) fn_attributes: HashMap<FnId, Box<[Attribute]>>,
@@ -517,6 +522,15 @@ impl Resolution {
     #[must_use]
     pub fn arg_params(&self, args: ArgRange) -> &[u32] {
         &self.arg_params[args.start()..args.start() + args.count()]
+    }
+
+    /// The number of the rest parameter of the callee of the call `id`, if
+    /// it has one, which lowering gives the list of the arguments that fill
+    /// it, the empty list if none does (see "Calls" under
+    /// [Functions](crate::check::functions#functions)).
+    #[must_use]
+    pub fn call_rest(&self, id: ExprId) -> Option<u32> {
+        self.lowered.call_rests.get(&id).copied()
     }
 
     /// The parameters that the call `id` gives their defaults, each with its

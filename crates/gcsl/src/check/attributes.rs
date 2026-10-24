@@ -400,6 +400,7 @@ impl Checker<'_> {
         let mut failed = false;
         for arg in used.args.map_or(&[][..], |args| ast.args(args)) {
             let error = match arg.kind {
+                ArgKind::Spread { .. } => Some(format!("`#[{text}]` takes no spread argument")),
                 ArgKind::Positional if fields.len() != 1 => Some(format!(
                     "`#[{text}]` takes its arguments by name, as in `#[{text}({} = ...)]`",
                     fields.first().map_or("x", |(name, _, _)| name)

@@ -126,7 +126,9 @@
 //! like `int`, its calls ordinary calls, and the opaque type, `alias_site`, `builtin_use` and the
 //! special path of `Checker::check_call` go.
 
-use crate::ast::{ArgKind, ArgRange, Effect, Expr, ExprId, ExprKind, FnId, TypeExprId, TypeExprKind};
+use crate::ast::{
+    Arg, ArgKind, ArgRange, Effect, Expr, ExprId, ExprKind, FnId, TypeExprId, TypeExprKind,
+};
 use crate::diagnostic::Diagnostic;
 use crate::mentions::Resolve;
 use crate::names::Name;
@@ -138,6 +140,10 @@ use super::{
     DEFAULTED, KnownCallee, KnownParams, PURE_CONTEXT, ParamDefault, Typing, VarRef, filled_by,
     position, unknown_argument, unknown_builtin_argument,
 };
+
+/// Where an argument is bound: the call, its callee, the callee if it is
+/// known, and the number of the callee's first parameter the call binds.
+type ArgSite = (ExprId, ExprId, Option<KnownCallee>, usize);
 
 impl Checker<'_> {
     /// TEMPORARY (alias rule): types the call `id` of the built-in function `builtin`, whose typing
@@ -341,6 +347,9 @@ impl Checker<'_> {
                     next_positional += 1;
                     Some(next_positional - 1).filter(|&param| param < count)
                 }
+                ArgKind::Spread { span } => {
+                    self.misplaced_spread(span, (callee_span, &label), &mut erroneous)
+                }
                 ArgKind::Trailing => (positional < count).then(|| count - 1),
                 ArgKind::Named { name, .. } => {
                     let text = ast.names().get(name);
@@ -511,44 +520,44 @@ impl Checker<'_> {
             .iter()
             .any(|arg| matches!(arg.kind, ArgKind::Named { .. }));
         let found = positional + usize::from(trailing);
+        let rest = sig.rest.map(usize::from);
         let mut erroneous = false;
-        if found > count {
+        // A rest parameter takes every positional argument from its place.
+        if found > count && rest.is_none() {
             self.report_extra_arguments((call, callee_span, &function_label), args, count);
             erroneous = true;
         }
         let base = self.filled.len();
         self.filled.resize(base + count, u32::MAX);
-        let mut next_positional = 0;
+        let rest_base = self.rest_args.len();
+        // Where the rest parameter's arguments are written, and whether a
+        // spread is where there is no rest parameter, which is then the
+        // error to see, not the parameters it leaves unfilled.
+        let (mut next_positional, mut rest_run, mut misplaced_spread) = (0, None, false);
         for (index, arg) in arg_list.iter().enumerate() {
             let target = match arg.kind {
                 ArgKind::Positional => {
                     next_positional += 1;
-                    Some(next_positional - 1).filter(|&param| param < count)
+                    sig.positional(next_positional - 1)
                 }
+                ArgKind::Spread { span } if rest.is_none() => {
+                    misplaced_spread = true;
+                    self.misplaced_spread(span, (callee_span, &function_label), &mut erroneous)
+                }
+                ArgKind::Spread { .. } => rest,
                 ArgKind::Trailing => (positional < count).then(|| count - 1),
                 ArgKind::Named {
                     name,
                     span,
                     shorthand,
                 } => {
-                    let param = sig
-                        .params
-                        .iter()
-                        .position(|&(param, _)| param == Some(name));
-                    if param.is_none() {
-                        let filled = filled_by(arg_list, count, |name| {
-                            sig.params
-                                .iter()
-                                .position(|&(param, _)| param == Some(name))
-                        });
-                        self.report_unknown_argument(
-                            (name, span, shorthand),
-                            (callee, callee_ty),
-                            sig,
-                            &filled,
-                        );
-                        erroneous = true;
-                    }
+                    let param = self.named_target(
+                        (name, span, shorthand),
+                        (callee, callee_ty),
+                        sig,
+                        arg_list,
+                    );
+                    erroneous |= param.is_none();
                     param
                 }
             };
@@ -556,46 +565,230 @@ impl Checker<'_> {
                 self.check_alone(arg.value);
                 continue;
             };
-            let first = self.filled.get(base + param).copied().unwrap_or(u32::MAX);
-            if let Some(first) = arg_list.get(first as usize) {
-                let name = sig.params.get(param).and_then(|&(name, _)| name);
-                self.report_given_twice((param, name), first.span(ast), arg.span(ast));
-                erroneous = true;
-                self.check_alone(arg.value);
+            if Some(param) == rest {
+                let site = (id, callee, known, offset);
+                erroneous |= self.bind_rest_argument(
+                    (arg, index, param),
+                    (base, &mut rest_run),
+                    (site, sig),
+                    (callee_span, &function_label),
+                );
                 continue;
             }
-            if let Some(entry) = self.filled.get_mut(base + param) {
-                *entry = position(index);
-            }
-            let param_ty = sig.params.get(param).map_or(TyId::ERROR, |&(_, ty)| ty);
-            let context = self.argument_context(known, param + offset, (id, callee));
-            let found = self.check_expr_expecting_at(
-                arg.value,
-                param_ty,
-                (callee_span, &function_label),
-                context,
+            erroneous |= self.bind_one_argument(
+                (arg, index, param),
+                (base, arg_list),
+                ((id, callee, known, offset), (callback, recursive)),
+                (sig, (callee_span, &function_label)),
             );
-            // A recursive call measures every argument that is a parameter
-            // of the function, conservatively.
-            if recursive && self.types.laziness(found) == Laziness::Provisional {
-                self.claim_top(ast.get(arg.value).span, found);
-            }
-            if let Some(callback) = callback {
-                self.record_argument(callback, param, arg.value, param_ty);
-            }
+        }
+        // A rest parameter given nothing is the empty list.
+        if let Some(entry) = rest.and_then(|rest| self.filled.get_mut(base + rest))
+            && *entry == u32::MAX
+        {
+            *entry = DEFAULTED;
         }
         let defaults = known.map(|known| self.fill_defaults(known, (base, offset), count));
-        erroneous |= self.report_unfilled(
-            base,
-            (call, callee_span, &function_label),
-            sig,
-            (found, named, trailing),
-        );
+        if !misplaced_spread {
+            erroneous |= self.report_unfilled(
+                base,
+                (call, callee_span, &function_label),
+                sig,
+                (found, named || rest.is_some(), trailing),
+            );
+        }
+        let rest_args = self.rest_args.split_off(rest_base);
         if !erroneous {
             self.record_bound((id, args), (base, offset), defaults);
+            self.record_rest((id, args), &rest_args, (rest, offset));
         }
         self.filled.truncate(base);
         erroneous
+    }
+
+    /// Binds `arg`, number `index` of the call `id`'s arguments
+    /// `arg_list`, to the parameter number `param` of `sig`, no rest one,
+    /// of the callee `callee`, known as `known` if it is, its parameters
+    /// numbered from `offset`: marked filled in `filled[base..]` and checked
+    /// against its type, measured if the call is `recursive`, and recorded
+    /// for the callback `callback`, if any, as [`Checker::bind_call`] says.
+    /// A parameter filled twice is reported: true.
+    fn bind_one_argument(
+        &mut self,
+        (arg, index, param): (&Arg, usize, usize),
+        (base, arg_list): (usize, &[Arg]),
+        ((id, callee, known, offset), (callback, recursive)): (ArgSite, (Option<usize>, bool)),
+        (sig, (callee_span, function_label)): (&FnTy, (Span, &str)),
+    ) -> bool {
+        let ast = self.ast;
+        let first = self.filled.get(base + param).copied().unwrap_or(u32::MAX);
+        if let Some(first) = arg_list.get(first as usize) {
+            let name = sig.params.get(param).and_then(|&(name, _)| name);
+            self.report_given_twice((param, name), first.span(ast), arg.span(ast));
+            self.check_alone(arg.value);
+            return true;
+        }
+        if let Some(entry) = self.filled.get_mut(base + param) {
+            *entry = position(index);
+        }
+        let param_ty = sig.params.get(param).map_or(TyId::ERROR, |&(_, ty)| ty);
+        let context = self.argument_context(known, param + offset, (id, callee));
+        let found = self.check_expr_expecting_at(
+            arg.value,
+            param_ty,
+            (callee_span, function_label),
+            context,
+        );
+        // A recursive call measures every argument that is a parameter
+        // of the function, conservatively.
+        if recursive && self.types.laziness(found) == Laziness::Provisional {
+            self.claim_top(ast.get(arg.value).span, found);
+        }
+        if let Some(callback) = callback {
+            self.record_argument(callback, param, arg.value, param_ty);
+        }
+        false
+    }
+
+    /// The parameter of `sig` the named argument `name`, written at `span`,
+    /// shorthand if `shorthand`, of a call of `callee`, of type
+    /// `callee_ty`, among the arguments `arg_list`, fills: the one of its
+    /// name, reported unknown if there is none ([`Checker::report_unknown_argument`]).
+    fn named_target(
+        &mut self,
+        (name, span, shorthand): (Name, Span, bool),
+        (callee, callee_ty): (ExprId, TyId),
+        sig: &FnTy,
+        arg_list: &[Arg],
+    ) -> Option<usize> {
+        let count = sig.params.len();
+        let param = sig
+            .params
+            .iter()
+            .position(|&(param, _)| param == Some(name));
+        if param.is_none() {
+            let filled = filled_by(arg_list, count, |name| {
+                sig.params
+                    .iter()
+                    .position(|&(param, _)| param == Some(name))
+            });
+            self.report_unknown_argument(
+                (name, span, shorthand),
+                (callee, callee_ty),
+                sig,
+                &filled,
+            );
+        }
+        param
+    }
+
+    /// Reports the spread argument written at `span` of a call of a
+    /// function, labelled `function_label` at `callee_span`, that has no
+    /// rest parameter for it to fill, making the call `erroneous`; `None`,
+    /// the parameter it fills.
+    pub(super) fn misplaced_spread(
+        &mut self,
+        span: Span,
+        (callee_span, function_label): (Span, &str),
+        erroneous: &mut bool,
+    ) -> Option<usize> {
+        *erroneous = true;
+        self.errors.push(
+            Diagnostic::error("a spread argument fills a rest parameter", span)
+                .with_context(callee_span, function_label)
+                .with_note("this function has no rest parameter, `...name: T`"),
+        );
+        None
+    }
+
+    /// Binds `arg`, number `index` of the call `id`'s arguments, of the
+    /// callee `callee`, known as `known` if it is, its parameters numbered
+    /// from `offset`, to the rest parameter, number `param` of `sig` (see
+    /// "Rest parameters" under [Functions](crate::check::functions#functions)):
+    /// checked against its elements' type, or a spread against a list of
+    /// them, the parameter marked filled in `filled[base..]` if it was not,
+    /// and kept to record for lowering. A named argument is "a rest
+    /// parameter is given by position", and one apart from the others
+    /// given it, as `run` says, is reported ([`Checker::rest_argument`]):
+    /// true for either.
+    fn bind_rest_argument(
+        &mut self,
+        (arg, index, param): (&Arg, usize, usize),
+        (base, run): (usize, &mut Option<(usize, usize)>),
+        ((id, callee, known, offset), sig): (ArgSite, &FnTy),
+        (callee_span, function_label): (Span, &str),
+    ) -> bool {
+        if matches!(arg.kind, ArgKind::Named { .. }) {
+            self.errors.push(
+                Diagnostic::error("a rest parameter is given by position", arg.span(self.ast))
+                    .with_context(callee_span, function_label)
+                    .with_note("`...list` gives it a list's elements"),
+            );
+            self.check_alone(arg.value);
+            return true;
+        }
+        let apart = self.rest_argument(arg, (index, run), (callee_span, function_label));
+        if let Some(entry) = self.filled.get_mut(base + param)
+            && *entry == u32::MAX
+        {
+            *entry = position(index);
+        }
+        let element = sig.params.get(param).map_or(TyId::ERROR, |&(_, ty)| ty);
+        let expected = if matches!(arg.kind, ArgKind::Spread { .. }) {
+            self.types.list(element)
+        } else {
+            element
+        };
+        let context = self.argument_context(known, param + offset, (id, callee));
+        self.check_expr_expecting_at(arg.value, expected, (callee_span, function_label), context);
+        self.rest_args.push((index, param));
+        apart
+    }
+
+    /// Records, for lowering, that the arguments `rest_args` of the call
+    /// `id`, each by its index in `args` with its parameter, fill its
+    /// callee's rest parameter, number `rest`, numbered from `offset`, and
+    /// that the callee has one, if it does.
+    fn record_rest(
+        &mut self,
+        (id, args): (ExprId, ArgRange),
+        rest_args: &[(usize, usize)],
+        (rest, offset): (Option<usize>, usize),
+    ) {
+        for &(index, param) in rest_args {
+            if let Some(entry) = self.arg_params.get_mut(args.start() + index) {
+                *entry = position(param + offset);
+            }
+        }
+        if let Some(rest) = rest {
+            self.lowering.call_rests.insert(id, position(rest + offset));
+        }
+    }
+
+    /// Checks that `arg`, number `index` of a call's arguments, given to
+    /// the rest parameter, is written beside the others given it, as
+    /// `run`, the first and last of them so far, says, and widens `run` to
+    /// it: "a rest parameter's arguments are written together" otherwise,
+    /// returning true.
+    fn rest_argument(
+        &mut self,
+        arg: &Arg,
+        (index, run): (usize, &mut Option<(usize, usize)>),
+        (callee_span, function_label): (Span, &str),
+    ) -> bool {
+        let apart = run.is_some_and(|(_, last)| last + 1 != index);
+        *run = Some(run.map_or((index, index), |(first, _)| (first, index)));
+        if apart {
+            self.errors.push(
+                Diagnostic::error(
+                    "a rest parameter's arguments are written together",
+                    arg.span(self.ast),
+                )
+                .with_context(callee_span, function_label)
+                .with_note("so that they are evaluated in the order they are written"),
+            );
+        }
+        apart
     }
 
     /// Records, for lowering, the parameter each of the arguments `args` of

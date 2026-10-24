@@ -12,6 +12,16 @@
 //! written as a type there that is one of them is the parameter, whatever
 //! type of its name is declared.
 //!
+//! A parameter written `...NAME: TYPE` is the *rest parameter*
+//! ([`Param::rest`](crate::ast::Param::rest)), which the positional arguments
+//! from its position on fill; it has no default, "a rest parameter has no
+//! default", noted that given no arguments it is the empty list. A function
+//! type's parameter may be one too, `fn(...words: String): Int`. At a call, an
+//! argument `...EXPR` is a spread argument
+//! ([`ArgKind::Spread`](crate::ast::ArgKind::Spread)), a list whose elements
+//! fill the rest parameter. That a function has one rest parameter at most, and
+//! what a call gives it, is the checker's.
+//!
 //! A function expression is `fn`, `(`, parameters `NAME: TYPE` separated by
 //! `,` with an optional trailing `,`, `)`, the return marker, the return
 //! type, and the body, a block whose `{` must follow the return type
@@ -467,9 +477,15 @@ impl Parser<'_> {
     /// `,` or the `)` after it, raising `tallest` to the height of its type
     /// and its default. Returns whether the `)` ends the list.
     pub(super) fn parse_param(&mut self, open: Token, tallest: &mut u32) -> ParseResult<bool> {
-        let token = self.peek();
+        let mut token = self.peek();
         if token.kind == TokenKind::Caret {
             return self.parse_context_param(open, tallest);
+        }
+        // A rest parameter, `...words: String`.
+        let dots = (token.kind == TokenKind::DotDotDot).then_some(token.span);
+        if dots.is_some() {
+            self.advance();
+            token = self.peek();
         }
         let name = match token.kind {
             TokenKind::Ident(name) => name,
@@ -505,16 +521,23 @@ impl Parser<'_> {
         self.advance();
         let (ty, height) = self.parse_type()?;
         *tallest = (*tallest).max(height);
+        if dots.is_some() && self.peek().kind == TokenKind::Eq {
+            return Err(self.report(
+                Diagnostic::error("a rest parameter has no default", self.peek().span)
+                    .with_note("given no arguments, it is the empty list"),
+            ));
+        }
         let default = self.parse_default()?;
         if let Some(default) = default {
             *tallest = (*tallest).max(self.height_of(default));
         }
         self.param_stack.push(Param {
             name,
-            span: Span::join(token.span, self.type_span(ty)),
+            span: Span::join(dots.unwrap_or(token.span), self.type_span(ty)),
             ty,
             default,
             default_fn: None,
+            rest: dots.is_some(),
         });
         self.list_separator(open)
     }
@@ -673,6 +696,10 @@ impl Parser<'_> {
         let token = self.peek();
         let next = self.peek_at(1).kind;
         let kind = match (token.kind, next) {
+            (TokenKind::DotDotDot, _) => {
+                self.advance();
+                ArgKind::Spread { span: token.span }
+            }
             (TokenKind::Ident(name), TokenKind::Eq) => {
                 self.advance();
                 self.advance();

@@ -1059,3 +1059,46 @@ fn functions_with_other_operators() {
         vec!["unknown type `Nope`", "undefined variable `g`"]
     );
 }
+
+#[test]
+fn a_rest_parameter_takes_the_positional_arguments_from_its_place() {
+    let prefix = "fn count(...xs: Int, scale: Int = 1): Int { 0 }\n";
+    for (call, shown) in [
+        ("count()", "Int"),
+        ("count(1, 2, 3)", "Int"),
+        ("count(...[1, 2])", "Int"),
+        ("count(1, ...[2], 3, scale = 2)", "Int"),
+    ] {
+        assert_eq!(shown_result(&format!("{prefix}{call}")), shown, "{call}");
+    }
+    // The body sees it as a list, and its type shows it.
+    assert_eq!(
+        shown_result("fn words(...ws: String): List<String> { ws }\nwords"),
+        "fn(...ws: String): List<String>"
+    );
+    assert_eq!(
+        shown_result("let f: fn(...xs: Int): Int = fn(...xs: Int): Int { 0 }\nf"),
+        "fn(...xs: Int): Int"
+    );
+    for (text, message) in [
+        ("count(xs = [1])", "a rest parameter is given by position"),
+        (
+            "count(1, scale = 2, 3)",
+            "a rest parameter's arguments are written together",
+        ),
+        ("count(1, \"x\")", "mismatched types"),
+        ("count(...[\"x\"])", "mismatched types"),
+        ("let f: fn(a: Int): Int = count", "mismatched types"),
+        (
+            "fn one(x: Int): Int { x }\none(...[1])",
+            "a spread argument fills a rest parameter",
+        ),
+        (
+            "fn two(...a: Int, ...b: Int): Int { 0 }",
+            "a function has one rest parameter at most",
+        ),
+    ] {
+        let found = messages(&format!("{prefix}{text}"));
+        assert_eq!(found, [message], "{text}");
+    }
+}

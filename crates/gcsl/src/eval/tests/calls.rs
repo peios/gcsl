@@ -429,3 +429,26 @@ fn function_values_and_their_internal_errors() {
         "internal error: a closure of a function its IR lacks"
     );
 }
+
+#[test]
+fn a_rest_parameter_is_the_list_of_its_arguments() {
+    assert_eq!(
+        run("fn sum(...xs: Int, scale: Int = 1): Int { let mut t = 0\nfor x in xs { t := t + x }\nt * scale }\n\
+             let some = [4, 5]\n\
+             {a = sum(); b = sum(1, 2, 3); c = sum(...some); d = sum(1, ...some, 6, scale = 10)}")
+        .unwrap()
+        .to_string(),
+        "{a = 0; b = 6; c = 9; d = 160}"
+    );
+    // Through a value of a function type, and a generic one.
+    assert_eq!(
+        run(
+            "let f: fn(...xs: Int): Int = fn(...xs: Int): Int { xs[0] }\n\
+             fn first<T>(...xs: T): T { xs[0] }\n\
+             {a = f(7, 8); b = first(\"x\", \"y\"); c = first(...[1.5])}"
+        )
+        .unwrap()
+        .to_string(),
+        "{a = 7; b = \"x\"; c = 1.5}"
+    );
+}

@@ -155,9 +155,9 @@ fn pretty_output_for_lists() {
 
 #[test]
 fn list_errors() {
-    // A spread anywhere an expression starts, but in a list or at the
-    // start of an item.
-    for (text, at) in [("f(...xs)", 2), ("let x = ...xs", 8), ("[(...xs)]", 2)] {
+    // A spread anywhere an expression starts, but in a list, as an
+    // argument or at the start of an item.
+    for (text, at) in [("let x = ...xs", 8), ("[(...xs)]", 2), ("f((...xs))", 3)] {
         assert_eq!(
             error(text),
             (MISPLACED_SPREAD.to_owned(), Span::new(at, at + 3)),

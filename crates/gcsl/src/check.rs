@@ -1576,12 +1576,15 @@ const CONSTANT_FIELDS_NOTE: &str = "each field must be an `Int`, `Float`, `Bool`
 type AttributeFields = Vec<(Box<str>, TyId, Option<Constant>)>;
 
 /// The arguments of `args`, by their values, each with the parameter of
-/// `sig` it fills, as [`Checker::bind_arguments`] binds them: positional
-/// ones left to right, the trailing block the last, and named ones the
-/// parameters of their names; only the first that fills a parameter, and
-/// none that fills nothing.
-fn argument_targets(args: &[Arg], sig: &FnTy) -> Vec<(ExprId, usize)> {
+/// `sig` it fills and whether it is a spread, as [`Checker::bind_arguments`]
+/// binds them: positional ones left to right, those from the rest
+/// parameter's position on and every spread the rest parameter, the
+/// trailing block the last, and named ones the parameters of their names;
+/// only the first that fills a parameter but the rest parameter, and none
+/// that fills nothing.
+fn argument_targets(args: &[Arg], sig: &FnTy) -> Vec<(ExprId, usize, bool)> {
     let count = sig.params.len();
+    let rest = sig.rest.map(usize::from);
     let positional = args
         .iter()
         .filter(|arg| arg.kind == ArgKind::Positional)
@@ -1593,19 +1596,25 @@ fn argument_targets(args: &[Arg], sig: &FnTy) -> Vec<(ExprId, usize)> {
         let param = match arg.kind {
             ArgKind::Positional => {
                 next += 1;
-                Some(next - 1)
+                sig.positional(next - 1)
             }
+            ArgKind::Spread { .. } => rest,
             ArgKind::Trailing => (positional < count).then(|| count - 1),
             ArgKind::Named { name, .. } => sig
                 .params
                 .iter()
-                .position(|&(param, _)| param == Some(name)),
+                .position(|&(param, _)| param == Some(name))
+                .filter(|&param| Some(param) != rest),
         };
-        if let Some(param) = param.filter(|&param| param < count)
-            && let Some(slot @ false) = taken.get_mut(param)
-        {
+        let Some(param) = param.filter(|&param| param < count) else {
+            continue;
+        };
+        let spread = matches!(arg.kind, ArgKind::Spread { .. });
+        if Some(param) == rest {
+            targets.push((arg.value, param, spread));
+        } else if let Some(slot @ false) = taken.get_mut(param) {
             *slot = true;
-            targets.push((arg.value, param));
+            targets.push((arg.value, param, spread));
         }
     }
     targets
@@ -1812,6 +1821,10 @@ pub struct Checker<'a> {
     /// Reused for binding a call's arguments: for each parameter, the index
     /// in the call's arguments of the argument filling it, or `u32::MAX`.
     filled: Vec<u32>,
+    /// Reused for binding a call's arguments, as `filled` is: each argument
+    /// given to the rest parameter, by its index in the call's arguments,
+    /// with the parameter's number.
+    rest_args: Vec<(usize, usize)>,
     /// Index in `bindings` of the innermost block's first binding.
     block_start: usize,
     /// The fields of every block being checked, outermost block first.
@@ -2038,6 +2051,7 @@ impl<'a> Checker<'a> {
             callee_name: None,
             fn_params: Vec::new(),
             filled: Vec::new(),
+            rest_args: Vec::new(),
             block_start: 0,
             fields: Vec::new(),
             fields_start: 0,

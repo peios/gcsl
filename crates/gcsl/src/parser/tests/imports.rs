@@ -13,6 +13,7 @@ fn a_name_alone_after_a_named_argument_is_shorthand() {
             .iter()
             .map(|arg| match arg.kind {
                 ArgKind::Positional => "positional".to_owned(),
+                ArgKind::Spread { .. } => "spread".to_owned(),
                 ArgKind::Named {
                     name, shorthand, ..
                 } => {

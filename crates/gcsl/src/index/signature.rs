@@ -44,6 +44,8 @@ pub(super) struct Shown {
     pub(super) ty: String,
     /// Its default, as its source writes it, if it has one.
     pub(super) default: Option<String>,
+    /// Whether it is the rest parameter, shown `...name: T`.
+    pub(super) rest: bool,
 }
 
 /// What a signature shows of a callee ([`Index::callee`]).
@@ -128,6 +130,9 @@ impl Index {
                 label.push_str(", ");
             }
             let start = u32::try_from(label.len()).unwrap_or(u32::MAX);
+            if param.rest {
+                label.push_str("...");
+            }
             if let Some(name) = &param.name {
                 label.push_str(name);
                 label.push_str(": ");
@@ -141,9 +146,10 @@ impl Index {
         }
         label.push_str(&tail);
         let labels: Vec<Option<&str>> = params.iter().map(|param| param.name.as_deref()).collect();
+        let rest = params.iter().position(|param| param.rest);
         let active = match within {
             Within::Trailing => labels.len().checked_sub(1),
-            Within::Arguments(open) => active_parameter(tokens, open, offset, &labels),
+            Within::Arguments(open) => active_parameter(tokens, open, offset, (&labels, rest)),
         };
         Some(Signature {
             label,
@@ -177,6 +183,7 @@ impl Index {
                 name: Some(name.to_owned()),
                 ty: ty.to_owned(),
                 default: None,
+                rest: false,
             }],
             tail: format!("): {ret}"),
             generic: "<T>",
@@ -205,6 +212,7 @@ impl Index {
                                 .display(self.as_written(param), names)
                                 .to_string(),
                             default,
+                            rest: sig.rest.map(usize::from) == Some(at),
                         }
                     })
                     .collect();
@@ -358,7 +366,7 @@ fn active_parameter(
     tokens: &Tokens,
     open: usize,
     offset: u32,
-    named: &[Option<&str>],
+    (named, rest): (&[Option<&str>], Option<usize>),
 ) -> Option<usize> {
     let arguments = Arguments::of(tokens, open, offset);
     // In a named argument, past its `=`: the parameter it names.
@@ -369,7 +377,7 @@ fn active_parameter(
         return named.iter().position(|&n| n == Some(name));
     }
     arguments
-        .filled(tokens, named)
+        .filled(tokens, named, rest)
         .iter()
         .position(|&filled| !filled)
 }
@@ -439,8 +447,15 @@ impl Arguments {
     /// place is in fill: each a named argument names, anywhere in the list;
     /// the last, if a trailing block follows the list; and, from the left,
     /// those not filled so, one for each positional argument before the
-    /// place.
-    pub(super) fn filled(&self, tokens: &Tokens, named: &[Option<&str>]) -> Vec<bool> {
+    /// place, up to the rest parameter, number `rest`, if there is one,
+    /// which every positional argument from there fills, and which is never
+    /// filled up.
+    pub(super) fn filled(
+        &self,
+        tokens: &Tokens,
+        named: &[Option<&str>],
+        rest: Option<usize>,
+    ) -> Vec<bool> {
         let position = |name: &str| named.iter().position(|&n| n == Some(name));
         let mut filled = vec![false; named.len()];
         for (at, &argument) in self.spans.iter().enumerate() {
@@ -463,7 +478,13 @@ impl Arguments {
             .take(self.current)
             .filter(|&&argument| name_of(tokens, argument).is_none())
             .count();
-        for slot in filled.iter_mut().filter(|done| !**done).take(positional) {
+        let before_rest = rest.unwrap_or(filled.len());
+        for slot in filled
+            .iter_mut()
+            .take(before_rest)
+            .filter(|done| !**done)
+            .take(positional)
+        {
             *slot = true;
         }
         filled
@@ -508,6 +529,23 @@ mod tests {
             found.label[start as usize..end as usize].to_owned()
         });
         Some((found.label, active, found.documentation))
+    }
+
+    #[test]
+    fn every_positional_argument_from_a_rest_parameter_fills_it() {
+        let text = "w = 0\ndef f(a: Int, ...more: String, end: Bool = true): Int { a }\n";
+        let label = "def f(a: Int, ...more: String, end: Bool = true): Int";
+        for (call, active) in [
+            ("r = f(|1, \"s\")", Some("a: Int")),
+            ("r = f(1, |\"s\")", Some("...more: String")),
+            ("r = f(1, \"s\", \"t\", |\"u\")", Some("...more: String")),
+            ("r = f(1, \"s\", end = |true)", Some("end: Bool = true")),
+        ] {
+            let (found, at, _) =
+                help(&format!("{text}{call}\n"), &[]).unwrap_or_else(|| panic!("{call}"));
+            assert_eq!(found, label, "{call}");
+            assert_eq!(at.as_deref(), active, "{call}");
+        }
     }
 
     /// A `def` of three parameters, documented, below the file's first line,

@@ -381,6 +381,7 @@ impl Parser<'_> {
             ty,
             default: Some(read),
             default_fn: None,
+            rest: false,
         });
         self.list_separator(open)
     }

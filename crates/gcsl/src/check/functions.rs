@@ -95,6 +95,21 @@
 //! built-in function is typed apart (see [Built-in
 //! functions](crate::check::calls#built-in-functions)).
 //!
+//! **Rest parameters.** A function's rest parameter, `...words: T`, at most
+//! one, "a function has one rest parameter at most" for a second, is part
+//! of its type ([`FnTy::rest`](crate::types::FnTy::rest)), whose parameter
+//! type is its elements', `T`; the body declares it a `List<T>`. A call
+//! gives it every positional argument from its position on, each checked
+//! against `T`, and every spread argument, `...xs`, checked against
+//! `List<T>`; they are written together, "a rest parameter's arguments are
+//! written together" otherwise, so that they are evaluated in their order.
+//! It is never named, "a rest parameter is given by position", and never
+//! unfilled: given nothing it is the empty list. A spread where the callee
+//! has no rest parameter is "a spread argument fills a rest parameter".
+//! Each call of a callee with one is recorded with its number
+//! ([`Resolution::call_rest`](super::Resolution::call_rest)), and lowering
+//! gives it a list of its arguments, where the first is written.
+//!
 //! **Defaults.** A parameter of a function expression may have a default,
 //! `greeting: String = "hello"`, in any position, before, between or after
 //! parameters without one. A default is any expression. One that is a
@@ -386,6 +401,7 @@ impl Checker<'_> {
         // Each parameter's type before any inference, which its default
         // functions' copies of it are given.
         let mut resolved = Vec::with_capacity(params.len());
+        self.check_rests(params);
         for (index, param) in params.iter().enumerate() {
             let mut ty = self.resolve_type(param.ty, params_mode);
             resolved.push(ty);
@@ -595,10 +611,7 @@ impl Checker<'_> {
         self.block_start = self.bindings.len();
         self.fields_start = self.fields.len();
         for (index, param) in params.iter().enumerate() {
-            let ty = self
-                .fn_params
-                .get(base + index)
-                .map_or(TyId::ERROR, |&(_, ty)| ty);
+            let ty = self.param_type_in_body(param, base + index);
             self.declare_binding(param.name, ty, Some(param.span), BindingKind::Variable);
         }
         let errors = self.errors.len();
@@ -911,10 +924,7 @@ impl Checker<'_> {
                         .with_context(first.span, "first declared here"),
                 );
             }
-            let ty = self
-                .fn_params
-                .get(base + index)
-                .map_or(TyId::ERROR, |&(_, ty)| ty);
+            let ty = self.param_type_in_body(param, base + index);
             self.declare_binding(param.name, ty, Some(param.span), BindingKind::Variable);
             if decl.effect != Effect::Pure && ty != TyId::ERROR {
                 let callback = self.callback_parameter(index, param.ty);
@@ -1008,6 +1018,28 @@ impl Checker<'_> {
         } else {
             self.defaulted_record(ret)
                 .map(|record| Expecting::literal_only(record, (context, why), span))
+        }
+    }
+
+    /// The type the body sees `param` as, its type `fn_params[at]`'s: a
+    /// rest parameter is the list of what fills it.
+    pub(super) fn param_type_in_body(&mut self, param: &Param, at: usize) -> TyId {
+        let ty = self.fn_params.get(at).map_or(TyId::ERROR, |&(_, ty)| ty);
+        if param.rest && ty != TyId::ERROR {
+            self.types.list(ty)
+        } else {
+            ty
+        }
+    }
+
+    /// Reports the second rest parameter among `params`, if there is one:
+    /// "a function has one rest parameter at most".
+    pub(super) fn check_rests(&mut self, params: &[Param]) {
+        if let Some(second) = params.iter().filter(|param| param.rest).nth(1) {
+            self.errors.push(Diagnostic::error(
+                "a function has one rest parameter at most",
+                second.span,
+            ));
         }
     }
 }

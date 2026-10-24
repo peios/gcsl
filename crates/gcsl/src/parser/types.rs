@@ -492,6 +492,11 @@ impl Parser<'_> {
     /// raising `tallest` to the height of its type. Returns whether the `)`
     /// ends the list.
     pub(super) fn parse_param_ty(&mut self, open: Token, tallest: &mut u32) -> ParseResult<bool> {
+        // A rest parameter, `...words: String` or `...String`.
+        let rest = self.peek().kind == TokenKind::DotDotDot;
+        if rest {
+            self.advance();
+        }
         let token = self.peek();
         let name = match (token.kind, self.peek_at(1).kind) {
             (TokenKind::Ident(name), TokenKind::Colon) => {
@@ -508,7 +513,7 @@ impl Parser<'_> {
         if eq.kind == TokenKind::Eq {
             return Err(self.error(MISPLACED_DEFAULT, eq.span));
         }
-        self.param_ty_stack.push(ParamTy { name, ty });
+        self.param_ty_stack.push(ParamTy { name, ty, rest });
         self.list_separator(open)
     }
 

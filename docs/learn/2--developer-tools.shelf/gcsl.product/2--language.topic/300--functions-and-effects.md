@@ -71,6 +71,30 @@ long = build("main.c", output = "main.o", compiler = compiler)
 Before any named argument, a name on its own is an ordinary positional
 argument.
 
+## Rest parameters
+
+A rest parameter, written `...name: T`, takes every positional argument
+from its place on, and the body sees it as a `List<T>`. Parameters after it
+are given by name. A spread argument, `...list`, passes a list's elements
+to it, among single arguments:
+
+```gcsl
+fn command(program: String, ...words: String, quiet: Bool = false): String {
+    let all = join([program, ...words], " ")
+    if quiet { "{all} >/dev/null" } else { all }
+}
+let flags = ["-O2", "-Wall"]
+plain = command("cc")
+compile = command("cc", "-c", ...flags, "main.c")
+silent = command("make", "install", quiet = true)
+```
+
+A function has at most one rest parameter, and it has no default: given
+nothing, it is the empty list. Its arguments are written together, so that
+they run in the order they are written. A function type shows its rest
+parameter too, `fn(...words: String): Int`, and only a function with a rest
+parameter in the same place fits it.
+
 ## Generic functions
 
 A function can work on values of any type. Name its type parameters in

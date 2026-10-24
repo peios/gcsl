@@ -521,10 +521,7 @@ impl Checker<'_> {
         let receiver_ty = sig.params.first().map_or(TyId::ERROR, |&(_, ty)| ty);
         let context = self.argument_context(known, 0, (id, callee));
         self.expect_at(receiver, found, receiver_ty, (span, &label), context);
-        let rest = FnTy {
-            params: sig.params.get(1..).unwrap_or_default().into(),
-            ..sig.clone()
-        };
+        let rest = sig.after(1);
         let bound = Bound { known, offset: 1 };
         let erroneous = self.bind_call(id, (callee, method_ty, None), args, (&rest, bound));
         self.lowering.method_calls.insert(id, receiver);
@@ -569,14 +566,17 @@ impl Checker<'_> {
             let present = self.types.strip(found);
             self.bind_argument(&mut binding, (value, param_ty), present);
         }
-        let after_receiver = FnTy {
-            params: sig.params.get(offset..).unwrap_or_default().into(),
-            ..sig.clone()
-        };
+        let after_receiver = sig.after(offset);
         let mut untyped: Vec<(ExprId, TyId)> = Vec::new();
-        for (value, param) in argument_targets(ast.args(args), &after_receiver) {
+        for (value, param, spread) in argument_targets(ast.args(args), &after_receiver) {
             let Some(&(_, param_ty)) = sig.params.get(param + offset) else {
                 continue;
+            };
+            // A spread gives the rest parameter a list of its elements.
+            let param_ty = if spread {
+                self.types.list(param_ty)
+            } else {
+                param_ty
             };
             if !self.types.mentions(param_ty, generic) || self.expects_its_type(value) {
                 continue;
@@ -632,6 +632,7 @@ impl Checker<'_> {
             effect: sig.effect,
             meta,
             generic: None,
+            rest: sig.rest,
         })
     }
 

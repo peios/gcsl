@@ -698,10 +698,13 @@ fn call_shape(ast: &Ast, callee: ExprId, args: crate::ast::ArgRange, out: &mut S
                 trailing = Some(arg.value);
                 continue;
             }
-            ArgKind::Positional | ArgKind::Named { .. } if index > 0 => {
+            ArgKind::Positional | ArgKind::Named { .. } | ArgKind::Spread { .. } if index > 0 => {
                 out.push_str(", ");
             }
-            ArgKind::Positional | ArgKind::Named { .. } => {}
+            ArgKind::Positional | ArgKind::Named { .. } | ArgKind::Spread { .. } => {}
+        }
+        if let ArgKind::Spread { .. } = arg.kind {
+            out.push_str("...");
         }
         if let ArgKind::Named {
             shorthand: true, ..

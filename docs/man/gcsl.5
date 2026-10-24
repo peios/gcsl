@@ -148,6 +148,14 @@ Closures capture values when they are created.
 Calls accept positional and named arguments, evaluated in source order.
 After a named argument, a name alone, as in f(x, out = 1, compiler), is shorthand for compiler = compiler.
 A trailing block supplies the final parameter.
+A rest parameter,
+.IR ... name : T ,
+takes every positional argument from its place, a
+.BI List< T >
+in the body; the parameters after it are given by name, and a spread argument,
+.IR ... list ,
+passes a list's elements to it.
+A function has at most one, with no default.
 A named function may declare type parameters after its name, as in fn first<T>(items: List<T>, fallback: T): T; each call infers them from its arguments' types.
 A value of a type parameter can be passed, returned and stored, and nothing else; a generic function must be called, not used as a value.
 A method is declared at the top level with its receiver before its name, as in fn (n: Int) twice(): Int, and called on a value, as in 21.twice(); the method whose receiver type fits the value's type is chosen, the most specific when several fit.

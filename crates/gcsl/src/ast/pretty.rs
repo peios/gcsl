@@ -545,6 +545,9 @@ impl WrittenType<'_> {
                     if index > 0 {
                         f.write_str(", ")?;
                     }
+                    if param.rest {
+                        f.write_str("...")?;
+                    }
                     if let Some(name) = param.name {
                         write!(f, "{}: ", FieldName(names.get(name)))?;
                     }
@@ -695,7 +698,8 @@ impl<A: Annotate> Pretty<'_, A> {
                 write!(f, " {name}")?;
                 continue;
             }
-            write!(f, " ({name} ")?;
+            let rest = if param.rest { "..." } else { "" };
+            write!(f, " ({rest}{name} ")?;
             self.type_expr(f, param.ty)?;
             // A default, on lines of its own after its type.
             if let Some(default) = param.default {
@@ -741,6 +745,11 @@ impl<A: Annotate> Pretty<'_, A> {
                 ArgKind::Named { name, .. } => {
                     let name = FieldName(self.ast.names().get(name));
                     writeln!(f, "{:indent$}(named {name}", "", indent = depth * 2)?;
+                    self.node(f, arg.value, depth + 1)?;
+                    f.write_str(")")?;
+                }
+                ArgKind::Spread { .. } => {
+                    writeln!(f, "{:indent$}(spread", "", indent = depth * 2)?;
                     self.node(f, arg.value, depth + 1)?;
                     f.write_str(")")?;
                 }

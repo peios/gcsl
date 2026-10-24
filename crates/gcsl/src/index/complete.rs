@@ -646,12 +646,14 @@ impl Index {
             .iter()
             .map(|param| param.name.as_deref())
             .collect();
-        let filled = Arguments::of(tokens, open, offset).filled(tokens, &named);
+        let rest = callee.params.iter().position(|param| param.rest);
+        let filled = Arguments::of(tokens, open, offset).filled(tokens, &named, rest);
         callee
             .params
             .iter()
             .zip(filled)
-            .filter(|(_, filled)| !filled)
+            // A rest parameter is given by position, never by name.
+            .filter(|(param, filled)| !filled && !param.rest)
             .filter_map(|(param, _)| {
                 let name = param.name.as_deref()?;
                 Some(Completion {
