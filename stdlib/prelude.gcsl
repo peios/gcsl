@@ -397,6 +397,29 @@ type Package = {name: String, version: String, files: {*: Dir | File | List<File
     files = made.files
 }
 
+# Tests. A `test` definition, `def test runs(prog: File = build app()) {
+# ... }`, passes if its body succeeds, and fails if it fails: an `assert`, a
+# program that exits with an error, or any other failure. Its body is a
+# step, `#[hermetic]` by default, given what its parameters' defaults
+# build, so a test that passed is not run again for the same inputs;
+# `#[hermetic(false)]` runs one that cannot be a step every time.
+# `test NAME()` is a `TestResult`, its name, whether it passed and the
+# failure's message, and never itself a failure: its body's failure, after
+# its retries, is recovered outside the step.
+type TestResult = {name: String, passed: Bool, message: String}
+#[def_type] #[hermetic]
+def test(name: String, f: fn() -> {}) -> TestResult {
+    let outcome = recover {
+        await f()
+        = {passed = true; message = ""}
+    } else (failure) {
+        = {passed = false; message = failure.message}
+    }
+    name = name
+    passed = outcome.passed
+    message = outcome.message
+}
+
 # Platforms: an architecture and an operating system, as Rust names them.
 # `^host_platform` is where steps run: in plain GCSL this machine; a build
 # tool sets it to where it runs them. `^platform` is what is being built

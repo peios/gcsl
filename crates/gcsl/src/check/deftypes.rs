@@ -623,7 +623,9 @@ impl Checker<'_> {
             needs: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
-        self.check_fn_body(&decl, base, (None, ty, span), ret);
+        // Known by its path's last segment, as a host names its steps.
+        let named = self.ast.path(use_.path).last().and_then(PathSegment::name);
+        self.check_fn_body(&decl, base, (named, ty, span), ret);
         let ty = if generic {
             let found = self.expr_types[decl.body.index()];
             let params = sig.params.iter().copied();
@@ -651,7 +653,7 @@ impl Checker<'_> {
         self.definition_defers(deferred, sig.effect, def);
         // Its meta's cell, read as its body reads a top-level function.
         self.definition_meta(function, def, sig.meta);
-        let (_, needs) = self.finish_function(decl.params.len(), None);
+        let (_, needs) = self.finish_function(decl.params.len(), named);
         let allowed = self.types.need_set(sig.needs).to_vec();
         self.definition_needs(&needs, &allowed);
         ty

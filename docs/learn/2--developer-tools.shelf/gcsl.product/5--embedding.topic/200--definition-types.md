@@ -156,6 +156,23 @@ def package dev.example.greet() {
 version, and the files, which a packager library, such as gcslib's `ppk`,
 packs.
 
+The prelude's `test` is another. A test passes if its body succeeds and
+fails if it fails, by an `assert`, a program exiting with an error, or
+any other failure:
+
+```gcsl
+def test adds() {
+    assert 1 + 1 == 2
+}
+result = test adds()
+```
+
+`test adds()` is a `TestResult`, `{name = "adds"; passed = true; message
+= ""}`, and never itself a failure. `test` is `#[hermetic]`, so a build
+tool such as pekit runs each test's body as a step, given what its
+parameters' defaults build, and doesn't run a test that passed again for
+the same inputs.
+
 ## Metadata
 
 Function types can carry metadata with `META:`, `META->`, or `META->>`.

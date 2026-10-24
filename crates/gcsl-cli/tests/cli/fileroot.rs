@@ -246,7 +246,7 @@ fn dumps_show_metas() {
         "fn #0 defmeta package dev.peios.testpkg (frame 1, params 0, captures 0, height 6)"
     );
     assert!(
-        heads[1].starts_with("fn #1 package dev.peios.testpkg meta #")
+        heads[1].starts_with("fn #1 testpkg package dev.peios.testpkg meta #")
             && heads[1].ends_with(" (frame 4, params 1, captures 0, height 4)"),
         "{}",
         heads[1]

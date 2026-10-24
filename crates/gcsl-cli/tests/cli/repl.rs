@@ -344,22 +344,22 @@ fn dumps_show_top_level_functions_and_where_they_are_made() {
         // Those that copy nothing are made as the input starts, in their
         // own slots, the first of the input's.
         "(block @123..726\n\
-         \x20 (store describe#131 @156..225\n\
+         \x20 (store describe#133 @156..225\n\
          \x20   (make-closure #0 @156..225))\n\
-         \x20 (store even#132 @226..290\n",
+         \x20 (store even#134 @226..290\n",
         // One that copies `rate` just after `rate` is bound.
-        "\n  (store rate#137 @494..506\n\
+        "\n  (store rate#139 @494..506\n\
          \x20   (int 3 @505..506))\n\
-         \x20 (store scale#135 @525..559\n\
+         \x20 (store scale#137 @525..559\n\
          \x20   (make-closure #4 @525..559\n\
-         \x20     (load rate#137 @525..559)))\n\
-         \x20 (store scaled#85 @507..524\n",
+         \x20     (load rate#139 @525..559)))\n\
+         \x20 (store scaled#86 @507..524\n",
         // One that copies a mutable variable where it is written.
-        "\n  (store counted#136 @643..670\n\
+        "\n  (store counted#138 @643..670\n\
          \x20   (make-closure #5 @643..670\n",
         // A function reads another of the top level from the top level's
         // frame, not by a capture.
-        "\n        (fn top even#132 @190..194)\n",
+        "\n        (fn top even#134 @190..194)\n",
     ] {
         assert!(ir.contains(node), "{node}: {ir}");
     }
@@ -417,32 +417,32 @@ fn dumps_show_the_cells_of_top_level_fields_and_their_points() {
     for node in [
         // `com.x.lib.name` and the interior node `com.x.lib` are computed
         // before `com.x.app.deps`, the first item that needs them.
-        "\n  (store name#88 @273..295\n",
-        "\n  (store lib#87 @273..295\n\
+        "\n  (store name#89 @273..295\n",
+        "\n  (store lib#88 @273..295\n\
          \x20   (make-record [name] @273..295\n\
-         \x20     (load name#88 @273..295)))\n\
-         \x20 (store deps#85 @211..239\n\
+         \x20     (load name#89 @273..295)))\n\
+         \x20 (store deps#86 @211..239\n\
          \x20   (make-list @228..239\n\
-         \x20     (load lib#87 @229..238)))\n\
-         \x20 (store version#89 @296..321\n",
+         \x20     (load lib#88 @229..238)))\n\
+         \x20 (store version#90 @296..321\n",
         // An interior node is assembled from its children's cells once all
         // of them are computed.
-        "\n  (store app#84 @211..239\n\
+        "\n  (store app#85 @211..239\n\
          \x20   (make-record [deps name] @211..239\n\
-         \x20     (load deps#85 @211..239)\n\
-         \x20     (load name#86 @240..272)))\n",
+         \x20     (load deps#86 @211..239)\n\
+         \x20     (load name#87 @240..272)))\n",
         // A root read between its items is computed whole, before the read.
-        "\n  (store part#90 @526..536\n\
+        "\n  (store part#91 @526..536\n\
          \x20   (make-record [a b] @526..536\n\
-         \x20     (load a#91 @526..536)\n\
-         \x20     (load b#93 @550..560)))\n\
-         \x20 (store whole#92 @537..549\n",
+         \x20     (load a#92 @526..536)\n\
+         \x20     (load b#94 @550..560)))\n\
+         \x20 (store whole#93 @537..549\n",
         // The record of the input is made from the roots' cells.
         "\n  (make-record [com version part whole label] @59..574\n\
-         \x20   (load com#82 @211..214)\n",
+         \x20   (load com#83 @211..214)\n",
         // A function reads a cell from the top level's frame, not by a
         // capture.
-        "\n    (top top name#88 @451..465))",
+        "\n    (top top name#89 @451..465))",
     ] {
         assert!(ir.contains(node), "{node}: {ir}");
     }
@@ -525,7 +525,7 @@ fn dumps_show_returns_and_their_catches() {
         "(catch 0 @384..436\n",
         "(return 0 @403..423\n",
         "\n    (catch 1 @532..582\n\
-         \x20     (for hit#131 @532..582\n",
+         \x20     (for hit#133 @532..582\n",
         // A loop that cannot end collects nothing.
         "\n    (catch 2 @692..759\n\
          \x20     (loop-each @692..759\n",

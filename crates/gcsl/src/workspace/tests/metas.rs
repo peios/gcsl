@@ -974,7 +974,10 @@ fn definitions_with_plus_in_their_paths_are_ordinary_definitions() {
     );
     let index = workspace.file("pkgs/gnu.gcsl").unwrap();
     let ir = workspace.dump_ir(index).unwrap();
-    assert!(ir.contains("fn #1 package org.gnu.gmp-c++ meta #"), "{ir}");
+    assert!(
+        ir.contains("fn #1 \"gmp-c++\" package org.gnu.gmp-c++ meta #"),
+        "{ir}"
+    );
 }
 
 #[test]
@@ -1174,7 +1177,7 @@ fn definitions_with_digits_in_their_paths_are_ordinary_definitions() {
     let index = workspace.file("pkgs/lanes.gcsl").unwrap();
     let ir = workspace.dump_ir(index).unwrap();
     assert!(
-        ir.contains("fn #1 package org.golang.go-stage0-1.24 meta #"),
+        ir.contains("fn #1 \"24\" package org.golang.go-stage0-1.24 meta #"),
         "{ir}"
     );
 }
