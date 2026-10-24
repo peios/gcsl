@@ -731,6 +731,12 @@ fn a_root_context_is_set_from_a_field_its_target_never_reads() {
         panic!("not done");
     };
     assert_eq!(value.to_string(), "from conf!");
+    // What a host checks first: whether the field's path is there.
+    assert!(workspace.top_level_has(root, "conf", &["label"]));
+    assert!(workspace.top_level_has(root, "conf", &[]));
+    assert!(!workspace.top_level_has(root, "conf", &["keys"]));
+    assert!(!workspace.top_level_has(root, "conf", &["label", "deeper"]));
+    assert!(!workspace.top_level_has(root, "nope", &[]));
     // A field of another type is the `with`'s own error.
     let wrong = crate::workspace::graph::RootField {
         path: &["n"],

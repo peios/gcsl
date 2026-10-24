@@ -397,6 +397,30 @@ impl Workspace {
         })
     }
 
+    /// Whether the top-level field of file `file` named `name`, as
+    /// [`Workspace::top_level`] finds it, has a field at `path`, its type a
+    /// record with the first, whose type is a record with the next, and so
+    /// on: what a root field's path must name (see
+    /// [`Workspace::prepare_call_with`]). False if the file declares no such
+    /// field.
+    #[must_use]
+    pub fn top_level_has(&self, file: u32, name: &str, path: &[&str]) -> bool {
+        let Some((_, ((_, ty), _))) = self.top_level_cell(file, name) else {
+            return false;
+        };
+        let mut ty = ty;
+        for part in path {
+            let Some(key) = self.scan.names.lookup(part) else {
+                return false;
+            };
+            match self.types.field(self.types.strip(ty), key) {
+                Some(field) => ty = field,
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// Whether the top-level function of file `file` named `name`, as
     /// [`Workspace::top_level`] finds it, has returned for no arguments: as
     /// a call of it with none written in a file of `file`'s directory would
