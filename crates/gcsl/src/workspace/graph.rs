@@ -18,8 +18,9 @@ use std::mem;
 use std::rc::Rc;
 
 use crate::diagnostic::{Diagnostic, Mark};
-use crate::eval::graph::{Defers, Graph, GraphRun};
-use crate::eval::{Direct, Effects};
+use crate::eval::graph::{
+    EffectJob, Graph, GraphHost, GraphRun, NodeId, NodeKind, STEP_UNITS, StepCall, run_step_call,
+};
 use crate::ir::Ir;
 use crate::source::Span;
 use crate::session;
@@ -56,6 +57,82 @@ impl PreparedCall {
 }
 
 impl Workspace {
+    /// Runs the step that the deferred node `id` of `graph` is as a unit of
+    /// its own in graph mode, numbered [`STEP_UNITS`] plus the node's number,
+    /// as the host's engine runs a hermetic step (see pekit2's
+    /// `design/engine.md`, E1): its callee's body, given its arguments, in the
+    /// context it was made in, its effects nodes of its unit, which the host
+    /// runs ([`Workspace::effect_job`]), deferred calls in it as `host`
+    /// says, and its own `#[retry]` and `#[timeout]` not applied, which are
+    /// the host's. [`Progress::Paused`] if it needs a result the host has yet
+    /// to give, to run again from its start once it is given.
+    ///
+    /// # Errors
+    ///
+    /// The step's failure, in the input of the unit that made the node if it
+    /// is in none of its own; and an internal error if the node is no
+    /// deferred call's.
+    pub fn run_step(
+        &mut self,
+        graph: &mut Graph,
+        id: NodeId,
+        host: GraphHost<'_>,
+    ) -> Result<Progress, Diagnostic> {
+        let (call, unit) = match graph.node(id) {
+            Some(node) => (StepCall::of(node), node.unit()),
+            None => (None, 0),
+        };
+        let Some(call) = call else {
+            return Err(internal("a step that is no deferred call's"));
+        };
+        let run = GraphRun::new(
+            mem::take(graph),
+            STEP_UNITS.saturating_add(id.number()),
+            host.defers,
+        );
+        let extras = (
+            Some(&self.exec_result),
+            &self.scan.dir_texts[..],
+            host.effects,
+        );
+        let outcome = run_step_call(&call, (&mut self.frame, &mut self.memo), extras, &run);
+        let (left, paused) = run.finish();
+        *graph = left;
+        match outcome {
+            Ok(value) => Ok(Progress::Done(value)),
+            Err(error) if error.mark == Mark::PENDING => match paused {
+                Some(node) => Ok(Progress::Paused(node)),
+                None => Err(internal("a step stopped for no step")),
+            },
+            Err(mut error) => {
+                error.input.get_or_insert(unit);
+                Err(error)
+            }
+        }
+    }
+
+    /// The job of the effect node `id` of `graph`: its built-in and its
+    /// arguments as plain data, which the host runs on any thread
+    /// ([`EffectJob::run`]) and gives back ([`Graph::resolve`],
+    /// [`Workspace::from_plain`]).
+    ///
+    /// # Errors
+    ///
+    /// What of its arguments is no data, or that `graph` has no such effect
+    /// node.
+    pub fn effect_job(&self, graph: &Graph, id: NodeId) -> Result<EffectJob, String> {
+        let node = graph.node(id).ok_or("an effect the graph lacks")?;
+        let NodeKind::Effect(builtin) = node.kind() else {
+            return Err("a step that is no effect".to_owned());
+        };
+        let args = node
+            .args()
+            .iter()
+            .map(|value| self.to_plain(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(EffectJob::new(builtin, args, node.span()))
+    }
+
     /// Prepares the invocation of the definition of path `path` of the
     /// def-type of path `def_type` with the arguments `args`, in the root
     /// context `contexts`, as [`Workspace::invoke_with`] reads and checks
@@ -109,7 +186,8 @@ impl Workspace {
     }
 
     /// Runs `call`, a prepared invocation, in graph mode, against `graph`,
-    /// `defers` saying which deferring calls the host takes as steps (see
+    /// `host` saying which deferring calls are steps and how other effects
+    /// reach the system (see
     /// [Prepared calls](#prepared-calls)): the files it needs, then the call.
     /// [`Progress::Paused`] if one of them stopped for a step's result; else
     /// [`Progress::Done`] with the call's value, whose holes [`Graph::holes`]
@@ -123,26 +201,23 @@ impl Workspace {
         &mut self,
         call: &PreparedCall,
         graph: &mut Graph,
-        defers: Defers<'_>,
+        host: GraphHost<'_>,
     ) -> Result<Progress, InvokeError> {
         for file in call.files {
             if let Some(node) = self
-                .run_files(file, Some((&mut *graph, defers)))
+                .run_files(file, Some((&mut *graph, host)))
                 .map_err(InvokeError::Diagnostics)?
             {
                 return Ok(Progress::Paused(node));
             }
         }
-        let direct = Direct {
-            temp_dirs: Some(&self.temp_dirs),
-        };
         let context = (
             &mut self.memo,
             Some(&self.exec_result),
             &self.scan.dir_texts[..],
-            &direct as &dyn Effects,
+            host.effects,
         );
-        let run = GraphRun::new(mem::take(graph), call.unit, defers);
+        let run = GraphRun::new(mem::take(graph), call.unit, host.defers);
         let outcome = session::run_input_in(
             &call.ir,
             &mut self.frame,
@@ -172,4 +247,13 @@ impl Workspace {
             }
         }
     }
+}
+
+/// The internal error `message`, of no source.
+fn internal(message: &'static str) -> Diagnostic {
+    crate::diagnostic::InternalError {
+        message,
+        span: Span::new(0, 0),
+    }
+    .into()
 }

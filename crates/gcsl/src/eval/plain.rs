@@ -8,10 +8,11 @@
 //! floats, booleans, strings, durations and sizes, the empty record,
 //! records by field name, lists, variants and variants as values by their
 //! keys' text, secrets with their identity and their value, and files and
-//! directories by path and identity. A future that has run is its value.
-//! What is no data, a function, a built-in, a sandbox, a future that has not
-//! run or a step's result not given yet, has no plain form: "a step's result
-//! must be plain data: it holds a function", naming what it holds. A plain
+//! directories by path and identity, and sandboxes, which a step's body
+//! passes between its effects. A future that has run is its value. What is
+//! no data, a function, a built-in, a future that has not run or a step's
+//! result not given yet, has no plain form: "a step's result must be plain
+//! data: it holds a function", naming what it holds. A plain
 //! value made a value again ([`from_plain`]) interns its names in the
 //! workspace's table, so that it is the value it was made of: equal to it,
 //! by `===`.
@@ -19,7 +20,7 @@
 use std::rc::Rc;
 
 use crate::names::Names;
-use crate::value::{File, Layout, List, Quantity, Record, Secret, Tag, Value, Variant};
+use crate::value::{File, Layout, List, Quantity, Record, Sandbox, Secret, Tag, Value, Variant};
 
 /// A value as plain data (see [Plain values](#plain-values)).
 #[derive(Clone, Debug, PartialEq)]
@@ -73,6 +74,16 @@ pub enum Plain {
         path: String,
         /// Its identity, if it has one.
         identity: Option<String>,
+    },
+    /// A sandbox, by its copy's path, its commands' working directory and
+    /// their environment: what a step's body passes between its effects.
+    Sandbox {
+        /// Its copy, its `/`.
+        root: String,
+        /// Its commands' working directory, inside it.
+        cwd: String,
+        /// Its commands' environment.
+        env: Vec<(String, String)>,
     },
 }
 
@@ -163,7 +174,15 @@ pub fn to_plain(value: &Value, names: &Names) -> Result<Plain, String> {
             None => return refused("a future that has not run"),
         },
         Value::Fn(_) | Value::Builtin(_) => return refused("a function"),
-        Value::Sandbox(_) => return refused("a sandbox"),
+        Value::Sandbox(sandbox) => Plain::Sandbox {
+            root: sandbox.root.to_string(),
+            cwd: sandbox.cwd.to_string(),
+            env: sandbox
+                .env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        },
     })
 }
 
@@ -239,6 +258,14 @@ pub fn from_plain(plain: &Plain, names: &mut Names) -> Value {
         })),
         Plain::File { path, identity } => Value::File(plain_file(path, identity.as_deref())),
         Plain::Dir { path, identity } => Value::Dir(plain_file(path, identity.as_deref())),
+        Plain::Sandbox { root, cwd, env } => Value::Sandbox(Rc::new(Sandbox {
+            root: Rc::from(root.as_str()),
+            cwd: Rc::from(cwd.as_str()),
+            env: env
+                .iter()
+                .map(|(name, value)| (Rc::from(name.as_str()), Rc::from(value.as_str())))
+                .collect(),
+        })),
     }
 }
 

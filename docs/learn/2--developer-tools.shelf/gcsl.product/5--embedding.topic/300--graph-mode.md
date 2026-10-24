@@ -57,6 +57,24 @@ Effects that aren't inside a step are steps too: in graph mode, a unit
 never runs a program or touches a file itself. Each such effect becomes a
 step that the unit needs at once, which keeps it in program order.
 
+Every run in graph mode takes a `GraphHost`: which deferred calls the
+host takes as steps, and the `Effects` the unit's own effects use, such
+as the working directory that `file("hello.c")` resolves against.
+
+## Running many steps at once
+
+GCSL evaluates on one thread, but the programs steps run can run in
+parallel. Run a step's body as a unit of its own with
+`Workspace::run_step`: each `exec` in it becomes an effect step of that
+unit, and the unit stops at it. `Workspace::effect_job` turns that effect
+into an `EffectJob`, plain data you can send to a worker thread, where
+`EffectJob::run` runs it under your `Effects`, with a deadline if you want
+one. Give the result back with `Workspace::from_plain` and
+`graph.resolve`, and run the step again; it carries on to its next
+effect. One GCSL thread can drive as many running programs as you have
+workers. A step's own `#[retry]` and `#[timeout]` are left to you, since
+you see every attempt.
+
 ## Keys, inputs, and isolation
 
 `Workspace::step_inputs` gives what you need to key and stage a step:

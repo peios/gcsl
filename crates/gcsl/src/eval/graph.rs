@@ -68,8 +68,11 @@ use crate::ir::{FnCode, Ir, IrNode, IrRange};
 use crate::source::Span;
 use crate::value::{Closure, ContextFrame, Future, Value};
 
+use std::time::Instant;
+
 use crate::CALL_LEVELS;
 
+use super::plain::{Plain, from_plain, to_plain};
 use super::{Caller, Evaluator, Flow, MemoTables, Shared, internal};
 
 /// A node of an action graph, by its number (see [Graph mode](#graph-mode)).
@@ -218,6 +221,30 @@ type Position = (u32, u64);
 /// attributes, a deferring one among them, as a step (see [Graph
 /// mode](#graph-mode)).
 pub type Defers<'a> = &'a dyn Fn(&[Attribute]) -> bool;
+
+/// What a host gives a unit's run in graph mode: which deferring calls it
+/// takes as steps, and how the unit's effects that are no nodes reach the
+/// system, its working directory among them (see [Graph mode](#graph-mode)).
+#[derive(Clone, Copy)]
+pub struct GraphHost<'a> {
+    /// Which deferring calls are steps.
+    pub defers: Defers<'a>,
+    /// The unit's effect context.
+    pub effects: &'a dyn super::Effects,
+}
+
+impl std::fmt::Debug for GraphHost<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphHost")
+            .field("effects", &self.effects)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The number of the first unit that is a step's run, after every file's
+/// and every prepared call's: a step's unit is this plus its node's number
+/// (see [`crate::workspace::Workspace::run_step`]).
+pub const STEP_UNITS: u32 = 1 << 31;
 
 impl Graph {
     /// An empty graph.
@@ -719,69 +746,244 @@ impl Evaluator<'_> {
 pub(crate) fn run_node(
     node: &Node,
     (stack, memo): (&mut Vec<Value>, &mut MemoTables),
-    (exec_result, dirs, effects): (
-        Option<&Rc<crate::value::Layout>>,
-        &[Rc<str>],
-        &dyn super::Effects,
-    ),
+    extras: RunExtras<'_>,
 ) -> Result<Value, Diagnostic> {
-    let shared = Shared::new(exec_result, dirs, effects);
-    shared.context.replace(node.context.clone());
-    let base = stack.len();
     let span = node.site.span;
-    let result = match (node.kind, &node.closure) {
-        (NodeKind::Deferred, Some(closure)) => {
-            let Some(code) = closure.code.find_function(closure.function) else {
-                return Err(internal("a step's callee is no function of its code", span));
-            };
-            stack.resize(base + code.frame_size as usize, Value::Empty);
-            for (slot, value) in stack.iter_mut().skip(base).zip(node.args.iter()) {
-                *slot = value.clone();
-            }
-            let mut evaluator = Evaluator {
-                ir: &closure.code,
-                stack,
-                base,
-                captures: &closure.captures,
-                callee: Some(closure),
-                memo,
-                shared: &shared,
-                caller: node.caller,
-                levels: CALL_LEVELS,
-            };
-            if code.retry > 0 || code.timeout.is_some() {
-                evaluator
-                    .guarded_call(closure, base, (node.caller, CALL_LEVELS), &node.site)
-                    .map_err(|unwind| unwind.into_error(span))
-            } else {
-                evaluator
-                    .value(code.body)
-                    .or_else(|unwind| unwind.returned(span))
-            }
+    match (node.kind, StepCall::of(node)) {
+        (NodeKind::Deferred, Some(call)) => {
+            let shared = Shared::new(extras.0, extras.1, extras.2);
+            call_step(&call, (stack, memo), &shared, true)
         }
         (NodeKind::Effect(builtin), None) => {
-            let mut arguments: [Option<(Value, Span)>; Builtin::MAX_PARAMS] = Default::default();
-            for (entry, value) in arguments.iter_mut().zip(node.args.iter()) {
-                *entry = Some((value.clone(), span));
-            }
-            Evaluator {
-                ir: &node.code,
-                stack,
-                base,
-                captures: &[],
-                callee: None,
-                memo,
-                shared: &shared,
-                caller: node.caller,
-                levels: CALL_LEVELS,
-            }
-            .apply_builtin(builtin, arguments, &node.site)
-            .map_err(|unwind| unwind.into_error(span))
+            let shared = Shared::new(extras.0, extras.1, extras.2);
+            shared.context.replace(node.context.clone());
+            apply_effect(
+                builtin,
+                &node.args,
+                (&node.code, &node.site),
+                (stack, memo),
+                &shared,
+            )
         }
-        _ => return Err(internal("a step of another shape", span)),
+        _ => Err(internal("a step of another shape", span)),
+    }
+}
+
+/// The layout of `exec`'s result, the run's directories and its effect
+/// context, for [`run_node`] and [`run_step_call`].
+pub(crate) type RunExtras<'a> = (
+    Option<&'a Rc<crate::value::Layout>>,
+    &'a [Rc<str>],
+    &'a dyn super::Effects,
+);
+
+/// A deferred node's call, apart from its graph, which a run takes (see
+/// [`run_step_call`]).
+#[derive(Clone, Debug)]
+pub(crate) struct StepCall {
+    /// The callee.
+    closure: Rc<Closure>,
+    /// Its arguments, in parameter order.
+    args: Box<[Value]>,
+    /// The context it was made in.
+    context: Option<Rc<ContextFrame>>,
+    /// The caller its call gives it.
+    caller: Caller,
+    /// The call that made it.
+    site: IrNode,
+}
+
+impl StepCall {
+    /// The call of `node`, if it is a deferred call's.
+    pub(crate) fn of(node: &Node) -> Option<Self> {
+        Some(Self {
+            closure: Rc::clone(node.closure.as_ref()?),
+            args: node.args.clone(),
+            context: node.context.clone(),
+            caller: node.caller,
+            site: node.site,
+        })
+    }
+}
+
+/// Runs `call`, a step's, in graph mode, as the unit `run` is: its callee's
+/// body, in the context it was made in, its effects nodes of the unit, its
+/// own `#[retry]` and `#[timeout]` not applied, which are the host's for a
+/// step (see pekit2's `design/engine.md`, E5).
+///
+/// # Errors
+///
+/// The step's failure, or the stop for a step's result, marked
+/// [`Mark::PENDING`].
+pub(crate) fn run_step_call(
+    call: &StepCall,
+    (stack, memo): (&mut Vec<Value>, &mut MemoTables),
+    extras: RunExtras<'_>,
+    run: &GraphRun<'_>,
+) -> Result<Value, Diagnostic> {
+    let mut shared = Shared::new(extras.0, extras.1, extras.2);
+    shared.graph = Some(run);
+    call_step(call, (stack, memo), &shared, false)
+}
+
+/// Calls `call`'s callee with its arguments in its parameter slots, on
+/// `stack` above what it holds, sharing `shared`, in the call's context, with
+/// `#[retry]` and `#[timeout]` as its code says if `guarded`.
+fn call_step(
+    call: &StepCall,
+    (stack, memo): (&mut Vec<Value>, &mut MemoTables),
+    shared: &Shared<'_>,
+    guarded: bool,
+) -> Result<Value, Diagnostic> {
+    let closure = &call.closure;
+    let span = call.site.span;
+    let Some(code) = closure.code.find_function(closure.function) else {
+        return Err(internal("a step's callee is no function of its code", span));
+    };
+    shared.context.replace(call.context.clone());
+    let base = stack.len();
+    stack.resize(base + code.frame_size as usize, Value::Empty);
+    for (slot, value) in stack.iter_mut().skip(base).zip(call.args.iter()) {
+        *slot = value.clone();
+    }
+    let mut evaluator = Evaluator {
+        ir: &closure.code,
+        stack,
+        base,
+        captures: &closure.captures,
+        callee: Some(closure),
+        memo,
+        shared,
+        caller: call.caller,
+        levels: CALL_LEVELS,
+    };
+    let result = if guarded && (code.retry > 0 || code.timeout.is_some()) {
+        evaluator
+            .guarded_call(closure, base, (call.caller, CALL_LEVELS), &call.site)
+            .map_err(|unwind| unwind.into_error(span))
+    } else {
+        evaluator
+            .value(code.body)
+            .or_else(|unwind| unwind.returned(span))
     };
     stack.truncate(base);
     result
+}
+
+/// Applies the effectful built-in `builtin` to `args`, for its call `site` of
+/// `code`, on `stack`, sharing `shared`.
+fn apply_effect(
+    builtin: Builtin,
+    args: &[Value],
+    (code, site): (&Rc<Ir>, &IrNode),
+    (stack, memo): (&mut Vec<Value>, &mut MemoTables),
+    shared: &Shared<'_>,
+) -> Result<Value, Diagnostic> {
+    let mut arguments: [Option<(Value, Span)>; Builtin::MAX_PARAMS] = Default::default();
+    for (entry, value) in arguments.iter_mut().zip(args.iter()) {
+        *entry = Some((value.clone(), site.span));
+    }
+    let base = stack.len();
+    let result = Evaluator {
+        ir: code,
+        stack,
+        base,
+        captures: &[],
+        callee: None,
+        memo,
+        shared,
+        caller: Caller::default(),
+        levels: CALL_LEVELS,
+    }
+    .apply_builtin(builtin, arguments, site)
+    .map_err(|unwind| unwind.into_error(site.span));
+    stack.truncate(base);
+    result
+}
+
+/// An effect node's built-in and its arguments as plain data, which a host
+/// can run on any thread, apart from the workspace (see pekit2's
+/// `design/engine.md`, E1): what a step's `exec` is while it runs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectJob {
+    /// The built-in.
+    builtin: Builtin,
+    /// Its arguments, by parameter.
+    args: Vec<Plain>,
+    /// Where its call is.
+    span: Span,
+}
+
+impl EffectJob {
+    /// The job of an effect node, its arguments `args` made plain by its
+    /// workspace.
+    pub(crate) const fn new(builtin: Builtin, args: Vec<Plain>, span: Span) -> Self {
+        Self {
+            builtin,
+            args,
+            span,
+        }
+    }
+
+    /// The built-in it runs.
+    #[must_use]
+    pub const fn builtin(&self) -> Builtin {
+        self.builtin
+    }
+
+    /// Its arguments, by parameter, as plain data.
+    #[must_use]
+    pub fn args(&self) -> &[Plain] {
+        &self.args
+    }
+
+    /// Runs the built-in on its arguments, its effects through `effects`,
+    /// until `deadline` if there is one, a program it runs killed then: its
+    /// result as plain data, for the host to give the node back as a value
+    /// ([`crate::workspace::Workspace::from_plain`]).
+    ///
+    /// # Errors
+    ///
+    /// The built-in's failure, "the step timed out" marked as a deadline's
+    /// passing among them, or a result that is no data.
+    pub fn run(
+        &self,
+        effects: &(dyn super::Effects + Sync),
+        deadline: Option<Instant>,
+    ) -> Result<Plain, Diagnostic> {
+        let mut names = crate::names::Names::new();
+        let values: Vec<Value> = self
+            .args
+            .iter()
+            .map(|plain| from_plain(plain, &mut names))
+            .collect();
+        let layout = crate::workspace::exec_layout(&mut names);
+        let shared = Shared::new(Some(&layout), &[], effects);
+        if let Some(own) = deadline {
+            shared.deadlines.borrow_mut().push(super::Deadline {
+                number: 1,
+                own,
+                effective: own,
+                message: Rc::from("the step timed out"),
+            });
+            shared.earliest.set(Some(own));
+        }
+        let mut builder = crate::ir::IrBuilder::with_capacity(1);
+        let root = builder.alloc(crate::ir::IrKind::Empty, self.span);
+        let code = Rc::new(builder.finish_program(root, (0, Vec::new()), Vec::new(), (0, 0)));
+        let site = IrNode {
+            kind: crate::ir::IrKind::Empty,
+            span: self.span,
+        };
+        let value = apply_effect(
+            self.builtin,
+            &values,
+            (&code, &site),
+            (&mut Vec::new(), &mut MemoTables::new()),
+            &shared,
+        )?;
+        to_plain(&value, &names).map_err(|message| Diagnostic::error(message, self.span))
+    }
 }
 
 /// A hash of `value`, for a scope's path and a position.

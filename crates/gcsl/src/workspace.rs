@@ -221,7 +221,7 @@ use crate::Outcome;
 use crate::check::ViewRecord;
 use crate::check::{Attribute, Builtin, KnownParams, Slot, Types};
 use crate::diagnostic::{Diagnostic, InternalError, Mark};
-use crate::eval::graph::{Defers, Graph, GraphRun, NodeId, NodeKind, run_node};
+use crate::eval::graph::{Graph, GraphHost, GraphRun, NodeId, NodeKind, run_node};
 use crate::eval::plain::{Plain, from_plain, to_plain};
 use crate::eval::{Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
@@ -363,7 +363,7 @@ fn builtin_cells() -> Vec<Value> {
 /// built once per run as the frame is laid out, and shared by every record
 /// `exec` or `exec_live` builds in the run, whatever file, input or function
 /// calls it (see [`crate::eval`]).
-fn exec_layout(names: &mut Names) -> Rc<Layout> {
+pub(crate) fn exec_layout(names: &mut Names) -> Rc<Layout> {
     Rc::new(Layout {
         names: Builtin::EXEC_FIELDS
             .iter()
@@ -599,8 +599,9 @@ impl Workspace {
     /// `graph`, which the host keeps for the whole evaluation, as
     /// [`Workspace::run`] runs them otherwise (see [Graph
     /// mode](crate::eval::graph#graph-mode)): each file a unit, numbered as
-    /// it is, `defers` saying, of a call of a function with these attributes,
-    /// a deferring one among them, whether the host takes it as a step.
+    /// it is, `host` saying, of a call of a function with these attributes, a
+    /// deferring one among them, whether it is a step, and how the files'
+    /// other effects, the working directory among them, reach the system.
     /// [`Progress::Paused`] if a unit stopped for a step's result, to run
     /// again, from where the run stopped, once the host has given it; else
     /// [`Progress::Done`] with file `index`'s value, whose holes, the results
@@ -613,9 +614,9 @@ impl Workspace {
         &mut self,
         index: u32,
         graph: &mut Graph,
-        defers: Defers<'_>,
+        host: GraphHost<'_>,
     ) -> Result<Progress, Vec<Diagnostic>> {
-        if let Some(node) = self.run_files(index, Some((graph, defers)))? {
+        if let Some(node) = self.run_files(index, Some((graph, host)))? {
             return Ok(Progress::Paused(node));
         }
         Ok(Progress::Done(
@@ -741,7 +742,7 @@ impl Workspace {
     pub(crate) fn run_files(
         &mut self,
         index: u32,
-        mut graph: Option<(&mut Graph, Defers<'_>)>,
+        mut graph: Option<(&mut Graph, GraphHost<'_>)>,
     ) -> Result<Option<NodeId>, Vec<Diagnostic>> {
         for at in self.scan.needed(index) {
             let Some(state) = self.runs.get_mut(at as usize) else {
@@ -765,15 +766,16 @@ impl Workspace {
             let direct = Direct {
                 temp_dirs: Some(&self.temp_dirs),
             };
+            let effects: &dyn Effects = graph.as_ref().map_or(&direct, |(_, host)| host.effects);
             let context = (
                 &mut self.memo,
                 Some(&self.exec_result),
                 &self.scan.dir_texts[..],
-                &direct as &dyn Effects,
+                effects,
             );
             let run = graph
                 .as_mut()
-                .map(|(graph, defers)| GraphRun::new(mem::take(*graph), at, *defers));
+                .map(|(graph, host)| GraphRun::new(mem::take(*graph), at, host.defers));
             let outcome =
                 session::run_input_in(&ir, &mut self.frame, context, (None, run.as_ref()));
             let paused = match (run, graph.as_mut()) {
