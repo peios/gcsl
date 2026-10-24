@@ -729,6 +729,24 @@
 //! context binds, flattened, as one dependency (`MemoTables::depend_contexts`):
 //! the future may read any of them after the call has returned.
 //!
+//! # Failure
+//!
+//! An assertion (`Evaluator::assert`) of a comparison evaluates its
+//! operands, each once, as values, and compares them as the comparison's
+//! own walker would (`Evaluator::compared`), so that a failed one labels
+//! each operand with its value, as `show` writes it, without evaluating
+//! anything twice; any other condition is evaluated as a `Bool`. A false
+//! one is "assertion failed: MESSAGE", at the condition, its message
+//! evaluated only then. A `recover` (`Evaluator::recover`) evaluates its
+//! body; a failure of it that `#[retry]` would retry, an error with no
+//! mark, being neither a bug in GCSL nor the passing of an enclosing call's
+//! deadline (see [Retry and timeout](#retry-and-timeout)), is caught: its
+//! message is pushed onto a stack in the run's shared state, which the
+//! fallback's `Failure` reads as the record `{message}`, and popped once the
+//! fallback has run. A deadline a call inside the body set is cleared by
+//! that call, its own failure, so it is caught; `break`, `continue` and
+//! `return` are no failures, and pass through. What the body ran stays run.
+//!
 //! # Metas
 //!
 //! A read of a function's meta, `func.versions` (see the checker's "Metas"),
@@ -1250,6 +1268,9 @@ struct Shared<'a> {
     /// The context the frame running is evaluated in, innermost frame first
     /// (see [Context](#context)): `None`, binding nothing, at the root.
     context: RefCell<Option<Rc<ContextFrame>>>,
+    /// The message of the failure each `recover` running its fallback
+    /// caught, innermost last (see [Failure](#failure)).
+    failures: RefCell<Vec<Rc<str>>>,
 }
 
 impl<'a> Shared<'a> {
@@ -1269,6 +1290,7 @@ impl<'a> Shared<'a> {
             earliest: Cell::new(None),
             deadlines_made: Cell::new(0),
             context: RefCell::new(None),
+            failures: RefCell::new(Vec::new()),
         }
     }
 }
@@ -1351,7 +1373,11 @@ impl Evaluator<'_> {
             IrKind::Top(slot, kind) => self.top_value(slot, kind, node),
             IrKind::LoadCallee | IrKind::MakeClosure { .. } => self.closure_value(node),
             IrKind::Tag { key, of, shown } => Ok(Value::Tag(self.tag((key, of, shown)))),
-            IrKind::ContextRead { .. } | IrKind::With { .. } => self.context_node(node),
+            IrKind::ContextRead { .. }
+            | IrKind::With { .. }
+            | IrKind::Assert { .. }
+            | IrKind::Recover { .. }
+            | IrKind::Failure(_) => self.whole_node(node),
             IrKind::ContextBind { .. } => mistyped(node, CONTEXT_BIND),
             IrKind::Meta(function) => self.meta_value(function, node),
             IrKind::Call {
@@ -1697,9 +1723,10 @@ impl Evaluator<'_> {
         }))
     }
 
-    /// Evaluates `node`, a read of a context or a `with` (see
-    /// [Context](#context)), as a value of any kind.
-    fn context_node(&mut self, node: &IrNode) -> Flow<Value> {
+    /// Evaluates `node`, one each walker evaluates as a whole value: a read
+    /// of a context or a `with` (see [Context](#context)), an assertion, a
+    /// `recover` or a failure (see [Failure](#failure)).
+    fn whole_node(&mut self, node: &IrNode) -> Flow<Value> {
         match node.kind {
             IrKind::ContextRead {
                 key,
@@ -1708,8 +1735,106 @@ impl Evaluator<'_> {
                 ..
             } => self.context_read(key, (default, depth), node),
             IrKind::With { parts, .. } => self.with(parts, node),
-            _ => mistyped(node, "a node evaluated as a context's that is none"),
+            IrKind::Assert { cond, message } => self.assert((cond, message), node),
+            IrKind::Recover { body, fallback, .. } => self.recover(body, fallback),
+            IrKind::Failure(layout) => self.failure(layout, node),
+            _ => mistyped(node, "a node evaluated whole that is none"),
         }
+    }
+
+    /// Evaluates the assertion `node`, of the condition `cond` and the
+    /// message `message` (see [Failure](#failure)): a comparison's operands
+    /// each once, as values, compared as the comparison would compare them
+    /// ([`Evaluator::compared`]), and any other condition as a `Bool`; if it
+    /// is false, "assertion failed: MESSAGE", at the condition, each operand
+    /// of a comparison labelled with its value, as `show` writes it.
+    #[inline(never)]
+    fn assert(&mut self, (cond, message): (IrId, IrId), node: &IrNode) -> Flow<Value> {
+        let condition = self.ir.get(cond);
+        let (holds, shown) = match comparison_operands(condition.kind) {
+            Some((lhs, rhs)) => {
+                let (left, right) = (self.value(lhs)?, self.value(rhs)?);
+                let holds = self.compared(condition, (&left, &right))?;
+                (holds, Some([(lhs, left), (rhs, right)]))
+            }
+            None => (self.bool(cond)?, None),
+        };
+        if holds {
+            return Ok(Value::Empty);
+        }
+        let message = self.string(message)?;
+        let mut error = Diagnostic::error(format!("assertion failed: {message}"), condition.span);
+        for (operand, value) in shown.into_iter().flatten() {
+            let text =
+                source_of(&value, node).map_or_else(|_| value.to_string(), |text| text.to_string());
+            error = error.with_context(self.ir.get(operand).span, format!("this is `{text}`"));
+        }
+        Err(error.into())
+    }
+
+    /// Whether the comparison `node` holds of `lhs` and `rhs`, its operands'
+    /// values, as the walker of its kind would compare them.
+    fn compared(&self, node: &IrNode, (lhs, rhs): (&Value, &Value)) -> Flow<bool> {
+        let amount = |value: &Value| match *value {
+            Value::Int(amount) | Value::Quantity(_, amount) => Some(amount),
+            _ => None,
+        };
+        let held = match (node.kind, lhs, rhs) {
+            (IrKind::IntCmp(cmp, _), _, _) => {
+                amount(lhs).zip(amount(rhs)).map(|(a, b)| cmp.test(&a, &b))
+            }
+            (IrKind::FloatCmp(cmp, _), Value::Float(a), Value::Float(b)) => Some(cmp.test(a, b)),
+            (IrKind::StrCmp(cmp, _), Value::Str(a), Value::Str(b)) => Some(cmp.test(&**a, &**b)),
+            (IrKind::BoolEq(equal, _), Value::Bool(a), Value::Bool(b)) => Some((a == b) == equal),
+            (IrKind::RecordEq(o) | IrKind::ListEq(o), _, _) => {
+                record_eq_shaped(self.ir, o.shape, lhs, rhs)
+            }
+            (IrKind::RecordNe(o) | IrKind::ListNe(o), _, _) => {
+                record_eq_shaped(self.ir, o.shape, lhs, rhs).map(|same| !same)
+            }
+            (IrKind::RecordSame(_) | IrKind::ListSame(_) | IrKind::ValueSame(_), _, _) => {
+                Some(lhs == rhs)
+            }
+            (IrKind::RecordNotSame(_) | IrKind::ListNotSame(_) | IrKind::ValueNotSame(_), _, _) => {
+                Some(lhs != rhs)
+            }
+            _ => None,
+        };
+        held.map_or_else(
+            || mistyped(node, "a comparison of values of another kind"),
+            Ok,
+        )
+    }
+
+    /// Evaluates `body`, the body of a `recover` (see [Failure](#failure)),
+    /// and, if it fails as `#[retry]` would retry, with no mark, `fallback`
+    /// instead, with its failure the innermost a `Failure` reads.
+    #[inline(never)]
+    fn recover(&mut self, body: IrId, fallback: IrId) -> Flow<Value> {
+        match self.value(body) {
+            Err(Unwind::Error(error)) if error.mark == ErrorMark::NONE => {
+                self.shared
+                    .failures
+                    .borrow_mut()
+                    .push(Rc::from(error.message));
+                let result = self.value(fallback);
+                self.shared.failures.borrow_mut().pop();
+                result
+            }
+            result => result,
+        }
+    }
+
+    /// The failure the innermost `recover` running its fallback caught, a
+    /// record of the layout `layout`, its one field its message.
+    fn failure(&self, layout: LayoutId, node: &IrNode) -> Flow<Value> {
+        let Some(message) = self.shared.failures.borrow().last().cloned() else {
+            return mistyped(node, "a failure read outside a `recover`'s fallback");
+        };
+        Ok(Value::Record(Rc::new(Record {
+            layout: Rc::clone(self.ir.layout(layout)),
+            values: Box::new([Value::Str(message)]),
+        })))
     }
 
     /// The value of the read `node` of the context of the declaration key
@@ -2986,8 +3111,8 @@ impl Evaluator<'_> {
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
             IrKind::LoadCallee => self.callee(node).map(Callee::Closure),
             IrKind::Tag { key, of, shown } => Ok(Callee::Tag(self.tag((key, of, shown)))),
-            IrKind::ContextRead { .. } | IrKind::With { .. } => {
-                match into_callee(self.context_node(node)?) {
+            IrKind::ContextRead { .. } | IrKind::With { .. } | IrKind::Recover { .. } => {
+                match into_callee(self.whole_node(node)?) {
                     Some(callee) => Ok(callee),
                     None => mistyped(node, "a context's value that is no function"),
                 }
@@ -3470,6 +3595,9 @@ impl Evaluator<'_> {
             | IrKind::As { .. }
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
+            | IrKind::Assert { .. }
+            | IrKind::Recover { .. }
+            | IrKind::Failure(_)
             | IrKind::MakeFuture { .. } => self.shared_amount(id, node),
             IrKind::ListLen(list) => self.list_len(list),
             IrKind::Block { items, result } => {
@@ -3575,13 +3703,19 @@ impl Evaluator<'_> {
                 kind: ValueKind::Deferred,
                 ..
             }
-            | IrKind::MakeFuture { .. } => mistyped(node, taken.deferred),
-            IrKind::ContextRead { .. } | IrKind::With { .. } => {
-                match (taken.owned)(self.context_node(node)?) {
-                    Some(value) => Ok(value),
-                    None => mistyped(node, "a context's value of another kind than its node"),
-                }
+            | IrKind::Recover {
+                kind: ValueKind::Deferred,
+                ..
             }
+            | IrKind::MakeFuture { .. } => mistyped(node, taken.deferred),
+            IrKind::ContextRead { .. }
+            | IrKind::With { .. }
+            | IrKind::Assert { .. }
+            | IrKind::Recover { .. }
+            | IrKind::Failure(_) => match (taken.owned)(self.whole_node(node)?) {
+                Some(value) => Ok(value),
+                None => mistyped(node, "a context's value of another kind than its node"),
+            },
             IrKind::Load(slot, _) => self.slot_as(slot, node, taken.borrowed),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, taken.borrowed),
             IrKind::Top(slot, _) => self.top_as(slot, node, taken.borrowed),
@@ -3711,6 +3845,9 @@ impl Evaluator<'_> {
             | IrKind::As { .. }
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
+            | IrKind::Assert { .. }
+            | IrKind::Recover { .. }
+            | IrKind::Failure(_)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &FLOAT),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a Float was expected"),
             IrKind::Block { items, result } => {
@@ -3810,6 +3947,9 @@ impl Evaluator<'_> {
             | IrKind::As { .. }
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
+            | IrKind::Assert { .. }
+            | IrKind::Recover { .. }
+            | IrKind::Failure(_)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &BOOL),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a Bool was expected"),
             IrKind::Is { .. } => self.is_test(node),
@@ -3961,6 +4101,9 @@ impl Evaluator<'_> {
             | IrKind::As { .. }
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
+            | IrKind::Assert { .. }
+            | IrKind::Recover { .. }
+            | IrKind::Failure(_)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &STRING),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a String was expected"),
             IrKind::Block { items, result } => {
@@ -4047,6 +4190,9 @@ impl Evaluator<'_> {
             | IrKind::As { .. }
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
+            | IrKind::Assert { .. }
+            | IrKind::Recover { .. }
+            | IrKind::Failure(_)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &RECORD),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a record was expected"),
             IrKind::Store(slot, value) => self.store(slot, value, node),
@@ -4433,6 +4579,27 @@ const DEFERRED_BOOL: &str = "a node that may be a future where a Bool was expect
 const DEFERRED_STRING: &str = "a node that may be a future where a String was expected";
 const DEFERRED_RECORD: &str = "a node that may be a future where a record was expected";
 const DEFERRED_FUNCTION: &str = "a node that may be a future where a function was expected";
+
+/// The operands of `kind`, if it is a comparison: what an assertion of it
+/// shows (see [Failure](#failure)).
+const fn comparison_operands(kind: IrKind) -> Option<(IrId, IrId)> {
+    match kind {
+        IrKind::IntCmp(_, o)
+        | IrKind::FloatCmp(_, o)
+        | IrKind::StrCmp(_, o)
+        | IrKind::BoolEq(_, o)
+        | IrKind::RecordSame(o)
+        | IrKind::RecordNotSame(o)
+        | IrKind::ListSame(o)
+        | IrKind::ListNotSame(o)
+        | IrKind::ValueSame(o)
+        | IrKind::ValueNotSame(o) => Some((o.lhs, o.rhs)),
+        IrKind::RecordEq(o) | IrKind::RecordNe(o) | IrKind::ListEq(o) | IrKind::ListNe(o) => {
+            Some((o.lhs, o.rhs))
+        }
+        _ => None,
+    }
+}
 
 /// The internal error of evaluating a binding of a `with` alone (see
 /// [Context](#context)).

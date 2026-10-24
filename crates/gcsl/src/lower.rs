@@ -416,12 +416,12 @@ use std::collections::HashMap;
 use crate::ast::{
     ArgRange, Ast, BinaryOp, DefTypeId, Effect, ElementRange, ExprId, ExprKind, FnId, ForHead,
     ForId, ItemId, ItemKind, ItemRange, Jump, LabelId, PartRange, PathRange, PathSegment,
-    SegmentKind, StrPart, UnaryOp, WithRange, path_span, symbol_span,
+    RecoverId, SegmentKind, StrPart, UnaryOp, WithRange, path_span, symbol_span,
 };
 use crate::ast::AttributeId;
 use crate::check::{
-    Attribute, AwaitMark, Builtin, Checked, Constant, FieldSchedule, Fileroot, JumpTarget, MadeAt,
-    ParamDefault, PathResolution, Resolution, Slot, Types, VarRef,
+    FAILURE_MESSAGE, Attribute, AwaitMark, Builtin, Checked, Constant, FieldSchedule, Fileroot,
+    JumpTarget, MadeAt, ParamDefault, PathResolution, Resolution, Slot, Types, VarRef,
 };
 use crate::mentions::{self, FieldNode};
 
@@ -1977,6 +1977,11 @@ impl Lowerer<'_> {
             }
             (ExprKind::DefTypeRef(def), _) => self.lower_def_type_ref(id, def, kind)?,
             (ExprKind::ContextRead(_), _) => self.lower_context_read(id, kind)?,
+            (ExprKind::Assert { cond, message }, _) => IrKind::Assert {
+                cond: self.lower_operand(cond, ValueKind::Bool)?,
+                message: self.lower_operand(message, ValueKind::String)?,
+            },
+            (ExprKind::Recover(recover), _) => self.lower_recover(recover, kind)?,
             (ExprKind::With { bindings, body }, _) => {
                 self.lower_with(id, (bindings, body), kind)?
             }
@@ -2474,6 +2479,46 @@ impl Lowerer<'_> {
     /// function's meta is recorded as its capture of the definition's
     /// ([`MetaAt::Capture`]). It is of kind `kind`, which can only be a
     /// function's.
+    /// Lowers the `recover` expression `recover`, of kind `kind` (see the
+    /// checker's "Failure"): its body, and its fallback, after storing the
+    /// failure, if the fallback names it, in the slot the check gave it.
+    fn lower_recover(
+        &mut self,
+        recover: RecoverId,
+        kind: ValueKind,
+    ) -> Result<IrKind, InternalError> {
+        let decl = *self.ast.recover_decl(recover);
+        let body = self.lower_operand(decl.body, kind)?;
+        let mut fallback = self.lower_operand(decl.fallback, kind)?;
+        if let Some(slot) = self.resolution.recover_slot(recover) {
+            let span = self.ast.get(decl.fallback).span;
+            let message = self
+                .ast
+                .names()
+                .lookup(FAILURE_MESSAGE)
+                .ok_or(InternalError {
+                    message: "a failure's field is not interned",
+                    span,
+                })?;
+            let layout = self.layout_of(&[message]);
+            let failure = self.builder.alloc(IrKind::Failure(layout), span);
+            let store = self.builder.alloc(IrKind::Store(slot, failure), span);
+            let items = self.builder.push_item_list(&[store]);
+            fallback = self.builder.alloc(
+                IrKind::Block {
+                    items,
+                    result: fallback,
+                },
+                span,
+            );
+        }
+        Ok(IrKind::Recover {
+            body,
+            fallback,
+            kind,
+        })
+    }
+
     /// Lowers `id`, a variant as a value (see the checker's "Enums"): a
     /// constant tag.
     fn lower_variant(&mut self, id: ExprId) -> Result<IrKind, InternalError> {

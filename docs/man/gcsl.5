@@ -203,6 +203,27 @@ Break'NAME and continue'NAME target a loop.
 Return'NAME leaves the named loop or block with a single result, not its accumulated list.
 An unlabeled return leaves a function or lazy body.
 No jump crosses a function boundary.
+.SH FAILURE
+.B assert
+.I COND
+.RB [ ,
+.IR MESSAGE ]
+is a statement that fails the run with "assertion failed: MESSAGE" when the condition is false; the default message is the condition as written, and each side of a comparison is shown with its value.
+.B recover {
+.I BODY
+.B } else
+.RB [ (
+.IB NAME )
+.B ] {
+.I FALLBACK
+.B }
+evaluates the fallback instead of the body if the body fails, with
+.I NAME
+bound to the failure,
+.BR "{message: String}" .
+It catches what
+.B #[retry]
+would retry: never a bug in GCSL, nor the timeout of an enclosing call.
 .SH CONTEXT
 .B context
 .I NAME

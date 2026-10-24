@@ -1,0 +1,1595 @@
+¸i¶ïËuÍ„ˆÿŒlƒj	»ÇœuÊ‡-H)&?# GCSL
+
+> A statically typed language for configuration and scripting.
+
+---
+
+# GCSL
+
+_GCSL / Getting Started_
+
+> A language for typed configuration values and executable scripts.
+
+GCSL is a statically typed scripting language. A program can describe a
+configuration record, compute a value, or run commands. You use the same
+expressions for all three, with function types separating pure computation
+from operations that can change the outside world.
+
+The `gcsl` command runs programs, checks them without execution, formats
+source files, and serves editor requests. Starting it without a command
+opens an interactive read-evaluate-print loop (REPL).
+
+## Values first
+
+A file is a block of declarations and expressions. Named fields form its
+resulting record. This configuration computes one field from another:
+
+```gcsl
+name = "gcsl"
+version = "0.1.0"
+archive = "{name}-{version}.tar.gz"
+```
+
+A file can instead return one expression. Use `let` for private values that
+don't become fields of a record. The checker catches incompatible types and
+unresolved names before any part of the program runs.
+
+## Execution and trust
+
+Pure functions use `:` before their result type. Impure functions use
+`->`; they can run processes, access files, and await deferred work.
+Memoized functions use `->>` and reuse results within an execution context.
+A `lazy` expression delays work until it is awaited. It doesn't start a
+background task.
+
+GCSL's type system is not a sandbox. Running a script gives its process and
+file operations the permissions of the process running GCSL. Check an
+unfamiliar program with `gcsl check` before deciding whether to run it.
+Checking does not establish that executing it is safe.
+
+## Where to go next
+
+Start with [Running a First Program](/gcsl/getting-started/running-a-first-program.md), then
+read [Values and Bindings](/gcsl/language/values-and-bindings.md). Use `gcsl(1)` for the
+command interface, `gcsl(5)` for language rules, and `gcsl-stdlib(3)` for
+standard functions.
+
+Pekit embeds GCSL to provide its own build interface. Its definitions and
+commands belong to Pekit. The separate `tree-sitter-gcsl` repository owns
+its editor grammar and queries; the compiler parser in this repository is
+the authority for whether a GCSL program is accepted.
+
+---
+
+# Running a First Program
+
+_GCSL / Getting Started_
+
+> Create, check, and run a small GCSL file.
+
+You can run a single GCSL file without creating a workspace. This example
+checks a small configuration and prints its computed description.
+
+## Before you start
+
+You need the following:
+
+- The `gcsl` executable on your command search path.
+- A writable directory for the example file.
+
+## Create and run the file
+
+1. Save the following text as `hello.gcsl`:
+
+   ```gcsl
+   let component = {name = "gcsl"; version = "0.1.0"}
+   "{component.name} {component.version}"
+   ```
+
+2. Check the file without running it:
+
+   ```sh
+   gcsl check hello.gcsl
+   ```
+
+3. Run the file:
+
+   ```sh
+   gcsl run hello.gcsl
+   ```
+
+## Check the result
+
+The check reports `no problems in 1 file checked` on standard error. The
+run prints the string contents on standard output:
+
+```text
+gcsl 0.1.0
+```
+
+A file whose result is `{}`, the empty record, prints nothing. Diagnostics
+go to standard error. See `gcsl(1)` for exit statuses and output modes.
+
+## Trying expressions interactively
+
+Run `gcsl` without arguments to open the REPL. Enter `let n = 21`, then
+`n * 2` on the next line. The second line prints `42 : Int`. Each input is
+one line; separate several items on that line with semicolons. Press
+**Ctrl+D** to leave the session.
+
+---
+
+# Values and Bindings
+
+_GCSL / The Language_
+
+> Understand block results, records, local names, and value updates.
+
+GCSL programs compute values. A block can return one value or construct a
+record of named fields, so you can use configuration data inside ordinary
+expressions without a separate data format.
+
+## Blocks and records
+
+Newlines or semicolons separate items inside a file or `{ ... }` block.
+A block without fields returns its final expression, or an explicit
+`= expression` result. A block with fields returns their record instead;
+it cannot also have an explicit result. The empty record `{}` represents
+an operation with no useful result.
+
+A field is a public part of the resulting record. A `let` binding is local
+to its scope. This block keeps the intermediate name private:
+
+```gcsl
+let release = "0.1.0"
+name = "gcsl"
+archive = "{name}-{release}.tar.gz"
+```
+
+Top-level fields and named functions can refer to declarations written
+later. Inner blocks evaluate their ordinary fields in order. Private
+`let` bindings become available after their declaration.
+
+## Updating a binding
+
+`:=` replaces the value associated with a local name. For an ordinary
+`let`, this is restricted to the block that declares it. Use `let mut`
+when an inner block of the same function needs to update the variable:
+
+```gcsl
+let mut total = 0
+for cost in [3, 8, 5] {
+    total := total + cost
+}
+total
+```
+
+The variable keeps its declared or inferred type. Values themselves do not
+change: replacing a record field or list element constructs an updated
+value for the binding. Other bindings and previously created closures
+keep the values they already held.
+
+A closure captures values when it is created. It cannot update a mutable
+variable belonging to its enclosing function. Pass in a value and return
+an updated value when you need that communication.
+
+## Names and arithmetic
+
+Names can contain hyphens. Write spaces around subtraction so that
+`left - right` is an operation rather than a name. Integer arithmetic uses
+signed 64-bit values with checked overflow. Floating-point values use
+64-bit precision. `/` produces a floating-point result; `//` and `%` are
+integer floor division and modulo.
+
+Integer literals adapt to an expected numeric type. A bound `Int` does
+not silently become a `Float`; use `float(value)` when that conversion is
+intended. Conditions require `Bool`, not a nonzero integer or a nonempty
+string. See `gcsl(5)` for syntax and operator rules.
+
+## Durations and sizes
+
+`Duration` and `Size` hold amounts with units. Write a duration as a
+number followed by units from largest to smallest: `30s`, `500ms`,
+`1h30m`, `2d`. The units are `d`, `h`, `m`, `s`, `ms`, `us` and `ns`, and a
+day is exactly 24 hours. Write a size with one unit: `512B`, the decimal
+`KB` to `PB`, or the binary `KiB` to `PiB`, as in `2GiB`. The last part of
+a literal can have a fraction if the result is a whole number of
+nanoseconds or bytes, so `1.5s` and `0.5KiB` are allowed but `1.5ns` is
+not. Units are case-sensitive.
+
+```gcsl
+let timeout = 1m30s
+retry_after = timeout // 3
+budget = 2 * timeout
+memory = 2GiB + 512MiB
+long = timeout > 1m
+message = "giving up after {timeout}"
+```
+
+Add or subtract two values of the same kind, multiply one by an `Int`,
+and use `//` to divide by an `Int` or by another value of the same kind.
+Dividing by the same kind gives an `Int`. `%` gives the remainder of one
+value by another of the same kind. Values of the same kind can be
+compared. Durations and sizes never mix with each other, with `Int` or
+with `Float`, and an integer is never a duration, so write `0s` rather
+than `0`. `/` is not available, because the result would not be a whole
+number of the smallest unit.
+
+A value is shown as its simplest literal: `retry_after` above is `30s`,
+`budget` is `3m`, and `memory` is `2560MiB`.
+
+---
+
+# Records and Types
+
+_GCSL / The Language_
+
+> Compose structural records and apply annotations and defaults.
+
+A record type describes the fields a value supplies. GCSL uses structural
+types: two declarations with the same structure describe the same type,
+and a record can be used where fewer of its fields are required.
+
+## Declaring a shape
+
+Use `type` to give a structure a reusable name. An annotation checks a
+value against that structure. Defaults supply omitted fields in a record
+literal checked against the type:
+
+```gcsl
+type Install = {from: String, exclude: List<String> = []}
+let item: Install = {from = "src"}
+item.exclude
+```
+
+Defaults are constant expressions, not arbitrary function calls. They are
+applied where a record literal has the expected type; they don't add
+fields to an already constructed variable with a smaller type.
+
+An annotation also determines what fields later code can see. Extra
+fields in a record literal produce a warning when an expected type hides
+them. A structural alias does not introduce a distinct runtime identity.
+
+## Generic types
+
+A type can take type parameters, named in angle brackets after its name.
+Each use names the types to put in their place:
+
+```gcsl
+type Pair<A, B> = {first: A, second: B}
+let entry: Pair<String, Int> = {first = "port"; second = 8080}
+entry.second
+```
+
+A use must give as many type arguments as the type has parameters, and a
+type without parameters takes none. Because types are structural,
+`Pair<String, Int>` is the same type as `{first: String, second: Int}`. A
+generic type can be built from another, as in
+`type Named<T> = Pair<String, T>`. It can't refer to itself, and it can't
+spread one of its parameters, because the parameter might not be a record.
+
+## Enums
+
+An extensible enum is a type whose variants any module can add. Declare
+the enum, with an optional bound that every variant's payload must fit,
+and then its variants, each with a payload type:
+
+```gcsl
+enum Shape extensible<{*: Int}>
+enum Shape::Square<{side: Int}>
+enum Shape::Point
+square = Shape::Square({side = 3})
+```
+
+A variant is also a value: `Shape::Square` on its own has the type
+`Variant<Shape, {side: Int}>`. Calling it makes a value of the enum,
+and you can pass it to a function as a key. `kind.matches(value)` tests
+whether a value is of that variant, and `kind.payload(value)` takes out
+its payload:
+
+```gcsl
+enum Tool extensible
+enum Tool::C<{cc: String}>
+fn find<T>(kind: Variant<Tool, T>, tools: List<Tool>, fallback: T): T {
+    for t in tools { if kind.matches(t) { return kind.payload(t) } }
+    fallback
+}
+cc = find(Tool::C, [Tool::C({cc = "gcc"})], {cc = "cc"}).cc
+```
+
+Unlike records, enums are nominal: two enums are different types even
+if they look alike. `value is Tool` tests whether a value is of the enum.
+Values of an enum are compared with `==` only when the enum has a bound,
+because an unbounded payload might hold a function. A variant is visible
+in its own file, to the other files of its directory and the directories
+below it, and to every file that imports its module.
+
+## Partial records
+
+`Partial<T>` holds any of the fields of the record type `T`. Use it to
+describe a record by only some of its fields, and `.matches()` to test
+a whole record against it:
+
+```gcsl
+type Platform = {arch: String, os: String}
+let wanted: Partial<Platform> = {arch = "x86_64"}
+fits = wanted.matches({arch = "x86_64"; os = "linux"})
+```
+
+A field of a partial record can't be read by name, because it may be
+absent.
+
+## Records of any fields
+
+A rest-field, `*: T`, gives the type of every field that a record type
+doesn't name. Use it when the field names are data, such as paths. A
+`{*: String}` holds any fields, each a `String`. Named fields keep their
+own types, so `{to: String, *: Int}` holds a `String` field `to`, and any
+other fields are `Int`s:
+
+```gcsl
+let files: {*: String} = {"bin/*" = "bin/*"; "sbin/*" = "sbin/*"}
+files
+```
+
+Write the record literal where the type is expected: in an annotation,
+an argument or a definition's result. There, each field that the type
+doesn't name is checked against the rest-field. A value whose own type
+has no rest-field doesn't fit one, because a record keeps fields that its
+static type hides, and they could be of any type.
+
+Read a named field as usual. A field that only the rest-field covers
+can't be read by name, and a record whose type has a rest-field can't be
+spread. Typed equality compares every field, and `is` and `as` test each
+field that the rest-field covers.
+
+## Combining fields
+
+Dotted definitions construct nested records. Compatible dotted paths
+merge, including across files in a workspace:
+
+```gcsl
+server.host = "localhost"
+server.port = 8080
+server.tls.enabled = true
+```
+
+A whole-field definition such as `server = {...}` closes that field to
+further dotted extensions. Define the individual dotted leaves when you
+want several files to contribute to a shared structure.
+
+A spread starts from another record's visible fields. Inside an ordinary
+record block, put defaults first and explicit overrides afterward:
+
+```gcsl
+let defaults = {host = "localhost"; port = 80}
+let config = {
+    ...defaults
+    port = 8080
+}
+config.port
+```
+
+A spread copies only fields visible through its operand's static type.
+It cannot replace an earlier explicit field inside an ordinary block.
+Top-level declarations are resolved across the whole input and take
+precedence over a spread of the same name regardless of textual order.
+
+## Unions and narrowing
+
+A union, such as `Int | String`, allows more than one shape. Use `is` to
+test a value and `as` for a checked conversion that fails at runtime if
+the value doesn't fit. In `if name is Type`, the branches see narrowed
+copies of the named value. This does not perform general flow analysis of
+later statements or dotted field paths.
+
+Typed equality `==` compares operands of the same static type. Total
+equality `===` compares complete runtime records, including fields hidden by
+their shared static type. Both require the same static operand type. The
+language's
+restrictions on unions, functions, and futures are described in
+`gcsl(5)` and [Inference Limits](/gcsl/language/inference-limits.md).
+
+---
+
+# Functions and Effects
+
+_GCSL / The Language_
+
+> Choose pure, impure, or memoized functions and understand captures.
+
+A function's signature says what it accepts, what it returns, and whether
+calling it can perform effects. This makes executable configuration
+reviewable: a pure calculation cannot silently run a process or read a
+file.
+
+## Choosing a function form
+
+Use `fn` for a private function and `def` for a function exposed as a
+field. Both forms declare parameter and result types. A function
+expression can also be assigned to a variable or passed to another
+function.
+
+The marker before the result type selects the effect:
+
+| Marker | Meaning |
+|---|---|
+| `:` | Pure computation; no effects or awaiting |
+| `->` | Impure computation; effects and awaiting are allowed |
+| `->>` | Impure computation memoized by its arguments |
+
+This private pure function accepts a named argument and a default:
+
+```gcsl
+fn scale(value: Int, factor: Int = 2): Int { value * factor }
+scale(value = 21)
+```
+
+Positional and named arguments are evaluated in source order. A trailing
+block supplies the last parameter, which is useful for functions that
+accept a configuration record.
+
+A default can be any expression. It can use the parameters before it and
+anything visible where the function is written:
+
+```gcsl
+let suffix = ".o"
+fn object(source: String, output: String = "{source}{suffix}"): String {
+    output
+}
+main = object("main.c")
+lib = object("lib.c", output = "lib.a")
+```
+
+A default is evaluated each time a call leaves its parameter out, after
+the arguments that are written and before the function's body runs. It
+has the function's effect, so a pure function's default cannot call an
+impure function. A default cannot use its own parameter or a later one.
+Only a call by the function's own name uses its defaults. A call through
+a copy, such as `g` after `let g = object`, or through a parameter must
+supply every argument.
+
+After a named argument, a name on its own is shorthand for passing the
+variable of that name to the parameter of that name. These two calls are
+the same:
+
+```gcsl
+fn build(source: String, output: String, compiler: String): String {
+    "{compiler} {source} -o {output}"
+}
+let compiler = "cc"
+short = build("main.c", output = "main.o", compiler)
+long = build("main.c", output = "main.o", compiler = compiler)
+```
+
+Before any named argument, a name on its own is an ordinary positional
+argument.
+
+## Generic functions
+
+A function can work on values of any type. Name its type parameters in
+angle brackets after its name, and use them as types in its signature and
+body:
+
+```gcsl
+fn first<T>(items: List<T>, fallback: T): T {
+    if len(items) > 0 { items[0] } else { fallback }
+}
+port = first([8080, 9090], 80)
+name = first([], "none")
+```
+
+Each call works out the type parameters from its arguments: here `T` is
+`Int` in the first call and `String` in the second. Inside the function, a
+value of type `T` can be passed on, returned, or put in a list or record,
+but nothing else, because `T` could be anything. A call where nothing binds
+a type parameter, such as one that only returns a `List<T>`, is an error.
+
+## Methods
+
+A method is a function you call on a value with a dot. Write its
+receiver in parentheses before its name:
+
+```gcsl
+fn (n: Int) twice(): Int { n * 2 }
+fn (items: List<T>) first_or<T>(fallback: T): T {
+    if len(items) > 0 { items[0] } else { fallback }
+}
+doubled = 21.twice()
+port = [8080].first_or(80)
+```
+
+The value before the dot is the receiver. GCSL chooses the method by
+the receiver's type, so methods with the same name can serve different
+types. When more than one fits, the one for the more specific type is
+used: a method for `List<Int>` is chosen over one for `List<T>` when
+the receiver is a `List<Int>`. A method's other parameters, defaults and
+effects work as a function's do.
+
+A method has no name of its own: `twice` alone is not a variable, and
+`x.twice` without parentheses reads a field. A record field and a method
+with the same name are an error when both could apply.
+
+Methods are declared at the top level of a file. A `fn` method is
+visible only in its own file. A `def` method is also visible to the
+other files of its directory and the directories below it, and to every
+file that imports its module, whatever the form of the import. In the
+REPL, methods are visible to later lines.
+
+## Calling for effects
+
+A call to an impure or memoized function can stand alone as a statement,
+outside a pure function, to run it for its effects. Its value is
+discarded, whatever it is, and anything it defers is awaited first, so no
+effect is lost:
+
+```gcsl
+fn build(source: String) -> String {
+    sh("make -C {source}")
+    sh("make -C {source} install")
+    = source
+}
+```
+
+Any other value standing alone is an error, because discarding it would
+do nothing: a pure expression has no effects to keep. Make it the block's
+result with `= ...`, bind it with `let`, or remove it.
+
+## Captures and recursion
+
+Closures hold copies of the values they capture. Rebinding a variable
+later doesn't change an existing closure. An inner function cannot rebind
+an outer function's variable.
+
+Top-level named functions are available regardless of textual order and
+can refer to each other within the file. Workspace files still need an
+acyclic dependency order: functions in two files cannot make those files
+need each other. Put mutually dependent definitions together or extract
+their shared dependencies.
+
+## Memoization
+
+A memoized function reuses a successful result for the same arguments in
+the same execution context. The cache belongs to the closure, so two
+closures created from one function expression have separate entries.
+Memoization also accounts for supported ambient inputs such as a caller
+path when the function reads it.
+
+This is not a persistent build cache. External changes to files or a
+command's environment do not invalidate a stored result. Use `->>` only
+when reusing the first result within that run is correct. Cached keys and
+results consume memory for the lifetime of their execution context.
+
+Read [Deferred Work](/gcsl/language/deferred-work.md) before using futures in function
+signatures; a bare type's present-or-future meaning depends on its
+position and the function's effect.
+
+---
+
+# Attributes
+
+_GCSL / The Language_
+
+> Tell the program that runs a function how to run it.
+
+An attribute goes before a function and says how to run it, for example
+whether a build step may be cached or how long it may take. GCSL checks
+every attribute. Most are read by the tool that runs the program, such as
+a build system, and GCSL itself acts on its own two, `retry` and
+`timeout`.
+
+```gcsl
+#[attribute] type hermetic = {on: Bool = true}
+
+#[hermetic]
+fn compile(source: String) -> String { "compiled {source}" }
+
+#[hermetic(false)] #[timeout(10m)]
+fn deploy(target: String) -> String { "deployed {target}" }
+
+result = deploy(compile("main.c"))
+```
+
+## Declaring an attribute
+
+An attribute's arguments form a record, so you declare an attribute as a
+record type marked `#[attribute]`. Each field is an argument, and a field
+with a default is an argument you can leave out:
+
+```gcsl
+#[attribute] type device = {name: String, count: Int = 1}
+
+#[device(name = "kvm")]
+fn boot() -> String { "booted" }
+
+booted = boot()
+```
+
+Arguments must be constants: literals, or lists and records of them. A
+field may be an `Int`, `Float`, `Bool`, `String`, `Duration` or `Size`, or
+a list or record of those. An attribute is declared, imported and named in
+the same way as any other type, so a tool usually provides its attributes
+in a module that you import.
+
+## Using an attribute
+
+Write `#[NAME]`, or `#[NAME(ARGUMENTS)]`, on the line before a function: a
+`fn`, a `def`, or a definition made with a definition type. An attribute
+with one field can take its argument by position, as in `#[timeout(10m)]`;
+one with more fields takes its arguments by name. A misspelt attribute is
+an error, so a mistake isn't silently ignored.
+
+GCSL provides two attributes of its own, `retry` and `timeout`:
+
+| Attribute | Argument | Meaning |
+|---|---|---|
+| `#[retry(times)]` | `times: Int` | If the call fails, run it again, up to this many more times. |
+| `#[timeout(limit)]` | `limit: Duration` | Fail the call if it runs for longer than this. |
+
+A retried call runs its whole body again with the same arguments, so any
+effects it has happen again: use `retry` only where that's safe. Retrying a
+pure function can't change its result, so GCSL warns about it. When a call
+times out, a program it's running is stopped. A function's own timeout
+counts as a failure that its `retry` can retry, and each attempt gets the
+full time. A timeout of an enclosing call is never retried by a call inside
+it.
+
+```gcsl
+#[retry(2)] #[timeout(30s)]
+fn fetch(url: String) -> String { exec(["echo", "fetched {url}"]).stdout }
+
+page = fetch("https://example.com")
+```
+
+## Attributes on a definition type
+
+Attributes on a definition type apply to every definition made with it.
+A definition's own attribute of the same name replaces the definition
+type's:
+
+```gcsl
+#[attribute] type hermetic = {on: Bool = true}
+
+#[def_type] #[hermetic]
+def check(name: String, f: fn(): Bool): fn(): Bool { f }
+
+def check fast() { true }
+#[hermetic(false)] def check online() { true }
+
+results = [(check fast)()(), (check online)()()]
+```
+
+Here `fast` is hermetic and `online` is not.
+
+---
+
+# Context
+
+_GCSL / The Language_
+
+> Pass settings such as the target platform through every call without threading them by hand.
+
+Some values matter deep inside a program without every function in
+between caring about them: the platform you are building for, for
+example, or the toolchains available. A *context* is a named value of
+that kind. You declare it once, read it with `^`, and set it for a call
+and everything that call does with `with`:
+
+```gcsl
+context arch: String = "x86_64"
+
+fn compiler(): String { "gcc-{^arch}" }
+fn build(): String { "built with {compiler()}" }
+
+native = build()
+cross = build() with { arch = "aarch64" }
+```
+
+`build` never mentions `arch`, yet `cross` is built with `gcc-aarch64`:
+the `with` reaches every call made inside it.
+
+## Declaring a context
+
+`context NAME: TYPE = DEFAULT` declares a context and its default, at the
+top level of a file. Every file of the workspace can read it without an
+import, so a name is declared only once. A context can leave out its
+default, `context toolchains: List<Toolchain>`; reading it then needs a
+`with` that sets it, and reading it without one is an error.
+
+A default is an expression, and it is evaluated where the context is
+read, in the context of the read. So one context can default to another,
+and follow it:
+
+```gcsl
+type Platform = {arch: String, os: String}
+context host_platform: Platform = {arch = "x86_64"; os = "linux"}
+context platform: Platform = ^host_platform
+
+target = ^platform.arch with { host_platform = {arch = "aarch64"; os = "linux"} }
+```
+
+A default must be pure: it can't call an impure function. To use a value
+that needs one, compute it first and bind it with `with`.
+
+## Setting a context with `with`
+
+`EXPR with { NAME = VALUE }` evaluates `EXPR` with the context `NAME`
+set to `VALUE`. It applies to the call or field access just before it,
+so `a + f() with {...}` sets the context for `f()` alone. It must be on
+the line where the expression ends. To set a context for several
+statements, use the block form, `with { NAME = VALUE } { ... }`.
+
+A dotted name sets one field of a record context and keeps the others:
+
+```gcsl
+type Platform = {arch: String, os: String}
+context platform: Platform = {arch = "x86_64"; os = "linux"}
+
+fn triple(): String { "{^platform.arch}-{^platform.os}" }
+riscv = triple() with { platform.arch = "riscv64" }
+```
+
+`with { arch }` is short for `with { arch = arch }`, setting the context
+from a variable of the same name.
+
+## Reading a context in a parameter
+
+A parameter written `^NAME` takes its default from the context of that
+name, so a caller can still pass a value explicitly. `fn f(^arch)` is the
+same as `fn f(arch: String = ^arch)`, with the type taken from the
+context's declaration:
+
+```gcsl
+context arch: String = "x86_64"
+fn compiler(^arch): String { "gcc-{arch}" }
+
+usual = compiler()
+explicit = compiler(arch = "mips")
+```
+
+## Context and deferred work
+
+A `lazy` keeps the context it was made in. Wherever it is later
+awaited, it reads the values that were set where it was written. A
+top-level field is computed when its file runs, so it reads the default
+values.
+
+Memoised functions stay correct: a memoised call's result is reused only
+for a call made in a context that gives every context the call read the
+same value.
+
+---
+
+# Failure
+
+_GCSL / The Language_
+
+> Check what must hold with assert, and handle a failure with recover.
+
+A program fails when it hits a runtime error: a `panic`, an index out of
+range, a program it runs exiting with an error, or a failed `assert`.
+Normally that ends the run. Two constructs work with failure directly:
+`assert`, which fails on purpose when something doesn't hold, and
+`recover`, which catches a failure and continues.
+
+## Asserting
+
+`assert COND` fails the run if the condition is false. The error shows
+the condition as you wrote it, and for a comparison it labels each side
+with its value, so a failed check explains itself:
+
+```text
+error: assertion failed: `output == "hello"`
+ --> app.gcsl:2:8
+  |
+2 | assert output == "hello"
+  |        ------    ------- this is `"hello"`
+  |        |
+  |        this is `"hullo"`
+```
+
+Give your own message after a comma, `assert ok, "the server did not
+start"`. Each side of a comparison is evaluated only once, so an
+assertion about a program's output doesn't run the program twice.
+
+## Recovering
+
+`recover { BODY } else { FALLBACK }` evaluates the body, and if it fails,
+evaluates the fallback instead. Name the failure to read its message:
+
+```gcsl
+fn half(n: Int): Int {
+    assert n % 2 == 0, "{n} is odd"
+    n // 2
+}
+
+even = recover { half(10) } else { 0 }
+odd = recover { half(7) } else { -1 }
+message = recover { "half is {half(7)}" } else (failure) { failure.message }
+```
+
+The failure is a record, `{message: String}`. The two blocks join as an
+`if`'s branches do, so they normally have one type.
+
+`recover` catches what `#[retry]` would retry, and nothing else. A bug in
+GCSL itself is never caught. Neither is a timeout of a call that encloses
+the `recover`: that timeout belongs to the enclosing call, which ends as
+if the `recover` weren't there. A `break`, `continue` or `return` inside
+the body is not a failure, and leaves through it as usual. Anything the
+body did before it failed stays done.
+
+---
+
+# Deferred Work
+
+_GCSL / The Language_
+
+> Delay effects with lazy expressions and resolve them with await.
+
+A future represents a calculation whose result is needed later. `lazy`
+creates that calculation without running it. Awaiting it evaluates the
+body and remembers the successful result. Futures are deferred work, not
+concurrent tasks.
+
+This program creates one future and then reads its result:
+
+```gcsl
+let answer = lazy 21 * 2
+await answer
+```
+
+## Where work happens
+
+A `lazy` body is an impure context, even when a pure function creates it.
+That lets a pure function plan effects without performing them. A pure
+function cannot await a future. Resolve the value in an impure caller
+before passing it into a pure calculation that needs the value itself.
+
+The checker inserts implicit awaits at uses that need a value's contents,
+such as arithmetic or a required present argument. It applies the same
+purity restriction to explicit and implicit awaits. A call to a pure
+function never secretly starts deferred work inside that function.
+
+## Writing contracts
+
+Use explicit wrappers when the distinction is part of an interface:
+
+| Type | Contract |
+|---|---|
+| `Present<Int>` | A present integer, equivalent to `Int` in an ordinary annotation |
+| `Future<Int>` | Deferred work yielding an integer |
+| `Int | Future<Int>` | Either a present or a deferred integer |
+
+A present value does not satisfy an explicitly required `Future<T>`.
+Nested future layers collapse: awaiting a future resolves it fully.
+Awaiting an already present value is a silent no-op.
+
+Bare types in impure parameters accept present or deferred values,
+including bare positions inside records and lists. Pure parameters infer
+whether their bodies need the value's contents. Impure and memoized
+results infer their present-or-future shape from the body. Explicit
+wrappers keep the contract you wrote.
+
+## Avoiding surprising inference
+
+A pure function with result `Int` requires a present result, even if it
+only returns its argument. It does not preserve a future's shape
+polymorphically. Recursive result inference also retains conservative
+parts of the declared signature. Use `Present<T>` or an explicit future
+contract where an API needs a stable distinction, and consult
+[Inference Limits](/gcsl/language/inference-limits.md) when an inferred type is wider
+than expected.
+
+---
+
+# Lists and Control Flow
+
+_GCSL / The Language_
+
+> Build lists, repeat expressions, and leave loops or functions.
+
+Lists hold ordered values of one element type. GCSL's loops are
+expressions, so a loop can collect results into a list or run only for its
+effects. This avoids a separate collection-building language.
+
+## Lists and ranges
+
+`List<Int>` and `Int[]` name the same type. Indexes start at zero; a
+negative or out-of-range index is a runtime error. A spread inserts
+another list's elements. An empty list needs an expected element type:
+
+```gcsl
+let empty: List<Int> = []
+let values = [...empty, 3, 8, 5]
+values[1]
+```
+
+`0..3` produces `[0, 1, 2]`; `0..=3` includes `3`. Bounds are integers and
+ranges run upward. A range used directly as a loop's iterable is counted
+without first allocating the list of all its integers.
+
+## Collecting and repeating
+
+A loop used as a value collects each iteration's result. A guard skips
+iterations that don't match:
+
+```gcsl
+let doubled = for n in [1, 2, 3] if n > 1 { n * 2 }
+doubled
+```
+
+A loop used as a statement discards its results. Use `for condition` for
+repetition while a condition holds, `for { ... }` without a condition,
+or `do { ... } for condition` to test after the body. A header can contain
+initialization and an update:
+
+```gcsl
+let values = for let i = 0; i < 3; i := i + 1 { i * 2 }
+values
+```
+
+A plain header variable can be rebound by the header. Write `let mut` if
+the body must also update it.
+
+## Leaving a computation
+
+`break` ends the enclosing loop and `continue` skips to its next
+iteration. Either can supply a value to the collecting loop before
+leaving that iteration. An unlabeled `return` returns from the enclosing
+function or `lazy` body.
+
+Labels identify an outer loop or a block. A labeled `return` leaves that
+target with one value; it does not append to a loop's accumulated list.
+Control flow cannot jump out through a function boundary. See `gcsl(5)`
+for label syntax and the distinction between collected and returned
+values.
+
+---
+
+# Inference Limits
+
+_GCSL / The Language_
+
+> Recognize supported inference and use explicit types at its boundaries.
+
+GCSL infers local values and selected present-or-future positions. It does
+not infer every relationship between types. Explicit annotations help you
+state an intended interface when a program reaches one of these limits.
+
+The following boundaries affect ordinary programs:
+
+| Boundary | What to write |
+|---|---|
+| An empty list has no independent element type | Give it an annotation or an expected `List<T>` type |
+| A pure function does not preserve arbitrary future shapes | Write the present or future contract explicitly |
+| Recursive impure results can retain a deferred possibility | Use `Present<T>` when the result must be present |
+| General type parameters and intersections are unsupported | Write concrete structural types |
+| There is no `None` value or optional-type shorthand | Represent alternatives using supported union members |
+| Narrowing recognizes a plain name tested directly by `if` | Bind a field to a name before testing it |
+| Narrowing does not establish facts after an early return | Keep uses inside the narrowed branch |
+| A narrowed mutable name is a branch-local copy | Don't try to update the original through that copy |
+| `len` and `show` use special call rules | Call them directly or through supported aliases, rather than storing them as ordinary function values |
+
+Expected types reach record fields, call arguments, and other supported
+literal contexts. An unrelated sibling expression is not a general
+constraint-solving mechanism. For example, annotate an empty list before
+combining it with independently inferred values.
+
+Warnings do not prevent execution. A union inferred from unlike branch
+results can produce a warning while the program remains valid. Use
+`gcsl check` to inspect the full set of errors and warnings, and
+`gcsl run --dump-types FILE` when the inferred shape is unclear.
+
+These are supported-language boundaries, not promises about a future
+inference engine. The checker implementation and its regression tests
+are the source for the behavior described here.
+
+---
+
+# Workspaces
+
+_GCSL / Files and Workspaces_
+
+> Understand directory scopes, imports, and checking across files.
+
+A GCSL workspace is a directory tree rooted at `workspace.gcsl`. Files in
+one directory share public declarations. Child directories inherit the
+public declarations above them, so common types and helpers can live at
+the root without repeated imports.
+
+The marker is an ordinary GCSL source file. It can be empty or declare
+shared values and functions. The disk loader finds the nearest enclosing
+marker when you run a file, reads the workspace, and checks every source
+before executing the selected file and its dependencies.
+
+## Public and private names
+
+Fields, `def` functions, and declared types contribute to a directory's
+public scope. `let`, `let mut`, and `fn` bindings remain private to their
+file. Dotted public paths merge when they define distinct leaves; a
+conflicting leaf is an error unless an earlier declaration explicitly
+permits shadowing.
+
+Sibling and child directories are not automatically in scope. Imports
+name paths from the workspace root, with `/` between directories, as the
+file system does. `import lib/helpers` names `lib/helpers.gcsl` or a
+directory of that path. Use `as` for a local alias, or import a named
+member with `from`.
+
+A directory or file name in a path is written as it is, dots and all, so
+`import pkgs/net.busybox.busybox as busybox` names the directory
+`pkgs/net.busybox.busybox`. An import without `as` is named after the
+path's last part, so that part must be a plain name; give a name such as
+`net.busybox.busybox` one with `as`.
+
+## Boundaries and evaluation order
+
+Hidden names and nested directories containing their own `workspace.gcsl`
+are excluded from an enclosing workspace's source discovery. A nested
+workspace is independent, not an importable child module of the outer
+workspace. Symbolic-link directory traversal is not a mechanism for
+extending the source tree.
+
+Dependencies determine file order; path order breaks ties. A file runs
+as a whole before a file that depends on it. Cyclic file dependencies are
+errors, including cycles introduced through function bodies or imports.
+
+A standalone file outside any workspace can import standard modules but
+cannot import arbitrary neighboring source files. Create a workspace
+marker when several files need to cooperate.
+
+## Deliberate overrides
+
+`#[shadowable]` marks a public declaration or import as replaceable by a
+later declaration in the workspace's defined order. The implicit prelude
+import is shadowable, so your own declarations can use its names.
+
+Use this attribute for intentional defaults. It is not an escape from
+all conflicts: an ordinary public leaf still cannot be defined twice.
+Whole-value overrides replace the old value, while distinct dotted
+leaves can merge. See `gcsl(5)` for ordering and import syntax.
+
+---
+
+# Organizing a Workspace
+
+_GCSL / Files and Workspaces_
+
+> Split shared declarations from an executable entry file.
+
+You can share a type and helper across files by putting them in a
+workspace. This example gives the entry file access to root declarations
+without an import.
+
+## Before you start
+
+You need `gcsl` on your command search path and an empty writable directory.
+
+## Create the workspace
+
+1. Save these declarations as `workspace.gcsl`:
+
+   ```gcsl
+   type Component = {name: String, version: String}
+   def describe(item: Component): String {
+       "{item.name} {item.version}"
+   }
+   ```
+
+2. Save the entry program as `main.gcsl` beside it:
+
+   ```gcsl
+   describe({name = "gcsl"; version = "0.1.0"})
+   ```
+
+3. From that directory, check the workspace and run the entry file:
+
+   ```sh
+   gcsl check
+   gcsl run main.gcsl
+   ```
+
+## Check the result
+
+The check reports `no problems in 2 files checked`. The run prints
+`gcsl 0.1.0`. The helper is visible because `def` contributes to the
+shared directory scope. Replacing `def` with `fn` makes it private to
+`workspace.gcsl`, so the entry file cannot resolve it.
+
+When adding a child library directory, import its public fields or
+functions by its root-relative path. Keep independent projects behind
+their own workspace markers rather than relying on hidden files to
+separate their scopes.
+
+---
+
+# File and Process Effects
+
+_GCSL / Files and Workspaces_
+
+> Understand paths, process execution, and temporary-file lifetime.
+
+GCSL provides standard functions for files and subprocesses. Their effects
+use the host process's authority. Absolute paths and explicit command
+arguments make those effects easier to inspect, but don't restrict what
+a program can access.
+
+## Locating files
+
+Import `fileroot` to locate source directories and `path` to compose paths.
+`fileroot.this` is the directory of the file containing the expression;
+`fileroot.workspace` is the workspace root. `fileroot.caller` identifies
+the source directory of the running function's caller.
+
+`path.join`, `path.normalize`, `path.dirname`, and `path.basename` operate
+lexically. They don't resolve symbolic links or prove that a path stays
+inside a directory. Use them for path construction, not access control.
+
+File operations under `fs` require absolute paths. The following program
+writes and reads a temporary file, then removes its temporary directory
+when the run ends:
+
+```gcsl
+import fs
+import path
+let directory = fs.temp_dir()
+let file = path.join(directory, "message.txt")
+fs.write(file, "GCSL")
+fs.read(file)
+```
+
+Temporary directories last for the owning run, workspace, or REPL session.
+Normal cleanup also runs after an evaluation error. Killing the process
+can leave temporary directories behind. Atomic replacement by `fs.write`
+protects readers from partial contents; it does not preserve a replaced
+file's permissions or provide a durable transaction across several files.
+
+## Running a process
+
+`exec` accepts a list whose first element names the program. Later elements
+are passed as arguments without shell interpretation. It returns a record
+with the exit status and captured output. A nonzero exit status is data,
+not a GCSL runtime error.
+
+`sh` instead executes a string through `/bin/sh` and fails the GCSL run
+when the command fails. Don't insert untrusted text into that string.
+Prefer `exec` when values need to become arguments rather than shell code.
+
+`exec_live` and `sh_live` also copy child output to GCSL's standard error
+as lines arrive. They still capture output in memory. All these commands
+inherit the host environment and working directory, and give the child
+null standard input. A source-relative `fileroot` value does not change
+a command's working directory.
+
+Consult `gcsl-stdlib(3)` for exact function contracts and error behavior.
+
+---
+
+# Checking and Formatting Programs
+
+_GCSL / Development Tools_
+
+> Check types and apply the standard GCSL formatter.
+
+You can check a GCSL program without running its effects, then format its
+source consistently. The checker and formatter deliberately have different
+scopes: checking needs workspace relationships; formatting only needs
+source text that parses.
+
+## Before you start
+
+You need `gcsl` and an existing source file or workspace. Commit or save
+your changes before rewriting files so you can review the formatting diff.
+
+## Check and format
+
+1. Check a file, including its enclosing workspace if it has one:
+
+   ```sh
+   gcsl check main.gcsl
+   ```
+
+2. Preview whether formatting would change that file:
+
+   ```sh
+   gcsl fmt --check main.gcsl
+   ```
+
+3. Apply the formatter and repeat the check:
+
+   ```sh
+   gcsl fmt main.gcsl
+   gcsl fmt --check main.gcsl
+   ```
+
+## Check the result
+
+The checker reports its summary on standard error. Warnings alone do not
+make it fail. The final formatting check succeeds without listing the
+file when it is already formatted.
+
+A file with lexical or syntax errors is left untouched by the formatter;
+fix those diagnostics and retry. Formatting does not require a successful
+type check. It uses one language style rather than editor-specific indent
+settings.
+
+## Checking a tree
+
+With no paths, both commands use the enclosing workspace and exclude
+nested workspaces. An explicit directory makes them discover nested
+workspaces too. However, `gcsl check DIRECTORY` checks workspaces, not
+unattached `.gcsl` files under that directory. Pass each standalone file
+explicitly when it also needs checking.
+
+For automation, `gcsl check --message-format json main.gcsl` writes one
+JSON diagnostic per line to standard output and keeps the summary on
+standard error. See `gcsl(1)` for the schema and exit statuses.
+
+---
+
+# Configuring an Editor
+
+_GCSL / Development Tools_
+
+> Connect an editor to the bundled GCSL language server.
+
+The GCSL language server supplies diagnostics and navigation from the same
+checker that runs programs. You can use it in an editor that supports the
+Language Server Protocol (LSP) over standard input and standard output.
+
+## Before you start
+
+You need the following:
+
+- An editor with configurable LSP support.
+- The `gcsl` executable on the editor's command search path.
+- A GCSL file or workspace to open.
+
+## Connect the server
+
+1. Associate files ending in `.gcsl` with a GCSL language entry in your
+   editor.
+2. Set the server command to `gcsl` and its argument list to `["lsp"]`.
+   Use standard input and standard output for transport.
+3. Open a GCSL file. For a multifile project, open the workspace directory
+   so the editor can supply file changes and watch notifications.
+
+## Check the result
+
+Hover over a declared name to see its type. Introduce a misspelled name and
+confirm that the editor displays a diagnostic. When an unambiguous
+spelling suggestion is available, a quick fix offers the replacement.
+
+The server checks source but does not evaluate programs. It supports
+completion, signature help, inlay hints, formatting, symbol search, and
+references. Rename checks the proposed edits before returning them and
+refuses changes that introduce errors or change name resolution. It does
+not rename files, directories, or standard-library declarations.
+
+## Incomplete source
+
+The index retains useful information around many syntax errors. For an
+unbalanced block, a query can use a repaired copy to answer navigation or
+completion while diagnostics still describe the real text. Rename needs
+the real source to be valid enough to verify and can be refused instead.
+
+Editor syntax highlighting is a separate integration. The grammar and
+queries in `tree-sitter-gcsl` are maintained in their own repository; they
+are not required for the `gcsl lsp` process to check your code.
+
+---
+
+# Embedding GCSL
+
+_GCSL / Embedding GCSL_
+
+> Choose a language-library entry point and preserve its execution requirements.
+
+The `gcsl` Rust crate exposes the language pipeline without requiring the
+command-line program. You can evaluate one source, retain an interactive
+session, or load a workspace supplied by your application.
+
+## Choosing the boundary
+
+The repository separates four responsibilities:
+
+| Crate | Responsibility |
+|---|---|
+| `gcsl` | Syntax, types, evaluation, formatting, and semantic indexing |
+| `gcsl-disk` | Finding workspace roots and reading source trees |
+| `gcsl-lsp` | Editor protocol, document state, and request handling |
+| `gcsl-cli` | Command arguments, terminal interaction, and output |
+
+`gcsl::run` evaluates a `SourceFile` as a standalone program. A `Session`
+retains names and values across inputs. `workspace::Workspace` evaluates
+selected files after a workspace check. The lower-level lexer, parser,
+checker, and index are available when you only need a particular stage.
+Consult the Rust API documentation for exact signatures and ownership.
+
+## Stack and lifetime
+
+Run the language pipeline on a thread with at least `gcsl::STACK_SIZE`
+bytes of stack, as the CLI does. Its configured size is 64 MiB. Parsing,
+checking, lowering, and evaluation share documented nesting limits; a host
+thread's default stack is not a substitute for the required reservation.
+
+Keep the source collection and diagnostic input numbering together.
+Standard-library files participate in the source list, so diagnostics can
+point into a helper as well as into user text. The library returns
+warnings with successful results instead of printing them.
+
+A workspace or session owns memoization state and temporary directories.
+Dropping it performs normal temporary-directory cleanup. Do not return a
+path to such a directory and then destroy its owner before a consumer has
+used it.
+
+## Effects are host effects
+
+The standard library is embedded in the binary. Its process and file
+operations still run with the embedding process's permissions and
+resources. The library does not impose a wall-clock limit or turn pure
+checking into an execution sandbox. A host that accepts untrusted programs
+needs an external isolation and resource policy.
+
+Use `gcsl-disk` when you want the CLI's workspace-discovery behavior.
+Supply sources yourself when your host has a different storage model;
+keep the language's dependency and scope rules intact.
+
+---
+
+# Definition Types and Metadata
+
+_GCSL / Embedding GCSL_
+
+> Build domain-specific declarations without changing the GCSL parser.
+
+A definition type lets a host or library describe a family of named
+functions. The language checks each definition against a shared signature,
+while the host can discover and invoke definitions by name. This is the
+mechanism used by integrations such as Pekit.
+
+## A family of definitions
+
+Mark a public function with `#[def_type]`. Its first parameter receives the
+definition's path as a string; its second receives the definition function.
+Further parameters become invocation arguments. This example wraps a
+pure string-producing definition:
+
+```gcsl
+#[def_type]
+def describe(name: String, body: fn(): String): String {
+    "{name}: {body()}"
+}
+def describe dev.peios.gcsl() { "language tools" }
+result = describe dev.peios.gcsl()
+```
+
+Declaring the definition does not execute its body. Calling its reference
+does. Definitions live in the definition type's namespace, separate from
+ordinary values of the same path. Their public paths merge through
+workspace directories and imports like other public declarations.
+
+## Definitions made with a variant
+
+A definition type can take a variant of an [enum](/gcsl/language/records-and-types.md)
+after the name, and the definition after that. Each definition then
+names a variant, and each variant has its own definitions. When the
+definition type is generic, the variant's payload type fills in its type
+parameter, so each definition's body is checked against its own
+variant's payload:
+
+```gcsl
+enum Tool extensible<{*: String}>
+enum Tool::C<{cc: String}>
+enum Tool::Rust<{rustc: String}>
+#[def_type]
+def Tool<T>(name: String, kind: Variant<Tool, T>, body: fn(): T): Tool {
+    kind(body())
+}
+def Tool::C gcc() { cc = "gcc" }
+def Tool::Rust gcc() { rustc = "rustc" }
+c = Tool::C gcc()
+rust = Tool::Rust gcc()
+```
+
+`Tool::C gcc` and `Tool::Rust gcc` are separate definitions. A reference
+names the variant in the same way as the definition, and the definition
+type receives the variant as its `kind` argument. Hosts don't invoke these
+definitions by name: programs reach them through references, for example
+in a list of registered toolchains.
+
+## Metadata
+
+Function types can carry metadata with `META:`, `META->`, or `META->>`.
+These distinguish pure reads, impure reads, and memoized reads. A
+`defmeta` declaration supplies the metadata of a definition in its
+directory. Reading a field through the function reference reads that
+metadata according to its effect.
+
+Metadata is not a separate package-format contract. The definition type
+chooses its shape, and the host integration owns what those fields mean.
+Use the host's documentation for package or build semantics.
+
+## Host invocation
+
+A checked workspace exposes definition types and their definitions. Host
+APIs can invoke a selected definition with named textual arguments parsed
+against its declared parameter types. When a value the host gets back holds
+a reference, such as `build = build busybox`, the host can ask which
+definition it names and then invoke it, or read its metadata, by name. The
+host can also invoke a definition in a [context](/gcsl/language/context.md) of its
+choosing, such as the platform a build step runs on, by giving each
+context a value of its declared type, for example one it got back from
+an earlier run. Only that invocation sees those values: what each file
+computes as it runs uses the declared defaults. The
+`gcsl` executable itself exposes
+`run`, `check`, `fmt`, and `lsp`; it does not add a general command for each
+definition type.
+
+Keep protocol or package policy in the integration repository. Keep
+language syntax, type checking, and discovery semantics in GCSL. This
+separation lets other hosts use the same language without inheriting
+Pekit's packaging model.
+
+---
+
+# 100 The Language Pipeline
+
+_GCSL / gcsl-internals_
+
+> Follow source through checking and type-specialized evaluation.
+
+GCSL is a tree-walking interpreter with a typed intermediate
+representation. The stages are separate so a formatter or editor can stop
+before execution while using the same syntax and type rules as the CLI.
+
+The main pipeline is:
+
+```text
+SourceFile
+    -> lexer and interned names/strings
+    -> parser and arena-based syntax tree
+    -> workspace resolution and type-check side tables
+    -> type-specialized intermediate representation
+    -> evaluation and a value with warnings
+```
+
+The lexer and parser can recover enough structure to report multiple
+errors. A failed check is never lowered into executable code. Recovery
+supports diagnostics and editor queries; it does not make a partially
+valid program executable.
+
+The checker resolves names and types expressions, recording captures,
+slots, argument destinations, and required awaits in side tables.
+Lowering makes those awaits explicit. Evaluation dispatches through
+specialized operations whose types have already been checked, rather than
+repeating the type system at each operation.
+
+## 100.1 Workspace scheduling
+
+The workspace scanner merges public field paths, resolves imports, and
+orders source files by dependencies. Each public leaf has an owner and a
+cell. Reading an interior record can require all its contributing owners.
+A cycle is a diagnostic, not an order selected at runtime.
+
+Top-level field scheduling differs from ordinary block order. It supports
+forward references while ensuring dependencies are initialized before a
+read. Shadowed declarations are still checked even when they do not
+contribute a runtime value.
+
+## 100.2 Sources
+
+The principal implementation is in `crates/gcsl/src/lexer.rs`,
+`parser.rs`, `workspace.rs`, `check.rs`, `lower.rs`, and `eval.rs`.
+Each module documents its internal invariants. The implementation here is
+not the separate Tree-sitter grammar used for highlighting.
+
+---
+
+# 200 Evaluation State
+
+_GCSL / gcsl-internals_
+
+> Understand values, futures, memo tables, and failure cleanup.
+
+GCSL evaluation uses reference-counted values and explicit execution
+contexts. A closure captures values; a frame holds the current call's
+slots. This supports value semantics without exposing shared mutable
+variables to programs.
+
+## 200.1 Futures and memo tables
+
+A future begins pending, becomes running during evaluation, and records a
+successful result. Reentering running work is an error rather than an
+infinite cycle through the same pending computation. A failed evaluation
+does not become a cached success.
+
+Memo tables belong to the execution context and are keyed by closure
+identity and argument values, with supported ambient inputs included when
+used. Keeping tables outside closures avoids introducing reference cycles
+through cached keys and results. Successful entries for live closures
+remain until their context ends; they are not an eviction-based cache.
+
+## 200.2 Exits and cleanup
+
+Runtime errors and language control flow share an unwinding path through
+the evaluator. A loop handles its own `break` or `continue`; a function,
+future, or labeled block handles a matching `return`. Intermediate
+operations restore stack and evaluation state before propagating an exit.
+
+A failed REPL input does not commit its new bindings or memo-table changes
+to the session. Effects already performed outside the interpreter are not
+rolled back. A file written or a subprocess started before an error still
+requires the host's ordinary handling.
+
+A workspace remembers the first runtime failure of each file. A later
+request that needs that file receives the original diagnostic without
+rerunning its effects or starting dependent files. Successful prior files
+keep their values, and unrelated files can still run. Create a new
+workspace object when you intentionally need to retry evaluation.
+
+## 200.3 Resource limits
+
+The parser's maximum expression depth is `gcsl::MAX_DEPTH`, 10,000 levels.
+Runtime expressions, calls, and awaits share a nesting budget; calls cost
+additional levels. Iterations reuse their body's depth rather than adding
+one level per iteration. Tail calls are not eliminated.
+
+These limits protect the recursive implementation, not total computation.
+A program can still loop indefinitely, allocate large values, capture
+large process output, or retain many memoized results. The embedding host
+owns any execution timeout and memory limit.
+
+The main implementation lives in `eval.rs`, `value.rs`, and `session.rs`.
+
+---
+
+# 300 Tooling State
+
+_GCSL / gcsl-internals_
+
+> Understand source discovery, editor snapshots, and formatter boundaries.
+
+GCSL tooling shares language analysis while keeping disk access and editor
+protocol handling outside the core. This prevents checking and formatting
+from depending on an evaluator run.
+
+## 300.1 Source discovery
+
+`gcsl-disk` finds workspace markers and returns a source collection with
+stable path and diagnostic mappings. It excludes hidden names and nested
+workspace trees when reading one workspace. The CLI and language server
+use this shared layer rather than implementing separate import rules.
+
+A check of a directory discovers workspaces. A format of a directory
+finds source files, including standalone files. Their traversal results
+are therefore intentionally different.
+
+## 300.2 Editor snapshots
+
+`gcsl-lsp` overlays open document text on disk sources and asks a worker to
+check the affected workspace. Queries use an up-to-date semantic index;
+they can force a pending check before answering. Diagnostics continue to
+refer to actual source even when a query temporarily repairs unmatched
+braces to find usable names.
+
+Rename computes proposed edits and checks their effect before offering
+them. Standard-library, file, and directory identities are not editable
+through that operation. Formatting returns edits from the language's
+formatter rather than applying the editor's formatting preferences.
+
+Only local `file:` document URIs with an empty or `localhost` authority
+and an absolute decoded path map to disk files. Other URI forms are
+checked as standalone documents, not treated as local workspace paths.
+
+## 300.3 Formatter
+
+The formatter works from tokens, comments, and parsed structure. It does
+not need evaluation or successful type inference. Syntax errors prevent a
+rewrite of that file. The CLI uses a temporary file and replacement so
+readers don't observe a partially written formatted file.
+
+The principal code is in `crates/gcsl-disk/src/lib.rs`,
+`crates/gcsl-lsp/src/`, `crates/gcsl/src/index/`, and
+`crates/gcsl/src/fmt.rs`. The CLI adapters live in
+`crates/gcsl-cli/src/`.

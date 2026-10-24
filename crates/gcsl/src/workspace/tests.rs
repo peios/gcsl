@@ -12509,3 +12509,85 @@ fn an_invocation_runs_in_the_context_its_host_sets() {
          context is given data of its type: no function or future"
     );
 }
+
+#[test]
+fn a_recover_catches_what_retry_would_retry_and_an_assertion_shows_its_operands() {
+    let text = "fn check(x: Int): Int {\n\
+                \x20   assert x > 0, \"x must be positive\"\n\
+                \x20   x * 2\n\
+                }\n\
+                a = recover { check(3) } else { 0 }\n\
+                b = recover { check(-1) } else (e) { e.message }\n\
+                c = recover { panic(\"boom\") } else (failure) { \"caught {failure.message}\" }\n\
+                d = recover { [1, 2][5] } else { -1 }\n\
+                f = recover { recover { panic(\"inner\") } else (e) { panic(\"re: {e.message}\") } } \
+                else (e) { e.message }\n\
+                let s = \"hello\"\n\
+                g = recover { assert s == \"hullo\"; \"passed\" } else (e) { e.message }\n\
+                fn leave(): Int {\n\
+                \x20   let _ = for i in [1, 2, 3] {\n\
+                \x20       recover { if i == 2 { return i * 10 }; {} } else { {} }\n\
+                \x20   }\n\
+                \x20   0\n\
+                }\n\
+                h = leave()";
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+    assert_eq!(
+        rooted_text(&files, "app.gcsl"),
+        "{a = 6; b = \"assertion failed: x must be positive\"; c = \"caught boom\"; d = -1; \
+         f = \"re: inner\"; g = \"assertion failed: `s == \\\"hullo\\\"`\"; h = 20}"
+    );
+    // A failed assertion labels each side of its comparison with its value.
+    let files = [
+        ("workspace.gcsl", ""),
+        ("app.gcsl", "let s = \"hello\"\nassert s == \"hullo\""),
+    ];
+    let mut workspace = rooted(&files).unwrap();
+    let app = workspace.file("app.gcsl").unwrap();
+    let error = workspace.run(app).unwrap_err().remove(0);
+    assert_eq!(error.message, "assertion failed: `s == \"hullo\"`");
+    let labels: Vec<&str> = error
+        .labels
+        .iter()
+        .map(|label| label.text.as_str())
+        .collect();
+    assert_eq!(labels, ["this is `\"hello\"`", "this is `\"hullo\"`"]);
+}
+
+#[test]
+fn a_recover_inside_a_timed_call_leaves_its_timeout_to_the_call() {
+    let text = "#[timeout(200ms)]\n\
+                fn slow() -> String {\n\
+                \x20   recover { let r = exec([\"sleep\", \"3\"]); \"slept {r.status}\" } else (e) { \
+                \"inner caught: {e.message}\" }\n\
+                }\n\
+                r = recover { slow() } else (e) { \"outer caught: {e.message}\" }";
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+    assert_eq!(
+        rooted_text(&files, "app.gcsl"),
+        "{r = \"outer caught: `slow` timed out after 200ms\"}"
+    );
+}
+
+#[test]
+fn assertion_and_recover_errors() {
+    let errors = |text: &str| {
+        let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+        check_errors(&files).join("\n")
+    };
+    for (text, message) in [
+        ("assert 1", "mismatched types"),
+        ("assert true, 1", "mismatched types"),
+        (
+            "r = recover { 1 } else (e) { e.nope }",
+            "no field `nope` in `{message: String}`",
+        ),
+        (
+            "fn imp() -> Int { 1 }\nfn p(): Int { recover { imp() } else { 0 } }",
+            "cannot call an impure function from a pure function",
+        ),
+    ] {
+        let found = errors(text);
+        assert!(found.starts_with(message), "{text}: {found}");
+    }
+}

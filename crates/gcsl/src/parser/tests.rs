@@ -279,6 +279,18 @@ fn type_args(ast: &Ast, args: TypeArgRange, out: &mut String) {
     out.push('>');
 }
 
+/// Writes a `recover`, `recover BODY else (NAME) FALLBACK`.
+fn recover_shape(ast: &Ast, id: crate::ast::RecoverId, out: &mut String) {
+    let decl = ast.recover_decl(id);
+    out.push_str("recover ");
+    expr(ast, decl.body, out);
+    out.push_str(" else ");
+    if let Some((name, _)) = decl.error {
+        write!(out, "({}) ", ast.names().get(name)).unwrap();
+    }
+    expr(ast, decl.fallback, out);
+}
+
 /// Writes a context's declaration, `context NAME: TYPE = DEFAULT`.
 fn context_item(ast: &Ast, context: &crate::ast::ContextDecl, out: &mut String) {
     out.push_str("context ");
@@ -502,6 +514,13 @@ fn expr(ast: &Ast, id: ExprId, out: &mut String) {
         ExprKind::For(id) => for_shape(ast, id, out),
         ExprKind::Variant { of, name } => variant_expr(ast, (of, name), out),
         ExprKind::ContextRead(name) => write!(out, "^{}", ast.names().get(name)).unwrap(),
+        ExprKind::Assert { cond, message } => {
+            out.push_str("assert ");
+            expr(ast, cond, out);
+            out.push_str(", ");
+            expr(ast, message, out);
+        }
+        ExprKind::Recover(id) => recover_shape(ast, id, out),
         ExprKind::With { bindings, body } => with_shape(ast, (bindings, body), out),
         ExprKind::DefTypeRef(def) => {
             let (def_type, path) = ast.show_def_type(def);
@@ -7308,6 +7327,48 @@ fn contexts_reads_withs_and_context_parameters_parse() {
         (
             "fn f(^arch = \"x\"): String { arch }",
             "a context parameter's default is its context",
+        ),
+    ] {
+        assert_eq!(error(text).0, message, "{text}");
+    }
+}
+
+#[test]
+fn assertions_and_recovers_parse() {
+    assert_eq!(shape("assert x == 1"), "assert (x == 1), \"`x == 1`\"");
+    assert_eq!(
+        shape("assert ok, \"it failed\""),
+        "assert ok, \"it failed\""
+    );
+    assert_eq!(
+        shape("r = recover { f() } else { 0 }"),
+        "r = recover {f()} else {0}"
+    );
+    assert_eq!(
+        shape("r = recover { f() }\nelse (e) { e.message }"),
+        "r = recover {f()} else (e) {(e . message)}"
+    );
+    // `assert` and `recover` are names everywhere else.
+    assert_eq!(
+        shape("assert = 1\nrecover = 2\nr = recover"),
+        "assert = 1; recover = 2; r = recover"
+    );
+    for (text, message) in [
+        (
+            "r = recover { 1 } 2",
+            "expected `else` after the body of `recover`, found `2`",
+        ),
+        (
+            "r = recover { 1 } else (1) { 2 }",
+            "expected the failure's name after `(`, found `1`",
+        ),
+        (
+            "r = recover { 1 } else (e { 2 }",
+            "expected `)` after the failure's name, found `{`",
+        ),
+        (
+            "r = recover { 1 } else 2",
+            "expected `{` to start the fallback of `recover`, found `2`",
         ),
     ] {
         assert_eq!(error(text).0, message, "{text}");

@@ -841,14 +841,25 @@ fn the_result_must_be_the_last_item() {
     );
 }
 
-/// The parts of a `with` of the bindings `bindings` and the body `body`,
-/// as they are evaluated: each binding's value, then the body.
-fn with_parts(ast: &Ast, (bindings, body): (crate::ast::WithRange, ExprId)) -> Vec<ExprId> {
-    let values = ast
-        .with_bindings(bindings)
-        .iter()
-        .map(|binding| binding.value);
-    values.chain([body]).collect()
+/// The parts of the expression `id`, a `with`, an assertion or a
+/// `recover`, as they are evaluated: a `with`'s bindings' values and body,
+/// an assertion's condition and message, a `recover`'s body and fallback.
+fn parts_of(ast: &Ast, id: ExprId) -> Vec<ExprId> {
+    match ast.get(id).kind {
+        ExprKind::With { bindings, body } => {
+            let values = ast
+                .with_bindings(bindings)
+                .iter()
+                .map(|binding| binding.value);
+            values.chain([body]).collect()
+        }
+        ExprKind::Assert { cond, message } => vec![cond, message],
+        ExprKind::Recover(recover) => {
+            let decl = ast.recover_decl(recover);
+            vec![decl.body, decl.fallback]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Every `let` in `body` and the blocks nested in it, in the order their
@@ -891,8 +902,8 @@ fn visit_lets(ast: &Ast, id: ExprId, out: &mut Vec<ItemId>) {
             visit_lets(ast, lhs, out);
             visit_lets(ast, rhs, out);
         }
-        ExprKind::With { bindings, body } => {
-            for part in with_parts(ast, (bindings, body)) {
+        ExprKind::With { .. } | ExprKind::Assert { .. } | ExprKind::Recover(_) => {
+            for part in parts_of(ast, id) {
                 visit_lets(ast, part, out);
             }
         }

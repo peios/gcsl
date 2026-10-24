@@ -1123,6 +1123,34 @@ pub enum IrKind {
         /// The kind of the body, and of the node.
         kind: ValueKind,
     },
+    /// `assert COND, MESSAGE` (see [`crate::eval`], "Failure"): evaluates
+    /// `cond`, a `Bool` node, or, for a comparison, its operands, each once,
+    /// and compares them; if it is false, the runtime error "assertion
+    /// failed: MESSAGE", of `message`, a `String` node evaluated only then,
+    /// each operand of a comparison labelled with its value. Of kind
+    /// [`ValueKind::Record`], `{}`.
+    Assert {
+        /// The condition.
+        cond: IrId,
+        /// The message.
+        message: IrId,
+    },
+    /// `recover { BODY } else { FALLBACK }` (see [`crate::eval`],
+    /// "Failure"): evaluates `body`; if it fails, as `#[retry]` would retry,
+    /// evaluates `fallback` instead, with the failure the one an
+    /// [`IrKind::Failure`] reads. Of kind `kind`.
+    Recover {
+        /// The body.
+        body: IrId,
+        /// The fallback.
+        fallback: IrId,
+        /// The kind of both, and of the node.
+        kind: ValueKind,
+    },
+    /// The failure the innermost `recover` running its fallback caught, a
+    /// record `{message: String}` of the layout it names. Of kind
+    /// [`ValueKind::Record`].
+    Failure(LayoutId),
     /// One binding of an [`IrKind::With`], only ever one of its `binds`:
     /// the context of the declaration key `key`, bound to the value of
     /// `value`, a node of any kind.
@@ -1259,6 +1287,7 @@ impl IrKind {
             | IrKind::Top(..)
             | IrKind::LoadCallee
             | IrKind::Tag { .. }
+            | IrKind::Failure(_)
             | IrKind::Caller
             | IrKind::Helper
             | IrKind::Interp(_)
@@ -1336,6 +1365,8 @@ impl IrKind {
                 ..
             } => (None, [Some(lhs), Some(rhs), None]),
             IrKind::If { cond, then, else_ } => (None, [Some(cond), Some(then), Some(else_)]),
+            IrKind::Assert { cond, message } => (None, [Some(cond), Some(message), None]),
+            IrKind::Recover { body, fallback, .. } => (None, [Some(body), Some(fallback), None]),
             IrKind::Block { result, .. } => (None, [Some(result), None, None]),
             IrKind::Call { callee, .. } => (Some(callee), NONE),
         }
@@ -1433,6 +1464,8 @@ impl IrKind {
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. }
+            | IrKind::Assert { .. }
+            | IrKind::Failure(_)
             | IrKind::Helper
             | IrKind::For { collect: false, .. }
             | IrKind::Loop { collect: false, .. } => KindStep::Own(ValueKind::Record),
@@ -1450,6 +1483,7 @@ impl IrKind {
             | IrKind::As { kind, .. }
             | IrKind::Catch { kind, .. }
             | IrKind::ContextRead { kind, .. }
+            | IrKind::Recover { kind, .. }
             | IrKind::With { kind, .. }
             | IrKind::Top(_, kind) => KindStep::Own(kind),
             IrKind::MakeClosure { .. }
@@ -1509,6 +1543,9 @@ impl IrKind {
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Assert { .. }
+            | IrKind::Recover { .. }
+            | IrKind::Failure(_)
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::ContextBind { .. }
@@ -1621,6 +1658,9 @@ impl IrKind {
             IrKind::LoadCallee => "load-callee",
             IrKind::Tag { .. } => "tag",
             IrKind::ContextRead { .. } => "context-read",
+            IrKind::Assert { .. } => "assert",
+            IrKind::Recover { .. } => "recover",
+            IrKind::Failure(_) => "failure",
             IrKind::With { .. } => "with",
             IrKind::ContextBind { .. } => "context-bind",
             IrKind::Caller => "caller",
@@ -1716,6 +1756,9 @@ impl IrNode {
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Assert { .. }
+            | IrKind::Recover { .. }
+            | IrKind::Failure(_)
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::ContextBind { .. }

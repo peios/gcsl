@@ -424,6 +424,33 @@ impl fmt::Display for FnId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ForId(u32);
 
+/// Index of a `recover` expression's details in the recover arena of the
+/// [`Ast`] that allocated it (see [`Ast::recover_decl`]); later stages
+/// index their per-`recover` tables by it too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RecoverId(u32);
+
+impl RecoverId {
+    /// The id as an index into the arena and into side tables.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// A `recover` expression, `recover { BODY } else (NAME) { FALLBACK }` (see
+/// the parser's [Failure](crate::parser#failure)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoverDecl {
+    /// The body, a block.
+    pub body: ExprId,
+    /// The name the failure is bound to in the fallback, and where it is
+    /// written, if one is.
+    pub error: Option<(Name, Span)>,
+    /// The fallback, a block.
+    pub fallback: ExprId,
+}
+
 impl ForId {
     /// The `for` numbered `number`. Ids are normally assigned by the
     /// parser; this is for tests.
@@ -1623,6 +1650,18 @@ pub enum ExprKind {
     /// definition and its own arguments (see [Def-types](#def-types)). Its
     /// details are in the def-type arena (see [`Ast::def_type`]).
     DefTypeRef(DefTypeId),
+    /// `assert COND` or `assert COND, MESSAGE`, a statement of type `{}`
+    /// (see the parser's [Failure](crate::parser#failure)).
+    Assert {
+        /// The condition.
+        cond: ExprId,
+        /// The message: the one written, or else a string literal written
+        /// nowhere of the condition as it is written, in backticks.
+        message: ExprId,
+    },
+    /// `recover { BODY } else { FALLBACK }`, its details in the recover
+    /// arena (see [`Ast::recover_decl`]).
+    Recover(RecoverId),
     /// A read of a context, `^NAME`, as in `^arch` (see the parser's
     /// [Context](crate::parser#context)). The name ends the expression's
     /// span.
@@ -1731,6 +1770,8 @@ impl Expr {
             | ExprKind::DefTypeRef(_)
             | ExprKind::ContextRead(_)
             | ExprKind::With { .. }
+            | ExprKind::Assert { .. }
+            | ExprKind::Recover(_)
             | ExprKind::Error
             | ExprKind::NoField(_)
             | ExprKind::Unclosed { .. } => None,
@@ -3086,6 +3127,7 @@ pub struct AstBuilder {
     with_bindings: Vec<WithBinding>,
     elements: Vec<Element>,
     fors: Vec<ForDecl>,
+    recovers: Vec<RecoverDecl>,
     labels: Vec<Label>,
     imports: Vec<ImportDecl>,
     import_members: Vec<ImportMember>,
@@ -3224,6 +3266,7 @@ pub struct BuilderMark {
     with_bindings: usize,
     elements: usize,
     fors: usize,
+    recovers: usize,
     labels: usize,
     imports: usize,
     import_members: usize,
@@ -3352,6 +3395,14 @@ impl AstBuilder {
     pub fn push_fn(&mut self, decl: FnDecl) -> FnId {
         let id = FnId(next_id(self.fns.len()));
         self.fns.push(decl);
+        id
+    }
+
+    /// Adds the `recover` expression `decl` to the recover arena and
+    /// returns its id, which its [`ExprKind::Recover`] node then carries.
+    pub fn push_recover(&mut self, decl: RecoverDecl) -> RecoverId {
+        let id = RecoverId(next_id(self.recovers.len()));
+        self.recovers.push(decl);
         id
     }
 
@@ -3552,6 +3603,7 @@ impl AstBuilder {
             with_bindings: self.with_bindings.len(),
             elements: self.elements.len(),
             fors: self.fors.len(),
+            recovers: self.recovers.len(),
             labels: self.labels.len(),
             imports: self.imports.len(),
             import_members: self.import_members.len(),
@@ -3579,6 +3631,7 @@ impl AstBuilder {
         self.with_bindings.truncate(mark.with_bindings);
         self.elements.truncate(mark.elements);
         self.fors.truncate(mark.fors);
+        self.recovers.truncate(mark.recovers);
         self.labels.truncate(mark.labels);
         self.imports.truncate(mark.imports);
         self.import_members.truncate(mark.import_members);
@@ -3660,6 +3713,7 @@ impl AstBuilder {
             with_bindings: self.with_bindings,
             elements: self.elements,
             fors: self.fors,
+            recovers: self.recovers,
             labels: self.labels,
             imports: self.imports,
             import_members: self.import_members,
@@ -3698,6 +3752,7 @@ pub struct Ast {
     with_bindings: Vec<WithBinding>,
     elements: Vec<Element>,
     fors: Vec<ForDecl>,
+    recovers: Vec<RecoverDecl>,
     labels: Vec<Label>,
     imports: Vec<ImportDecl>,
     import_members: Vec<ImportMember>,
@@ -4034,6 +4089,23 @@ impl Ast {
     #[must_use]
     pub fn for_count(&self) -> usize {
         self.fors.len()
+    }
+
+    /// Returns the `recover` expression `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this tree.
+    #[must_use]
+    pub fn recover_decl(&self, id: RecoverId) -> &RecoverDecl {
+        &self.recovers[id.index()]
+    }
+
+    /// The number of `recover` expressions in the tree, which bounds every
+    /// [`RecoverId`] in it.
+    #[must_use]
+    pub fn recover_count(&self) -> usize {
+        self.recovers.len()
     }
 
     /// Returns the import item `id`.
@@ -4795,7 +4867,7 @@ impl Ast {
                     Some(first) => first,
                     None => return node,
                 },
-                ExprKind::If { cond, .. } => cond,
+                ExprKind::If { cond, .. } | ExprKind::Assert { cond, .. } => cond,
                 ExprKind::Unary { operand, .. } => operand,
                 ExprKind::Binary { lhs, .. } => lhs,
                 ExprKind::List(elements) => match self.elements(elements).first() {
@@ -4823,6 +4895,7 @@ impl Ast {
                 }
                 ExprKind::Lazy(function) => self.fn_decl(function).body,
                 ExprKind::DefTypeRef(def) => self.def_type(def).dt,
+                ExprKind::Recover(id) => self.recover_decl(id).body,
                 ExprKind::Call { callee, .. } | ExprKind::Unclosed { callee, .. } => callee,
                 ExprKind::For(id) => {
                     let decl = self.for_decl(id);
@@ -5794,6 +5867,11 @@ impl<A: Annotate> Pretty<'_, A> {
             }
             ExprKind::ContextRead(name) => write!(f, "context ^{}", self.ast.names().get(name)),
             ExprKind::With { .. } => f.write_str("with"),
+            ExprKind::Assert { .. } => f.write_str("assert"),
+            ExprKind::Recover(id) => match self.ast.recover_decl(id).error {
+                Some((name, _)) => write!(f, "recover ({})", self.ast.names().get(name)),
+                None => f.write_str("recover"),
+            },
             ExprKind::Error => f.write_str("error"),
             ExprKind::NoField(_) => f.write_str(". <missing>"),
             ExprKind::Unclosed { .. } => f.write_str("unclosed call"),
@@ -5937,6 +6015,19 @@ impl<A: Annotate> Pretty<'_, A> {
                 self.node(f, operand, depth + 1)?;
             }
             ExprKind::With { bindings, body } => self.with_parts(f, (bindings, body), depth + 1)?,
+            ExprKind::Assert { cond, message } => {
+                for part in [cond, message] {
+                    f.write_str("\n")?;
+                    self.node(f, part, depth + 1)?;
+                }
+            }
+            ExprKind::Recover(id) => {
+                let decl = self.ast.recover_decl(id);
+                for part in [decl.body, decl.fallback] {
+                    f.write_str("\n")?;
+                    self.node(f, part, depth + 1)?;
+                }
+            }
             ExprKind::Binary { lhs, rhs, .. }
             | ExprKind::Index {
                 expr: lhs,

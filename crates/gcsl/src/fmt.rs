@@ -1293,6 +1293,17 @@ mod tests {
     }
 
     #[test]
+    fn assertions_and_recovers_are_spaced_as_statements_and_blocks() {
+        check(&[
+            ("assert  x == 1 ,  \"why\"\n", "assert x == 1, \"why\"\n"),
+            (
+                "r = recover {  f() }  else  ( e ) { e.message }\n",
+                "r = recover { f() } else (e) { e.message }\n",
+            ),
+        ]);
+    }
+
+    #[test]
     fn a_context_s_caret_is_glued_to_its_name() {
         check(&[
             (

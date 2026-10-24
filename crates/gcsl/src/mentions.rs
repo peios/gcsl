@@ -1865,6 +1865,21 @@ impl Walker<'_> {
                     self.name(binding, ast.get(id).span);
                 }
             }
+            ExprKind::Assert { cond, message } => {
+                self.expr(cond);
+                self.expr(message);
+            }
+            // The failure's name is the fallback's.
+            ExprKind::Recover(id) => {
+                let decl = *ast.recover_decl(id);
+                self.expr(decl.body);
+                let depth = self.shadows.len();
+                if let Some((name, _)) = decl.error {
+                    self.shadows.push(name);
+                }
+                self.expr(decl.fallback);
+                self.shadows.truncate(depth);
+            }
             // The bindings' values are read where the `with` is; their
             // names are contexts', of no scope.
             ExprKind::With { bindings, body } => {

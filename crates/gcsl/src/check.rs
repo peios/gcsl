@@ -1511,6 +1511,21 @@
 //! Each read and `with` is recorded for lowering by its declarations' keys
 //! ([`Resolution::context_read`], [`Resolution::with_keys`]).
 //!
+//! # Failure
+//!
+//! `assert COND, MESSAGE` (see the parser's
+//! [Failure](crate::parser#failure)) is `{}`: its condition must be a
+//! `Bool`, "an assertion's condition is a Bool", and its message a
+//! `String` (`Checker::check_assert`). `recover { BODY } else (e) {
+//! FALLBACK }` (`Checker::check_recover`) checks its body, then its
+//! fallback in a scope of its own, where the failure, if it is named, is a
+//! variable of type `{message: String}` in a slot of its own, recorded for
+//! lowering ([`Resolution::recover_slot`]); its type is the join of the
+//! two, as an `if`'s branches', warned of as theirs are when it widens to
+//! a union, "the branches of this `recover` have different types". Its
+//! effect is its blocks': a `recover` catches a failure, it does nothing
+//! of its own.
+//!
 //! # Attributes
 //!
 //! An attribute says how to run a function, for the host that runs it or
@@ -3238,9 +3253,9 @@ use crate::ast::{
     Annotate, Arg, ArgKind, ArgRange, Ast, AttributeId, AttributeUse, BinaryOp, DefTypeId,
     DefTypeRole, Effect, Element, ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy,
     FieldTyKind, FieldTyRange, FnDecl, FnId, ForHead, ForId, GenericOwner, Item, ItemId, ItemKind,
-    ItemRange, Jump, Label, LabelId, MetaTy, Param, PartRange, PathRange, PathSegment, SegmentKind,
-    StrPart, Syntax, TypeArgRange, TypeExprId, TypeExprKind, TypeProblem, UnaryOp, WithRange,
-    path_span, symbol_span,
+    ItemRange, Jump, Label, LabelId, MetaTy, Param, PartRange, PathRange, PathSegment, RecoverId,
+    SegmentKind, StrPart, Syntax, TypeArgRange, TypeExprId, TypeExprKind, TypeProblem, UnaryOp,
+    WithRange, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::mentions::{self, FieldLeaf, FieldTree, Mentions, Need, Resolve, Schedule};
@@ -4194,6 +4209,9 @@ struct ForLowering {
     /// Each `with`, by its id, with the key of the declaration of each
     /// binding's context, in order (see [Context](#context)).
     withs: HashMap<ExprId, Box<[Name]>>,
+    /// The slot each `recover` whose fallback names its failure stores the
+    /// failure in (see [Failure](#failure)).
+    recover_slots: HashMap<RecoverId, Slot>,
     /// The attributes of each function item that has any, by its function,
     /// in source order (see [Attributes](#attributes)).
     fn_attributes: HashMap<FnId, Box<[Attribute]>>,
@@ -4601,6 +4619,10 @@ pub struct Resolution {
     lowered: ForLowering,
 }
 
+/// The field of a `recover`'s failure, `{message: String}` (see
+/// [Failure](#failure)).
+pub(crate) const FAILURE_MESSAGE: &str = "message";
+
 /// What a `break`, `continue` or `return` item is for (see
 /// [`Resolution::target`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -4701,6 +4723,13 @@ impl Resolution {
     #[must_use]
     pub fn context_read(&self, id: ExprId) -> Option<Name> {
         self.lowered.context_reads.get(&id).copied()
+    }
+
+    /// The slot the `recover` `id` stores its failure in for its fallback,
+    /// if the fallback names it (see [Failure](#failure)).
+    #[must_use]
+    pub fn recover_slot(&self, id: RecoverId) -> Option<Slot> {
+        self.lowered.recover_slots.get(&id).copied()
     }
 
     /// The keys of the declarations of the contexts the `with` `id` binds,
@@ -15211,6 +15240,8 @@ impl<'a> Checker<'a> {
             ExprKind::Variant { of, name } => self.check_variant(id, (of, name)),
             ExprKind::ContextRead(name) => self.check_context_read(id, name),
             ExprKind::With { bindings, body } => self.check_with(id, bindings, body),
+            ExprKind::Assert { cond, message } => self.check_assert(id, cond, message),
+            ExprKind::Recover(recover) => self.check_recover(recover),
             ExprKind::Size(_) => TyId::SIZE,
             ExprKind::Bool(_) => TyId::BOOL,
             ExprKind::Str(_) => TyId::STRING,
@@ -17217,6 +17248,59 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+    }
+
+    /// Types `id`, `assert COND` or `assert COND, MESSAGE` (see
+    /// [Failure](#failure)): the condition a `Bool`, the message a `String`;
+    /// the statement `{}`.
+    fn check_assert(&mut self, id: ExprId, cond: ExprId, message: ExprId) -> TyId {
+        let keyword = Span::new(self.ast.get(id).span.start, self.ast.get(id).span.start + 6);
+        let cond_ty = self.check_expr(cond);
+        self.expect(
+            cond,
+            cond_ty,
+            TyId::BOOL,
+            keyword,
+            "an assertion's condition is a Bool",
+        );
+        let ty = self.check_expr(message);
+        self.expect(
+            message,
+            ty,
+            TyId::STRING,
+            keyword,
+            "an assertion's message is a String",
+        );
+        if cond_ty == TyId::ERROR {
+            TyId::ERROR
+        } else {
+            TyId::EMPTY
+        }
+    }
+
+    /// Types `id`, the `recover` expression `recover` (see
+    /// [Failure](#failure)): its body, then its fallback, in a scope where
+    /// the failure, if it is named, is a variable of type `{message:
+    /// String}` in a slot of its own, recorded for lowering. Its type is
+    /// the join of the body's and the fallback's, as an `if`'s branches'.
+    fn check_recover(&mut self, recover: RecoverId) -> TyId {
+        let decl = *self.ast.recover_decl(recover);
+        let body = self.check_expr(decl.body);
+        let outer = (self.block_start, self.next_slot);
+        self.block_start = self.bindings.len();
+        if let Some((name, span)) = decl.error {
+            // Interned by the parser for a named failure.
+            let message = self.ast.names().lookup(FAILURE_MESSAGE);
+            let failure = message.map_or(TyId::ERROR, |message| {
+                self.types.record([(message, TyId::STRING)])
+            });
+            let slot = self.declare_binding(name, failure, Some(span), BindingKind::Variable);
+            self.lowering.recover_slots.insert(recover, slot);
+        }
+        let fallback = self.check_expr(decl.fallback);
+        self.bindings.truncate(self.block_start);
+        (self.block_start, self.next_slot) = outer;
+        self.branches((decl.body, body), (decl.fallback, fallback), "`recover`")
     }
 
     /// The context named `name` that the input sees, read or bound at `span`
@@ -19417,7 +19501,7 @@ impl<'a> Checker<'a> {
             return self.never;
         }
         if has_else {
-            self.branches((then, then_ty), (else_, else_ty))
+            self.branches((then, then_ty), (else_, else_ty), "`if`")
         } else {
             self.empty_branch(keyword, then, then_ty)
         }
@@ -20376,6 +20460,7 @@ impl<'a> Checker<'a> {
         &mut self,
         (then, then_ty): (ExprId, TyId),
         (else_, else_ty): (ExprId, TyId),
+        what: &str,
     ) -> TyId {
         if then_ty == else_ty {
             return then_ty;
@@ -20385,33 +20470,34 @@ impl<'a> Checker<'a> {
         let else_ty = self.adapt_to(else_, else_ty, then_ty);
         let (joined, widened) = self.types.join(then_ty, else_ty);
         if widened {
-            self.branches_widened((then, then_ty), (else_, else_ty), joined);
+            self.branches_widened((then, then_ty), (else_, else_ty), (joined, what));
         }
         joined
     }
 
-    /// Warns that the branches of an `if`, `then` and `else_`, of types
-    /// `then_ty` and `else_ty`, have different types, which `joined`, the
-    /// `if`'s type, widened to a union of: at the `else` branch's value
-    /// (see [`Checker::branch_value`]), labelled with its type, with a label
-    /// of the other branch's on its value, and a note naming the union.
+    /// Warns that the branches of an `if`, or a `recover`'s body and
+    /// fallback, `what` it is, `then` and `else_`, of types `then_ty` and
+    /// `else_ty`, have different types, which `joined`, its type, widened
+    /// to a union of: at the `else` branch's value (see
+    /// [`Checker::branch_value`]), labelled with its type, with a label of
+    /// the other branch's on its value, and a note naming the union.
     fn branches_widened(
         &mut self,
         (then, then_ty): (ExprId, TyId),
         (else_, else_ty): (ExprId, TyId),
-        joined: TyId,
+        (joined, what): (TyId, &str),
     ) {
         let then_label = format!("this is {}", self.in_label(then_ty));
         let else_label = format!("this is {}", self.in_label(else_ty));
         let note = format!(
-            "the `if` is {}; annotate it with that type if both are meant, or tell them apart \
+            "the {what} is {}; annotate it with that type if both are meant, or tell them apart \
              with `is`",
             self.in_message(joined)
         );
         let (then_at, else_at) = (self.branch_value(then), self.branch_value(else_));
         self.warnings.push(
             Diagnostic::warning(
-                "the branches of this `if` have different types",
+                format!("the branches of this {what} have different types"),
                 self.ast.get(else_at).span,
             )
             .with_label(else_label)
@@ -22107,8 +22193,8 @@ impl<'a> Checker<'a> {
     /// error).
     ///
     /// Only integer literals, parentheses, negation, `await` of a present
-    /// value, `+ - *`, blocks, `with`s and `if`s with `else` can be
-    /// untyped, and an
+    /// value, `+ - *`, blocks, `with`s, `recover`s and `if`s with `else`
+    /// can be untyped, and an
     /// untyped node's children
     /// (an `if`'s branches, not its condition) are untyped or concrete of
     /// the same kind, so the walk only ever meets those nodes. Every other
@@ -22141,6 +22227,7 @@ impl<'a> Checker<'a> {
             | ExprKind::For(_)
             | ExprKind::DefTypeRef(_)
             | ExprKind::ContextRead(_)
+            | ExprKind::Assert { .. }
             | ExprKind::Error
             | ExprKind::NoField(_)
             | ExprKind::Unclosed { .. } => {}
@@ -22150,6 +22237,11 @@ impl<'a> Checker<'a> {
             | ExprKind::Unary { operand: inner, .. }
             | ExprKind::With { body: inner, .. } => {
                 self.coerce(inner, ty);
+            }
+            ExprKind::Recover(id) => {
+                let decl = *self.ast.recover_decl(id);
+                self.coerce(decl.body, ty);
+                self.coerce(decl.fallback, ty);
             }
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.coerce(lhs, ty);
