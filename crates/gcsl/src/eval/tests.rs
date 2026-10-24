@@ -1,4 +1,7 @@
 use super::*;
+use super::memo::{MIN_SWEEP_THRESHOLD, key_hash};
+use std::fs;
+use std::path::{Path, PathBuf};
 use crate::check::check;
 use crate::lexer::tokenize;
 use crate::lower::lower;
