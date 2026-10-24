@@ -62,6 +62,21 @@ fn a_parameter_s_default_needs_what_it_reads_at_the_call() {
         ),
         "[\"given\", \"bound\"]"
     );
+    // A call inside a function needs it of that function, unless a `with`
+    // there binds it.
+    assert_eq!(
+        value_of(
+            "fn f(^arch): String { arch }\n\
+             fn g(): String { f() }\n\
+             fn h(): String { f() with { arch = \"in\" } }\n\
+             = [g() with { arch = \"a\" }, h()]"
+        ),
+        "[\"a\", \"in\"]"
+    );
+    assert_eq!(
+        value_of("fn f(^arch): String { arch }\nfn g(): String { f() }\n= g"),
+        "fn(^arch): String"
+    );
     let (message, notes) = error_of("fn f(^arch): String { arch }\nx = f()");
     assert_eq!(message, "context `arch` has no value here");
     assert_eq!(
@@ -273,6 +288,13 @@ fn a_definition_cannot_need_a_context() {
             "its def-type calls a definition with no context bound: bind it with a `with` inside \
           the definition, or give the context a default"
         ]
+    );
+    // One cause is one error: `arch`, not that and `arch | target` too.
+    let both = "context target: String = ^arch\n\
+                def package p() { v = \"{^arch}{^target}\" }";
+    assert_eq!(
+        error_of(&format!("{def_type}{both}")).0,
+        "context `arch` has no value in this definition"
     );
     // Bound inside, it needs nothing.
     let bound = value_of(&format!(

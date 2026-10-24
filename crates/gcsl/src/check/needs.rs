@@ -34,7 +34,9 @@
 //! when its body is checked (`Checker::check_fn`); a default function's are
 //! its parameter's. With no function around it, a read or a call is at the
 //! top level, where an uncovered need is "context `arch` has no value here",
-//! noted with what needs it ([`NeedWhy`]). A definition's type is its
+//! noted with what needs it ([`NeedWhy`]); of the needs one read or call
+//! leaves unmet, only those no other implies are reported (`strongest`), so
+//! that one cause is one error. A definition's type is its
 //! def-type's exactly, so one that needs a context its def-type's function
 //! type does not is "context `arch` has no value in this definition".
 //!
@@ -72,6 +74,22 @@ pub(super) enum NeedWhy {
     Call(Option<Name>),
     /// The defaults of the parameters a call leaves out.
     Defaults,
+}
+
+/// Of `items`, each with a need that `need_of` gives, those whose need no
+/// other's implies, in order: so that one cause is one error, `arch`'s, not
+/// that and `arch | target`'s too.
+fn strongest<T>(items: &[T], need_of: impl Fn(&T) -> &Need) -> Vec<&T> {
+    items
+        .iter()
+        .filter(|item| {
+            let need = need_of(item);
+            !items.iter().any(|other| {
+                let other = need_of(other);
+                other != need && implies(other, need)
+            })
+        })
+        .collect()
 }
 
 /// What a [`MemberUse`] uses.
@@ -183,8 +201,8 @@ impl Checker<'_> {
             }
             return;
         }
-        for need in unmet {
-            let error = self.no_value_here(&need, span, why);
+        for need in strongest(&unmet, |need| need) {
+            let error = self.no_value_here(need, span, why);
             self.errors.push(error);
         }
     }
@@ -239,10 +257,12 @@ impl Checker<'_> {
     /// def-type's function type's: "context `arch` has no value in this
     /// definition" (see [Needs](#needs)).
     pub(super) fn definition_needs(&mut self, needs: &[(Need, Span)], allowed: &[Need]) {
-        for (need, span) in needs {
-            if allowed.iter().any(|allowed| implies(allowed, need)) {
-                continue;
-            }
+        let unmet: Vec<(Need, Span)> = needs
+            .iter()
+            .filter(|(need, _)| !allowed.iter().any(|allowed| implies(allowed, need)))
+            .cloned()
+            .collect();
+        for (need, span) in strongest(&unmet, |(need, _)| need) {
             let (text, span) = (self.context_text(need), *span);
             let error = Diagnostic::error(
                 format!("context `{text}` has no value in this definition"),
@@ -469,10 +489,12 @@ impl Checker<'_> {
     /// Reports each of `needs`, what the function `used` uses needs, that
     /// `used`, a use typed before they were known, does not cover.
     fn check_early_use(&mut self, used: &MemberUse, needs: &[Need]) {
-        for need in needs {
-            if used.call && met(need, &used.covered) {
-                continue;
-            }
+        let unmet: Vec<Need> = needs
+            .iter()
+            .filter(|need| !(used.call && met(need, &used.covered)))
+            .cloned()
+            .collect();
+        for need in strongest(&unmet, |need| need) {
             let error = self.undetermined_need(used, need);
             self.errors.push(error);
         }
