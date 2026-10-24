@@ -55,8 +55,28 @@
 //! "`../x` is outside the directory", and a file at the directory itself,
 //! or a copy that fails, are errors too, each naming `fs.compose_dir`.
 
+//! # Fetching
+//!
+//! `fetch(url, sha256)`, the built-in `fetch` (`fetch`), downloads the file
+//! at `url` into a new temporary directory of the run, named by the last
+//! segment of the URL's path, `download` if it has none, and checks it
+//! against `sha256`, the SHA-256 digest of its contents in hex, any case:
+//! the same digest is the same bytes, so the file is fixed wherever and
+//! whenever it is fetched. It runs `curl` to download and `sha256sum` to
+//! hash, through the run's [`Effects`] as any program, so GCSL itself needs
+//! no network or hashing of its own. A pin that is no digest, 64 hex digits,
+//! is an error before anything is downloaded; a file whose digest is not
+//! the pin is "`fetch` of `URL` gave a file whose sha256 is `FOUND`, not
+//! `PIN`", the file behind the URL having changed, which never builds from
+//! it; and `sha256 = ""`, the default, downloads only to fail with the
+//! digest it found, "`fetch` of `URL` is not pinned: its sha256 is `FOUND`",
+//! for the author to pin it. A host that keeps files by their digests, as
+//! pekit does, answers a call itself, from its store when it holds the
+//! digest, so that a pinned file is downloaded once.
+
 use std::collections::HashSet;
 use std::fs;
+use std::process::Command;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -419,4 +439,103 @@ pub(super) fn read_file(file: &File, effects: &dyn Effects, node: &IrNode) -> Fl
                 .into(),
         ),
     }
+}
+
+/// The SHA-256 digest a pin names, in lower case, or `None` if it is no
+/// digest, 64 hex digits; `Some("")` for no pin.
+fn pin_of(sha256: &str) -> Option<String> {
+    let pin = sha256.trim().to_ascii_lowercase();
+    let digest = pin.len() == 64 && pin.bytes().all(|byte| byte.is_ascii_hexdigit());
+    (pin.is_empty() || digest).then_some(pin)
+}
+
+/// The name a file fetched from `url` is given: the last segment of its
+/// path, its query and fragment left off, or `download` for none.
+#[must_use]
+pub fn fetched_name(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let path = path.split_once("://").map_or(path, |(_, rest)| rest);
+    let last = path.rsplit('/').next().unwrap_or("");
+    let host_only = !path.contains('/');
+    if last.is_empty() || host_only || last == "." || last == ".." {
+        "download".to_owned()
+    } else {
+        last.to_owned()
+    }
+}
+
+/// Runs `command` through `effects`: its standard output, or why it could
+/// not run or did not succeed.
+fn run_through(effects: &dyn Effects, command: Command) -> Result<String, String> {
+    let output = effects
+        .command(command)?
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+/// Applies `fetch`, for the call `node`, to `url` and `sha256` (see
+/// [Fetching](#fetching)): the downloaded file, which has that digest.
+pub(super) fn fetch(url: &str, sha256: &str, effects: &dyn Effects, node: &IrNode) -> Flow<Value> {
+    let fail = |message: String| Err(Diagnostic::error(message, node.span).into());
+    let Some(pin) = pin_of(sha256) else {
+        return fail(format!(
+            "`fetch` of `{url}` is pinned by `{sha256}`, which is no SHA-256 digest: 64 \
+             hexadecimal digits"
+        ));
+    };
+    let Some(made) = effects.temp_dir() else {
+        return mistyped(node, "`fetch` called in a run without an owner");
+    };
+    let path = match made {
+        Ok(dir) => format!("{dir}/{}", fetched_name(url)),
+        Err(reason) => {
+            return fail(format!(
+                "`fetch` could not create a temporary directory: {reason}"
+            ));
+        }
+    };
+    let host = match effects.host_path(&path) {
+        Ok(host) => host,
+        Err(reason) => return fail(format!("`fetch` cannot use `{path}`: {reason}")),
+    };
+    let mut curl = Command::new("curl");
+    curl.args(["--fail", "--silent", "--show-error", "--location"])
+        .args(["--retry", "2", "--output"])
+        .arg(&host)
+        .arg(url);
+    if let Err(reason) = run_through(effects, curl) {
+        return fail(format!("`fetch` could not download `{url}`: {reason}"));
+    }
+    let mut sum = Command::new("sha256sum");
+    sum.arg(&host);
+    let found = match run_through(effects, sum) {
+        Ok(listed) => listed
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        Err(reason) => return fail(format!("`fetch` could not hash `{url}`: {reason}")),
+    };
+    if pin.is_empty() {
+        return Err(Diagnostic::error(
+            format!("`fetch` of `{url}` is not pinned: its sha256 is `{found}`"),
+            node.span,
+        )
+        .with_note(format!("pin it: `fetch(\"{url}\", sha256 = \"{found}\")`"))
+        .into());
+    }
+    if found != pin {
+        return Err(Diagnostic::error(
+            format!("`fetch` of `{url}` gave a file whose sha256 is `{found}`, not `{pin}`"),
+            node.span,
+        )
+        .with_note("the file behind the URL is not the one pinned, so nothing is built from it")
+        .into());
+    }
+    Ok(entry(false, Rc::from(path)))
 }

@@ -1,6 +1,7 @@
 //! Tests of workspaces: `File`, `file(path)` and its methods.
 
 use super::*;
+use crate::workspace::tests::fs::fs_scratch;
 use crate::workspace::tests::shell::lone_error;
 use crate::workspace::tests::standard::lone;
 
@@ -441,4 +442,89 @@ fn a_sandbox_s_commands_are_killed_whole_and_its_paths_stay_inside() {
         error.message,
         "cannot show a sandbox: it is a live directory, not data"
     );
+}
+
+/// The SHA-256 digest of `hello\n`.
+const HELLO_SHA256: &str = "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03";
+
+/// A `file://` URL of a new file holding `hello\n`, or `None` where
+/// `curl` cannot run, which `fetch` needs.
+fn hello_url(name: &str) -> Option<String> {
+    let has_curl = std::process::Command::new("curl")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !has_curl {
+        return None;
+    }
+    let dir = fs_scratch(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = format!("{dir}/hello.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+    Some(format!("file://{path}"))
+}
+
+#[test]
+fn a_pinned_fetch_gives_the_file_it_names() {
+    let Some(url) = hello_url("fetch-pinned") else {
+        return;
+    };
+    let text = format!(
+        "let f = fetch(\"{url}\", sha256 = \"{}\")\n= [f.read(), f.path.ends_with(\"/hello.txt\")]",
+        HELLO_SHA256.to_ascii_uppercase()
+    );
+    assert_eq!(lone(&text).unwrap(), "[\"hello\\n\", true]");
+}
+
+#[test]
+fn a_fetch_that_is_not_what_was_pinned_fails_with_what_it_is() {
+    let Some(url) = hello_url("fetch-unpinned") else {
+        return;
+    };
+    let unpinned = lone_error(&format!("x = fetch(\"{url}\")"));
+    assert_eq!(
+        unpinned.message,
+        format!("`fetch` of `{url}` is not pinned: its sha256 is `{HELLO_SHA256}`")
+    );
+    assert_eq!(
+        unpinned.notes,
+        [format!(
+            "pin it: `fetch(\"{url}\", sha256 = \"{HELLO_SHA256}\")`"
+        )]
+    );
+    let other = "0".repeat(64);
+    let changed = lone_error(&format!("x = fetch(\"{url}\", sha256 = \"{other}\")"));
+    assert_eq!(
+        changed.message,
+        format!("`fetch` of `{url}` gave a file whose sha256 is `{HELLO_SHA256}`, not `{other}`")
+    );
+    let bad = lone_error(&format!("x = fetch(\"{url}\", sha256 = \"abc\")"));
+    assert!(
+        bad.message
+            .ends_with("which is no SHA-256 digest: 64 hexadecimal digits")
+    );
+    let missing = lone_error("x = fetch(\"file:///nonexistent/pekit-nothing\", sha256 = \"\")");
+    assert!(
+        missing
+            .message
+            .starts_with("`fetch` could not download `file:///nonexistent/pekit-nothing`"),
+        "{}",
+        missing.message
+    );
+}
+
+#[test]
+fn a_fetched_file_is_named_by_its_url_s_last_segment() {
+    use crate::eval::fetched_name;
+    assert_eq!(
+        fetched_name("https://zlib.net/fossils/zlib-1.3.1.tar.gz"),
+        "zlib-1.3.1.tar.gz"
+    );
+    assert_eq!(
+        fetched_name("https://x.org/a/b.tar.xz?mirror=1#top"),
+        "b.tar.xz"
+    );
+    assert_eq!(fetched_name("https://x.org/"), "download");
+    assert_eq!(fetched_name("https://x.org"), "download");
+    assert_eq!(fetched_name("https://x.org/a/.."), "download");
 }

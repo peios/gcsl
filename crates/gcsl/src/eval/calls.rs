@@ -313,7 +313,7 @@ use super::{
 use super::builtins::{enum_builtin, secret_builtin};
 use super::kinds::{as_function, float_to_int, into_callee, mixed};
 use super::elements::element_builtin;
-use super::files::{dir_files, inside, make_file, read_file};
+use super::files::{dir_files, fetch, inside, make_file, read_file};
 use super::graph::effect_builtin;
 use super::sandbox::{sandbox_entry, sandbox_exec};
 use super::system::{exec, file_system, write_file};
@@ -401,6 +401,9 @@ impl Evaluator<'_> {
             }
             (Builtin::FileRead, Value::File(file), None) => {
                 read_file(&file, self.shared.effects, node)
+            }
+            (Builtin::Fetch, Value::Str(url), Some(Value::Str(sha256))) => {
+                fetch(&url, &sha256, self.shared.effects, node)
             }
             (Builtin::DirFiles, Value::Dir(dir), None) => {
                 dir_files(&dir, self.shared.effects, node)

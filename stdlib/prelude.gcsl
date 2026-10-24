@@ -192,6 +192,16 @@ type FileSet = List<File>
 
 file = builtins.file
 
+# `fetch(url, sha256)` downloads the file at `url`, which must have the
+# SHA-256 digest `sha256`, so that it is the same file wherever and whenever
+# it is fetched; without one it fails with the digest it found, to pin it
+# with. A build tool keeps fetched files by their digests, and fetches each
+# once. It fails at its call: it is `#[track_caller]`.
+#[track_caller]
+def fetch(url: String, sha256: String = "") -> File {
+    builtins.fetch(url, sha256)
+}
+
 #[track_caller]
 def (f: File) read() -> String {
     builtins.file_read(f)

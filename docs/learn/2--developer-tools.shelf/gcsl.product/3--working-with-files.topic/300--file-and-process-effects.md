@@ -146,6 +146,27 @@ are; a build tool can also compare their contents. When GCSL runs a program
 under a build tool, the tool chooses the working directory, so `file()`
 and `exec` agree there too.
 
+## Fetching
+
+`fetch(url, sha256)` downloads a file and checks it against a SHA-256
+digest, so it's the same file wherever and whenever it's fetched:
+
+```text
+let zlib = fetch(
+    "https://zlib.net/fossils/zlib-1.3.1.tar.gz",
+    sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+)
+```
+
+If the file behind the URL changes, its digest doesn't match the pin, and
+`fetch` fails rather than give you different bytes. To find the digest in
+the first place, leave it out: `fetch` downloads the file and fails with
+the digest it found, ready to paste in.
+
+Plain GCSL runs `curl` to download and `sha256sum` to check, so both must
+be installed. A build tool such as pekit keeps fetched files by their
+digests, and downloads each one only once.
+
 ## Directories
 
 A `Dir` is a tree of files: an unpacked archive, a toolchain, or what a

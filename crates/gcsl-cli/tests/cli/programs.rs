@@ -85,11 +85,11 @@ fn run_has_the_string_built_ins_and_path() {
     let output = gcsl(&["run", "tests/fixtures/string_builtins.gcsl", "--dump-ir"]);
     let ir = stdout(&output);
     assert!(
-        ir.contains("  (store parts#78 @0..27\n    (call @8..27\n      (load split#60 @8..13)\n"),
+        ir.contains("  (store parts#80 @0..27\n    (call @8..27\n      (load split#61 @8..13)\n"),
         "{ir}"
     );
-    assert!(ir.contains("(load join#61 @32..36)"), "{ir}");
-    assert!(ir.contains("(load join#132 @153..162)"), "{ir}");
+    assert!(ir.contains("(load join#62 @32..36)"), "{ir}");
+    assert!(ir.contains("(load join#135 @153..162)"), "{ir}");
     // Nothing of `path`'s own code.
     assert!(!ir.contains("segments"), "{ir}");
     assert_eq!(output.status.code(), Some(0));

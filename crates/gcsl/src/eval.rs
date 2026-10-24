@@ -70,6 +70,7 @@ use kinds::{Extract, Taken, mixed};
 use unions::{other_fields, with_fields};
 use builtins::described;
 pub use effects::{Direct, Effects};
+pub use files::fetched_name;
 use graph::GraphRun;
 pub use system::TempDirs;
 pub use text::compare_versions;
