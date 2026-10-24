@@ -219,9 +219,10 @@ use crate::Outcome;
 
 #[cfg(test)]
 use crate::check::ViewRecord;
-use crate::check::{Builtin, KnownParams, Slot, Types};
+use crate::check::{Attribute, Builtin, KnownParams, Slot, Types};
 use crate::diagnostic::{Diagnostic, InternalError, Mark};
-use crate::eval::graph::{Defers, Graph, GraphRun, NodeId, run_node};
+use crate::eval::graph::{Defers, Graph, GraphRun, NodeId, NodeKind, run_node};
+use crate::eval::plain::{Plain, from_plain, to_plain};
 use crate::eval::{Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::names::{Name, Names};
@@ -373,6 +374,26 @@ fn exec_layout(names: &mut Names) -> Rc<Layout> {
             .map(|&text| Box::from(text))
             .collect(),
     })
+}
+
+/// What a host needs of a step to key, stage and run it (see
+/// [`Workspace::step_inputs`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepInputs {
+    /// What the step is.
+    pub kind: NodeKind,
+    /// Its arguments, in parameter order.
+    pub args: Vec<Plain>,
+    /// Its callee's captures, which its code reads; none for an effect.
+    pub captures: Vec<Plain>,
+    /// Each context bound where it was made, by its declaration's key's
+    /// text, sorted, with its value.
+    pub context: Vec<(String, Plain)>,
+    /// Its callee's attributes, in source order; none for an effect.
+    pub attributes: Vec<Attribute>,
+    /// The files whose sources make its code, by number; none for an
+    /// effect.
+    pub code_files: Vec<u32>,
 }
 
 /// What running a unit in graph mode came to (see [`Workspace::run_graph`]).
@@ -630,6 +651,66 @@ impl Workspace {
         run_node(node, context, extras).map_err(|mut error| {
             error.input.get_or_insert(node.unit());
             error
+        })
+    }
+
+    /// `value` as plain data, which a host can hash, keep and give back (see
+    /// [Plain values](crate::eval::plain#plain-values)).
+    ///
+    /// # Errors
+    ///
+    /// What it holds that is no data: "a step's result must be plain data:
+    /// it holds a function".
+    pub fn to_plain(&self, value: &Value) -> Result<Plain, String> {
+        to_plain(value, &self.scan.names)
+    }
+
+    /// The value `plain` is the plain form of, its names interned in the
+    /// workspace's table (see [Plain values](crate::eval::plain#plain-values)).
+    pub fn from_plain(&mut self, plain: &Plain) -> Value {
+        from_plain(plain, &mut self.scan.names)
+    }
+
+    /// What a host needs of the node `id` of `graph` to key, stage and run
+    /// it as a step, once its data edges are given (see [Graph
+    /// mode](crate::eval::graph#graph-mode)): its arguments, its callee's
+    /// captures and its context as plain data, its callee's attributes, and
+    /// the files whose sources make its code, by number, every file its
+    /// callee's file needs and that file, standard ones among them; none for
+    /// an effect, a built-in's.
+    ///
+    /// # Errors
+    ///
+    /// What of it is no data, or that `graph` has no node `id`.
+    pub fn step_inputs(&self, graph: &Graph, id: NodeId) -> Result<StepInputs, String> {
+        let names = &self.scan.names;
+        let node = graph.node(id).ok_or("a step the graph lacks")?;
+        let plain_all = |values: &[Value]| -> Result<Vec<Plain>, String> {
+            values.iter().map(|value| to_plain(value, names)).collect()
+        };
+        let context = node
+            .context()
+            .iter()
+            .map(|(key, value)| Ok((names.get(*key).to_owned(), to_plain(value, names)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        let (captures, attributes, code_files) = match node.closure() {
+            Some(closure) => {
+                let file = closure.code.input();
+                (
+                    plain_all(&closure.captures)?,
+                    closure.attributes().to_vec(),
+                    self.scan.needed(file),
+                )
+            }
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        Ok(StepInputs {
+            kind: node.kind(),
+            args: plain_all(node.args())?,
+            captures,
+            context,
+            attributes,
+            code_files,
         })
     }
 

@@ -188,6 +188,13 @@ impl Node {
     pub const fn state(&self) -> &NodeState {
         &self.state
     }
+
+    /// Each context the context it was made in binds, by its declaration's
+    /// key, sorted, with its nearest binding's value: what it runs in.
+    #[must_use]
+    pub fn context(&self) -> Vec<(crate::names::Name, Value)> {
+        flattened(self.context.as_ref())
+    }
 }
 
 /// The action graph of an evaluation, which a host keeps across its units'
@@ -794,7 +801,7 @@ fn context_values(context: Option<&Rc<ContextFrame>>) -> Vec<Value> {
 
 /// The context `context` flattened: each key it binds, sorted, with its
 /// nearest binding's value.
-fn flattened(context: Option<&Rc<ContextFrame>>) -> Vec<(crate::names::Name, Value)> {
+pub(crate) fn flattened(context: Option<&Rc<ContextFrame>>) -> Vec<(crate::names::Name, Value)> {
     let mut found: Vec<(crate::names::Name, Value)> = Vec::new();
     let mut at = context;
     while let Some(frame) = at {

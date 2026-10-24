@@ -1371,6 +1371,7 @@ pub(crate) mod files;
 pub mod graph;
 pub(crate) mod kinds;
 pub(crate) mod memo;
+pub mod plain;
 pub(crate) mod sandbox;
 pub(crate) mod system;
 pub(crate) mod text;

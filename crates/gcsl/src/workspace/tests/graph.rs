@@ -311,3 +311,82 @@ fn a_step_that_fails_fails_where_its_result_is_needed() {
     let (value, _) = drive(&mut workspace, file);
     assert_eq!(value, Value::Str(Rc::from("caught: no compiler")));
 }
+
+#[test]
+fn a_value_made_plain_and_back_is_the_value_it_was() {
+    let (mut workspace, file) = lone_workspace(
+        "enum Shape extensible\n\
+         enum Shape::Square<{side: Int}>\n\
+         = {\n\
+           n = 1; x = 1.5; ok = true; s = \"text\"; t = 30s; e = {}\n\
+           items = [1, 2]; shape = Shape::Square({side = 3}); kind = Shape::Square\n\
+           key = secret(\"k3y\", \"api key\"); src = file(\"/src/a.c\"); out = dir(\"/out\")\n\
+         }",
+    );
+    let Progress::Done(value) = workspace
+        .run_graph(file, &mut Graph::new(), &every)
+        .unwrap()
+    else {
+        panic!("not done");
+    };
+    let plain = workspace.to_plain(&value).unwrap();
+    let back = workspace.from_plain(&plain);
+    assert_eq!(back, value);
+    // Its files and directories, for staging.
+    assert_eq!(plain.files(), [("/src/a.c", false), ("/out", true)]);
+    // What is no data has no plain form.
+    let (mut workspace, file) = lone_workspace("= {f = fn(): Int { 1 }}");
+    let Progress::Done(value) = workspace
+        .run_graph(file, &mut Graph::new(), &every)
+        .unwrap()
+    else {
+        panic!("not done");
+    };
+    assert_eq!(
+        workspace.to_plain(&value).unwrap_err(),
+        "a step's result must be plain data: it holds a function"
+    );
+}
+
+#[test]
+fn a_step_s_inputs_are_what_a_host_keys_and_stages_it_by() {
+    let (mut workspace, file) = lone_workspace(
+        "context arch: String = \"x86_64\"\n\
+         let flags = [\"-O2\"]\n\
+         #[step] fn cc(src: File) -> String { \"cc {flags} {src.path}\" }\n\
+         = cc(file(\"/src/a.c\")) with { arch = \"riscv64\" }",
+    );
+    let mut graph = Graph::new();
+    workspace.run_graph(file, &mut graph, &every).unwrap();
+    let inputs = workspace.step_inputs(&graph, NodeId::of(0)).unwrap();
+    assert_eq!(inputs.kind, NodeKind::Deferred);
+    assert_eq!(
+        inputs.args,
+        [crate::eval::plain::Plain::File {
+            path: "/src/a.c".to_owned(),
+            identity: None
+        }]
+    );
+    // What its code captured, and the context it runs in.
+    assert_eq!(
+        inputs.captures,
+        [crate::eval::plain::Plain::List(vec![
+            crate::eval::plain::Plain::Str("-O2".to_owned())
+        ])]
+    );
+    assert_eq!(inputs.context.len(), 1);
+    assert!(
+        inputs.context[0].0.starts_with("<context arch@"),
+        "{:?}",
+        inputs.context
+    );
+    assert_eq!(
+        inputs.context[0].1,
+        crate::eval::plain::Plain::Str("riscv64".to_owned())
+    );
+    // Its attribute, and the files its code is made of: its own, and the
+    // standard library's.
+    assert_eq!(inputs.attributes.len(), 1);
+    assert!(inputs.code_files.contains(&file));
+    assert!(inputs.code_files.len() > 1);
+}
