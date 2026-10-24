@@ -3057,3 +3057,11 @@ fn an_enclosing_timeout_is_never_retried_and_a_call_s_own_is() {
     assert_eq!(errors[0].notes, ["`slow` was tried 3 times"]);
     assert_eq!(counter.count(), 3);
 }
+
+#[test]
+fn a_spread_of_an_impure_function_s_list_parameter_awaits_its_elements() {
+    let text = "fn run(words: List<String>) -> String { exec([\"echo\", ...words]).stdout }\n\
+                let later = lazy \"two\"\n\
+                = run([\"one\", later])";
+    assert_eq!(run(text).unwrap().to_string(), "one two\n");
+}

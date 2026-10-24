@@ -939,3 +939,20 @@ fn unused_futures() {
         );
     }
 }
+
+#[test]
+fn a_spread_whose_elements_may_be_futures_awaits_its_list_deeply() {
+    // An impure function's `List<String>` parameter's elements may be
+    // futures: spread into a list of present strings, it is awaited.
+    let text = "fn run(words: List<String>) -> List<String> { let all: List<String> = [\"a\", ...words]\n= all }";
+    assert_eq!(marks(text), [("words", AwaitMark::Deep)]);
+    // One whose elements fit as they are is awaited at the top alone, as
+    // any spread's operand is measured.
+    assert_eq!(
+        marks("fn run(words: List<String>) -> List<String | Future<String>> { [\"a\", ...words] }"),
+        [("words", AwaitMark::Top)]
+    );
+    // In a pure function, awaiting it is an error.
+    let text = "fn g(xs: List<Int | Future<Int>>): List<Int> { [...xs] }";
+    assert_implicit_await_error(text, last(text, "xs"), "List<Int | Future<Int>>");
+}

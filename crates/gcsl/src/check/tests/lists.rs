@@ -356,22 +356,20 @@ fn spreads_are_measured_and_must_be_lists() {
         messages("[...{ a = 1 }]"),
         vec!["cannot spread a value of type `{a: Int}`: it is not a list"]
     );
-    // Against an expected element type, its elements must fit as they
-    // are: there is nothing to await for each.
+    // Against an expected element type, a list whose elements fit once
+    // awaited is awaited deeply, outside a pure function.
     let text = "let xs: List<Present<Int>> = [1, ...[lazy 2]]";
+    assert_eq!(super::futures::marks(text), [("[lazy 2]", AwaitMark::Deep)]);
+    // One whose elements fit in no way is a mismatch, with no note.
+    let text = "let xs: List<Int> = [...[\"a\"]]";
     let found = diagnostics(text);
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].message, "mismatched types");
-    assert_eq!(found[0].span, at(text, "[lazy 2]"));
+    assert_eq!(found[0].span, at(text, "[\"a\"]"));
     assert_eq!(
         found[0].label.as_deref(),
-        Some("expected List<Int>, found List<Future<Int>>")
+        Some("expected List<Int>, found List<String>")
     );
-    assert_eq!(found[0].notes.len(), 1);
-    assert!(found[0].notes[0].contains("no expression to await"));
-    // A mismatch for another reason has no note.
-    let found = diagnostics("let xs: List<Int> = [...[\"a\"]]");
-    assert_eq!(found[0].message, "mismatched types");
     assert!(found[0].notes.is_empty());
     // Elements that fit, and a provisional list's elements where a
     // present element is expected, which are measured.

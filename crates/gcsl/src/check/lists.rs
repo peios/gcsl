@@ -69,10 +69,11 @@
 //! `for`s, have the record literals among their elements, and their
 //! spreads, given them in the same way, the rest of the block, the `if` and
 //! the list checked as ever (`Checker::fill_elements`).
-//! Its elements are not measured: where an element type is expected, they
-//! must fit it as they are, since there is no expression to await for each;
-//! a list whose elements would fit only once awaited is a mismatch, with a
-//! note saying why.
+//! Where an element type is expected, its elements must fit it as they are,
+//! or the operand is awaited, deeply if they may be futures, so that they
+//! do: spreading a `List<String>` parameter of an impure function, whose
+//! elements may be futures, into `exec`'s words awaits it, subject to the
+//! purity rule, as an argument is.
 //!
 //! **Indexes.** `e[i]` measures `e` at the top, which must be a list
 //! ("cannot index a value of type T: it is not a list"), and `i`, which
@@ -147,9 +148,9 @@
 use crate::ast::{Element, ElementRange, ExprId, PartRange, StrPart};
 use crate::diagnostic::Diagnostic;
 use crate::source::Span;
-use crate::types::TyId;
+use crate::types::{AwaitKind, TyId};
 
-use super::{Checker, Stated};
+use super::{AwaitSite, Checker, Stated};
 
 impl Checker<'_> {
     /// Types an interpolated string: each interpolated expression is
@@ -518,9 +519,9 @@ impl Checker<'_> {
     /// `element`, as stated at `context`, labelled `why`: the operand is
     /// measured at the top and must be a list (see [`Checker::check_spread`])
     /// whose element type fits `element` as it is, once a provisional type
-    /// in it where `element` is present is measured. There is no expression
-    /// to await for each element, so a list whose elements would fit only
-    /// once awaited is a mismatch, whose note says so. Where `element` is a
+    /// in it where `element` is present is measured, or once the operand is
+    /// awaited, deeply if its elements may be futures, subject to the purity
+    /// rule (see [`Checker::await_here`]). Where `element` is a
     /// record type with defaults itself, an operand that is a `for` has the
     /// record literal its body results in given them first, and one that is
     /// a block with a result or an `if` with `else` the record literals
@@ -546,23 +547,25 @@ impl Checker<'_> {
         } else {
             match self.claim_against(value, list, expected) {
                 Some(claimed) if self.types.is_subtype(claimed, expected) => claimed,
-                _ => {
-                    let found = self.types.list_element(list).unwrap_or(TyId::ERROR);
+                claimed => {
+                    let found = claimed.unwrap_or(list);
+                    // Its elements fit once the list is awaited deeply.
+                    if let Some(kind) = self.types.needs_await(found, expected) {
+                        self.await_here(value, found, kind, AwaitSite::Implicit);
+                        let awaited = match kind {
+                            AwaitKind::Top => self.types.strip(found),
+                            AwaitKind::Deep => self.types.present(found),
+                        };
+                        return self.types.list_element(awaited).unwrap_or(TyId::ERROR);
+                    }
                     let label = format!(
                         "expected {}, found {}",
                         self.in_label(expected),
-                        self.in_label(list)
+                        self.in_label(found)
                     );
-                    let mut error = Diagnostic::error("mismatched types", self.ast.get(value).span)
+                    let error = Diagnostic::error("mismatched types", self.ast.get(value).span)
                         .with_label(label)
                         .with_context(context, why);
-                    if self.types.needs_await(found, element).is_some() {
-                        error = error.with_note(
-                            "its elements would fit once awaited, but a spread cannot await them: \
-                             there is no expression to await; spread a list of their awaited \
-                             values instead",
-                        );
-                    }
                     self.errors.push(error);
                     return TyId::ERROR;
                 }
