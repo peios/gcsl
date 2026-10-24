@@ -801,7 +801,7 @@ impl Checker<'_> {
     /// type's, unless the input's view sees a file with syntax errors, in
     /// whose source that could not be parsed the name may be declared: the
     /// check then fails quietly, its error reported where the source is
-    /// (see [Syntax errors](crate::workspace#syntax-errors)).
+    /// (see [Syntax errors](crate::workspace::parse#syntax-errors)).
     pub(super) fn unresolved(&mut self, error: Diagnostic) {
         if self.sees_broken() {
             self.quiet.failed = true;

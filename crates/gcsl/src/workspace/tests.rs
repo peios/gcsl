@@ -1,4 +1,13 @@
 use super::*;
+use super::checking::{check_in, check_scan};
+use crate::ast::{self, Syntax, TypeStore};
+use crate::check::Scope;
+use crate::lexer;
+use crate::mentions::Need;
+use crate::names;
+use crate::parser;
+use crate::source::Span;
+use crate::value::Quantity;
 use crate::ir::IrKind;
 
 /// Scans the workspace of `files`, each a path and a text.

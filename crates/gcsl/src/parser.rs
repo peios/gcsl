@@ -1034,7 +1034,7 @@
 //! not check that one. A recovered tree is checked, an error node being of
 //! type `Error`, silently, and a block with an error item erroneous, as is
 //! a name that names nothing in it (see the workspace's [Syntax
-//! errors](crate::workspace#syntax-errors)); it is never lowered.
+//! errors](crate::workspace::parse#syntax-errors)); it is never lowered.
 //!
 //! # Depth
 //!
