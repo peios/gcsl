@@ -102,7 +102,10 @@ use crate::lexer;
 use crate::names::Name;
 use crate::source::Span;
 
-use super::{Alias, BUILTINS, File, PRELUDE, STANDARD_DIR, Scan, Target, TypeImport, clashes};
+use super::parse::is_library_path;
+use super::{
+    Alias, BUILTINS, File, LIBRARIES, PRELUDE, STANDARD_DIR, Scan, Target, TypeImport, clashes,
+};
 
 /// `error` with the label `text` at `span` of file `input`: a label of the
 /// primary span's own file when it is that file, else an excerpt of its
@@ -199,6 +202,7 @@ pub(super) fn imports(
                     return;
                 }
                 let resolved = module(scan, &modules, path, &mut both);
+                let resolved = library_sees(scan, (file, decl.path_at), resolved);
                 let module_of = resolved.as_ref().ok().copied();
                 if let Some(target @ (Target::Dir(_) | Target::File(_))) = module_of {
                     modules_named.push(target);
@@ -333,6 +337,69 @@ pub(super) fn inherit_imports(file: &File, inherited: &[Alias], aliases: &mut Ve
     }
 }
 
+/// Where a library is looked for, as GCSL's hosts look for it.
+const LIBRARY_ROOTS_NOTE: &str = "a library is looked for in each directory of \
+                                  `$GCSL_LIBRARY_PATH`, then in `.gcsl/libraries/` at the \
+                                  workspace's root";
+
+/// The library whose module path is `shown`, `<lib>` and its segments,
+/// written at `written`: its directory, whole, no directory above it being
+/// a module (see [Libraries](crate::workspace#libraries)), or that it is not
+/// found.
+fn library_module(
+    modules: &Modules,
+    shown: &[&str],
+    written: Span,
+) -> Result<Target, Option<Diagnostic>> {
+    match modules.dirs.get(&shown.join("/")) {
+        Some(&dir) => Ok(Target::Dir(dir)),
+        None => Err(Some(
+            Diagnostic::error(
+                format!(
+                    "library `{}` is not found",
+                    shown.get(1..).unwrap_or_default().join("/")
+                ),
+                written,
+            )
+            .with_note(LIBRARY_ROOTS_NOTE),
+        )),
+    }
+}
+
+/// `resolved`, what an import of `file` written at `at` names, unless the
+/// file is a library's and it names a workspace's module, which is an error:
+/// a library sees libraries and the standard library alone, so that it means
+/// the same in every workspace (see [Libraries](crate::workspace#libraries)).
+fn library_sees(
+    scan: &Scan,
+    (file, at): (&File, Span),
+    resolved: Result<Target, Option<Diagnostic>>,
+) -> Result<Target, Option<Diagnostic>> {
+    match resolved {
+        Ok(target) if is_library_path(&file.path) && of_workspace(scan, target) => {
+            Err(Some(Diagnostic::error(
+                "a library imports only libraries and the standard library, never a workspace's \
+                 modules",
+                at,
+            )))
+        }
+        other => other,
+    }
+}
+
+/// Whether `target` is a module of the workspace's own: none of a library's,
+/// of the standard library's or a built-in one.
+fn of_workspace(scan: &Scan, target: Target) -> bool {
+    let path = match target {
+        Target::Dir(dir) => scan.dirs.get(dir as usize).map(|dir| dir.path.as_str()),
+        Target::File(file) => scan.files.get(file as usize).map(|file| file.path.as_str()),
+        _ => None,
+    };
+    path.is_some_and(|path| {
+        !is_library_path(path) && !path.starts_with(STANDARD_DIR) && path != BUILTINS
+    })
+}
+
 /// What the module path `path` names, or the error that it names nothing
 /// (`None` for a directory and file of one name already reported, and for
 /// any path of a lone file but the standard library's, which the checker
@@ -353,6 +420,9 @@ pub(crate) fn module(
         .filter_map(|segment| Some((scan.names.get(segment.name()?), segment.span)))
         .collect();
     let shown: Vec<&str> = named.iter().map(|&(text, _)| text).collect();
+    if shown.first() == Some(&LIBRARIES) {
+        return library_module(modules, &shown, written);
+    }
     if let [only] = shown.as_slice() {
         if *only == BUILTINS {
             return Ok(Target::Dir(scan.builtins_dir));

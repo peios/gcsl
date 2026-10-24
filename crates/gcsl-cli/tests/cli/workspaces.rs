@@ -455,3 +455,71 @@ fn repl_keeps_imports_across_lines() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+/// A workspace in a new temporary directory of `files`, each a path below
+/// it and its text: its root, canonical.
+fn temporary_workspace(name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("gcsl-cli-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (path, text) in files {
+        let path = dir.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    std::fs::canonicalize(dir).unwrap()
+}
+
+#[test]
+fn run_reads_the_libraries_a_workspace_imports_from_the_library_roots() {
+    let outside = temporary_workspace(
+        "library-path",
+        &[("github.com/x/words/words.gcsl", "hi = \"hello,\"")],
+    );
+    let root = temporary_workspace(
+        "libraries",
+        &[
+            ("workspace.gcsl", ""),
+            (
+                "app.gcsl",
+                "import \"github.com/x/greet\"\nx = greet.hello(\"jack\")",
+            ),
+            (
+                ".gcsl/libraries/github.com/x/greet/greet.gcsl",
+                "import \"github.com/x/words\"\n\
+                 def hello(name: String): String { \"{words.hi} {name}\" }",
+            ),
+        ],
+    );
+    let run = |library_path: &PathBuf| {
+        Command::new(binary())
+            .args(["run", "app.gcsl"])
+            .current_dir(&root)
+            .env("GCSL_LIBRARY_PATH", library_path)
+            .output()
+            .unwrap()
+    };
+    // One from the workspace's own `.gcsl/libraries/`, the other from the
+    // path.
+    let output = run(&outside);
+    assert_eq!(
+        stdout(&output),
+        "{x = \"hello, jack\"}\n",
+        "{}",
+        stderr(&output)
+    );
+    // One no root has: reported at its import.
+    let output = run(&root.join("nowhere"));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("error: library `github.com/x/words` is not found"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("GCSL_LIBRARY_PATH"),
+        "{}",
+        stderr(&output)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}

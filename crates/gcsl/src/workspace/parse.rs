@@ -119,7 +119,7 @@ use crate::names::{Name, Names};
 use crate::source::{SourceFile, Span};
 
 use super::{
-    BUILTINS, Dir, File, FileScope, Library, Node, PRELUDE, Placing, ROOT, Scan, count,
+    BUILTINS, Dir, File, FileScope, LIBRARIES, Library, Node, PRELUDE, Placing, ROOT, Scan, count,
     parent_path, standard_source,
 };
 
@@ -453,12 +453,24 @@ pub(super) fn parse(source: &SourceFile, names: &mut Names) -> Parsed {
     (ast, spelled, errors)
 }
 
-/// The directory `path`, added with the directories above it if new.
+/// Whether `path`, a directory's or a file's, is a library's, under
+/// [`LIBRARIES`] (see [Libraries](crate::workspace#libraries)).
+#[must_use]
+pub(crate) fn is_library_path(path: &str) -> bool {
+    path == LIBRARIES || path.starts_with(&format!("{LIBRARIES}/"))
+}
+
+/// The directory `path`, added with the directories above it if new; a
+/// library's directory with none.
 pub(super) fn intern_dir(dirs: &mut Vec<Dir>, index: &mut HashMap<String, u32>, path: &str) -> u32 {
     if let Some(&dir) = index.get(path) {
         return dir;
     }
-    let parent = (!path.is_empty()).then(|| intern_dir(dirs, index, parent_path(path)));
+    // A library's directory is a root of its own, as a standard file's is,
+    // apart from the workspace's tree and every other library's (see
+    // [Libraries](crate::workspace#libraries)).
+    let parent = (!path.is_empty() && !is_library_path(path))
+        .then(|| intern_dir(dirs, index, parent_path(path)));
     let dir = count(dirs.len());
     dirs.push(Dir {
         path: path.to_owned(),

@@ -34,6 +34,27 @@ A directory or file name in a path is written as it is, dots and all, so
 path's last part, so that part must be a plain name; give a name such as
 `net.busybox.busybox` one with `as`.
 
+## Libraries
+
+A library is a module that lives apart from any workspace, named by a
+path in quotes:
+
+```text
+import "github.com/gcslib/gcc"
+import compile, link from "github.com/gcslib/gcc"
+```
+
+The `gcsl` program looks for the library's directory in each directory
+of `$GCSL_LIBRARY_PATH`, then in `.gcsl/libraries/` at the workspace's
+root, and uses the first it finds. A library is the `.gcsl` files directly
+in its directory, which share their public declarations as a workspace
+directory's files do.
+
+A library sees only its own files, the standard library, and the other
+libraries it imports: never anything of the workspace that uses it. So a
+library means the same in every workspace, and a name it uses can't be
+picked up from yours by accident.
+
 ## Boundaries and evaluation order
 
 Hidden names and nested directories containing their own `workspace.gcsl`

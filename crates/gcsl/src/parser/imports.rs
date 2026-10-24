@@ -92,8 +92,8 @@ use crate::lexer::{self, Token, TokenKind};
 use crate::source::Span;
 
 use super::{
-    EMPTY_MODULE_SEGMENT, MODULE_SEGMENT, ParseResult, Parser, QUOTED_MODULE_PATH, Reported,
-    SINGLE_MEMBER,
+    EMPTY_MODULE_SEGMENT, LIBRARY_PATH, MODULE_SEGMENT, ParseResult, Parser, QUOTED_MODULE_PATH,
+    Reported, SINGLE_MEMBER,
 };
 
 /// The error for a glob in an import of anything but a def-type's
@@ -412,6 +412,7 @@ impl Parser<'_> {
         globbed: bool,
     ) -> ParseResult<Span> {
         match first.kind {
+            TokenKind::Str(_) if !globbed => return self.parse_library_path(first),
             TokenKind::Str(_) | TokenKind::StrStart(_) => {
                 return Err(self.error(QUOTED_MODULE_PATH, first.span));
             }
@@ -461,6 +462,48 @@ impl Parser<'_> {
             start = segment.end.saturating_add(1);
         }
         self.pos += glued;
+        Ok(span)
+    }
+
+    /// Reads the library path `first`, a string with no interpolation, as the
+    /// module path `<lib>/SEGMENTS` (see [Imports](#imports)): its segments
+    /// those of a module path, separated by `/`, each one at its place in the
+    /// string, after a first, [`LIBRARIES`](crate::workspace::LIBRARIES), at
+    /// the opening quote, which no other path can name.
+    fn parse_library_path(&mut self, first: Token) -> ParseResult<Span> {
+        let span = first.span;
+        let written = self.source.slice(span).to_owned();
+        let text = written
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or("");
+        if text.is_empty() || text.contains('\\') {
+            return Err(self.error(LIBRARY_PATH, span));
+        }
+        self.path.push(PathSegment {
+            kind: SegmentKind::Name(self.names.intern(crate::workspace::LIBRARIES)),
+            span: Span::new(span.start, span.start.saturating_add(1)),
+        });
+        let mut start = span.start.saturating_add(1);
+        for part in text.split('/') {
+            let len = u32::try_from(part.len()).unwrap_or(u32::MAX);
+            let segment = Span::new(start, start.saturating_add(len));
+            if part.is_empty() {
+                return Err(self.error(LIBRARY_PATH, span));
+            }
+            if !lexer::is_module_segment(part) {
+                return Err(self.error(
+                    format!("`{part}` cannot name a library: {MODULE_SEGMENT}"),
+                    segment,
+                ));
+            }
+            self.path.push(PathSegment {
+                kind: SegmentKind::Name(self.names.intern(part)),
+                span: segment,
+            });
+            start = segment.end.saturating_add(1);
+        }
+        self.pos += 1;
         Ok(span)
     }
 

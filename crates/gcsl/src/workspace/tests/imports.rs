@@ -514,3 +514,107 @@ fn an_importing_files_items_are_in_any_order() {
         assert_eq!(record, ["a = 7", "b = 4"], "{main}");
     }
 }
+
+/// A workspace whose `app.gcsl` is `text`, beside a library
+/// `github.com/x/greet` that imports another, `github.com/x/words`.
+fn with_libraries(text: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("workspace.gcsl", "answer = 41".to_owned()),
+        (
+            "<lib>/github.com/x/greet/greet.gcsl",
+            "import \"github.com/x/words\"\n\
+             def hello(name: String): String { \"{words.hi} {name}\" }"
+                .to_owned(),
+        ),
+        (
+            "<lib>/github.com/x/words/words.gcsl",
+            "hi = \"hello,\"".to_owned(),
+        ),
+        ("app.gcsl", text.to_owned()),
+    ]
+}
+
+/// The value of `app.gcsl` of `files`, or its errors' messages.
+fn app_of(files: &[(&'static str, String)]) -> Result<String, Vec<String>> {
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, text)| (*path, text.as_str()))
+        .collect();
+    match rooted(&files) {
+        Ok(mut workspace) => {
+            let app = workspace.file("app.gcsl").unwrap();
+            Ok(workspace.run(app).unwrap().value.to_string())
+        }
+        Err(errors) => Err(errors.into_iter().map(|error| error.message).collect()),
+    }
+}
+
+#[test]
+fn a_library_is_imported_by_its_path_whole_or_by_member() {
+    assert_eq!(
+        app_of(&with_libraries(
+            "import \"github.com/x/greet\"\nx = greet.hello(\"jack\")"
+        )),
+        Ok("{x = \"hello, jack\"}".to_owned())
+    );
+    assert_eq!(
+        app_of(&with_libraries(
+            "import \"github.com/x/greet\" as g\nimport hello from \"github.com/x/greet\"\n\
+             x = [g.hello(\"a\"), hello(\"b\")]"
+        )),
+        Ok("{x = [\"hello, a\", \"hello, b\"]}".to_owned())
+    );
+}
+
+#[test]
+fn a_library_sees_libraries_and_the_standard_library_alone() {
+    // Nothing of the workspace, whose root is no directory above it.
+    let mut files = with_libraries("import \"github.com/x/greet\"\nx = greet.hello(\"a\")");
+    files[2].1 = "hi = \"{answer}\"".to_owned();
+    let errors = app_of(&files).unwrap_err();
+    assert!(
+        errors.iter().any(|e| e == "undefined variable `answer`"),
+        "{errors:?}"
+    );
+    // Nor any module of it.
+    files[2].1 = "import app\nhi = \"x\"".to_owned();
+    let errors = app_of(&files).unwrap_err();
+    assert_eq!(
+        errors,
+        [
+            "a library imports only libraries and the standard library, never a workspace's \
+          modules"
+        ]
+    );
+    // A library it does not have.
+    let errors = app_of(&with_libraries("import \"github.com/x/nope\"\nx = 1")).unwrap_err();
+    assert_eq!(errors, ["library `github.com/x/nope` is not found"]);
+}
+
+#[test]
+fn a_library_path_is_segments_separated_by_slashes() {
+    for (text, expected) in [
+        (
+            "import \"\"\nx = 1",
+            "a library's path is its segments separated by `/`",
+        ),
+        (
+            "import \"a//b\"\nx = 1",
+            "a library's path is its segments separated by `/`",
+        ),
+        ("import \"a/b..c\"\nx = 1", "`b..c` cannot name a library"),
+    ] {
+        let errors = app_of(&with_libraries(text)).unwrap_err();
+        assert!(errors[0].starts_with(expected), "{text}: {errors:?}");
+    }
+    let source = SourceFile::new(
+        "app.gcsl",
+        "import \"github.com/x/greet\"\nimport hello from \"github.com/x/greet\"\nimport fs\n\
+         import \"github.com/y/z\" as z",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::workspace::library_imports(&source),
+        ["github.com/x/greet", "github.com/y/z"]
+    );
+}

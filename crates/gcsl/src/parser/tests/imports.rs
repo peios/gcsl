@@ -121,11 +121,17 @@ fn import_only_at_the_top_level_of_a_file() {
 
 #[test]
 fn import_path_errors() {
+    // A string names a library, but with an interpolation in it, or with
+    // a glob, it names nothing.
     assert_eq!(
-        error("import \"github.com/x\""),
-        (QUOTED_MODULE_PATH.to_owned(), Span::new(7, 21))
+        error("import \"github.com/{x}\""),
+        (QUOTED_MODULE_PATH.to_owned(), Span::new(7, 20))
     );
-    assert_eq!(message("import x from \"lib\""), QUOTED_MODULE_PATH);
+    assert_eq!(
+        message("import package * from \"lib\"/*"),
+        QUOTED_MODULE_PATH
+    );
+    assert!(message("import \"a//b\"").starts_with("a library's path is its segments"));
     assert_eq!(
         message("import from as f"),
         "expected a path after `from`, found `as`"

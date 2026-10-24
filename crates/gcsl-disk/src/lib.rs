@@ -26,6 +26,18 @@
 //! the file `gcsl run` was given, is given to it with the name it is shown
 //! by, and is read once: its text is the one given.
 //!
+//! # Libraries
+//!
+//! A file imports a library by its path, `import "github.com/gcslib/gcc"`
+//! (see [`gcsl::workspace`], "Libraries"). [`read_workspace`] reads every
+//! library the workspace's files import, and every library those import,
+//! each from the first of the *library roots* ([`library_roots`]) that has a
+//! directory of its path: each directory of `$GCSL_LIBRARY_PATH`, then
+//! `.gcsl/libraries/` under the workspace's root. A library is the `.gcsl`
+//! files directly in its directory, named `<lib>/PATH/FILE` for the library,
+//! wherever they were found, and shown as any file is. A library no root has
+//! is not read: the library reports it at the import.
+//!
 //! The root must be absolute and canonical for the library's `fileroot`
 //! module. [`find_workspace`] canonicalises the file it is given
 //! (`fs::canonicalize`), once, so the root it finds above it is canonical
@@ -294,13 +306,111 @@ pub fn read_workspace(
             }
         }
     }
-    let given = given.and_then(|(at, _)| paths.iter().position(|(name, _)| name == at));
+    read_libraries(root, &mut relative, &mut shown_sources)?;
+    let given = given.and_then(|(at, _)| relative.iter().position(|source| source.name() == at));
     Ok(Sources {
         relative,
         shown: shown_sources,
         nested,
         given,
     })
+}
+
+/// The directories libraries are looked for in, in order: each of
+/// `$GCSL_LIBRARY_PATH`'s, then `.gcsl/libraries` under the workspace's root
+/// `root` (see the module documentation, "Libraries").
+#[must_use]
+pub fn library_roots(root: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = std::env::var_os("GCSL_LIBRARY_PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    roots.push(root.join(".gcsl").join("libraries"));
+    roots
+}
+
+/// Adds to `relative` and `shown_sources` the files of every library they import,
+/// and every library those import, each found in the first of the library
+/// roots of `root` that has it, and both lists put in the order the library
+/// numbers its files in, by their names relative to the root (see the module
+/// documentation, "Libraries"). A library no root has is left for the
+/// library to report at its import.
+fn read_libraries(
+    root: &Path,
+    relative: &mut Vec<SourceFile>,
+    shown_sources: &mut Vec<SourceFile>,
+) -> Result<(), ReadError> {
+    let roots = library_roots(root);
+    let mut wanted: Vec<String> = relative
+        .iter()
+        .flat_map(gcsl::workspace::library_imports)
+        .collect();
+    let mut done: Vec<String> = Vec::new();
+    while let Some(library) = wanted.pop() {
+        if done.contains(&library) {
+            continue;
+        }
+        done.push(library.clone());
+        let Some(dir) = roots
+            .iter()
+            .map(|at| at.join(&library))
+            .find(|dir| dir.is_dir())
+        else {
+            continue;
+        };
+        let unreadable = |error| ReadError::Unreadable {
+            path: shown(&dir),
+            error,
+        };
+        let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+            .map_err(unreadable)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension() == Some(OsStr::new("gcsl"))
+                    && path.is_file()
+                    && !path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            })
+            .collect();
+        files.sort();
+        for path in files {
+            let text = fs::read_to_string(&path).map_err(|error| ReadError::Unreadable {
+                path: shown(&path),
+                error,
+            })?;
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            let name = format!(
+                "{}/{library}/{}",
+                gcsl::workspace::LIBRARIES,
+                file_name.unwrap_or_default()
+            );
+            let shown_name = shown(&path).display().to_string();
+            let loaded = SourceFile::new(name, text.clone())
+                .and_then(|source| Ok((source, SourceFile::new(shown_name.clone(), text)?)));
+            let (source, shown_source) = loaded.map_err(|error| ReadError::Unloadable {
+                name: shown_name,
+                error,
+            })?;
+            wanted.extend(gcsl::workspace::library_imports(&source));
+            relative.push(source);
+            shown_sources.push(shown_source);
+        }
+    }
+    // As the library sorts its files, by name.
+    let mut pairs: Vec<(SourceFile, SourceFile)> = std::mem::take(relative)
+        .into_iter()
+        .zip(std::mem::take(shown_sources))
+        .collect();
+    pairs.sort_by(|a, b| a.0.name().as_bytes().cmp(b.0.name().as_bytes()));
+    (*relative, *shown_sources) = pairs.into_iter().unzip();
+    Ok(())
 }
 
 #[cfg(test)]

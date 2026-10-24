@@ -174,9 +174,14 @@ const LET_SHADOWS_NOTE: &str = "a `let` or `fn` already shadows";
 /// item.
 const MISPLACED_NO_PRELUDE: &str = "`#![no_prelude]` must come before anything else in the file";
 
-/// The error for a module path written as a string.
+/// The error for a module path written as a string where a library's path
+/// cannot be: with interpolation, or with a glob.
 const QUOTED_MODULE_PATH: &str =
     "a module path is written without quotes, its segments separated by `/`";
+
+/// The error for a library's path that is not segments separated by `/`.
+const LIBRARY_PATH: &str =
+    "a library's path is its segments separated by `/`, as `\"github.com/gcslib/gcc\"`";
 
 /// The error for an empty segment of a module path, at its `/`.
 const EMPTY_MODULE_SEGMENT: &str = "expected a module name before and after each `/`";

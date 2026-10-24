@@ -211,6 +211,26 @@
 //! (`no_prelude_in_input`). Its `#[shadowable]` marks are a file's within
 //! it, and change nothing between inputs, a later one shadowing an earlier
 //! one's names already.
+//!
+//! # Libraries
+//!
+//! A LIBRARY is a module apart from any workspace, named by its path, as a
+//! string, `import "github.com/gcslib/gcc"`: the parser reads it as the
+//! module path `<lib>/github.com/gcslib/gcc`, its first segment
+//! [`LIBRARIES`], which no file of a workspace can name. Its files are given
+//! with the workspace's by the host, which finds them (`gcsl-disk` in each of
+//! its library roots, [`library_imports`] telling it which a file imports),
+//! named `<lib>/PATH/FILE.gcsl`, so that a library is named the same however
+//! it was found, on receipts among other places. Each library's directory is
+//! a directory with no directory above, as a standard file's is: it sees its
+//! own files' declarations, the prelude's and what it imports, which may be
+//! other libraries and the standard library, but never a workspace's module,
+//! "a library imports only libraries and the standard library, never a
+//! workspace's modules", so a library means the same in every workspace. A
+//! library's path names its directory whole, no directory above it being a
+//! module; one the host did not give is "library `PATH` is not found", noted
+//! with where hosts look for one. A library's path that is not segments of a
+//! module path separated by `/` is the parser's error.
 
 use std::mem;
 use std::path::PathBuf;
@@ -283,6 +303,40 @@ const ROOT: u32 = u32::MAX;
 /// `<stdlib>/STEM.gcsl`, which is how a diagnostic of one names it, in a
 /// directory of its own with this path.
 pub const STANDARD_DIR: &str = "<stdlib>";
+
+/// The paths of the libraries `source` imports, `github.com/gcslib/gcc`,
+/// each once, in source order: what a host loads before a workspace that has
+/// the file is checked, and loads again for each library's own files, until
+/// it has every library the workspace needs (see [Libraries](#libraries)).
+/// A file that does not parse gives what it imports as far as it parses.
+#[must_use]
+pub fn library_imports(source: &SourceFile) -> Vec<String> {
+    let (ast, _) = crate::parser::parse_source(source);
+    let mut found: Vec<String> = Vec::new();
+    for &item in ast.items(ast.root()) {
+        let crate::ast::ItemKind::Import(id) = ast.item(item).kind else {
+            continue;
+        };
+        let names: Vec<&str> = ast
+            .path(ast.import_decl(id).path)
+            .iter()
+            .filter_map(crate::ast::PathSegment::name)
+            .map(|name| ast.names().get(name))
+            .collect();
+        if let Some((&LIBRARIES, rest)) = names.split_first() {
+            let path = rest.join("/");
+            if !found.contains(&path) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// The root of every library's path, which no file of a workspace can have:
+/// `import "github.com/gcslib/gcc"` names the module `<lib>/github.com/gcslib/gcc`
+/// (see [Libraries](#libraries)).
+pub const LIBRARIES: &str = "<lib>";
 
 /// The name of the module of built-in functions.
 pub(crate) const BUILTINS: &str = "builtins";
