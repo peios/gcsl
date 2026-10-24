@@ -1325,6 +1325,7 @@ fn source_of(value: &Value, node: &IrNode) -> Flow<Rc<str>> {
             // file as the call that makes it.
             Value::Secret(_)
             | Value::File(_)
+            | Value::Dir(_)
             | Value::Tag(_)
             | Value::Int(_)
             | Value::Float(_)

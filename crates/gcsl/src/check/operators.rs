@@ -394,6 +394,7 @@ impl Checker<'_> {
             let unordered = [lhs_ty, rhs_ty].into_iter().find(|&ty| {
                 ty == TyId::BOOL
                     || ty == TyId::FILE
+                    || ty == TyId::DIR
                     || self.types.is_record(ty)
                     || self.types.list_element(ty).is_some()
                     || self.types.fn_sig(ty).is_some()
@@ -495,6 +496,7 @@ impl Checker<'_> {
             && (lhs_ty == TyId::BOOL
                 || lhs_ty == TyId::STRING
                 || lhs_ty == TyId::FILE
+                || lhs_ty == TyId::DIR
                 || is_quantity(lhs_ty)
                 || self.types.is_record(lhs_ty)
                 || self.types.list_element(lhs_ty).is_some()

@@ -146,4 +146,58 @@ are; a build tool can also compare their contents. When GCSL runs a program
 under a build tool, the tool chooses the working directory, so `file()`
 and `exec` agree there too.
 
+## Directories
+
+A `Dir` is a tree of files: an unpacked archive, a toolchain, or what a
+command leaves in a directory. `dir(path)` makes one, resolved as `file`
+resolves a path. Inside it, `d.file(path)` and `d.dir(path)` name a file
+and a directory by a path relative to it, and `d.files()` lists every file
+in the tree:
+
+```gcsl
+import fs
+import path
+let root = fs.temp_dir()
+fs.mkdir(path.join(root, "include"))
+fs.write(path.join(root, "include/greet.h"), "void greet(void);")
+let tree = dir(root)
+header = tree.file("include/greet.h").read()
+count = len(tree.files())
+```
+
+A path that would leave the directory, such as `d.file("../secret")`, is an
+error: a directory's files are its own. `d.exec(...words)` runs a command
+with the directory as its working directory.
+
+Use a `Dir` for a tree, and a `FileSet` for loose files such as headers,
+sources and objects. A `FileSet` has no root, so it can't say where each of
+its files belongs in a tree.
+
+### Composing a directory
+
+`fs.compose_dir` makes a new directory from a record that maps paths to
+what goes there:
+
+```gcsl
+import fs
+import path
+let root = fs.temp_dir()
+fs.write(path.join(root, "main.c"), "int main(void);")
+fs.write(path.join(root, "notes.txt"), "build notes")
+let src = dir(root)
+let stage = fs.compose_dir({
+    "/" = src
+    "docs/notes.txt" = src.file("notes.txt")
+    "flat" = [src.file("main.c")]
+})
+listing = stage.exec("ls", "flat").stdout
+```
+
+A `Dir`'s tree goes under its key, `/` meaning the new directory itself; a
+`File` goes at its key; and each file of a list goes under its key by its
+name. Placing two things at one path is an error. Everything is copied, so
+a command that writes in the new directory changes none of the originals.
+Copying a large tree, such as a toolchain, takes time and space; a build
+tool such as pekit mounts the trees instead.
+
 Consult `gcsl-stdlib(3)` for exact function contracts and error behavior.

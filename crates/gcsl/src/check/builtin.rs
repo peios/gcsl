@@ -129,6 +129,23 @@ pub enum Builtin {
     /// `secrets` as environment variables, and reports what it did as a
     /// secret (see [Secrets](crate::check::secrets#secrets)). Impure.
     ExecSecret,
+    /// `dir(path: String) -> Dir`: the directory at `path`, made absolute
+    /// as `file` makes a file's, the prelude's `dir(path)`. Impure.
+    Dir,
+    /// `dir_files(d: Dir) -> List<File>`: every file of the tree `d`, by
+    /// path, the prelude's `d.files()`. Impure: it reads the tree.
+    DirFiles,
+    /// `dir_file(d: Dir, path: String): File`: the file at `path`, relative,
+    /// in `d`, the prelude's `d.file(path)`; a path outside `d` is a runtime
+    /// error.
+    DirFile,
+    /// `dir_dir(d: Dir, path: String): Dir`: the directory at `path`,
+    /// relative, in `d`, the prelude's `d.dir(path)`, as `dir_file`.
+    DirDir,
+    /// `fs_compose_dir(entries: {*: Dir | File | List<File>}) -> Dir`: a new
+    /// directory of `entries`, each placed at its key, `fs.compose_dir`.
+    /// Impure.
+    FsComposeDir,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -152,7 +169,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 33] = [
+    pub const ALL: [Builtin; 38] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -186,6 +203,11 @@ impl Builtin {
         Builtin::File,
         Builtin::FileRead,
         Builtin::ExecSecret,
+        Builtin::Dir,
+        Builtin::DirFiles,
+        Builtin::DirFile,
+        Builtin::DirDir,
+        Builtin::FsComposeDir,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -247,6 +269,11 @@ impl Builtin {
             Builtin::File => "file",
             Builtin::FileRead => "file_read",
             Builtin::ExecSecret => "exec_secret",
+            Builtin::Dir => "dir",
+            Builtin::DirFiles => "dir_files",
+            Builtin::DirFile => "dir_file",
+            Builtin::DirDir => "dir_dir",
+            Builtin::FsComposeDir => "fs_compose_dir",
         }
     }
 
@@ -263,6 +290,7 @@ impl Builtin {
             Builtin::FsCopy => Some("fs.copy"),
             Builtin::FsTempDir => Some("fs.temp_dir"),
             Builtin::FsWrite => Some("fs.write"),
+            Builtin::FsComposeDir => Some("fs.compose_dir"),
             Builtin::Len
             | Builtin::Int
             | Builtin::Float
@@ -289,8 +317,29 @@ impl Builtin {
             | Builtin::SecretReveal
             | Builtin::File
             | Builtin::FileRead
-            | Builtin::ExecSecret => None,
+            | Builtin::ExecSecret
+            | Builtin::Dir
+            | Builtin::DirFiles
+            | Builtin::DirFile
+            | Builtin::DirDir => None,
         }
+    }
+
+    /// Whether it is one of the built-ins of files and directories: `file`,
+    /// `file_read`, `dir`, `dir_files`, `dir_file`, `dir_dir` and
+    /// `fs_compose_dir` (see [Files](crate::check::files#files)).
+    #[must_use]
+    pub const fn is_of_files(self) -> bool {
+        matches!(
+            self,
+            Builtin::File
+                | Builtin::FileRead
+                | Builtin::Dir
+                | Builtin::DirFiles
+                | Builtin::DirFile
+                | Builtin::DirDir
+                | Builtin::FsComposeDir
+        )
     }
 
     /// The names of its parameters, in order, which named arguments match.
@@ -301,6 +350,9 @@ impl Builtin {
             Builtin::Len => &["list"],
             Builtin::Int | Builtin::Float => &["x"],
             Builtin::Exec | Builtin::ExecLive | Builtin::ExecSecret => &["argv", "options"],
+            Builtin::DirFiles => &["d"],
+            Builtin::DirFile | Builtin::DirDir => &["d", "path"],
+            Builtin::FsComposeDir => &["entries"],
             Builtin::Panic => &["message"],
             Builtin::Split => &["s", "sep"],
             Builtin::Join => &["parts", "sep"],
@@ -311,7 +363,7 @@ impl Builtin {
             | Builtin::Fields
             | Builtin::SecretValue
             | Builtin::SecretReveal => &["s"],
-            Builtin::File => &["path"],
+            Builtin::File | Builtin::Dir => &["path"],
             Builtin::FileRead => &["f"],
             Builtin::CompareVersions => &["a", "b"],
             Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
@@ -347,7 +399,10 @@ impl Builtin {
             | Builtin::FsWrite
             | Builtin::File
             | Builtin::FileRead
-            | Builtin::ExecSecret => Effect::Impure,
+            | Builtin::ExecSecret
+            | Builtin::Dir
+            | Builtin::DirFiles
+            | Builtin::FsComposeDir => Effect::Impure,
             Builtin::Len
             | Builtin::Int
             | Builtin::Float
@@ -369,7 +424,9 @@ impl Builtin {
             | Builtin::PartialMatches
             | Builtin::Secret
             | Builtin::SecretValue
-            | Builtin::SecretReveal => Effect::Pure,
+            | Builtin::SecretReveal
+            | Builtin::DirFile
+            | Builtin::DirDir => Effect::Pure,
         }
     }
 
@@ -408,7 +465,12 @@ impl Builtin {
             | Builtin::SecretReveal
             | Builtin::File
             | Builtin::FileRead
-            | Builtin::ExecSecret => Typing::Ordinary,
+            | Builtin::ExecSecret
+            | Builtin::Dir
+            | Builtin::DirFiles
+            | Builtin::DirFile
+            | Builtin::DirDir
+            | Builtin::FsComposeDir => Typing::Ordinary,
         }
     }
 
@@ -458,6 +520,11 @@ impl Builtin {
             Builtin::SecretReveal => "fn<T>(s: Secret<T>): Revealed<T>",
             Builtin::File => "fn(path: String) -> File",
             Builtin::FileRead => "fn(f: File) -> String",
+            Builtin::Dir => "fn(path: String) -> Dir",
+            Builtin::DirFiles => "fn(d: Dir) -> List<File>",
+            Builtin::DirFile => "fn(d: Dir, path: String): File",
+            Builtin::DirDir => "fn(d: Dir, path: String): Dir",
+            Builtin::FsComposeDir => "fn(entries: {*: List<File> | Dir | File}) -> Dir",
         }
     }
 
@@ -522,6 +589,16 @@ impl Builtin {
             Builtin::Trim | Builtin::FsRead => ([TyId::STRING, UNUSED], TyId::STRING),
             Builtin::File => ([TyId::STRING, UNUSED], TyId::FILE),
             Builtin::FileRead => ([TyId::FILE, UNUSED], TyId::STRING),
+            Builtin::Dir => ([TyId::STRING, UNUSED], TyId::DIR),
+            Builtin::DirFiles => ([TyId::DIR, UNUSED], types.list(TyId::FILE)),
+            Builtin::DirFile => ([TyId::DIR, TyId::STRING], TyId::FILE),
+            Builtin::DirDir => ([TyId::DIR, TyId::STRING], TyId::DIR),
+            Builtin::FsComposeDir => {
+                let files = types.list(TyId::FILE);
+                let entry = types.union([TyId::DIR, TyId::FILE, files]);
+                let entries = types.record_with_rest([], Some(entry), Vec::new());
+                ([entries, UNUSED], TyId::DIR)
+            }
             Builtin::StripPrefix | Builtin::StripSuffix => {
                 ([TyId::STRING, TyId::STRING], TyId::STRING)
             }
@@ -643,5 +720,6 @@ pub(super) fn builtin_types(names: &Names) -> BuiltinTypes {
         (names.lookup("Duration"), TyId::DURATION),
         (names.lookup("Size"), TyId::SIZE),
         (names.lookup("File"), TyId::FILE),
+        (names.lookup("Dir"), TyId::DIR),
     ]
 }

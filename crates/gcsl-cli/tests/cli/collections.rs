@@ -63,12 +63,12 @@ fn dumps_show_lists() {
          \x20     (int 22 @446..448)\n\
          \x20     (await @450..458\n\
          \x20       (index @450..458\n\
-         \x20         (load found#80 @450..455)\n\
+         \x20         (load found#90 @450..455)\n\
          \x20         (int 0 @456..457)))\n",
         "\n    (list-len @478..487\n\
-         \x20     (load open#81 @482..486)))\n",
+         \x20     (load open#91 @482..486)))\n",
         "\n      (await *! @524..529\n\
-         \x20       (load found#80 @524..529))\n",
+         \x20       (load found#90 @524..529))\n",
         "\n    (list-eq == * @539..563\n",
         "\n    (make-list @575..643\n\
          \x20     (spread @576..611\n",
@@ -150,23 +150,23 @@ fn dumps_show_fors_and_ranges() {
     for node in [
         // A `for` shows its variable's slot, named, as every slot is, by
         // the last variable stored in it.
-        "\n    (for ports#78 @213..248\n\
+        "\n    (for ports#88 @213..248\n\
          \x20     (range @222..235\n\
          \x20       (int 0 @222..223)\n\
          \x20       (list-len @225..235\n",
-        "\n    (for webs#79 if @310..354\n\
-         \x20     (load hosts#77 @322..327)\n\
+        "\n    (for webs#89 if @310..354\n\
+         \x20     (load hosts#87 @322..327)\n\
          \x20     (str-cmp != @331..345\n",
         // The statement of `{}`s discards its body's values; the statement
         // of futures builds its list, and awaits it deeply.
-        "\n  (for-each checks#80 @426..459\n\
-         \x20   (load webs#79 @438..442)\n",
+        "\n  (for-each checks#90 @426..459\n\
+         \x20   (load webs#89 @438..442)\n",
         "\n  (await *! @524..562\n\
-         \x20   (for checks#80 @524..562\n",
-        "\n    (for checks#80 @596..621\n\
-         \x20     (load ports#78 @605..610)\n\
+         \x20   (for checks#90 @524..562\n",
+        "\n    (for checks#90 @596..621\n\
+         \x20     (load ports#88 @605..610)\n\
          \x20     (await @611..621\n",
-        "\n    (for i#81 @678..702\n\
+        "\n    (for i#91 @678..702\n\
          \x20     (range-inclusive @687..692\n",
     ] {
         assert!(ir.contains(node), "{node}: {ir}");
@@ -270,24 +270,24 @@ fn dumps_show_mutable_variables() {
     for node in [
         // A rebind in a `for`'s body, and in an `if` in it, stores into the
         // variable's one slot.
-        "\n  (store total#79 @159..176\n\
+        "\n  (store total#89 @159..176\n\
          \x20   (int 0 @175..176))\n",
         "\n    (block @299..366\n\
-         \x20     (store total#79 @303..324\n\
+         \x20     (store total#89 @303..324\n\
          \x20       (int-add @312..324\n\
-         \x20         (load total#79 @312..317)\n",
+         \x20         (load total#89 @312..317)\n",
         "\n        (block @348..364\n\
-         \x20         (store slowest#80 @350..362\n\
-         \x20           (load conf#81 @361..362))\n",
+         \x20         (store slowest#90 @350..362\n\
+         \x20           (load conf#91 @361..362))\n",
         // The guard reads the slot the body writes.
         "\n      (int-cmp >= @621..635\n\
-         \x20       (load budget#82 @621..627)\n",
-        "\n        (store budget#82 @638..661\n",
+         \x20       (load budget#92 @621..627)\n",
+        "\n        (store budget#92 @638..661\n",
         // The closure copies the variable when it is made.
-        "\n  (store report#84 @721..753\n\
+        "\n  (store report#94 @721..753\n\
          \x20   (make-closure #0 @734..753\n\
-         \x20     (load total#79 @734..753)))\n\
-         \x20 (store total#79 @754..764\n",
+         \x20     (load total#89 @734..753)))\n\
+         \x20 (store total#89 @754..764\n",
         // A function's own variable, in its own frame.
         "\n      (block @823..841\n\
          \x20       (store sum#1 @825..839\n",
@@ -409,7 +409,7 @@ fn dumps_show_loops_and_their_stops() {
         // A header's items before the condition run once, in a block
         // around the loop; those after it are the loop's last parts.
         "\n    (block @306..363\n\
-         \x20     (store costs#74 @310..319\n",
+         \x20     (store costs#84 @310..319\n",
         "\n      (loop @306..363\n",
         // `for { }` tests `true`.
         "\n    (loop @692..753\n\
@@ -512,10 +512,10 @@ fn dumps_show_unions_tests_and_narrowing() {
     for node in [
         // The test looks at the kind alone, and writes the slot the
         // branches read, which a later variable takes once it is free.
-        "(is int first#76 @324..332\n\
-         \x20           (load label#75 @324..325))\n\
+        "(is int first#86 @324..332\n\
+         \x20           (load label#85 @324..325))\n\
          \x20         (block @333..338\n\
-         \x20           (load first#76 @335..336))\n",
+         \x20           (load first#86 @335..336))\n",
         "(as int @612..635\n",
         "(value-same === @708..745\n",
     ] {
@@ -624,17 +624,17 @@ fn dumps_show_element_updates() {
     for node in [
         // One update for the whole path: its value, its list and its
         // positions, and its steps.
-        "\n  (store hosts#72 @247..266\n\
+        "\n  (store hosts#82 @247..266\n\
          \x20   (update [].up @247..258\n\
          \x20     (bool true @262..266)\n\
-         \x20     (load hosts#72 @247..252)\n\
+         \x20     (load hosts#82 @247..252)\n\
          \x20     (int 0 @253..254)))\n",
-        "\n      (store hosts#72 @364..406\n\
+        "\n      (store hosts#82 @364..406\n\
          \x20       (update [].ports[] @364..381\n\
          \x20         (int-add @385..406\n",
         "\n            (update [][] @497..507\n",
         // The value, which rebinds `r`, comes before the read of `r`.
-        "\n  (store r#76 @735..778\n\
+        "\n  (store r#86 @735..778\n\
          \x20   (update .a @735..738\n\
          \x20     (block @742..778\n",
     ] {
@@ -738,21 +738,21 @@ fn dumps_show_spreads() {
     // The operand is stored once, in a slot of its own, and each field is
     // read from it by name into the field's slot; the override stores into
     // the same slot, and the field keeps its place.
-    let node = "\n      (store url#75 @176..187\n\
-                \x20       (load defaults#72 @179..187))\n\
-                \x20     (store conf#73 @176..187\n\
+    let node = "\n      (store url#85 @176..187\n\
+                \x20       (load defaults#82 @179..187))\n\
+                \x20     (store conf#83 @176..187\n\
                 \x20       (field host @179..187\n\
-                \x20         (load url#75 @179..187)))\n\
-                \x20     (store port#74 @176..187\n\
+                \x20         (load url#85 @179..187)))\n\
+                \x20     (store port#84 @176..187\n\
                 \x20       (field port @179..187\n\
-                \x20         (load url#75 @179..187)))\n\
-                \x20     (store port#74 @190..201\n\
+                \x20         (load url#85 @179..187)))\n\
+                \x20     (store port#84 @190..201\n\
                 \x20       (int 8080 @197..201))\n";
     assert!(ir.contains(node), "{node}: {ir}");
     let node = "\n      (make-record [host port url] @172..227\n\
-                \x20       (load conf#73 @179..187)\n\
-                \x20       (load port#74 @190..194)\n\
-                \x20       (load url#75 @204..207))))\n";
+                \x20       (load conf#83 @179..187)\n\
+                \x20       (load port#84 @190..194)\n\
+                \x20       (load url#85 @204..207))))\n";
     assert!(ir.contains(node), "{node}: {ir}");
     assert_eq!(output.status.code(), Some(0));
 }

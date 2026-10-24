@@ -137,6 +137,21 @@ Return the one file whose path is name or ends with /name; none, or several, is 
 .TP
 .B type FileSet = List<File>, type FilePath = String
 Aliases for lists of files and for paths.
+A FileSet is a list of loose files; a tree of files is a Dir.
+.TP
+.B dir(path: String) -> Dir
+Return the directory at path, resolved and normalised as file resolves a file's; nothing is read.
+d.path is its absolute path; under plain GCSL two directories are equal when their paths are.
+.TP
+.B Dir.file(path: String): File, Dir.dir(path: String): Dir
+Return the file or directory at path in d, relative, a leading slash meaning d's root, normalised lexically.
+A path that would leave d is a runtime error, and Dir.file needs a path below d; neither reads anything.
+.TP
+.B Dir.files() -> List<File>
+Return every entry of d's tree that is no directory, symbolic links included and never followed, sorted by path.
+.TP
+.B Dir.exec(...words: String, env, interactive, panic, until) -> {status: Int, stdout: String, stderr: String}
+Run words[0] with words[1..] in d, as exec does with cwd d.path.
 .TP
 .B panic(message: String): Never
 Stop evaluation with a runtime diagnostic containing message.
@@ -188,6 +203,12 @@ The parent directory must exist.
 Replacement uses ordinary new-file permissions, 0666 reduced by the process umask, rather than preserving old permissions.
 A symbolic link at p is replaced, not followed.
 Failure removes the temporary file.
+.TP
+.B fs.compose_dir(entries: {*: Dir | File | List<File>}) -> Dir
+Make a new directory of the run, removed as temporary directories are, and place each entry of entries at its key, a path in it, / or . meaning the directory itself.
+A Dir's tree is copied under its key, a File to its key, and each file of a List<File> under its key by its name; directories merge.
+Everything is copied, permissions kept and symbolic links copied as links, so a program writing in the directory changes nothing it was made of.
+Two entries placing one path, a key outside the directory, and a file at the directory itself are runtime errors.
 .TP
 .B fs.temp_dir() -> String
 Create a distinct empty directory with mode 0700 and return its absolute path.

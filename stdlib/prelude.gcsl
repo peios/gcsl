@@ -216,6 +216,49 @@ def (f: File) exec(
     )
 }
 
+# Directories: `dir(path)` is the directory at `path`, resolved as `file`
+# resolves one. A tree of files is a `Dir`: an unpacked archive, a
+# toolchain's root, what a step leaves in a directory. `d.path` is its path;
+# `d.file(path)` and `d.dir(path)` the file and the directory at `path` in
+# it, which must not leave it; `d.files()` every file of it, by path; and
+# `d.exec(...words)` runs `words[0]` with the arguments `words[1..]` in it,
+# as `exec` does, with its options but `cwd`, which it is. Each fails at its
+# call: they are `#[track_caller]`.
+dir = builtins.dir
+
+#[track_caller]
+def (d: Dir) file(path: String): File {
+    builtins.dir_file(d, path)
+}
+
+#[track_caller]
+def (d: Dir) dir(path: String): Dir {
+    builtins.dir_dir(d, path)
+}
+
+#[track_caller]
+def (d: Dir) files() -> List<File> {
+    builtins.dir_files(d)
+}
+
+#[track_caller]
+def (d: Dir) exec(
+    ...words: Present<String>,
+    env: Present<{*: String}> = {},
+    interactive: Present<Bool> = false,
+    panic: Present<Bool> = true,
+    until: Present<String> = "",
+) -> {status: Int, stdout: String, stderr: String} {
+    exec(
+        words,
+        cwd = d.path,
+        env = env,
+        interactive = interactive,
+        panic = panic,
+        until = until,
+    )
+}
+
 #[track_caller]
 def (files: List<File>) file(name: String): File {
     let found = for f in files if f.path == name or ends_with(f.path, "/" + name) { f }

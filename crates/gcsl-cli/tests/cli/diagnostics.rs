@@ -72,13 +72,13 @@ fn dumps_show_record_types_and_record_ir() {
     assert_eq!(
         stdout(&output),
         "(block @32..45\n\
-         \x20 (store x#57 @32..37\n\
+         \x20 (store x#63 @32..37\n\
          \x20   (int 1 @36..37))\n\
-         \x20 (store y#58 @38..45\n\
+         \x20 (store y#64 @38..45\n\
          \x20   (str \"a\" @42..45))\n\
          \x20 (make-record [x y] @32..45\n\
-         \x20   (load x#57 @32..33)\n\
-         \x20   (load y#58 @38..39)))\n"
+         \x20   (load x#63 @32..33)\n\
+         \x20   (load y#64 @38..39)))\n"
     );
     assert_eq!(stderr(&output), "");
     assert_eq!(output.status.code(), Some(0));
@@ -107,11 +107,11 @@ fn dumps_show_names_and_slots() {
          Newline @32..33\n\
          Eof @32..32\n\
          (block @0..32\n\
-         \x20 (store count#72 @0..13\n\
+         \x20 (store count#82 @0..13\n\
          \x20   (int 1 @12..13))\n\
-         \x20 (store count#73 @14..32\n\
+         \x20 (store count#83 @14..32\n\
          \x20   (int-add @23..32\n\
-         \x20     (load count#72 @23..28)\n\
+         \x20     (load count#82 @23..28)\n\
          \x20     (int 1 @31..32)))\n\
          \x20 (empty @0..32))\n"
     );

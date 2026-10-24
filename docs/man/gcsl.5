@@ -68,6 +68,7 @@ Inner record blocks retain ordered construction.
 .SH TYPES
 The built-in value types include Int, Float, Bool, String, Duration, Size, File, records, lists, functions, futures, and unions.
 File is nominal: it holds a file's absolute path, read as f.path, and the content identity a host gives it; no record fits it, files compare equal by both and have no order.
+Dir, a tree of files, is nominal in the same way, with the same one field, path.
 The empty record type is {}.
 List<T> and T[] are equivalent.
 Type aliases are structural and do not create nominal runtime identities.

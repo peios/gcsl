@@ -1106,7 +1106,7 @@ impl Index {
     /// The type of the field `name` of `ty`, if it is a record type with
     /// one, or a file and `name` is `path`.
     fn field_of(&self, ty: TyId, name: Name) -> Option<TyId> {
-        if self.types.strip(ty) == TyId::FILE {
+        if matches!(self.types.strip(ty), TyId::FILE | TyId::DIR) {
             return (self.scan.names.get(name) == "path").then_some(TyId::STRING);
         }
         let fields = self.types.record_fields(self.types.strip(ty))?;
@@ -1118,12 +1118,12 @@ impl Index {
     /// value of a local or a node; a file's one field, `path`, if it is a
     /// file.
     fn record_members(&self, ty: Option<TyId>, of: Option<Symbol>) -> Vec<Completion> {
-        if ty.is_some_and(|ty| self.types.strip(ty) == TyId::FILE) {
+        if ty.is_some_and(|ty| matches!(self.types.strip(ty), TyId::FILE | TyId::DIR)) {
             return vec![Completion {
                 label: "path".to_owned(),
                 kind: CompletionKind::Field,
                 detail: self.short(TyId::STRING),
-                documentation: Some("The file's path, absolute.".to_owned()),
+                documentation: Some("Its path, absolute.".to_owned()),
                 sort: sort_text(FILE, "path"),
                 insert: quoted("path"),
                 range: None,
@@ -2006,6 +2006,20 @@ mod tests {
         assert_eq!(path.kind, CompletionKind::Field);
         assert_eq!(path.detail.as_deref(), Some("String"));
         for method in ["read", "exec"] {
+            assert_eq!(
+                named(&found, method).kind,
+                CompletionKind::Method,
+                "{method}"
+            );
+        }
+        // A directory, its path and its own methods.
+        let files = [(
+            "app.gcsl",
+            "fn f() -> String {\n    let root = dir(\"/a\")\n    root.|\n}\n",
+        )];
+        let found = complete(&files, "app.gcsl");
+        assert_eq!(named(&found, "path").kind, CompletionKind::Field);
+        for method in ["file", "dir", "files", "exec"] {
             assert_eq!(
                 named(&found, method).kind,
                 CompletionKind::Method,

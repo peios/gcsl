@@ -313,7 +313,7 @@ use super::{
 };
 use super::builtins::{enum_builtin, secret_builtin};
 use super::kinds::{as_function, float_to_int, into_callee, mixed};
-use super::files::{make_file, read_file};
+use super::files::{dir_files, inside, make_file, read_file};
 use super::system::{exec, file_system, write_file};
 use super::text::{join, sort_versions, split, string_list, strip_prefix, strip_suffix, trim};
 
@@ -376,6 +376,33 @@ impl Evaluator<'_> {
         result
             .or_else(|unwind| unwind.returned(node.span))
             .map_err(|error| self.call_error(error, &closure, node).into())
+    }
+
+    /// Applies `builtin`, one of the built-ins of files and directories, for
+    /// the call `node`, to `first` and `second`, if it takes two (see
+    /// [Files](crate::eval::files#files)).
+    fn file_builtin(
+        &self,
+        builtin: Builtin,
+        first: Value,
+        second: Option<Value>,
+        node: &IrNode,
+    ) -> Flow<Value> {
+        match (builtin, first, second) {
+            (Builtin::File | Builtin::Dir, Value::Str(path), None) => {
+                make_file(builtin, &path, node)
+            }
+            (Builtin::FileRead, Value::File(file), None) => read_file(&file, node),
+            (Builtin::DirFiles, Value::Dir(dir), None) => dir_files(&dir, node),
+            (Builtin::DirFile | Builtin::DirDir, Value::Dir(dir), Some(Value::Str(path))) => {
+                inside(builtin, &dir, &path, node)
+            }
+            (Builtin::FsComposeDir, entries, None) => self.compose_dir(&entries, node),
+            _ => mistyped(
+                node,
+                "a built-in of files called with arguments of other kinds",
+            ),
+        }
     }
 
     /// Applies `builtin`, `exec`, `exec_live` or `exec_secret`, for the call
@@ -578,8 +605,9 @@ impl Evaluator<'_> {
                 write_file(&p, &contents, node)
             }
             (Builtin::FsTempDir, None, None) => self.temp_dir(node),
-            (Builtin::File, Some((Value::Str(path), _)), None) => make_file(&path, node),
-            (Builtin::FileRead, Some((Value::File(file), _)), None) => read_file(&file, node),
+            (_, Some((first, _)), second) if builtin.is_of_files() => {
+                self.file_builtin(builtin, first, second, node)
+            }
             (
                 Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir | Builtin::FsCopy,
                 Some((Value::Str(p), _)),

@@ -27,7 +27,16 @@
 #   leaves no temporary file behind. A file it replaces does not keep its
 #   permissions: the new file has the mode any new file gets (0666 less the
 #   umask), and a symbolic link at `p` is replaced, not followed. `p` a
-#   directory is an error.
+#   directory is an error;
+# - `compose_dir(entries)`: a new directory of the run, removed as
+#   `temp_dir`'s are, of the record `entries`, whose every key is a path in
+#   it, `/` or `.` for the directory itself: a `Dir`'s tree is copied under
+#   its key, a `File` to its key, and each file of a `List<File>` under its
+#   key by its name. Directories merge; two entries placing one file is an
+#   error, as a key leaving the directory is. Everything is COPIED, its
+#   permissions kept and its symbolic links as links, so that a program
+#   writing in the directory changes nothing it was made of; a host that
+#   isolates steps, as pekit does, mounts instead.
 #
 # Like every standard file it is a scope of its own: it sees its own
 # declarations, the prelude's names, and `builtins`.
@@ -39,3 +48,4 @@ mkdir = builtins.fs_mkdir
 copy = builtins.fs_copy
 temp_dir = builtins.fs_temp_dir
 write = builtins.fs_write
+compose_dir = builtins.fs_compose_dir

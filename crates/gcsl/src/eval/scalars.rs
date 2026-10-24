@@ -592,8 +592,11 @@ impl Evaluator<'_> {
             IrKind::Show(operand) => self.show(operand, node),
             IrKind::Caller => self.caller_text(node),
             IrKind::FilePath(file) => match self.value(file)? {
-                Value::File(file) => Ok(Rc::clone(&file.path)),
-                _ => mistyped(node, "the path of a value that is not a file"),
+                Value::File(file) | Value::Dir(file) => Ok(Rc::clone(&file.path)),
+                _ => mistyped(
+                    node,
+                    "the path of a value that is neither a file nor a directory",
+                ),
             },
             _ => mistyped(node, "a node whose text is not computed"),
         }

@@ -1183,8 +1183,8 @@ pub enum IrKind {
         /// Its value.
         value: IrId,
     },
-    /// `f.path`: the path of the file the node, of any kind, is (see
-    /// [`crate::eval`], "Files"). Of kind [`ValueKind::String`].
+    /// `f.path`: the path of the file or directory the node, of any kind,
+    /// is (see [`crate::eval`], "Files"). Of kind [`ValueKind::String`].
     FilePath(IrId),
     /// `fileroot.caller`: yields the text of the running frame's caller, the
     /// directory of the file whose code made the call the frame runs for,

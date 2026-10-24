@@ -40,8 +40,8 @@ impl Checker<'_> {
         if let Some(meta) = self.types.fn_sig(record_ty).and_then(|sig| sig.meta) {
             return self.meta_read(id, record, meta, name);
         }
-        if self.types.strip(record_ty) == TyId::FILE {
-            return self.file_field(id, name);
+        if let ty @ (TyId::FILE | TyId::DIR) = self.types.strip(record_ty) {
+            return self.file_field(id, name, ty);
         }
         if let Some(ty) = self.field_of(record_ty, name) {
             return ty;

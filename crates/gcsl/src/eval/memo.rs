@@ -848,6 +848,10 @@ pub(super) fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize)
             state.write_u8(14);
             file.hash(state);
         }
+        Value::Dir(dir) => {
+            state.write_u8(15);
+            dir.hash(state);
+        }
         Value::Record(record) => {
             state.write_u8(5);
             state.write_usize(record.values.len());

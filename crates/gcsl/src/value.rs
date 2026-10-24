@@ -755,15 +755,22 @@ pub enum Value {
     /// A file: its path and the content identity a host gives it (see
     /// [Files](crate::eval::files#files)), compared by both.
     File(Rc<File>),
+    /// A directory, a tree of files: its path and the content identity a
+    /// host gives it, as a file's (see [Files](crate::eval::files#files)),
+    /// compared by both.
+    Dir(Rc<File>),
 }
 
-/// A file, as values carry it (see [Files](crate::eval::files#files)).
+/// A file or a directory, as values carry it (see
+/// [Files](crate::eval::files#files)): [`Value::File`] or [`Value::Dir`]
+/// says which.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct File {
     /// Its path, absolute.
     pub path: Rc<str>,
-    /// The identity of its content, as a host records it: `None` under
-    /// plain GCSL, which never looks at a file's content to make one.
+    /// The identity of its content, as a host records it, a directory's of
+    /// its whole tree: `None` under plain GCSL, which never looks at a
+    /// file's content to make one.
     pub identity: Option<Rc<str>>,
 }
 
@@ -827,7 +834,9 @@ impl Value {
             Value::Future(_) => ValueKind::Deferred,
             // A value of an enum is of no kind of its own: present, of the
             // kind a node of an enum's type has; and so is a secret.
-            Value::Variant(_) | Value::Secret(_) | Value::File(_) => ValueKind::Mixed,
+            Value::Variant(_) | Value::Secret(_) | Value::File(_) | Value::Dir(_) => {
+                ValueKind::Mixed
+            }
         }
     }
 
@@ -867,18 +876,39 @@ impl Value {
     /// any depth, in the order met, each once: what a host takes into a
     /// step's sandbox of its arguments, and back out of its result (see
     /// [Files](crate::eval::files#files)). A closure's or a future's captures are not
-    /// looked into, nor a secret's value.
+    /// looked into, nor a secret's value. A directory is no file: see
+    /// [`Value::dirs`].
     #[must_use]
     pub fn files(&self) -> Vec<Rc<File>> {
+        self.found(|value| match value {
+            Value::File(file) => Some(file),
+            _ => None,
+        })
+    }
+
+    /// The directories this value holds, as [`Value::files`] finds its
+    /// files: each a tree a host takes into a step's sandbox whole.
+    #[must_use]
+    pub fn dirs(&self) -> Vec<Rc<File>> {
+        self.found(|value| match value {
+            Value::Dir(dir) => Some(dir),
+            _ => None,
+        })
+    }
+
+    /// What `pick` picks of the values this value holds, in a field, an
+    /// element or a payload at any depth, in the order met, each once.
+    fn found(&self, pick: impl Fn(&Value) -> Option<&Rc<File>>) -> Vec<Rc<File>> {
         let mut found: Vec<Rc<File>> = Vec::new();
         let mut pending: Vec<&Value> = vec![self];
         while let Some(value) = pending.pop() {
-            match value {
-                Value::File(file) => {
-                    if !found.contains(file) {
-                        found.push(Rc::clone(file));
-                    }
+            if let Some(picked) = pick(value) {
+                if !found.contains(picked) {
+                    found.push(Rc::clone(picked));
                 }
+                continue;
+            }
+            match value {
                 Value::Record(record) => pending.extend(record.values.iter().rev()),
                 Value::List(list) => pending.extend(list.values().iter().rev()),
                 Value::Variant(variant) => pending.push(&variant.payload),
@@ -1002,6 +1032,7 @@ impl fmt::Display for Value {
             Value::Secret(_) => f.write_str("***"),
             // As the call that makes it, which reads back as an equal file.
             Value::File(file) => write!(f, "file({})", Quoted(&file.path)),
+            Value::Dir(dir) => write!(f, "dir({})", Quoted(&dir.path)),
             Value::Future(future) => f.write_str(future.display()),
             Value::Record(record) => {
                 f.write_str("{")?;

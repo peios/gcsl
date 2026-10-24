@@ -1553,9 +1553,9 @@ pub(crate) fn check_variant_payloads(
 /// The names of the built-in types: those of [`BuiltinTypes`], and the
 /// type constructors, `List`, `Future` and `Present`. A `type` may not be
 /// named like one: "`Int` is a built-in type".
-pub(crate) const BUILTIN_TYPE_NAMES: [&str; 14] = [
-    "Int", "Float", "Bool", "String", "Duration", "Size", "File", "List", "Future", "Present",
-    "Variant", "Partial", "Secret", "Revealed",
+pub(crate) const BUILTIN_TYPE_NAMES: [&str; 15] = [
+    "Int", "Float", "Bool", "String", "Duration", "Size", "File", "Dir", "List", "Future",
+    "Present", "Variant", "Partial", "Secret", "Revealed",
 ];
 
 /// The name of the checker's attribute that retries a call.
@@ -1664,7 +1664,7 @@ pub(crate) const BUILTIN_ATTRIBUTES: [&str; 7] = [
 
 /// The type names every program can use, as `(name, type)` pairs. A name
 /// the program never mentions has no [`Name`].
-type BuiltinTypes = [(Option<Name>, TyId); 7];
+type BuiltinTypes = [(Option<Name>, TyId); 8];
 
 /// A check in progress. See the module documentation.
 pub struct Checker<'a> {
@@ -2764,6 +2764,7 @@ impl<'a> Checker<'a> {
             | TyKind::String
             | TyKind::Quantity(_)
             | TyKind::File
+            | TyKind::Dir
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never

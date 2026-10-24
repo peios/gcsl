@@ -179,3 +179,144 @@ fn a_value_s_files_are_found_at_any_depth_each_once() {
         .collect();
     assert_eq!(paths, ["/a", "/c"]);
 }
+
+/// A tree in this process's temporary directory, named for `test`: `a.txt`,
+/// `sub/b.txt` and `sub/link`, a symbolic link to `b.txt`; and its path.
+fn temp_tree(test: &str) -> String {
+    let root = std::env::temp_dir().join(format!("gcsl-14d-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    std::fs::write(root.join("sub/b.txt"), "b\n").unwrap();
+    std::os::unix::fs::symlink("b.txt", root.join("sub/link")).unwrap();
+    root.to_str().unwrap().to_owned()
+}
+
+#[test]
+fn a_dir_is_a_tree_whose_files_and_dirs_are_inside_it() {
+    let root = temp_tree("tree");
+    let text = format!(
+        "let d = dir(\"{root}/sub/..\")\n\
+         p = d.path\n\
+         names = for f in d.files() {{ f.path }}\n\
+         b = d.file(\"sub/b.txt\").read()\n\
+         same = d.dir(\"/sub\") == dir(\"{root}/sub\")\n\
+         top = d.dir(\"\") == d\n\
+         s = d"
+    );
+    assert_eq!(
+        lone(&text).unwrap(),
+        format!(
+            "{{p = \"{root}\"; names = [\"{root}/a.txt\", \"{root}/sub/b.txt\", \"{root}/sub/link\"]; \
+             b = \"b\\n\"; same = true; top = true; s = dir(\"{root}\")}}"
+        )
+    );
+    // It runs a program in it.
+    assert_eq!(
+        lone(&format!("= dir(\"{root}\").exec(\"ls\", \"sub\").stdout")).unwrap(),
+        "b.txt\nlink\n"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+    // Its files and dirs never leave it.
+    let text = "x = dir(\"/a\").file(\"b/../../c\")";
+    let error = lone_error(text);
+    assert_eq!(error.message, "`b/../../c` is not inside `/a`");
+    assert_eq!(at(text, &error), "dir(\"/a\").file(\"b/../../c\")");
+    assert_eq!(
+        lone_error("x = dir(\"/a\").file(\".\")").message,
+        "`d.file` needs a path inside the directory"
+    );
+    assert_eq!(lone("= dir(\"/\").file(\"etc\").path").unwrap(), "/etc");
+    // Typed as a file is: its one field, its own type, no order.
+    let error = lone_error("x = dir(\"/a\").name");
+    assert_eq!(error.message, "no field `name` in Dir");
+    assert_eq!(error.notes, ["a directory's one field is `path`"]);
+    assert_eq!(
+        lone_error("let d: Dir = file(\"/a\")").message,
+        "mismatched types"
+    );
+    assert_eq!(
+        lone_error("x = dir(\"/a\") < dir(\"/b\")").message,
+        "cannot order Dir"
+    );
+    assert_eq!(
+        lone_error("x = dir(\"/gcsl-no-such-dir-14d\").files()").message,
+        "cannot list `/gcsl-no-such-dir-14d`"
+    );
+    // A toolchain's layout holds both.
+    assert_eq!(
+        lone("let t: {*: File | Dir} = {root = dir(\"/a\"); cc = file(\"/a/cc\")}\n= t").unwrap(),
+        "{root = dir(\"/a\"); cc = file(\"/a/cc\")}"
+    );
+}
+
+#[test]
+fn compose_dir_copies_each_entry_to_its_place() {
+    let root = temp_tree("compose");
+    let text = format!(
+        "import fs\n\
+         let src = dir(\"{root}\")\n\
+         let made = fs.compose_dir({{\n\
+             \"/\" = src\n\
+             \"opt/one.txt\" = src.file(\"a.txt\")\n\
+             \"flat\" = [src.file(\"a.txt\"), src.file(\"sub/b.txt\")]\n\
+         }})\n\
+         names = for f in made.files() {{ strip_prefix(f.path, made.path) }}\n\
+         b = made.file(\"flat/b.txt\").read()\n\
+         link = made.exec(\"readlink\", \"sub/link\").stdout"
+    );
+    assert_eq!(
+        lone(&text).unwrap(),
+        "{names = [\"/a.txt\", \"/flat/a.txt\", \"/flat/b.txt\", \"/opt/one.txt\", \"/sub/b.txt\", \
+         \"/sub/link\"]; b = \"b\\n\"; link = \"b.txt\\n\"}"
+    );
+    // A program writing in it changes nothing it was made of.
+    let text = format!(
+        "import fs\n\
+         let made = fs.compose_dir({{\"/\" = dir(\"{root}\")}})\n\
+         x = made.exec(\"sh\", \"-c\", \"echo changed > a.txt\").status\n\
+         a = dir(\"{root}\").file(\"a.txt\").read()"
+    );
+    assert_eq!(lone(&text).unwrap(), "{x = 0; a = \"a\\n\"}");
+    // Two entries placing one file, a key leaving it, a file as it.
+    for (entries, message) in [
+        (
+            format!("\"/\" = dir(\"{root}\"); \"a.txt\" = file(\"{root}/sub/b.txt\")"),
+            "`fs.compose_dir`: two entries place `a.txt`",
+        ),
+        (
+            format!("\"x\" = [file(\"{root}/a.txt\"), file(\"{root}/a.txt\")]"),
+            "`fs.compose_dir`: two entries place `x/a.txt`",
+        ),
+        (
+            format!("\"../up\" = file(\"{root}/a.txt\")"),
+            "`fs.compose_dir`: `../up` is outside the directory",
+        ),
+    ] {
+        let error = lone_error(&format!("import fs\nx = fs.compose_dir({{{entries}}})"));
+        assert_eq!(error.message, message, "{entries}");
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_value_s_dirs_are_found_apart_from_its_files() {
+    let source = SourceFile::new(
+        "lone.gcsl",
+        "a = dir(\"/a\")\nb = [{c = file(\"/c\")}, {d = dir(\"/a\")}, {e = dir(\"/e\")}]",
+    )
+    .unwrap();
+    let value = crate::run(&source).unwrap().value;
+    let dirs: Vec<String> = value
+        .dirs()
+        .iter()
+        .map(|dir| dir.path.to_string())
+        .collect();
+    assert_eq!(dirs, ["/a", "/e"]);
+    let files: Vec<String> = value
+        .files()
+        .iter()
+        .map(|file| file.path.to_string())
+        .collect();
+    assert_eq!(files, ["/c"]);
+}

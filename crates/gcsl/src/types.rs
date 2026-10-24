@@ -413,6 +413,9 @@ impl TyId {
     /// A file, `File`: a path and the content identity a host gives it
     /// (see [Files](crate::check::files#files)).
     pub const FILE: TyId = TyId(9);
+    /// A directory, `Dir`: a tree of files, its path and the content
+    /// identity a host gives it (see [Files](crate::check::files#files)).
+    pub const DIR: TyId = TyId(10);
 
     /// The type of `quantity`: [`TyId::DURATION`] or [`TyId::SIZE`].
     #[must_use]
@@ -542,6 +545,9 @@ pub enum TyKind {
     /// `File`, [`TyId::FILE`]: a file, a type of its own that no record fits
     /// (see [Files](crate::check::files#files)).
     File,
+    /// `Dir`, [`TyId::DIR`]: a directory, a tree of files, a type of its
+    /// own as `File` is (see [Files](crate::check::files#files)).
+    Dir,
 }
 
 /// What a generic function's type parameters belong to: one of its own,
@@ -849,6 +855,7 @@ impl TypeTable {
             TyKind::Quantity(Quantity::Duration),
             TyKind::Quantity(Quantity::Size),
             TyKind::File,
+            TyKind::Dir,
         ] {
             table.intern(kind);
         }
@@ -915,6 +922,7 @@ impl TypeTable {
             | TyKind::String
             | TyKind::Quantity(_)
             | TyKind::File
+            | TyKind::Dir
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -998,6 +1006,7 @@ impl TypeTable {
             | TyKind::String
             | TyKind::Quantity(_)
             | TyKind::File
+            | TyKind::Dir
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -1263,6 +1272,7 @@ impl TypeTable {
             | TyKind::String
             | TyKind::Quantity(_)
             | TyKind::File
+            | TyKind::Dir
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -1570,7 +1580,8 @@ impl TypeTable {
             | (TyKind::Float, Value::Float(_))
             | (TyKind::Bool, Value::Bool(_))
             | (TyKind::String, Value::Str(_))
-            | (TyKind::File, Value::File(_)) => true,
+            | (TyKind::File, Value::File(_))
+            | (TyKind::Dir, Value::Dir(_)) => true,
             (TyKind::Quantity(wanted), Value::Quantity(quantity, _)) => wanted == quantity,
             (TyKind::Record(record), Value::Empty) => record.fields.is_empty(),
             (TyKind::Record(record), Value::Record(fields)) => {
@@ -2101,6 +2112,7 @@ impl TypeTable {
             | TyKind::String
             | TyKind::Quantity(_)
             | TyKind::File
+            | TyKind::Dir
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -3058,7 +3070,9 @@ impl TypeTable {
             TyKind::List(_) => Some(ValueKind::List),
             // A secret, a file, and a value of an enum, which is present, are
             // of the kind only they say.
-            TyKind::Secret(..) | TyKind::File | TyKind::Enum { .. } => Some(ValueKind::Mixed),
+            TyKind::Secret(..) | TyKind::File | TyKind::Dir | TyKind::Enum { .. } => {
+                Some(ValueKind::Mixed)
+            }
             // TEMPORARY (alias rule): a special built-in's opaque type is a function's kind (see
             // the [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
             // A variant is called as a function is.
@@ -3395,6 +3409,39 @@ impl Display<'_> {
         }
     }
 
+    /// Writes the record type `record` (see [`TypeTable::display`]): its
+    /// fields by name, each with its default if it has one, and its
+    /// rest-field after them.
+    fn record(&self, record: &RecordTy, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Stored by `Name`, shown by text.
+        let mut fields: Vec<(&str, Name, TyId)> = record
+            .fields
+            .iter()
+            .map(|&(name, ty)| (self.names.get(name), name, ty))
+            .collect();
+        fields.sort_unstable_by_key(|&(text, _, _)| text);
+        f.write_str("{")?;
+        for (index, &(text, name, ty)) in fields.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{}: {}", FieldName(text), self.nested(ty))?;
+            // A default after its field's type, as it is written.
+            if let Some(constant) = self.table.field_default(self.id, name) {
+                f.write_str(" = ")?;
+                write_constant(f, constant, self.names)?;
+            }
+        }
+        // The rest-field after the named ones.
+        if let Some(rest) = record.rest() {
+            if !fields.is_empty() {
+                f.write_str(", ")?;
+            }
+            write!(f, "*: {}", self.nested(rest))?;
+        }
+        f.write_str("}")
+    }
+
     /// Writes the union of `members` (see [`TypeTable::display`]): in the
     /// order [`TypeTable::shown_members`] gives, separated by ` | `,
     /// function types in parentheses, since a function type's return type
@@ -3450,6 +3497,7 @@ impl fmt::Display for Display<'_> {
             TyKind::Bool => f.write_str("Bool"),
             TyKind::String => f.write_str("String"),
             TyKind::File => f.write_str("File"),
+            TyKind::Dir => f.write_str("Dir"),
             TyKind::Error => f.write_str("<error>"),
             TyKind::Never => f.write_str("Never"),
             &TyKind::Param { generic, index } => {
@@ -3486,35 +3534,7 @@ impl fmt::Display for Display<'_> {
                 }
             }
             TyKind::Union(members) => self.union(members, f),
-            TyKind::Record(record) => {
-                // Stored by `Name`, shown by text.
-                let mut fields: Vec<(&str, Name, TyId)> = record
-                    .fields
-                    .iter()
-                    .map(|&(name, ty)| (self.names.get(name), name, ty))
-                    .collect();
-                fields.sort_unstable_by_key(|&(text, _, _)| text);
-                f.write_str("{")?;
-                for (index, &(text, name, ty)) in fields.iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{}: {}", FieldName(text), self.nested(ty))?;
-                    // A default after its field's type, as it is written.
-                    if let Some(constant) = self.table.field_default(self.id, name) {
-                        f.write_str(" = ")?;
-                        write_constant(f, constant, self.names)?;
-                    }
-                }
-                // The rest-field after the named ones.
-                if let Some(rest) = record.rest() {
-                    if !fields.is_empty() {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "*: {}", self.nested(rest))?;
-                }
-                f.write_str("}")
-            }
+            TyKind::Record(record) => self.record(record, f),
             TyKind::Fn(sig) => {
                 f.write_str("fn")?;
                 if let Some(generic) = sig.generic {
