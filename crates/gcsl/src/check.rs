@@ -2007,6 +2007,18 @@ impl<'a> Checker<'a> {
         self
     }
 
+    /// This checker, its input, which is no workspace's file, seeing the
+    /// contexts `known`, each by its name, as a host's built call that binds
+    /// them sees them.
+    #[must_use]
+    pub(crate) fn with_known_contexts(
+        mut self,
+        known: Vec<(Name, crate::workspace::SeenContext)>,
+    ) -> Self {
+        self.contexts.known = known;
+        self
+    }
+
     /// A checker for `ast` whose outermost block starts with the variables
     /// of `scope` already declared. `scope` must come from checking earlier
     /// input interned into the same [`crate::names::Names`] as `ast` and the

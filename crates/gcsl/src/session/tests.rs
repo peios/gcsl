@@ -273,7 +273,7 @@ fn a_session_runs_the_standard_library_first() {
     // The standard files are its first inputs, and the built-in
     // functions' cells its first slots, written as the frame was laid
     // out.
-    assert_eq!(first(), 4);
+    assert_eq!(first(), 5);
     assert_eq!(
         session.source(3).map(SourceFile::name),
         Some("<stdlib>/prelude.gcsl")
@@ -1447,9 +1447,9 @@ fn a_union_variable_is_used_by_later_inputs() {
 #[test]
 fn a_session_runs_exec_panic_and_sh() {
     let mut session = Session::new();
-    // The forty-nine built-in functions' cells are its first slots.
+    // The fifty built-in functions' cells are its first slots.
     assert_eq!(
-        &session.frame[..49],
+        &session.frame[..50],
         Builtin::ALL.map(Value::Builtin).as_slice()
     );
     // On the first input, and on later ones, through a variable.

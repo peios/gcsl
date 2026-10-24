@@ -600,3 +600,28 @@ pub(super) fn unpack(
     }
     Ok(entry(true, Rc::from(root)))
 }
+
+/// Applies `which`, for the call `node`, to `name`: the program of that name
+/// on this process's `PATH`, the first directory's that has a file of the
+/// name its user may run.
+pub(super) fn which(name: &str, node: &IrNode) -> Flow<Value> {
+    use std::os::unix::fs::PermissionsExt;
+    let fail = |message: String| Err(Diagnostic::error(message, node.span).into());
+    if name.is_empty() || name.contains('/') {
+        return fail(format!(
+            "`which` finds a program by its name, which `{name}` is not"
+        ));
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let found = std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            fs::metadata(candidate)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        });
+    match found.and_then(|path| path.to_str().map(Rc::from)) {
+        Some(path) => Ok(entry(false, path)),
+        None => fail(format!("`{name}` is not on `PATH`")),
+    }
+}

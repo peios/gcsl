@@ -74,6 +74,14 @@ impl Checker<'_> {
         if let Some(found) = self.workspace.and_then(|workspace| workspace.context(name)) {
             return Some(found);
         }
+        if let Some(&(_, found)) = self
+            .contexts
+            .known
+            .iter()
+            .find(|&&(known, _)| known == name)
+        {
+            return Some(found);
+        }
         let names = self.ast.names();
         let text = names.get(name);
         let declared = self

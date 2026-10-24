@@ -425,6 +425,15 @@ pub enum RequestError {
         /// The name asked for.
         name: String,
     },
+    /// A field a host sets a root context from is no top-level field of its
+    /// file ([`Workspace::prepare_call_with`](super::Workspace::prepare_call_with)):
+    /// "`workspace.gcsl` has no top-level field `pekitconf`".
+    NoField {
+        /// The file's path, relative to the root.
+        file: String,
+        /// The name asked for.
+        name: String,
+    },
     /// A context a host sets for an invocation is declared nowhere in the
     /// workspace ([`Workspace::invoke_with`](super::Workspace::invoke_with)): "no context `arhc` is
     /// declared".
@@ -514,6 +523,9 @@ impl RequestError {
             RequestError::NoFunction { file, name } => {
                 format!("`{file}` has no top-level function `{name}`")
             }
+            RequestError::NoField { file, name } => {
+                format!("`{file}` has no top-level field `{name}`")
+            }
             RequestError::NoContext { name, .. } => format!("no context `{name}` is declared"),
             RequestError::ContextValue { name, ty } => {
                 format!("the value given for context `{name}` is not a `{ty}`")
@@ -599,6 +611,7 @@ impl RequestError {
             | RequestError::DuplicateArgument { .. }
             | RequestError::MissingArguments { .. }
             | RequestError::NoFunction { .. }
+            | RequestError::NoField { .. }
             | RequestError::DuplicateContext { .. } => Vec::new(),
         }
     }

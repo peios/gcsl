@@ -1320,3 +1320,49 @@ fn a_def_type_generic_in_its_result_types_each_definition_by_its_body() {
         "{messages:?}"
     );
 }
+
+/// Two registered C toolchains of no files of their own, one for each
+/// architecture, and what each `get` of a C toolchain gives.
+const TOOLCHAINS: &str = "import toolchain\n\
+                          import Toolchain from toolchain\n\
+                          def Toolchain::C x86() {\n\
+                          \x20   host_platform = {}\n\
+                          \x20   platform = {arch = \"x86_64\"}\n\
+                          \x20   provides = {root = dir(\"/x\"); runtime = dir(\"/\"); cc = file(\"/x/cc\"); \
+                          ar = file(\"/x/ar\"); ld = file(\"/x/ld\"); sysroot = dir(\"/x\")}\n\
+                          }\n\
+                          def Toolchain::C arm() {\n\
+                          \x20   host_platform = {arch = \"x86_64\"}\n\
+                          \x20   platform = {arch = \"aarch64\"}\n\
+                          \x20   provides = {root = dir(\"/a\"); runtime = dir(\"/\"); cc = file(\"/a/cc\"); \
+                          ar = file(\"/a/ar\"); ld = file(\"/a/ld\"); sysroot = dir(\"/a\")}\n\
+                          }\n\
+                          fn cc() -> String { toolchain.get(Toolchain::C).cc.path }\n";
+
+#[test]
+fn a_toolchain_is_the_first_registered_that_fits_the_platforms() {
+    let text = format!(
+        "{TOOLCHAINS}\
+         let registered = [Toolchain::C x86, Toolchain::C arm]\n\
+         let on = {{arch = \"x86_64\"; os = \"linux\"}}\n\
+         = with {{ toolchains = registered; host_platform = on }} {{\n\
+         \x20   [cc(), cc() with {{ platform = {{arch = \"aarch64\"; os = \"linux\"}} }}]\n\
+         }}"
+    );
+    assert_eq!(lone(&text).unwrap(), "[\"/x/cc\", \"/a/cc\"]");
+    // None fits: the kind and both platforms named.
+    let text = format!(
+        "{TOOLCHAINS}\
+         x = cc() with {{ toolchains = [Toolchain::C arm]; \
+         host_platform = {{arch = \"riscv64\"; os = \"linux\"}}; \
+         platform = {{arch = \"riscv64\"; os = \"linux\"}} }}"
+    );
+    let error = lone_error(&text);
+    assert!(
+        error
+            .message
+            .starts_with("no toolchain of kind `Toolchain::C` runs on `riscv64-linux`"),
+        "{}",
+        error.message
+    );
+}

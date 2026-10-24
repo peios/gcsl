@@ -134,6 +134,9 @@ pub(super) struct ContextsChecked {
     /// The contexts the root of the input's run binds, which the host sets,
     /// by their keys: met at the top level as a `with` there meets them.
     pub(super) root: Vec<Name>,
+    /// The contexts an input of no workspace's file sees, by their names, a
+    /// host's built call among them: those its `with`s bind.
+    pub(super) known: Vec<(Name, crate::workspace::SeenContext)>,
 }
 
 impl Checker<'_> {

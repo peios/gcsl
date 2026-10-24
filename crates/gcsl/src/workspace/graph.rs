@@ -26,8 +26,24 @@ use crate::source::Span;
 use crate::session;
 use crate::value::ContextFrame;
 
-use super::invoke::{Invocation, invoked_here, missing_definition};
+use super::invoke::{FieldCell, Invocation, invoked_here, missing_definition};
 use super::{Argument, Given, InvokeError, Progress, Workspace, count, merge_files};
+
+/// A root context a host sets for a prepared call from a top-level field of
+/// the workspace ([`Workspace::prepare_call_with`]): the context `context`,
+/// set to the value of the top-level field `field` of file `file`, read
+/// through the fields `path`, `pekitconf.toolchains` for `toolchains`.
+#[derive(Clone, Copy, Debug)]
+pub struct RootField<'a> {
+    /// The context's name.
+    pub context: &'a str,
+    /// The file, by its number.
+    pub file: u32,
+    /// Its top-level field.
+    pub field: &'a str,
+    /// The fields read of the field's value, in order.
+    pub path: &'a [&'a str],
+}
 
 /// An invocation of a definition, prepared to run in graph mode, as many
 /// times as it takes (see [Prepared calls](#prepared-calls)).
@@ -41,9 +57,9 @@ pub struct PreparedCall {
     at: (u32, Span),
     /// The root context the host set for it.
     root: Option<Rc<ContextFrame>>,
-    /// The files it needs, which run before it: the definition's and its
-    /// def-type's.
-    files: [u32; 2],
+    /// The files it needs, which run before it: the definition's, its
+    /// def-type's, and each whose field it sets a root context from.
+    files: Vec<u32>,
     /// Its number as a unit, after every file's.
     unit: u32,
 }
@@ -139,10 +155,57 @@ impl Workspace {
     /// call's check's.
     pub fn prepare_call(
         &mut self,
-        (def_type, path): (&str, &str),
+        call: (&str, &str),
         args: &[(String, Given)],
         contexts: &[(String, crate::Value)],
     ) -> Result<PreparedCall, InvokeError> {
+        self.prepare_call_with(call, args, contexts, &[])
+    }
+
+    /// [`Workspace::prepare_call`], with root contexts set from top-level
+    /// fields of the workspace too, as if the call were written in `with {
+    /// CONTEXT = FIELD.PATH } { ... }`: each field read in the call's own
+    /// unit, once its file has run in it, checked against its context's
+    /// type as a `with`'s value is, as pekit sets `^toolchains` from
+    /// `workspace.gcsl`'s `pekitconf.toolchains` (see [Prepared
+    /// calls](#prepared-calls)).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Workspace::prepare_call`], and a field that is no
+    /// top-level field of its file, [`RequestError::NoField`](super::RequestError::NoField).
+    pub fn prepare_call_with(
+        &mut self,
+        (def_type, path): (&str, &str),
+        args: &[(String, Given)],
+        contexts: &[(String, crate::Value)],
+        fields: &[RootField<'_>],
+    ) -> Result<PreparedCall, InvokeError> {
+        let mut cells = Vec::with_capacity(fields.len());
+        for (number, field) in fields.iter().enumerate() {
+            let Some((_, (cell, _))) = self.top_level_cell(field.file, field.field) else {
+                let file = self
+                    .scan
+                    .files
+                    .get(field.file as usize)
+                    .map(|file| file.path.clone())
+                    .unwrap_or_default();
+                return Err(InvokeError::Request(super::RequestError::NoField {
+                    file,
+                    name: field.field.to_owned(),
+                }));
+            };
+            cells.push(FieldCell {
+                context: self.scan.names.intern(field.context),
+                bound: self.scan.names.intern(&format!("<root field {number}>")),
+                cell,
+                path: field
+                    .path
+                    .iter()
+                    .map(|name| self.scan.names.intern(name))
+                    .collect(),
+            });
+        }
         let root = self.root_frame(contexts).map_err(InvokeError::Request)?;
         let resolved = self.invoked(def_type, path)?;
         let given = args
@@ -159,12 +222,14 @@ impl Workspace {
             )));
         };
         let definition = definition.clone();
-        let files = [definition.file, found.listed.file];
+        let mut files = vec![definition.file, found.listed.file];
+        files.extend(fields.iter().map(|field| field.file));
         let known = self.def_type_known(found);
         let (mut ir, warnings) = self.lower_definition_call(
             (&definition, Invocation::Call(&args)),
             (resolved.def_type_cell, resolved.definition_cell),
             (known, root.as_ref()),
+            &cells,
         )?;
         ir.reserve_frame(count(self.frame.len()));
         let unit = count(self.scan.files.len()).saturating_add(self.calls_prepared);
@@ -197,7 +262,7 @@ impl Workspace {
         graph: &mut Graph,
         host: GraphHost<'_>,
     ) -> Result<Progress, InvokeError> {
-        for file in call.files {
+        for &file in &call.files {
             if let Some(node) = self
                 .run_files(file, Some((&mut *graph, host)))
                 .map_err(InvokeError::Diagnostics)?

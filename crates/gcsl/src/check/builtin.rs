@@ -141,6 +141,11 @@ pub enum Builtin {
     /// `strip` components of each path left off, the `archive` module's
     /// `unpack`. A host may answer it itself. Impure.
     ArchiveUnpack,
+    /// `which(name: String) -> File`: the program `name` on this process's
+    /// `PATH`, the first directory's that has a file of the name its user
+    /// may run, the `toolchain` module's way to the host's own tools.
+    /// Impure.
+    Which,
     /// `exec_secret(argv: List<String>, options: {cwd, env, panic, secrets,
     /// until}) -> Secret<{status: Int, stderr: String, stdout: String}>`:
     /// runs a program as `exec` does, given the revealed secrets of
@@ -216,7 +221,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 49] = [
+    pub const ALL: [Builtin; 50] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -253,6 +258,7 @@ impl Builtin {
         Builtin::FileRead,
         Builtin::Fetch,
         Builtin::ArchiveUnpack,
+        Builtin::Which,
         Builtin::ExecSecret,
         Builtin::Dir,
         Builtin::DirFiles,
@@ -330,6 +336,7 @@ impl Builtin {
             Builtin::FileRead => "file_read",
             Builtin::Fetch => "fetch",
             Builtin::ArchiveUnpack => "archive_unpack",
+            Builtin::Which => "which",
             Builtin::ExecSecret => "exec_secret",
             Builtin::Dir => "dir",
             Builtin::DirFiles => "dir_files",
@@ -390,6 +397,7 @@ impl Builtin {
             | Builtin::FileRead
             | Builtin::Fetch
             | Builtin::ArchiveUnpack
+            | Builtin::Which
             | Builtin::ExecSecret
             | Builtin::Dir
             | Builtin::DirFiles
@@ -416,6 +424,7 @@ impl Builtin {
                 | Builtin::FileRead
                 | Builtin::Fetch
                 | Builtin::ArchiveUnpack
+                | Builtin::Which
                 | Builtin::Dir
                 | Builtin::DirFiles
                 | Builtin::DirFile
@@ -469,6 +478,7 @@ impl Builtin {
             Builtin::FileRead => &["f"],
             Builtin::Fetch => &["url", "sha256"],
             Builtin::ArchiveUnpack => &["archive", "strip"],
+            Builtin::Which => &["name"],
             Builtin::CompareVersions => &["a", "b"],
             Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
             Builtin::FsCopy => &["from", "to"],
@@ -505,6 +515,7 @@ impl Builtin {
             | Builtin::FileRead
             | Builtin::Fetch
             | Builtin::ArchiveUnpack
+            | Builtin::Which
             | Builtin::ExecSecret
             | Builtin::Dir
             | Builtin::DirFiles
@@ -584,6 +595,7 @@ impl Builtin {
             | Builtin::FileRead
             | Builtin::Fetch
             | Builtin::ArchiveUnpack
+            | Builtin::Which
             | Builtin::ExecSecret
             | Builtin::Dir
             | Builtin::DirFiles
@@ -649,6 +661,7 @@ impl Builtin {
             Builtin::FileRead => "fn(f: File) -> String",
             Builtin::Fetch => "fn(url: String, sha256: String) -> File",
             Builtin::ArchiveUnpack => "fn(archive: File, strip: Int) -> Dir",
+            Builtin::Which => "fn(name: String) -> File",
             Builtin::Dir => "fn(path: String) -> Dir",
             Builtin::DirFiles => "fn(d: Dir) -> List<File>",
             Builtin::DirFile => "fn(d: Dir, path: String): File",
@@ -693,7 +706,7 @@ impl Builtin {
                 ([TyId::STRING, TyId::STRING], TyId::BOOL)
             }
             Builtin::Trim | Builtin::FsRead => ([TyId::STRING, UNUSED], TyId::STRING),
-            Builtin::File => ([TyId::STRING, UNUSED], TyId::FILE),
+            Builtin::File | Builtin::Which => ([TyId::STRING, UNUSED], TyId::FILE),
             Builtin::FileRead => ([TyId::FILE, UNUSED], TyId::STRING),
             Builtin::Fetch => ([TyId::STRING, TyId::STRING], TyId::FILE),
             Builtin::ArchiveUnpack => ([TyId::FILE, TyId::INT], TyId::DIR),

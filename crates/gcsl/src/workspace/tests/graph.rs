@@ -683,3 +683,58 @@ fn a_graph_s_nodes_are_listed_in_the_order_they_were_made() {
             .all(|(at, (number, _))| *number as usize == at)
     );
 }
+
+#[test]
+fn a_root_context_is_set_from_a_field_its_target_never_reads() {
+    let files = [
+        (
+            "workspace.gcsl",
+            "context label: String = \"default\"\nconf = {label = \"from conf\"; n = 1}",
+        ),
+        ("app/build.gcsl", "def build x() { = \"{^label}!\" }"),
+    ];
+    let mut workspace = rooted(&files).unwrap();
+    let root = workspace.file("workspace.gcsl").unwrap();
+    let field = crate::workspace::graph::RootField {
+        context: "label",
+        file: root,
+        field: "conf",
+        path: &["label"],
+    };
+    let call = workspace
+        .prepare_call_with(("build", "x"), &[], &[], &[field])
+        .unwrap();
+    let mut graph = Graph::new();
+    let Progress::Done(value) = workspace.run_prepared(&call, &mut graph, every()).unwrap() else {
+        panic!("not done");
+    };
+    assert_eq!(value.to_string(), "from conf!");
+    // A field of another type is the `with`'s own error.
+    let wrong = crate::workspace::graph::RootField {
+        path: &["n"],
+        ..field
+    };
+    match workspace.prepare_call_with(("build", "x"), &[], &[], &[wrong]) {
+        Err(InvokeError::Diagnostics(errors)) => {
+            assert!(
+                errors[0].message.starts_with("mismatched types"),
+                "{errors:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // A field there is not.
+    let missing = crate::workspace::graph::RootField {
+        field: "nope",
+        ..field
+    };
+    match workspace.prepare_call_with(("build", "x"), &[], &[], &[missing]) {
+        Err(InvokeError::Request(error)) => {
+            assert_eq!(
+                error.message(),
+                "`workspace.gcsl` has no top-level field `nope`"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}

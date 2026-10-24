@@ -40,7 +40,8 @@
 //! `fs_temp_dir` and `fs_write`, and `sort_versions` and `show`;
 //! `fileroot` where files are (below). The *standard files* are the
 //! `.gcsl` files of the repository's `stdlib/` directory, compiled in
-//! ([`crate::STANDARD`]): `archive.gcsl`, unpacking archives; `fs.gcsl`, the
+//! ([`crate::STANDARD`]): `archive.gcsl`, unpacking archives;
+//! `toolchain.gcsl`, the tools a library asks for; `fs.gcsl`, the
 //! file system, whose members are
 //! the file system's built-in functions, bound as the prelude binds the
 //! others (`exists = builtins.fs_exists`, `write = builtins.fs_write`), so
@@ -54,7 +55,7 @@
 //! namespace, and a file or directory at the workspace's root named like
 //! one of them is an error of the scan, "`builtins` is the name of a
 //! built-in module" (and so for `fileroot`), "`prelude` is the name of a
-//! standard module" (and so for `archive`, `path` and `fs`), reported at the start of
+//! standard module" (and so for `archive`, `toolchain`, `path` and `fs`), reported at the start of
 //! the file, or of the first file under the directory, whether or not any
 //! file imports it. A path of more
 //! than one segment never names one, and a file or directory below the
