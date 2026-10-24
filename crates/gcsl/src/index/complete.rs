@@ -723,7 +723,8 @@ impl Index {
     /// The locals declared in `ast` in scope at `offset`, innermost and
     /// latest first, each name once: the names of the `let`s, `fn`s and
     /// fields of each block around it before the item it is in, the
-    /// parameters of each function whose body it is in, the variable of
+    /// parameters of each function whose body it is in, and those before
+    /// the parameter of each function whose default it is in, the variable of
     /// each `for` whose body or guard it is in, and the `let`s of each
     /// condition loop's header before it. The file's own top level is not
     /// among them.
@@ -741,11 +742,24 @@ impl Index {
                 }
                 ExprKind::Fn(function) => {
                     let decl = ast.fn_decl(function);
+                    let params = ast.params(decl.params);
                     let body = ast.get(decl.body).span;
-                    if body.start < offset && offset <= body.end {
-                        let params = ast
-                            .params(decl.params)
+                    // In the body every parameter, and in a default the
+                    // ones before it.
+                    let seen = if body.start < offset && offset <= body.end {
+                        Some(params.len())
+                    } else {
+                        params.iter().position(|param| {
+                            param.default.is_some_and(|default| {
+                                let at = ast.get(default).span;
+                                at.start <= offset && offset <= at.end
+                            })
+                        })
+                    };
+                    if let Some(seen) = seen {
+                        let params = params
                             .iter()
+                            .take(seen)
                             .map(|param| (param.name, self.param_name(param.name, param.span)))
                             .collect();
                         scopes.push((span.start, params));
@@ -1590,6 +1604,20 @@ mod tests {
         );
         assert!(!labels(&found).contains(&"p"));
         assert!(labels(&found).contains(&"f"));
+    }
+
+    #[test]
+    fn a_default_is_offered_the_parameters_before_it() {
+        let found = complete(
+            &[(
+                "app.gcsl",
+                "fn f(first: Int, second: Int = fir| + 1, third: Int = 0): Int { second }\n",
+            )],
+            "app.gcsl",
+        );
+        assert_eq!(named(&found, "first").detail.as_deref(), Some("Int"));
+        assert!(!labels(&found).contains(&"second"));
+        assert!(!labels(&found).contains(&"third"));
     }
 
     #[test]

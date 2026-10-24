@@ -330,7 +330,16 @@
 //! size with `Vec::resize`; then it evaluates each argument in the caller's
 //! frame, in source order, into its parameter's slot of the new frame, runs
 //! the body in a new `Evaluator` whose base is the new frame's, and finally
-//! truncates the stack back, whether the body succeeded or failed. The
+//! truncates the stack back, whether the body succeeded or failed. An
+//! argument whose value is an [`ArgValue::Default`], which a call gives a parameter
+//! left out whose default is no constant, after the arguments written, in
+//! parameter order, is the result of calling the default function the
+//! callee's closure keeps at that capture, as a call in the caller's frame
+//! is, with the caller the call gives its callee, and with the values of
+//! the parameters before it, read from the new frame: so a default sees
+//! the arguments before it, written or defaulted, and runs on the caller's
+//! side of the call, before the callee's body starts, once for each call
+//! that leaves its parameter out (`Evaluator::default_arg`). The
 //! stack keeps its capacity, so once it has grown to a program's deepest
 //! recursion, a call allocates nothing: not its frame, not its arguments'
 //! slots, and nothing to look anything up, since every variable is a slot
@@ -880,7 +889,7 @@ use crate::ast::FnId;
 use crate::check::{Builtin, Slot};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
-    CatchId, Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField,
+    ArgValue, CatchId, Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField,
     LazyShapeId, ListShape, MetaAt, Operands, RestShape, ShapeId, ShapedOperands, StepAt, StepMode,
     UpdatePathId, UpdateStep,
 };
@@ -2000,7 +2009,7 @@ impl Evaluator<'_> {
             .resize(base + code.frame_size as usize, Value::Empty);
         // An argument may fail, or stop for a loop around the call, after
         // the frame has grown: either way the frame goes.
-        if let Err(unwind) = self.arguments(args, base) {
+        if let Err(unwind) = self.arguments(args, base, (&closure, depth)) {
             self.stack.truncate(base);
             return Err(unwind);
         }
@@ -2062,8 +2071,12 @@ impl Evaluator<'_> {
         let mut arguments: [Option<(Value, Span)>; Builtin::MAX_PARAMS] = Default::default();
         for &arg in self.ir.items(args) {
             let arg = self.ir.get(arg);
-            let IrKind::Arg { param, value } = arg.kind else {
-                return mistyped(arg, "a call's argument is not an argument");
+            let IrKind::Arg {
+                param,
+                value: ArgValue::Node(value),
+            } = arg.kind
+            else {
+                return mistyped(arg, "a built-in's argument is not a node's value");
             };
             let span = self.ir.get(value).span;
             let value = self.value(value)?;
@@ -2228,7 +2241,7 @@ impl Evaluator<'_> {
         // An argument may fail, or stop for a loop around the call, after
         // the frame has grown: either way the frame goes, and no entry has
         // been made yet.
-        if let Err(unwind) = self.arguments(args, base) {
+        if let Err(unwind) = self.arguments(args, base, (closure, depth)) {
             self.stack.truncate(base);
             return Err(unwind);
         }
@@ -2342,22 +2355,95 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Evaluates the arguments `args` of a call, `Arg` nodes, in order, in
-    /// this frame, writing each to its parameter's slot of the frame that
-    /// starts at `base`.
-    fn arguments(&mut self, args: IrRange, base: usize) -> Flow<()> {
+    /// Evaluates the arguments `args` of a call of `callee` at depth `depth`
+    /// in this frame's body, `Arg` nodes, in order, in this frame, writing
+    /// each to its parameter's slot of the frame that starts at `base`. An
+    /// argument a call gives a parameter's default that is no constant, a
+    /// [`ArgValue::Default`], comes after the ones written, in parameter
+    /// order, and is the value of the default function the callee keeps at
+    /// its capture called with the values of the parameters before it, read
+    /// from the new frame ([`Evaluator::default_arg`]).
+    fn arguments(
+        &mut self,
+        args: IrRange,
+        base: usize,
+        (callee, depth): (&Rc<Closure>, u16),
+    ) -> Flow<()> {
         for &arg in self.ir.items(args) {
             let node = self.ir.get(arg);
             let IrKind::Arg { param, value } = node.kind else {
                 return mistyped(node, "a call's argument is not an argument");
             };
-            let value = self.value(value)?;
+            let value = match value {
+                ArgValue::Node(value) => self.value(value)?,
+                ArgValue::Default { capture, .. } => {
+                    let earlier = base..base + param as usize;
+                    self.default_arg((callee, capture), earlier, (depth, node))?
+                }
+            };
             let Some(slot) = self.stack.get_mut(base + param as usize) else {
                 return mistyped(node, "an argument for a parameter outside the frame");
             };
             *slot = value;
         }
         Ok(())
+    }
+
+    /// The value a call at depth `depth` in this frame's body gives a
+    /// parameter whose default is no constant, the argument `node`: the
+    /// default function's closure, capture number `capture` of `callee`,
+    /// called, as a call in this frame is, with the values of the stack's
+    /// slots `earlier`, the parameters before it in the callee's new frame
+    /// (see the checker's "Calls"). So the default runs on the caller's side
+    /// of the call, with the caller's caller, before the callee's body
+    /// starts.
+    fn default_arg(
+        &mut self,
+        (callee, capture): (&Rc<Closure>, u32),
+        earlier: std::ops::Range<usize>,
+        (depth, node): (u16, &IrNode),
+    ) -> Flow<Value> {
+        let Some(Value::Fn(default)) = callee.captures.get(capture as usize) else {
+            return mistyped(node, "a default that its callee keeps no function for");
+        };
+        let default = Rc::clone(default);
+        let Some(code) = default.code.find_function(default.function) else {
+            return mistyped(node, "a closure of a function its IR lacks");
+        };
+        let entering = self.levels + usize::from(depth) + CALL_LEVELS;
+        if entering + code.height as usize > MAX_DEPTH {
+            return Err(nested_too_deeply(node).into());
+        }
+        let Some(values) = self.stack.get(earlier.clone()).map(<[Value]>::to_vec) else {
+            return mistyped(node, "a default's parameters lie outside its call's frame");
+        };
+        let base = self.stack.len();
+        self.stack
+            .resize(base + code.frame_size as usize, Value::Empty);
+        for (slot, value) in self.stack[base..].iter_mut().zip(values) {
+            *slot = value;
+        }
+        let passed = self.callee_caller();
+        let result = Evaluator {
+            ir: &default.code,
+            stack: self.stack,
+            base,
+            captures: &default.captures,
+            callee: Some(&default),
+            memo: self.memo,
+            shared: self.shared,
+            caller: passed,
+            levels: entering,
+        }
+        .value(code.body);
+        self.stack.truncate(base);
+        match result.or_else(|unwind| unwind.returned(node.span)) {
+            Err(mut error) if error.input.is_none() && default.code.input() != self.ir.input() => {
+                error.input = Some(default.code.input());
+                Err(error.into())
+            }
+            result => result.map_err(Unwind::from),
+        }
     }
 
     /// Evaluates the `Call` `node` of `callee` with the arguments `args`, at

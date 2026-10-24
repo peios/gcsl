@@ -498,8 +498,18 @@
 //! annotated. A parameter may have a default, `NAME: TYPE = EXPR`, any
 //! expression after the `=` as an argument is (`Parser::parse_default`),
 //! in any position, in a `fn` expression, a named `fn` item, a `def` and a
-//! def-type's `def` alike, since each is parsed as one ([`Param::default`]);
-//! what a default may be is the checker's business. Not in a function type,
+//! def-type's `def` alike, since each is parsed as one ([`Param::default`]).
+//! Once the parameters and the return marker are parsed, each default that
+//! is no constant ([`crate::ast::is_constant`]) is given its *default
+//! function* ([`Param::default_fn`], `Parser::with_default_fns`): a
+//! [`FnDecl`] with no expression of its own, whose parameters are copies of
+//! the ones before it, as written, without their defaults, whose return
+//! type is the parameter's, whose effect is the function's (a memoised
+//! one's is impure), whose marker is the function's, and whose body is the
+//! default, as a `lazy`'s body is an expression. It adds no syntax: the
+//! default is still where it is written, and the formatter and the index see
+//! it there. How it is checked, and run, is the checker's business (see
+//! [`crate::check`], "Calls"). Not in a function type,
 //! nor in the parameters of a definition made with a def-type, which are
 //! names alone ("expected `,` or `)`" at an `=` there, as before). The
 //! marker is one of three, each an [`Effect`] of the
@@ -2545,6 +2555,7 @@ impl Parser<'_> {
             span: token.span,
             ty,
             default: None,
+            default_fn: None,
         });
         let separator = self.peek();
         Ok(self.list_separator(open)?.then_some(separator))
@@ -4348,9 +4359,10 @@ impl Parser<'_> {
         if let Some(reported) = failed {
             return Err(reported);
         }
-        let params = self.builder.push_params(&self.param_stack[base..]);
-        self.param_stack.truncate(base);
+        let own: Vec<Param> = self.param_stack.drain(base..).collect();
         let (effect, marker) = self.return_marker()?;
+        let own = self.with_default_fns(own, (effect, marker));
+        let params = self.builder.push_params(&own);
         let (ret, ret_height) = self.parse_type()?;
         // Only a function type has a meta.
         if self.meta_marker().is_some() {
@@ -4372,6 +4384,55 @@ impl Parser<'_> {
             body,
         });
         self.alloc(ExprKind::Fn(id), span, height)
+    }
+
+    /// The parameters `params` of a function expression of effect `effect`,
+    /// each whose default is no constant ([`crate::ast::is_constant`]) given
+    /// its default function (see [Functions and calls](#functions-and-calls)):
+    /// a function of the parameters before it, as they are written, with no
+    /// defaults of their own, whose result type is the parameter's, whose
+    /// effect is the function's, a memoised one's impure, whose marker is
+    /// the function's, `marker`, so that an error of its effect points where
+    /// the function declares it, and whose body is the default.
+    fn with_default_fns(
+        &mut self,
+        mut params: Vec<Param>,
+        (effect, marker): (Effect, Span),
+    ) -> Vec<Param> {
+        let effect = match effect {
+            Effect::Pure => Effect::Pure,
+            Effect::Memo | Effect::Impure => Effect::Impure,
+        };
+        for at in 0..params.len() {
+            let Some(default) = params.get(at).and_then(|param| param.default) else {
+                continue;
+            };
+            if crate::ast::is_constant(&self.builder, default) {
+                continue;
+            }
+            let earlier: Vec<Param> = params
+                .iter()
+                .take(at)
+                .map(|param| Param {
+                    default: None,
+                    default_fn: None,
+                    ..*param
+                })
+                .collect();
+            let ty = params.get(at).map(|param| param.ty);
+            let earlier = self.builder.push_params(&earlier);
+            let function = self.builder.push_fn(FnDecl {
+                params: earlier,
+                ret: ty,
+                effect,
+                marker,
+                body: default,
+            });
+            if let Some(param) = params.get_mut(at) {
+                param.default_fn = Some(function);
+            }
+        }
+        params
     }
 
     /// Parses a parameter of a function expression whose parameter list
@@ -4423,6 +4484,7 @@ impl Parser<'_> {
             span: Span::join(token.span, self.type_span(ty)),
             ty,
             default,
+            default_fn: None,
         });
         self.list_separator(open)
     }

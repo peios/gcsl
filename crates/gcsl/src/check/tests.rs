@@ -12475,8 +12475,16 @@ fn a_union_of_unit_like_members_is_unit_like() {
 
 // ----- Parameter defaults -----
 
+/// The constant of `default`, which must be one.
+fn constant_of(default: &ParamDefault) -> Constant {
+    match default {
+        ParamDefault::Constant(constant) => constant.clone(),
+        ParamDefault::Function { .. } => panic!("a default function: {default:?}"),
+    }
+}
+
 /// The defaults of the function expression numbered `n` of `text`, as
-/// the check found them.
+/// the check found them, each a constant.
 fn defaults_of(text: &str, n: u32) -> Vec<Option<Constant>> {
     let (_, _, output) = check_prelude(text);
     let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
@@ -12485,11 +12493,14 @@ fn defaults_of(text: &str, n: u32) -> Vec<Option<Constant>> {
         .resolution
         .function(FnId::new(n))
         .defaults
-        .clone()
+        .iter()
+        .map(|default| default.as_ref().map(constant_of))
+        .collect()
 }
 
 /// Each call of `text` that gives defaults, as its text, with the
-/// parameters it gives them and their constants, in source order.
+/// parameters it gives them and their constants, in source order: each
+/// default a constant.
 fn given_defaults(text: &str) -> Vec<(&str, Vec<(u32, Constant)>)> {
     let (ast, _, output) = check_prelude(text);
     let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
@@ -12497,7 +12508,11 @@ fn given_defaults(text: &str) -> Vec<(&str, Vec<(u32, Constant)>)> {
     let mut calls: Vec<(Span, Vec<(u32, Constant)>)> = ast
         .expr_ids()
         .filter(|&id| !resolution.call_defaults(id).is_empty())
-        .map(|id| (ast.get(id).span, resolution.call_defaults(id).to_vec()))
+        .map(|id| {
+            let defaults = resolution.call_defaults(id).iter();
+            let constants = defaults.map(|(param, default)| (*param, constant_of(default)));
+            (ast.get(id).span, constants.collect())
+        })
         .collect();
     calls.sort_by_key(|(span, _)| span.start);
     calls
@@ -12588,9 +12603,11 @@ fn a_default_is_a_constant() {
 }
 
 #[test]
-fn a_default_that_is_not_a_constant_is_an_error() {
+fn a_default_that_is_no_constant_is_a_default_function() {
     // A name, a call, an interpolated string, a spread, and what is
-    // not quite a literal, a list or a record of them.
+    // not quite a literal, a list or a record of them: each is checked as
+    // its parameter's default function, with no error, and the function's
+    // closure keeps it after its own captures.
     let cases = [
         ("let x = 1\nfn f(p: Int = x): Int { p }", "x"),
         ("fn f(p: Int = len([1])): Int { p }", "len([1])"),
@@ -12631,19 +12648,54 @@ fn a_default_that_is_not_a_constant_is_an_error() {
         ),
         ("fn f(p: Int = 1 : Int): Int { p }", "1 : Int"),
     ];
-    for (text, default) in cases {
-        let found = diagnostics(text);
-        assert_eq!(found.len(), 1, "{text}: {found:?}");
-        let error = &found[0];
-        assert_eq!(error.message, NOT_CONSTANT, "{text}");
-        assert_eq!(error.notes, vec![CONSTANT_NOTE.to_owned()], "{text}");
-        // At the whole default.
+    for (text, _) in cases {
+        // `f` is the last function the parser makes: its default function,
+        // made as its parameters are parsed, comes before it.
+        let (ast, _, output) = check_prelude(text);
+        let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
+        let f = FnId::new(u32::try_from(ast.fn_count() - 1).unwrap());
+        let resolution = output.checked.resolution.function(f).clone();
+        let capture = u32::try_from(resolution.captures.len()).unwrap();
         assert_eq!(
-            &text[error.span.start as usize..error.span.end as usize],
-            default,
+            resolution.defaults,
+            [Some(ParamDefault::Function { capture })],
             "{text}"
         );
     }
+}
+
+#[test]
+fn a_parameter_a_default_measures_is_present() {
+    // The default runs on the arguments before the body: what it measures,
+    // the function measures, so a pure function's bare parameter is present
+    // by it, and a future for it is the call-site error, labelled there.
+    // The default function is function 0, `f` function 1.
+    let measured = "fn f(a: Int, b: Int = a * 2): {v: Int} { v = b }\n";
+    assert_eq!(fn_type(measured, 1), "fn(a: Int, b: Int): {v: Int}");
+    let text = format!("{measured}fn p(): {{v: Int}} {{ f(lazy 4) }}");
+    let found = diagnostics(&text);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        found[0].message,
+        "this argument would be awaited inside `f`, which is pure"
+    );
+    let measuring = Span::new(at(&text, "a * 2").start, at(&text, "a * 2").start + 1);
+    assert!(
+        labels(&found[0]).contains(&(measuring, "`a` is measured here")),
+        "{:?}",
+        labels(&found[0])
+    );
+    // One it passes on as it is stays the either shape.
+    let passed =
+        "fn f(a: Int, b: {k: Int, w: Int | Future<Int>} = { k = 1 + 0; w = a }): {k: Int} { b }\n";
+    assert_eq!(
+        fn_type(passed, 1),
+        "fn(a: Int | Future<Int>, b: {k: Int, w: Int | Future<Int>}): {k: Int}"
+    );
+    // A provisional parameter of an enclosing function a default measures
+    // is that function's, as in any pure function nested in it.
+    let nested = "fn make(n: Int): Int {\n    let g = fn(m: Int = n * 10): Int { m }\n    g()\n}";
+    assert_eq!(fn_type(nested, 2), "fn(n: Int): Int");
 }
 
 #[test]

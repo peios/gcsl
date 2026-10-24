@@ -1965,7 +1965,7 @@ fn function_values_and_their_internal_errors() {
     let arg = builder.alloc(
         IrKind::Arg {
             param: 0,
-            value: one,
+            value: crate::ir::ArgValue::Node(one),
         },
         Span::new(0, 1),
     );
@@ -2766,6 +2766,74 @@ fn a_default_given_is_the_memo_key_an_argument_would_be() {
     assert!(same(&values[0], &values[3]));
     assert!(!same(&values[0], &values[4]));
     assert!(!same(&values[0], &values[5]));
+}
+
+#[test]
+fn a_default_that_is_no_constant_is_evaluated_for_each_call() {
+    // Each call that leaves the parameter out evaluates it anew, with the
+    // parameters before it, written or given their defaults, and what the
+    // function's scope holds where the function is written.
+    let text = "let base = 100\n\
+                    fn f(a: Int, b: Int = a * 2, c: Int = a + b + base): List<Int> { [a, b, c] }\n\
+                    x = f(1)\n\
+                    y = f(2)\n\
+                    z = f(1, 5)\n\
+                    w = f(c = 0, a = 3)";
+    let shown: Vec<String> = fields(text).iter().map(ToString::to_string).collect();
+    assert_eq!(
+        shown,
+        ["[1, 2, 103]", "[2, 4, 106]", "[1, 5, 106]", "[3, 6, 0]"]
+    );
+    // A nested function's default captures from its own frame, each time
+    // it is made.
+    let text = "fn make(n: Int): Int {\n\
+                    \x20   let g = fn(m: Int = n * 10): Int { m }\n\
+                    \x20   g()\n\
+                    }\n\
+                    a = make(1)\n\
+                    b = make(2)";
+    let shown: Vec<String> = fields(text).iter().map(ToString::to_string).collect();
+    assert_eq!(shown, ["10", "20"]);
+}
+
+#[test]
+fn what_a_default_reads_orders_the_fields_and_shadowing_keeps_it() {
+    // A field the default alone reads is computed before the field that
+    // calls the function, as one its body read would be.
+    let shown: Vec<String> = fields("r = f(1)\nk = 3\nfn f(a: Int, b: Int = a + k): Int { b }")
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(shown, ["4", "3"]);
+    // A shadowed function's default is never run, and the one that stands
+    // gives its own.
+    let text = "let k = 2\n\
+                    #[shadowable] def greet(a: Int, b: Int = a * k): Int { b }\n\
+                    def greet(a: Int, b: Int = a + k): Int { b }\n\
+                    r = greet(5)";
+    assert_eq!(fields(text)[1].to_string(), "7");
+}
+
+#[test]
+fn a_default_that_is_no_constant_is_given_before_the_memo_key_is_made() {
+    // A memoised function's default is evaluated at the call, so the key is
+    // the arguments with it, as if written.
+    let text = "fn f(x: Int, y: Int = x + 1) ->> {v: Int} { v = x * y }\n\
+                    a = f(1)\n\
+                    b = f(1, 2)\n\
+                    c = f(1, 3)";
+    let values = fields(text);
+    assert!(same(&values[0], &values[1]));
+    assert!(!same(&values[0], &values[2]));
+    assert_eq!(values[0].to_string(), "{v = 2}");
+}
+
+#[test]
+fn a_failing_default_fails_the_call_at_the_default() {
+    let text = "fn f(a: List<Int>, b: Int = a[5]): Int { b }\nx = f([1])";
+    let error = run(text).unwrap_err();
+    let at = text.find("a[5]").unwrap();
+    assert_eq!(error.span.start as usize, at, "{error:?}");
 }
 
 #[test]

@@ -158,10 +158,17 @@
 //!
 //! A function expression lowers to a [`IrKind::MakeClosure`], whose items
 //! are loads, in the frame creating the closure, of the values it captures,
-//! in capture order. A call is a [`IrKind::Call`] whose items are
+//! in capture order, followed by a `MakeClosure` of each default function
+//! of its parameters' defaults that are no constants, in parameter order
+//! (see the checker's "Calls"): so a function's closure keeps, after its own
+//! captures, the closures of its default functions, made where it is and
+//! capturing there. A call is a [`IrKind::Call`] whose items are
 //! [`IrKind::Arg`] nodes in source order, each naming the parameter its
 //! value is passed as, followed by one for each parameter the call gives
-//! its default, the default's constant, in parameter order.
+//! its default, in parameter order: the default's constant, or an
+//! [`ArgValue::Default`], which the call evaluates once the arguments
+//! before it are in the callee's frame, by calling the default function the
+//! callee closure keeps with the values of the parameters before it.
 //!
 //! A definition made with a def-type that declares a meta (see the
 //! checker's "Metas") has its meta's closure in a cell of the top level's
@@ -649,6 +656,26 @@ pub struct ShapedOperands {
     pub rhs: IrId,
 }
 
+/// The value of an [`IrKind::Arg`]: a node, evaluated in the caller's
+/// frame, or, for a parameter the call leaves out whose default is no
+/// constant, that default (see [Functions](#functions)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgValue {
+    /// The value of the node.
+    Node(IrId),
+    /// The result of calling the default function whose closure is the
+    /// callee closure's capture number `capture`, after the function's own,
+    /// with the values of the parameters before it, in the callee's new
+    /// frame. Of the parameter's kind, `kind`.
+    Default {
+        /// The index of the default function's closure among the callee
+        /// closure's captures.
+        capture: u32,
+        /// The kind of the parameter's value.
+        kind: ValueKind,
+    },
+}
+
 /// What an [`IrNode`] computes. Operand ids of `Int*` nodes always refer to
 /// Int-typed nodes, of `Float*` nodes (except [`IrKind::IntToFloat`]) to
 /// Float-typed nodes, of `Str*` nodes to String-typed nodes, of `Bool*`,
@@ -1016,7 +1043,7 @@ pub enum IrKind {
         /// The index of the parameter it fills.
         param: u32,
         /// Its value.
-        value: IrId,
+        value: ArgValue,
     },
     /// Reads one of the values the closure being run captured, by its index
     /// in capture order. Carries the value's kind, as a `Load` does.
@@ -1133,6 +1160,10 @@ impl IrKind {
             | IrKind::Empty
             | IrKind::Load(..)
             | IrKind::LoadCapture(..)
+            | IrKind::Arg {
+                value: ArgValue::Default { .. },
+                ..
+            }
             | IrKind::Top(..)
             | IrKind::LoadCallee
             | IrKind::Caller
@@ -1145,7 +1176,10 @@ impl IrKind {
                 record: operand, ..
             }
             | IrKind::Store(_, operand)
-            | IrKind::Arg { value: operand, .. }
+            | IrKind::Arg {
+                value: ArgValue::Node(operand),
+                ..
+            }
             | IrKind::Spread(operand)
             | IrKind::ListLen(operand)
             | IrKind::Show(operand)
@@ -1955,7 +1989,10 @@ impl Ir {
                     };
                     continue;
                 }
-                IrKind::Arg { value, .. } => {
+                IrKind::Arg {
+                    value: ArgValue::Node(value),
+                    ..
+                } => {
                     id = value;
                     continue;
                 }
@@ -2019,6 +2056,10 @@ impl Ir {
                 | IrKind::Index { kind, .. }
                 | IrKind::Call { kind, .. }
                 | IrKind::LoadCapture(_, kind)
+                | IrKind::Arg {
+                    value: ArgValue::Default { kind, .. },
+                    ..
+                }
                 | IrKind::Await { kind, .. }
                 | IrKind::As { kind, .. }
                 | IrKind::Catch { kind, .. }
@@ -2298,6 +2339,14 @@ impl IrBuilder {
     }
 
     /// Appends `items` to the item pool as one list and returns its range.
+    /// The nodes of the list `range`, pushed by [`IrBuilder::push_item_list`].
+    pub(crate) fn items(&self, range: IrRange) -> &[IrId] {
+        let start = range.start as usize;
+        self.item_lists
+            .get(start..start + range.len as usize)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn push_item_list(&mut self, items: &[IrId]) -> IrRange {
         let start = u32::try_from(self.item_lists.len()).unwrap_or(u32::MAX);
         self.item_lists.extend_from_slice(items);
@@ -2777,6 +2826,10 @@ impl Pretty<'_> {
                 f.write_str(" ")?;
                 self.lazy_shape(f, shape)?;
             }
+            IrKind::Arg {
+                param,
+                value: ArgValue::Default { capture, .. },
+            } => write!(f, " {param} default {capture}")?,
             IrKind::Arg { param, .. } | IrKind::LoadCapture(param, _) => write!(f, " {param}")?,
             IrKind::For { slot, parts, .. } => {
                 self.slot(f, slot)?;

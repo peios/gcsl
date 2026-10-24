@@ -766,6 +766,44 @@ fn renaming_a_variable_keeps_a_shorthand_argument_naming_its_parameter() {
     );
 }
 
+#[test]
+fn a_parameter_read_in_a_later_default_is_one_symbol() {
+    // A default that is no constant is its own function in the checker,
+    // whose parameters copy the earlier ones: reading one there is still
+    // the parameter, as is a name it captures from where `f` is written.
+    let text = "let base = 1\nfn f(a: Int, b: Int = a + base): Int { a * b }\nr = f(2)\n";
+    let files = [("app.gcsl", text)];
+    let all = places(
+        &files,
+        &[
+            ("app.gcsl", "fn f(|a"),
+            ("app.gcsl", "= |a + base"),
+            ("app.gcsl", "{ |a * b"),
+        ],
+    );
+    assert_eq!(references(&files, ("app.gcsl", "= |a + base"), true), all);
+    assert_eq!(references(&files, ("app.gcsl", "{ |a * b"), true), all);
+    assert_eq!(
+        renamed(&files, ("app.gcsl", "= |a + base"), "first"),
+        Ok(vec![(
+            "app.gcsl".to_owned(),
+            text.replace("f(a: Int", "f(first: Int")
+                .replace("= a + base", "= first + base")
+                .replace("{ a * b", "{ first * b")
+        )])
+    );
+    let base = places(
+        &files,
+        &[("app.gcsl", "let |base"), ("app.gcsl", "a + |base")],
+    );
+    assert_eq!(references(&files, ("app.gcsl", "a + |base"), true), base);
+    let Indexed { index, .. } = indexed(&files);
+    let mut index = index.unwrap();
+    let file = index.file("app.gcsl").unwrap();
+    let hover = index.hover(file, offset(text, "= |a + base")).unwrap();
+    assert!(hover.text.contains("Int"), "{}", hover.text);
+}
+
 fn renamed_err(files: &[(&str, &str)], at: (&str, &str), new: &str) -> String {
     renamed(files, at, new).unwrap_err()
 }

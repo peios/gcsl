@@ -1864,14 +1864,20 @@ impl Walker<'_> {
     }
 
     /// Walks a function expression, whose parameters shadow names in its
-    /// body. Kept out of [`Walker::expr`], so that the frame each level of
+    /// body and each in the defaults after it. Kept out of [`Walker::expr`],
+    /// so that the frame each level of
     /// nesting takes on the native stack stays small.
     #[inline(never)]
     fn function(&mut self, function: FnId) {
         let decl = *self.ast.fn_decl(function);
         let depth = self.shadows.len();
-        self.shadows
-            .extend(self.ast.params(decl.params).iter().map(|param| param.name));
+        // Each default sees the parameters before it, and the body all.
+        for param in self.ast.params(decl.params) {
+            if let Some(default) = param.default {
+                self.expr(default);
+            }
+            self.shadows.push(param.name);
+        }
         self.expr(decl.body);
         self.shadows.truncate(depth);
     }

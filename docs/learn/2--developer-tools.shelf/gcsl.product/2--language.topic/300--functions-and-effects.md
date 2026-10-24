@@ -31,9 +31,29 @@ fn scale(value: Int, factor: Int = 2): Int { value * factor }
 scale(value = 21)
 ```
 
-Defaults are constants. Positional and named arguments are evaluated in
-source order. A trailing block supplies the last parameter, which is
-useful for functions that accept a configuration record.
+Positional and named arguments are evaluated in source order. A trailing
+block supplies the last parameter, which is useful for functions that
+accept a configuration record.
+
+A default can be any expression. It can use the parameters before it and
+anything visible where the function is written:
+
+```gcsl
+let suffix = ".o"
+fn object(source: String, output: String = "{source}{suffix}"): String {
+    output
+}
+main = object("main.c")
+lib = object("lib.c", output = "lib.a")
+```
+
+A default is evaluated each time a call leaves its parameter out, after
+the arguments that are written and before the function's body runs. It
+has the function's effect, so a pure function's default cannot call an
+impure function. A default cannot use its own parameter or a later one.
+Only a call by the function's own name uses its defaults. A call through
+a copy, such as `g` after `let g = object`, or through a parameter must
+supply every argument.
 
 After a named argument, a name on its own is shorthand for passing the
 variable of that name to the parameter of that name. These two calls are

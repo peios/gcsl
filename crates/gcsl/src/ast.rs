@@ -95,8 +95,10 @@
 //! ([`Param::default`]), parsed after the parameter's type and so before
 //! the function's body, which a call that knows the function gives the
 //! parameter when it leaves it unfilled (see [`crate::check`], "Calls").
-//! The tree accepts any expression there; the checker accepts only a
-//! constant.
+//! One that is no constant ([`is_constant`]) has a default function too
+//! ([`Param::default_fn`]), a function of the parameters before it whose
+//! body is the default, which the parser makes, and which a call calls on
+//! its side for the parameter.
 //!
 //! A `lazy EXPR`, [`ExprKind::Lazy`], is a deferred expression: its operand
 //! is the body of an anonymous, parameterless function, run when the
@@ -775,6 +777,12 @@ pub struct Param {
     pub ty: TypeExprId,
     /// Its default, the expression after its `=`, if it has one.
     pub default: Option<ExprId>,
+    /// The default function of its default, if it has one that is no
+    /// constant ([`is_constant`]): a function of the parameters before it,
+    /// whose body is the default, which a call that leaves the parameter out
+    /// calls on its side of the call (see the parser's [Functions and
+    /// calls](crate::parser#functions-and-calls)).
+    pub default_fn: Option<FnId>,
 }
 
 /// What a function may do, as the marker before its return type declares
@@ -2463,6 +2471,104 @@ pub struct AstBuilder {
     no_prelude: Option<Span>,
     syntax: Syntax,
     quoted: Vec<Span>,
+}
+
+/// What [`is_constant`] reads of a tree: a finished [`Ast`], or the parser's
+/// [`AstBuilder`] while it builds one, so that the parser and the checker
+/// apply one rule.
+pub trait ConstantTree {
+    /// The expression `id`.
+    fn constant_expr(&self, id: ExprId) -> &Expr;
+    /// The elements of the list `range`.
+    fn constant_elements(&self, range: ElementRange) -> &[Element];
+    /// The items of the list `range`.
+    fn constant_items(&self, range: ItemRange) -> &[ItemId];
+    /// The item `id`.
+    fn constant_item(&self, id: ItemId) -> &Item;
+    /// The segments of the path `range`.
+    fn constant_path(&self, range: PathRange) -> &[PathSegment];
+}
+
+impl ConstantTree for Ast {
+    fn constant_expr(&self, id: ExprId) -> &Expr {
+        self.get(id)
+    }
+    fn constant_elements(&self, range: ElementRange) -> &[Element] {
+        self.elements(range)
+    }
+    fn constant_items(&self, range: ItemRange) -> &[ItemId] {
+        self.items(range)
+    }
+    fn constant_item(&self, id: ItemId) -> &Item {
+        self.item(id)
+    }
+    fn constant_path(&self, range: PathRange) -> &[PathSegment] {
+        self.path(range)
+    }
+}
+
+impl ConstantTree for AstBuilder {
+    fn constant_expr(&self, id: ExprId) -> &Expr {
+        self.get(id)
+    }
+    fn constant_elements(&self, range: ElementRange) -> &[Element] {
+        let start = range.start as usize;
+        &self.elements[start..start + range.len as usize]
+    }
+    fn constant_items(&self, range: ItemRange) -> &[ItemId] {
+        self.items(range)
+    }
+    fn constant_item(&self, id: ItemId) -> &Item {
+        self.item(id)
+    }
+    fn constant_path(&self, range: PathRange) -> &[PathSegment] {
+        let start = range.start as usize;
+        &self.paths[start..start + range.len as usize]
+    }
+}
+
+/// Whether the expression `id` of `tree`, a parameter's or a field's
+/// default, is a constant (see the checker's
+/// [Calls](crate::check#functions)): a literal, a string without
+/// interpolation (raw or not), an integer, a float, `true` or `false`; `-`
+/// applied directly to an integer or float literal; a list literal without
+/// a spread whose elements are constants; or a record block whose items are
+/// all fields `NAME = CONSTANT`, of one name each and not annotated, `{}`
+/// among them. Nothing else, not even in parentheses. A parameter's default
+/// that is none is evaluated at each call that leaves it out, through its
+/// default function ([`Param::default_fn`]); a field's must be one.
+///
+/// Recurses once per level of list and record nesting.
+#[must_use]
+pub fn is_constant(tree: &impl ConstantTree, id: ExprId) -> bool {
+    match tree.constant_expr(id).kind {
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) => true,
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } => matches!(
+            tree.constant_expr(operand).kind,
+            ExprKind::Int(_) | ExprKind::Float(_)
+        ),
+        ExprKind::List(elements) => tree
+            .constant_elements(elements)
+            .iter()
+            .all(|element| element.spread.is_none() && is_constant(tree, element.value)),
+        ExprKind::Block { items, label: None } => {
+            tree.constant_items(items)
+                .iter()
+                .all(|&item| match tree.constant_item(item).kind {
+                    ItemKind::Field {
+                        path,
+                        ty: None,
+                        value,
+                        function: false,
+                    } => tree.constant_path(path).len() == 1 && is_constant(tree, value),
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Where every arena and pool of an [`AstBuilder`] was, to put it back

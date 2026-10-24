@@ -42,6 +42,19 @@ fn value_type(session: &Session) -> String {
 }
 
 #[test]
+fn a_default_that_is_no_constant_reaches_later_inputs() {
+    // The function's closure keeps its default's, made in the input that
+    // declares it, so a later input's call gives it.
+    let mut session = Session::new();
+    value(
+        &mut session,
+        "let base = 5\nfn f(a: Int, b: Int = a + base): Int { b }",
+    );
+    assert_eq!(value(&mut session, "f(1)").to_string(), "6");
+    assert_eq!(value(&mut session, "let base = 50\nf(2)").to_string(), "7");
+}
+
+#[test]
 fn an_input_with_syntax_errors_reports_them_all_and_commits_nothing() {
     let mut session = Session::new();
     // Every syntax error, and nothing of the input runs or is kept: not

@@ -37,7 +37,13 @@
 //! default's [`Constant`] built where the call is: an `IntConst`,
 //! `FloatConst`, `BoolConst` or `StrConst`, a `MakeList` of its elements, a
 //! `MakeRecord` of its fields in the order they are written, its layout
-//! shared as a record block's is, or `Empty` (`Lowerer::lower_constant`).
+//! shared as a record block's is, or `Empty` (`Lowerer::lower_constant`);
+//! or, for a default that is no constant, an [`ArgValue::Default`] of the capture of
+//! the callee's closure that keeps its default function, of the
+//! parameter's kind by the callee's type. So a function's `MakeClosure`
+//! has, after the reads of what it captures, a `MakeClosure` of each of its
+//! default functions, in parameter order, each lowered into the function
+//! table as a function is (`Lowerer::with_default_fns`).
 //! So the callee is given a full list of arguments, as if every one had
 //! been written, and a memoised function's key is the same either way.
 //!
@@ -414,7 +420,7 @@ use crate::ast::{
 };
 use crate::check::{
     AwaitMark, Builtin, Checked, Constant, FieldSchedule, Fileroot, JumpTarget, MadeAt,
-    PathResolution, Resolution, Slot, Types, VarRef,
+    ParamDefault, PathResolution, Resolution, Slot, Types, VarRef,
 };
 use crate::mentions::{self, FieldNode};
 
@@ -436,9 +442,9 @@ enum RootField {
 }
 use crate::diagnostic::InternalError;
 use crate::ir::{
-    CatchId, Cmp, FnCode, FnKind, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, LazyField,
-    LazyRest, LazyShape, LazyShapeId, ListShape, MetaAt, Operands, RestShape, Shape, ShapeId,
-    ShapedOperands, StepAt, StepMode, TestCode, TestId, UpdateStep,
+    ArgValue, CatchId, Cmp, FnCode, FnKind, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId,
+    LazyField, LazyRest, LazyShape, LazyShapeId, ListShape, MetaAt, Operands, RestShape, Shape,
+    ShapeId, ShapedOperands, StepAt, StepMode, TestCode, TestId, UpdateStep,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -912,23 +918,39 @@ impl Lowerer<'_> {
                     ExprKind::Lazy(function) => (function, FnKind::Future),
                     _ => continue,
                 };
-                let params = u32::try_from(ast.params(ast.fn_decl(function).params).len())
-                    .unwrap_or(u32::MAX);
-                let body = self.builder.alloc(IrKind::Empty, span);
-                if let Some(entry @ None) = self.functions.get_mut(function.index()) {
-                    *entry = Some(FnCode {
-                        body,
-                        kind,
-                        frame_size: params,
-                        param_count: params,
-                        capture_count: 0,
-                        height: 1,
-                        name: None,
-                        display: Box::from(""),
-                        slot_names: Box::from([]),
-                    });
+                // A function's default functions have no node of their own
+                // (see the checker's "Calls").
+                let defaults = ast.params(ast.fn_decl(function).params);
+                let defaults = defaults.iter().filter_map(|param| param.default_fn);
+                let defaults: Vec<(FnId, FnKind)> = defaults
+                    .map(|default| (default, FnKind::Function))
+                    .collect();
+                for (function, kind) in std::iter::once((function, kind)).chain(defaults) {
+                    self.stub_function(function, kind, span);
                 }
             }
+        }
+    }
+
+    /// Enters function `function`, of kind `kind`, into the function table
+    /// as code that does nothing, at `span`, unless it has an entry.
+    fn stub_function(&mut self, function: FnId, kind: FnKind, span: Span) {
+        let ast = self.ast;
+        let params =
+            u32::try_from(ast.params(ast.fn_decl(function).params).len()).unwrap_or(u32::MAX);
+        let body = self.builder.alloc(IrKind::Empty, span);
+        if let Some(entry @ None) = self.functions.get_mut(function.index()) {
+            *entry = Some(FnCode {
+                body,
+                kind,
+                frame_size: params,
+                param_count: params,
+                capture_count: 0,
+                height: 1,
+                name: None,
+                display: Box::from(""),
+                slot_names: Box::from([]),
+            });
         }
     }
 
@@ -2327,10 +2349,61 @@ impl Lowerer<'_> {
         self.reads_caller.push(false);
         let captures = self.lower_function(id, function, kind);
         self.reads_caller.pop();
-        Ok(IrKind::MakeClosure {
-            function,
-            captures: captures?,
-        })
+        let captures = self.with_default_fns(function, captures?)?;
+        Ok(IrKind::MakeClosure { function, captures })
+    }
+
+    /// The items of the `MakeClosure` of function `function`, whose own
+    /// captures are `captures`: those, then a `MakeClosure` of the default
+    /// function of each of its parameters' defaults that is no constant, in
+    /// parameter order, made here, in the frame making the function's
+    /// closure (see the checker's "Calls"); `captures` itself if it has
+    /// none.
+    fn with_default_fns(
+        &mut self,
+        function: FnId,
+        captures: IrRange,
+    ) -> Result<IrRange, InternalError> {
+        let ast = self.ast;
+        let defaults: Vec<FnId> = ast
+            .params(ast.fn_decl(function).params)
+            .iter()
+            .filter_map(|param| param.default_fn)
+            .collect();
+        if defaults.is_empty() {
+            return Ok(captures);
+        }
+        let mut items: Vec<IrId> = self.builder.items(captures).to_vec();
+        for default in defaults {
+            items.push(self.lower_default_fn(default)?);
+        }
+        Ok(self.builder.push_item_list(&items))
+    }
+
+    /// Lowers the default function `function` of a parameter (see the
+    /// checker's "Calls"): its body, the default, into the function table,
+    /// as code of [`FnKind::Function`], and itself to the `MakeClosure` that
+    /// captures, in the current frame, what the checker found it captures.
+    fn lower_default_fn(&mut self, function: FnId) -> Result<IrId, InternalError> {
+        let body_expr = self.ast.fn_decl(function).body;
+        let span = self.ast.get(body_expr).span;
+        self.reads_caller.push(false);
+        // A default starts with no loop or labelled block around it.
+        let outer = (
+            std::mem::take(&mut self.loops),
+            std::mem::take(&mut self.catches),
+        );
+        let body = self.lower_expr(body_expr);
+        (self.loops, self.catches) = outer;
+        let captures = body.and_then(|body| {
+            let display = Box::from("default");
+            self.enter_code(function, (FnKind::Function, body), (span, display))
+        });
+        self.reads_caller.pop();
+        let captures = captures?;
+        Ok(self
+            .builder
+            .alloc(IrKind::MakeClosure { function, captures }, span))
     }
 
     /// Lowers a def-type reference of `def`, spanning `span`, whose path goes
@@ -2408,20 +2481,12 @@ impl Lowerer<'_> {
         );
         let base = self.item_stack.len();
         for (param, value) in [(0, name), (1, definition)] {
-            let arg = self.builder.alloc(IrKind::Arg { param, value }, span);
-            self.item_stack.push(arg);
+            self.push_arg(param, ArgValue::Node(value), span);
         }
         for (at, &(_, ty)) in (0u32..).zip(sig.params.iter()) {
             let kind = self.table.value_kind(ty).ok_or(mistyped)?;
             let value = self.builder.alloc(IrKind::Load(Slot::at(at), kind), span);
-            let arg = self.builder.alloc(
-                IrKind::Arg {
-                    param: at.saturating_add(2),
-                    value,
-                },
-                span,
-            );
-            self.item_stack.push(arg);
+            self.push_arg(at.saturating_add(2), ArgValue::Node(value), span);
         }
         let args = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
@@ -2556,12 +2621,25 @@ impl Lowerer<'_> {
         (kind, body): (FnKind, IrId),
     ) -> Result<IrRange, InternalError> {
         let span = self.ast.get(id).span;
-        let resolution = self.resolution.function(function);
         let display = self
             .table
             .display(self.expr_types.get(id), self.ast.names())
             .to_string()
             .into_boxed_str();
+        self.enter_code(function, (kind, body), (span, display))
+    }
+
+    /// Enters function `function`, of kind `kind`, whose body lowered to
+    /// `body`, into the function table, shown as `display`, an error located
+    /// at `span`, and returns the list of the loads, in the current frame,
+    /// of what it captures.
+    fn enter_code(
+        &mut self,
+        function: FnId,
+        (kind, body): (FnKind, IrId),
+        (span, display): (Span, Box<str>),
+    ) -> Result<IrRange, InternalError> {
+        let resolution = self.resolution.function(function);
         let code = FnCode {
             body,
             kind,
@@ -2881,27 +2959,53 @@ impl Lowerer<'_> {
                     span,
                 });
             }
-            let value = self.lower_expr(arg.value)?;
+            let value = ArgValue::Node(self.lower_expr(arg.value)?);
             let node = self
                 .builder
                 .alloc(IrKind::Arg { param, value }, arg.span(ast));
             self.item_stack.push(node);
         }
         let close = ast.get(id).close_span().unwrap_or(span);
-        for (param, constant) in resolution.call_defaults(id) {
-            let value = self.lower_constant(constant, close);
-            let node = self.builder.alloc(
-                IrKind::Arg {
-                    param: *param,
-                    value,
-                },
-                close,
-            );
-            self.item_stack.push(node);
+        for (param, default) in resolution.call_defaults(id) {
+            let value = match default {
+                ParamDefault::Constant(constant) => {
+                    ArgValue::Node(self.lower_constant(constant, close))
+                }
+                &ParamDefault::Function { capture } => {
+                    let kind = self.param_kind(id, *param).ok_or(InternalError {
+                        message: "a call's default is for a parameter its callee lacks",
+                        span,
+                    })?;
+                    ArgValue::Default { capture, kind }
+                }
+            };
+            self.push_arg(*param, value, close);
         }
         let list = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
         Ok(list)
+    }
+
+    /// Pushes on the item stack an `Arg` of `value` for parameter number
+    /// `param`, spanning `span`.
+    fn push_arg(&mut self, param: u32, value: ArgValue, span: Span) {
+        let arg = self.builder.alloc(IrKind::Arg { param, value }, span);
+        self.item_stack.push(arg);
+    }
+
+    /// The kind of the value of parameter number `param` of the callee of
+    /// the call `call`, by the callee's function type; `None` if it has no
+    /// such parameter.
+    fn param_kind(&self, call: ExprId, param: u32) -> Option<ValueKind> {
+        let (ExprKind::Call { callee, .. } | ExprKind::Unclosed { callee, .. }) =
+            self.ast.get(call).kind
+        else {
+            return None;
+        };
+        let callee_ty = self.table.strip(self.expr_types.get(callee));
+        let sig = self.table.fn_sig(callee_ty)?;
+        let &(_, ty) = sig.params.get(param as usize)?;
+        self.table.value_kind(ty)
     }
 
     /// Lowers `constant`, a parameter's default or a field's (see the

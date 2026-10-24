@@ -9220,6 +9220,30 @@ fn a_def_with_defaults_gives_them_from_another_file() {
 }
 
 #[test]
+fn a_def_s_default_that_is_no_constant_runs_for_another_file() {
+    // The default reads its own file's `suffix`, which the calling file
+    // cannot see, and the parameter before it; `fileroot.caller` in it is
+    // the calling file's directory, as it would be written at the call.
+    let files = [
+        (
+            "workspace.gcsl",
+            "import fileroot\n\
+                 let suffix = \"!\"\n\
+                 def greet(name: String, line: String = \"hi {name}{suffix}\"): String { line }\n\
+                 def from(dir: String = fileroot.caller): String { dir }",
+        ),
+        (
+            "app/main.gcsl",
+            "a = greet(\"jack\")\nb = greet(\"jack\", \"yo\")\nc = from()",
+        ),
+    ];
+    assert_eq!(
+        rooted_text(&files, "app/main.gcsl"),
+        "{a = \"hi jack!\"; b = \"yo\"; c = \"<root>/app\"}"
+    );
+}
+
+#[test]
 fn a_declared_types_field_defaults_reach_every_file() {
     // A type's defaults are copied out of the file declaring it into
     // each file using it, by its name from a directory below and

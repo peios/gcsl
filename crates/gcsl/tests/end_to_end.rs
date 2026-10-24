@@ -1265,14 +1265,14 @@ fn defaults_are_kept_across_repl_inputs() {
 #[test]
 fn a_default_error_renders_exactly() {
     assert_eq!(
-        rendered("let x = 1\nfn f(p: Int = x + 1): Int { p }\n"),
-        "error: a parameter's default must be a constant\n\
-         \x20--> calc.gcsl:2:15\n\
+        rendered("fn f(a: Int = b, b: Int = 1): Int { a }\n"),
+        "error: undefined variable `b`\n\
+         \x20--> calc.gcsl:1:15\n\
          \x20 |\n\
-         2 | fn f(p: Int = x + 1): Int { p }\n\
-         \x20 |               ^^^^^\n\
+         1 | fn f(a: Int = b, b: Int = 1): Int { a }\n\
+         \x20 |               ^  ------ `b` is a parameter from here on\n\
          \x20 |\n\
-         \x20 = note: a literal, or a list or record of literals\n"
+         \x20 = note: a parameter's default sees only the parameters before it\n"
     );
     assert_eq!(
         rendered("fn f(p: Int = \"one\"): Int { p }\n"),

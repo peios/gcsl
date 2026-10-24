@@ -38,8 +38,9 @@ fn an_item_is_small() {
 
 #[test]
 fn a_parameter_is_small() {
-    // Its name, span and type, 16 bytes, and its optional default, 8.
-    assert_eq!(size_of::<Param>(), 24);
+    // Its name, span and type, 16 bytes, its optional default, 8, and its
+    // optional default function, 8.
+    assert_eq!(size_of::<Param>(), 32);
 }
 
 #[test]
