@@ -673,6 +673,9 @@ pub(super) const HOSTED: [(&str, &str); 4] = [
 #[test]
 fn an_invocation_runs_in_the_context_its_host_sets() {
     let mut workspace = rooted(&HOSTED).unwrap();
+    // A host can tell which contexts it can set.
+    assert!(workspace.declares_context("host_platform"));
+    assert!(!workspace.declares_context("hostplatform"));
     let plat = workspace.file("plat.gcsl").unwrap();
     let platform = workspace.run(plat).unwrap().value;
     let set = |label: &str| {

@@ -166,6 +166,17 @@ impl Workspace {
         self.invoke_in((def_type, path), args, root)
     }
 
+    /// Whether the workspace declares a context named `name`: one a host can
+    /// set for an invocation ([`Workspace::invoke_with`]), as pekit sets
+    /// `host_platform` where a library declares it.
+    #[must_use]
+    pub fn declares_context(&self, name: &str) -> bool {
+        self.scan
+            .names
+            .lookup(name)
+            .is_some_and(|name| self.scan.contexts.iter().any(|c| c.name == name))
+    }
+
     /// The root frame of the context a host sets for an invocation, each of
     /// `contexts` a context's name and its value, checked as
     /// [`Workspace::invoke_with`] says; `None` for none.
