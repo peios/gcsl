@@ -12699,6 +12699,26 @@ fn a_parameter_a_default_measures_is_present() {
 }
 
 #[test]
+fn a_default_function_shares_its_function_s_parameter_types() {
+    // Its copies of the earlier parameters are not resolved again, so an
+    // error in one is reported once.
+    let found = diagnostics("fn f(a: Nope, b: Int = 1 + 1): Int { b }");
+    let messages: Vec<&str> = found.iter().map(|d| d.message.as_str()).collect();
+    assert_eq!(messages, ["unknown type `Nope`"]);
+    // A memoised function's default sees a present parameter, as its body
+    // does: adding to it needs no await.
+    let text = "let k = 3\nfn m(a: Int, b: Int = a + k) ->> Int { a * b }\nr = m(2)";
+    let (ast, _, output) = check_prelude(text);
+    let output = output.unwrap_or_else(|errors| panic!("{errors:?}"));
+    let start = at(text, "a + k").start;
+    let read = ast
+        .expr_ids()
+        .find(|&id| ast.get(id).span == Span::new(start, start + 1))
+        .unwrap();
+    assert_eq!(output.checked.resolution.await_of(read), AwaitMark::None);
+}
+
+#[test]
 fn a_default_is_checked_against_its_parameters_type() {
     let text = "fn f(p: Int = \"no\"): Int { p }";
     let found = diagnostics(text);

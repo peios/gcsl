@@ -14308,8 +14308,12 @@ impl<'a> Checker<'a> {
         // Each default and the type it is checked against: its parameter's,
         // before any inference.
         let mut defaults = Vec::new();
+        // Each parameter's type before any inference, which its default
+        // functions' copies of it are given.
+        let mut resolved = Vec::with_capacity(params.len());
         for (index, param) in params.iter().enumerate() {
             let mut ty = self.resolve_type(param.ty, params_mode);
+            resolved.push(ty);
             if let Some(default) = param.default {
                 defaults.push((index, default, (ty, param.ty)));
             }
@@ -14338,7 +14342,7 @@ impl<'a> Checker<'a> {
         let ret_span = decl.ret.map_or(self.ast.get(decl.body).span, |ret| {
             self.ast.type_expr(ret).span
         });
-        let (default_fns, measured) = self.check_default_fns(params, &mut defaults);
+        let (default_fns, measured) = self.check_default_fns((params, &resolved), &mut defaults);
         self.functions.push(Function {
             fn_id: function,
             bindings_start: self.bindings.len(),
@@ -14383,11 +14387,8 @@ impl<'a> Checker<'a> {
         self.callbacks.truncate(callbacks.0);
         self.callback_positions.truncate(callbacks.1);
         self.fn_params.truncate(base);
-        let top = self.functions.len() == 1;
         let demanded = self.finish_function(decl.params.len(), callee);
-        if top {
-            self.add_default_copies();
-        }
+        self.add_default_copies();
         if let Some(resolution) = self.fn_resolutions.get_mut(function.index()) {
             resolution.unnarrowed = unnarrowed;
             resolution.defaults =
@@ -14402,7 +14403,8 @@ impl<'a> Checker<'a> {
     }
 
     /// Checks each default of `defaults`, the defaults of a function whose
-    /// parameters are `params`, each with its parameter's number, that is no
+    /// parameters are `params`, of the types `resolved` before any
+    /// inference, each with its parameter's number, that is no
     /// constant, as its default function (`Checker::check_default_fn`), in
     /// the scope the function is written in, before the function's frame is
     /// entered (see [Calls](#calls)), and takes it out of `defaults`, which
@@ -14411,7 +14413,7 @@ impl<'a> Checker<'a> {
     /// parameter, where a default first measures it, if one does.
     fn check_default_fns(
         &mut self,
-        params: &[Param],
+        (params, resolved): (&[Param], &[TyId]),
         defaults: &mut Vec<(usize, ExprId, (TyId, TypeExprId))>,
     ) -> (Vec<(usize, bool)>, Vec<Option<Span>>) {
         let mut default_fns = Vec::new();
@@ -14425,7 +14427,8 @@ impl<'a> Checker<'a> {
             let unseen = params.get(index..).unwrap_or_default();
             let unseen = unseen.iter().map(|param| (param.name, param.span));
             self.defaults_checked.unseen.extend(unseen);
-            let (checked, demanded) = self.check_default_fn(default_fn, expected);
+            let earlier = resolved.get(..index).unwrap_or_default();
+            let (checked, demanded) = self.check_default_fn(default_fn, (earlier, expected));
             self.defaults_checked.unseen.truncate(outer);
             default_fns.push((index, checked));
             for (first, found) in measured.iter_mut().zip(demanded) {
@@ -14440,11 +14443,12 @@ impl<'a> Checker<'a> {
         (default_fns, measured)
     }
 
-    /// Adds the copies of the defaults of the top-level function whose body
-    /// was just checked to its own (see [Calls](#calls)).
+    /// Once a function's body is checked, if it is the top-level function
+    /// whose body is being checked, adds the copies of its defaults to its
+    /// own (see [Calls](#calls)).
     fn add_default_copies(&mut self) {
         let copies = &mut self.defaults_checked.copies;
-        if copies.is_empty() {
+        if copies.is_empty() || !self.functions.is_empty() {
             return;
         }
         if let Some(own) = self
@@ -14462,8 +14466,10 @@ impl<'a> Checker<'a> {
     /// resolved for its function before any inference and as written, is
     /// `expected` (see [Calls](#calls)): in a frame of its own, as a function
     /// written where its parameter's function is, whose parameters are the
-    /// ones before the parameter, declared with the types their function
-    /// gives them, and whose body, the default, is checked against
+    /// ones before the parameter, declared with the types `earlier` their
+    /// function resolved them to before any inference, not resolved again,
+    /// so that their errors are reported once and a memoised function's
+    /// default sees them as its body does, and whose body, the default, is checked against
     /// `expected` as an annotated initialiser is against its annotation. Its
     /// effect is its function's, so a pure function's default is checked as
     /// pure code, its bare parameters inferred as any pure function's are
@@ -14475,18 +14481,17 @@ impl<'a> Checker<'a> {
     fn check_default_fn(
         &mut self,
         function: FnId,
-        (expected, written): (TyId, TypeExprId),
+        (earlier, (expected, written)): (&[TyId], (TyId, TypeExprId)),
     ) -> (bool, Vec<Option<Span>>) {
         // A function in the body must not see a name meant for another.
         self.callee_name = None;
         let decl = *self.ast.fn_decl(function);
         let pure = decl.effect == Effect::Pure;
-        let (params_mode, _) = bareness_of(decl.effect);
         let params = self.ast.params(decl.params);
         let base = self.fn_params.len();
         let mut provisional = false;
         for (index, param) in params.iter().enumerate() {
-            let mut ty = self.resolve_type(param.ty, params_mode);
+            let mut ty = earlier.get(index).copied().unwrap_or(TyId::ERROR);
             if pure && ty != TyId::ERROR && self.is_inferred(param.ty) {
                 ty = self.types.provisional(function, position(index), ty);
                 provisional = true;

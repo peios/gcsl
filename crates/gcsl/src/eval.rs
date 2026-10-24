@@ -2414,14 +2414,20 @@ impl Evaluator<'_> {
         if entering + code.height as usize > MAX_DEPTH {
             return Err(nested_too_deeply(node).into());
         }
-        let Some(values) = self.stack.get(earlier.clone()).map(<[Value]>::to_vec) else {
+        if earlier.end > self.stack.len() {
             return mistyped(node, "a default's parameters lie outside its call's frame");
-        };
+        }
+        // The default's frame sits above the callee's, so its parameters
+        // are copied up, in place: nothing is allocated once the stack has
+        // grown, as for any call.
         let base = self.stack.len();
         self.stack
             .resize(base + code.frame_size as usize, Value::Empty);
-        for (slot, value) in self.stack[base..].iter_mut().zip(values) {
-            *slot = value;
+        for (at, from) in earlier.enumerate() {
+            let value = self.stack.get(from).cloned().unwrap_or(Value::Empty);
+            if let Some(slot) = self.stack.get_mut(base + at) {
+                *slot = value;
+            }
         }
         let passed = self.callee_caller();
         let result = Evaluator {
