@@ -177,7 +177,7 @@
 //! top-level declaration.
 //!
 //! In a workspace, an `import` lowers to nothing where it stands (see the
-//! checker's [Imports](crate::check#imports)). A reference through an
+//! checker's [Imports](crate::check::imports#imports)). A reference through an
 //! imported name is lowered as a reference to the node it reaches is: a
 //! `Load` of the cell from top-level code, an [`IrKind::Top`] of it from a
 //! function or a `lazy`. Every read of a `def` reached through an import,
@@ -908,7 +908,7 @@ impl Lowerer<'_> {
             None => self.builder.alloc(IrKind::Empty, span),
         };
         // An imported value file's value is a cell: stored as the block
-        // ends, the last item of the top level (see [Imports](crate::check#imports)).
+        // ends, the last item of the top level (see [Imports](crate::check::imports#imports)).
         let value_cell = self.resolution.value_cell();
         if is_root && value_cell != Slot::NONE {
             let store = self.builder.alloc(IrKind::Store(value_cell, result), span);
@@ -1100,7 +1100,7 @@ impl Lowerer<'_> {
     /// records first, each a `MakeRecord` of `Load`s of the fields' cells,
     /// which the files that own them, run before this one, have written (a
     /// `def`'s cell being its function's slot; see
-    /// [Imports](crate::check#imports)).
+    /// [Imports](crate::check::imports#imports)).
     fn store_imported_records(&mut self, span: Span) {
         let resolution = self.resolution;
         for (slot, fields) in resolution.imported_records() {
@@ -1112,7 +1112,7 @@ impl Lowerer<'_> {
     /// the `MakeRecord` of `fields`, a `Load` of each one's cell at its
     /// name, of the kind of its type, shown at `span`: a record a file of a
     /// workspace assembles of other files' cells, and of its own computed
-    /// before it (see [Imports](crate::check#imports)).
+    /// before it (see [Imports](crate::check::imports#imports)).
     fn store_record(&mut self, slot: Slot, fields: &[(Name, Slot, TyId)], span: Span) {
         self.layout_names.clear();
         self.record_loads.clear();
@@ -1139,7 +1139,7 @@ impl Lowerer<'_> {
     /// first, the file's own record of each node it shares with other
     /// files, which its value holds in place of the shared node's cell,
     /// whose value has the other files' parts (see [Directory
-    /// scope](crate::check#directory-scope)).
+    /// scope](crate::check::imports#directory-scope)).
     fn store_own_records(&mut self) -> Result<(), InternalError> {
         let resolution = self.resolution;
         let tree = &resolution.field_schedule().tree;
@@ -1165,7 +1165,7 @@ impl Lowerer<'_> {
     /// workspace, a node shared with other files has their children too,
     /// after its own, unless `own`, which builds the file's own record of
     /// it, from its own children's own records (see [Directory
-    /// scope](crate::check#directory-scope)).
+    /// scope](crate::check::imports#directory-scope)).
     fn assemble(
         &mut self,
         node: &FieldNode,

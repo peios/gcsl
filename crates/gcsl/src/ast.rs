@@ -3200,7 +3200,7 @@ impl ConstantTree for AstBuilder {
 
 /// Whether the expression `id` of `tree`, a parameter's or a field's
 /// default, is a constant (see the checker's
-/// [Calls](crate::check#functions)): a literal, a string without
+/// [Calls](crate::check::functions#functions)): a literal, a string without
 /// interpolation (raw or not), an integer, a float, `true` or `false`; `-`
 /// applied directly to an integer, float, duration or size literal; a list literal without
 /// a spread whose elements are constants; or a record block whose items are

@@ -111,7 +111,7 @@
 //!
 //! Any other outer name, `#[NAME]` or `#[NAME(ARGS)]`, is a *use* of an
 //! attribute, which the checker resolves (see the checker's
-//! [Attributes](crate::check#attributes)): its arguments are parsed as a
+//! [Attributes](crate::check::attributes#attributes)): its arguments are parsed as a
 //! call's are, positional or named, and its `]` must follow its `)`,
 //! "expected `]` after the attribute's arguments" otherwise. A use applies
 //! to the item after it, which must be a function item, a named `fn` at any

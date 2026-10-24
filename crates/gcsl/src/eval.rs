@@ -811,7 +811,7 @@
 //! # Retry and timeout
 //!
 //! A call of a function with `#[retry]` or `#[timeout]` (see the checker's
-//! [Attributes](crate::check#attributes)), whose code says so
+//! [Attributes](crate::check::attributes#attributes)), whose code says so
 //! ([`FnCode::retry`], [`FnCode::timeout`]), runs its body through
 //! `Evaluator::guarded_body`, a frame between the call and the body that
 //! costs [`GUARD_LEVELS`] more of the nesting budget; every other call runs

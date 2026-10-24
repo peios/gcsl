@@ -429,7 +429,7 @@
 //!   declares none. A type imported as a built-in type's name is "`Int` is a
 //!   built-in type".
 //! - A type marked `#[attribute]` is an attribute's declaration (see the
-//!   checker's [Attributes](crate::check#attributes)): the store records it
+//!   checker's [Attributes](crate::check::attributes#attributes)): the store records it
 //!   by its number, with what a host knows it by, its file's path without
 //!   `.gcsl` and its name ([`TypeStore::mark_attribute`]), so that a session's
 //!   later inputs know it too, but one named like a built-in attribute,
@@ -478,7 +478,7 @@
 //!
 //! # Methods
 //!
-//! A method (see the checker's [Methods](crate::check#methods)) binds no
+//! A method (see the checker's [Methods](crate::check::methods#methods)) binds no
 //! name, so it is in no tree, no view and no record: a file's methods are
 //! its tree's ([`Ast::methods`]), each a top-level function of its file
 //! under a binding no source can write. A file sees the `def` methods of
@@ -509,7 +509,7 @@
 //! # Enums
 //!
 //! An enum is a `type` declaration defined by no type expression (see the
-//! checker's [Enums](crate::check#enums)): its declaration in the store is
+//! checker's [Enums](crate::check::enums#enums)): its declaration in the store is
 //! a leaf, [`TypeExprKind::Enum`], of its key, a name of its name and of
 //! its file's path, or `input N` for a session's input (`Scan::origin`,
 //! [`names::enum_key`]), so it is seen, imported and qualified as any type
@@ -526,7 +526,7 @@
 //!
 //! # Context
 //!
-//! A context (see the checker's [Context](crate::check#context)) is in no
+//! A context (see the checker's [Context](crate::check::context#context)) is in no
 //! tree, no view and no record. The scan finds every file's declarations
 //! (`declare_contexts`), each with its declaration's key, of its name and
 //! of its file's path, or `input N` for a session's input, and its default's
@@ -681,7 +681,7 @@
 //!
 //! [`Workspace::invoke_with`] invokes a definition as [`Workspace::invoke`]
 //! does, in a context the host sets (see the checker's
-//! [Context](crate::check#context)): each a context's name and a value of
+//! [Context](crate::check::context#context)): each a context's name and a value of
 //! its declared type, data the host has from an earlier run, bound around
 //! the call as a `with` binds it. What a file computes as it runs reads the
 //! declared defaults, whatever invokes it, so a file's cells never depend
@@ -5182,7 +5182,7 @@ fn slashed_module(modules: &Modules<'_>, shown: &[&str]) -> Option<String> {
 /// The suggestion for `name`, a segment of a module path that names no
 /// module in the directory at path `at` (`""`, the root), the path's last
 /// segment if `last` and its only one if `only` (see
-/// [Suggestions](crate::check#suggestions)): the nearest of the directories
+/// [Suggestions](crate::check::names#suggestions)): the nearest of the directories
 /// in `at` (none a workspace of its own), the stems of its files if `last`
 /// (a file has no modules in it), and, for a path of one segment, the
 /// standard modules, `builtins` and `fileroot`.
@@ -5406,7 +5406,7 @@ fn members(
 
 /// The suggestion for `name`, imported by member from `target`, which has
 /// no root or type of that name (see
-/// [Suggestions](crate::check#suggestions)): the nearest of its roots and
+/// [Suggestions](crate::check::names#suggestions)): the nearest of its roots and
 /// its types.
 fn member_suggestion<'s>(scan: &'s Scan, target: Target, name: &str) -> Option<&'s str> {
     let roots = target_roots(scan, target);
@@ -6949,7 +6949,7 @@ fn view_edges(scan: &Scan, file: &File) -> (Vec<mentions::ViewNode>, Vec<bool>) 
 }
 
 /// What the checker knows of the workspace while it checks one of its
-/// files (see [Directory scope](crate::check#directory-scope)).
+/// files (see [Directory scope](crate::check::imports#directory-scope)).
 #[derive(Debug)]
 pub(crate) struct Context<'a> {
     /// The workspace.
@@ -7193,7 +7193,7 @@ impl<'a> Context<'a> {
     }
 
     /// The roots of the file's view, each with the rank of its scope for a
-    /// suggestion (see [Suggestions](crate::check#suggestions)), the nearer
+    /// suggestion (see [Suggestions](crate::check::names#suggestions)), the nearer
     /// the smaller: its own, 4; its directories', one rank each from 5 up,
     /// its own directory first; what it imports, the rank after the root
     /// directory's; the implicit prelude's, the one after that; but not the
