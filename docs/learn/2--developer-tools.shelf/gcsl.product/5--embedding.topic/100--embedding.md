@@ -45,8 +45,10 @@ used it.
 ## Effects are host effects
 
 The standard library is embedded in the binary. Its process and file
-operations still run with the embedding process's permissions and
-resources. The library does not impose a wall-clock limit or turn pure
+operations go through an effect context, `Effects`, which a host can
+replace, and by default they run with the embedding process's
+permissions and resources (see [Running steps for a
+host](~gcsl/graph-mode)). The library does not impose a wall-clock limit or turn pure
 checking into an execution sandbox. A host that accepts untrusted programs
 needs an external isolation and resource policy.
 
