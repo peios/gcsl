@@ -40,6 +40,47 @@ doesn't name, and the arguments of a memoised call. Two secrets with one
 identity are one secret to them, whatever their values, so neither can
 tell anything about a value.
 
+## Secrets from a keychain
+
+A build shouldn't hold its secrets in its source. The `keychain` module
+gives them by name instead, and the same build file works wherever the
+secret is kept:
+
+```text
+import keychain
+
+let token = keychain.string("api-token")
+let key = keychain.file("module-signing")
+```
+
+`keychain.string` gives a `Secret<String>` and `keychain.file` a
+`Secret<File>`. Each looks in the keychain's configuration first: the
+context `keychain_keys`, a list of entries naming a secret, the profile
+it's for, and the file that holds it. A relative path is relative to the
+workspace's root:
+
+```text
+let key = keychain.file("module-signing") with {
+    keychain_keys = [{profile = "dev"; name = "module-signing"; file = "keys/test.pem"}]
+}
+```
+
+The profile is the context `keychain_profile`, `dev` unless something
+sets it, so a release build can use other keys than a developer's. A
+string from a file is the file's contents, without a newline at the end.
+
+With nothing configured, a secret comes from the environment: a file from
+the path in `$GCSL_SECRET_FILE_<NAME>`, and a string from that file or
+the value of `$GCSL_SECRET_<NAME>`. `<NAME>` is the secret's name in
+capitals, with `_` for each character that isn't a letter or a digit, so
+`api-token` is `$GCSL_SECRET_API_TOKEN`. A secret found in none of these
+fails, naming the variable to set.
+
+A keychain's secret is identified by its profile and name, `dev/api-token`,
+unless the program running GCSL identifies it otherwise. A build tool
+such as pekit adds a keyed hash of the secret's contents, so that a
+changed key never reuses what was made with the old one.
+
 ## A secret decides nothing
 
 What a program does never depends on a secret, because whoever can see

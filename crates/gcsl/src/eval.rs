@@ -1370,6 +1370,7 @@ pub mod effects;
 pub(crate) mod elements;
 pub(crate) mod files;
 pub mod graph;
+pub(crate) mod keychain;
 pub(crate) mod kinds;
 pub(crate) mod memo;
 pub mod plain;

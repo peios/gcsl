@@ -314,6 +314,7 @@ use super::builtins::{enum_builtin, secret_builtin};
 use super::kinds::{as_function, float_to_int, into_callee, mixed};
 use super::elements::element_builtin;
 use super::files::{dir_files, fetch, inside, make_file, read_file, unpack, which};
+use super::keychain::keychain;
 use super::graph::effect_builtin;
 use super::sandbox::{sandbox_entry, sandbox_exec};
 use super::system::{exec, file_system, write_file};
@@ -409,6 +410,11 @@ impl Evaluator<'_> {
                 unpack(&archive, strip, self.shared.effects, node)
             }
             (Builtin::Which, Value::Str(name), None) => which(&name, node),
+            (
+                Builtin::KeychainString | Builtin::KeychainFile,
+                Value::Str(name),
+                Some(Value::Record(from)),
+            ) => keychain(builtin, &name, &from, self.shared.effects, node),
             (Builtin::DirFiles, Value::Dir(dir), None) => {
                 dir_files(&dir, self.shared.effects, node)
             }

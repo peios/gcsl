@@ -1,0 +1,54 @@
+# The keychain module: a module of GCSL's standard library, compiled into
+# every build and loaded by a run that imports it (`import keychain`). A
+# library asks it for a secret by name, the same way under any host, and
+# never asks where the secret is kept.
+#
+# - `context keychain_profile`: which of the keychain's secrets a build
+#   uses, `dev` by default; a release build uses its own, such as
+#   `release`, set by its host or with `with`.
+# - `context keychain_keys`: the keychain's configuration, each entry a
+#   name, the profile it is of and the file that holds it, its path
+#   absolute or relative to the workspace's root. A host such as pekit sets
+#   it from the workspace's configuration.
+# - `string(name)`: the secret string of the name `name` for the profile:
+#   the contents of its configured file, a newline at the end left out, or
+#   else of the file `$GCSL_SECRET_FILE_<NAME>` names, or else the value of
+#   `$GCSL_SECRET_<NAME>`, `NAME` in capitals with `_` for each character
+#   that is no letter or digit.
+# - `file(name)`: the secret file of the name, from its configured file or
+#   the file `$GCSL_SECRET_FILE_<NAME>` names.
+#
+# A secret's identity is the host's: by default `profile/name`. Resolve one
+# in a parameter default, `key = keychain.file("module-signing")`, so that a
+# step is given it as an argument.
+import builtins
+import fileroot
+import path
+
+type Key = {profile: String, name: String, file: String}
+
+context keychain_profile: String = "dev"
+
+context keychain_keys: List<Key> = []
+
+#[track_caller]
+def string(name: String, ^keychain_profile, ^keychain_keys) -> Secret<String> {
+    = builtins.keychain_string(name, from(name, keychain_profile, keychain_keys))
+}
+
+#[track_caller]
+def file(name: String, ^keychain_profile, ^keychain_keys) -> Secret<File> {
+    = builtins.keychain_file(name, from(name, keychain_profile, keychain_keys))
+}
+
+# Where the secret `name` of the profile `profile` is configured in `keys`:
+# its file's path, absolute, or empty if it is not.
+fn from(name: String, profile: String, keys: List<Key>) -> {profile: String, file: String} {
+    for key in keys {
+        if key.name == name and key.profile == profile {
+            let at = if path.is_absolute(key.file) { key.file } else { path.join(fileroot.workspace, key.file) }
+            return {profile = profile; file = at}
+        }
+    }
+    = {profile = profile; file = ""}
+}

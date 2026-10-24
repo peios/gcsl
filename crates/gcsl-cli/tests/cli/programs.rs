@@ -85,11 +85,11 @@ fn run_has_the_string_built_ins_and_path() {
     let output = gcsl(&["run", "tests/fixtures/string_builtins.gcsl", "--dump-ir"]);
     let ir = stdout(&output);
     assert!(
-        ir.contains("  (store parts#84 @0..27\n    (call @8..27\n      (load split#65 @8..13)\n"),
+        ir.contains("  (store parts#86 @0..27\n    (call @8..27\n      (load split#67 @8..13)\n"),
         "{ir}"
     );
-    assert!(ir.contains("(load join#66 @32..36)"), "{ir}");
-    assert!(ir.contains("(load join#139 @153..162)"), "{ir}");
+    assert!(ir.contains("(load join#68 @32..36)"), "{ir}");
+    assert!(ir.contains("(load join#141 @153..162)"), "{ir}");
     // Nothing of `path`'s own code.
     assert!(!ir.contains("segments"), "{ir}");
     assert_eq!(output.status.code(), Some(0));
@@ -298,4 +298,33 @@ fn repl_runs_programs_live() {
          \x20 | ^^^^^^^^^^^^^^^^^\n"
     );
     assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn a_keychain_s_secret_with_nothing_configured_is_the_environment_s() {
+    let dir = std::env::temp_dir().join(format!("gcsl-cli-keychain-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("key.pem");
+    std::fs::write(&key, "file-key").unwrap();
+    let program = dir.join("main.gcsl");
+    std::fs::write(
+        &program,
+        "import keychain\n\
+         let token = keychain.string(\"api-token\")\n\
+         let key = keychain.file(\"module-signing\")\n\
+         let run = exec_secret([\"sh\", \"-c\", \"test \\\"$TOKEN\\\" = t0k && test \\\"$(cat \\\"$KEY\\\")\\\" = file-key\"], secrets = {TOKEN = token.reveal(); KEY = key.reveal().path})\n\
+         = \"{token} {run.status}\"\n",
+    )
+    .unwrap();
+    let output = Command::new(binary())
+        .arg("run")
+        .arg(&program)
+        .env("GCSL_SECRET_API_TOKEN", "t0k")
+        .env("GCSL_SECRET_FILE_MODULE_SIGNING", &key)
+        .output()
+        .unwrap();
+    assert_eq!(stderr(&output), "");
+    assert_eq!(stdout(&output), "***\n");
+    assert_eq!(output.status.code(), Some(0));
+    std::fs::remove_dir_all(&dir).unwrap();
 }

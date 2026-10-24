@@ -98,10 +98,51 @@ pub trait Effects: std::fmt::Debug {
         std::env::current_dir().map_err(|error| error.to_string())
     }
 
+    /// What the host makes of the keychain's secret `secret` (see
+    /// [Keychains](crate::eval::keychain#keychains)): its public identity,
+    /// and for a file the path its programs find it at. `None`, as by
+    /// default, for its identity to be `profile/name` and a file's path its
+    /// own.
+    ///
+    /// # Errors
+    ///
+    /// Why the host will not give the secret.
+    fn keychain(&self, secret: &KeychainSecret<'_>) -> Option<Result<KeychainAnswer, String>> {
+        let _ = secret;
+        None
+    }
+
     /// A new, empty directory for the run, as GCSL code names it, removed
     /// with what is in it when the run's owner is done; `None` for a run
     /// that has no owner to remove it, which no checked program calls for.
     fn temp_dir(&self) -> Option<Result<String, String>>;
+}
+
+/// A secret a keychain gives, as a host is asked of it (see
+/// [Keychains](crate::eval::keychain#keychains)): its name, the profile it is
+/// of, what it holds, and for a file its path as GCSL code names it. It
+/// has no `Debug`, since it holds the secret's value.
+#[derive(Clone, Copy)]
+pub struct KeychainSecret<'a> {
+    /// Its name, `module-signing`.
+    pub name: &'a str,
+    /// The profile it is of, `dev`.
+    pub profile: &'a str,
+    /// What it holds: a file's contents, or a string's value.
+    pub contents: &'a [u8],
+    /// For a file, or a string read from one, the file's path.
+    pub file: Option<&'a str>,
+}
+
+/// What a host makes of a keychain's secret (see
+/// [Keychains](crate::eval::keychain#keychains)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeychainAnswer {
+    /// Its public identity, what receipts record of it.
+    pub identity: String,
+    /// For a file, the path its programs find it at; `None` for the file's
+    /// own.
+    pub path: Option<String>,
 }
 
 /// Plain GCSL's effect context: the system itself (see

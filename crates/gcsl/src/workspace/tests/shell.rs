@@ -293,7 +293,7 @@ fn every_record_exec_builds_shares_the_runs_one_layout() {
         .collect();
     let mut workspace = check(&sources).unwrap();
     // The driver wrote the fifty built-in functions' cells.
-    assert_eq!(assert_builtins_written(&workspace).len(), 52);
+    assert_eq!(assert_builtins_written(&workspace).len(), 54);
     let a = workspace.file("a.gcsl").unwrap();
     let b = workspace.file("b.gcsl").unwrap();
     let first = workspace.run(a).unwrap().value;

@@ -41,7 +41,8 @@
 //! `fileroot` where files are (below). The *standard files* are the
 //! `.gcsl` files of the repository's `stdlib/` directory, compiled in
 //! ([`crate::STANDARD`]): `archive.gcsl`, unpacking archives;
-//! `toolchain.gcsl`, the tools a library asks for; `fs.gcsl`, the
+//! `toolchain.gcsl`, the tools a library asks for; `keychain.gcsl`, the
+//! secrets it asks for; `fs.gcsl`, the
 //! file system, whose members are
 //! the file system's built-in functions, bound as the prelude binds the
 //! others (`exists = builtins.fs_exists`, `write = builtins.fs_write`), so

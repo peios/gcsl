@@ -150,6 +150,16 @@ pub enum Builtin {
     /// may run, the `toolchain` module's way to the host's own tools.
     /// Impure.
     Which,
+    /// `keychain_string(name: String, from: {profile: String, file: String})
+    /// -> Secret<String>`: the secret string of the name `name` for the
+    /// profile, from its configured file or the environment, the `keychain`
+    /// module's `string` (see [Keychains](crate::eval::keychain#keychains)).
+    /// Impure.
+    KeychainString,
+    /// `keychain_file(name: String, from: {profile: String, file: String})
+    /// -> Secret<File>`: the secret file of the name, as `keychain_string`
+    /// finds it, the `keychain` module's `file`. Impure.
+    KeychainFile,
     /// `exec_secret(argv: List<String>, options: {cwd, env, panic, secrets,
     /// until}) -> Secret<{status: Int, stderr: String, stdout: String}>`:
     /// runs a program as `exec` does, given the revealed secrets of
@@ -230,7 +240,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 52] = [
+    pub const ALL: [Builtin; 54] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -269,6 +279,8 @@ impl Builtin {
         Builtin::Fetch,
         Builtin::ArchiveUnpack,
         Builtin::Which,
+        Builtin::KeychainString,
+        Builtin::KeychainFile,
         Builtin::ExecSecret,
         Builtin::Dir,
         Builtin::DirFiles,
@@ -349,6 +361,8 @@ impl Builtin {
             Builtin::Fetch => "fetch",
             Builtin::ArchiveUnpack => "archive_unpack",
             Builtin::Which => "which",
+            Builtin::KeychainString => "keychain_string",
+            Builtin::KeychainFile => "keychain_file",
             Builtin::ExecSecret => "exec_secret",
             Builtin::Dir => "dir",
             Builtin::DirFiles => "dir_files",
@@ -413,6 +427,8 @@ impl Builtin {
             | Builtin::Fetch
             | Builtin::ArchiveUnpack
             | Builtin::Which
+            | Builtin::KeychainString
+            | Builtin::KeychainFile
             | Builtin::ExecSecret
             | Builtin::Dir
             | Builtin::DirFiles
@@ -440,6 +456,8 @@ impl Builtin {
                 | Builtin::Fetch
                 | Builtin::ArchiveUnpack
                 | Builtin::Which
+                | Builtin::KeychainString
+                | Builtin::KeychainFile
                 | Builtin::Dir
                 | Builtin::DirFiles
                 | Builtin::DirFile
@@ -495,6 +513,7 @@ impl Builtin {
             Builtin::Fetch => &["url", "sha256"],
             Builtin::ArchiveUnpack => &["archive", "strip"],
             Builtin::Which => &["name"],
+            Builtin::KeychainString | Builtin::KeychainFile => &["name", "from"],
             Builtin::CompareVersions => &["a", "b"],
             Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
             Builtin::FsCopy => &["from", "to"],
@@ -534,6 +553,8 @@ impl Builtin {
             | Builtin::Fetch
             | Builtin::ArchiveUnpack
             | Builtin::Which
+            | Builtin::KeychainString
+            | Builtin::KeychainFile
             | Builtin::ExecSecret
             | Builtin::Dir
             | Builtin::DirFiles
@@ -616,6 +637,8 @@ impl Builtin {
             | Builtin::Fetch
             | Builtin::ArchiveUnpack
             | Builtin::Which
+            | Builtin::KeychainString
+            | Builtin::KeychainFile
             | Builtin::ExecSecret
             | Builtin::Dir
             | Builtin::DirFiles
@@ -684,6 +707,12 @@ impl Builtin {
             Builtin::Fetch => "fn(url: String, sha256: String) -> File",
             Builtin::ArchiveUnpack => "fn(archive: File, strip: Int) -> Dir",
             Builtin::Which => "fn(name: String) -> File",
+            Builtin::KeychainString => {
+                "fn(name: String, from: {file: String, profile: String}) -> Secret<String>"
+            }
+            Builtin::KeychainFile => {
+                "fn(name: String, from: {file: String, profile: String}) -> Secret<File>"
+            }
             Builtin::Dir => "fn(path: String) -> Dir",
             Builtin::DirFiles => "fn(d: Dir) -> List<File>",
             Builtin::DirFile => "fn(d: Dir, path: String): File",
@@ -732,6 +761,16 @@ impl Builtin {
             }
             Builtin::Trim | Builtin::FsRead => ([TyId::STRING, UNUSED], TyId::STRING),
             Builtin::File | Builtin::Which => ([TyId::STRING, UNUSED], TyId::FILE),
+            Builtin::KeychainString | Builtin::KeychainFile => {
+                let [profile, file] = ["profile", "file"].map(|text| names.intern(text));
+                let from = types.record([(profile, TyId::STRING), (file, TyId::STRING)]);
+                let value = if self == Builtin::KeychainString {
+                    TyId::STRING
+                } else {
+                    TyId::FILE
+                };
+                ([TyId::STRING, from], types.secret(value))
+            }
             Builtin::FileRead => ([TyId::FILE, UNUSED], TyId::STRING),
             Builtin::Fetch => ([TyId::STRING, TyId::STRING], TyId::FILE),
             Builtin::ArchiveUnpack => ([TyId::FILE, TyId::INT], TyId::DIR),

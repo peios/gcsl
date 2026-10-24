@@ -57,7 +57,7 @@ impl Effects for Rooted {
 
 /// Runs `text`, a lone file, through `effects`, once the standard files
 /// have run in its workspace.
-fn run_through(text: &str, effects: &dyn Effects) -> Result<Value, Diagnostic> {
+pub(super) fn run_through(text: &str, effects: &dyn Effects) -> Result<Value, Diagnostic> {
     let source = SourceFile::new("lone.gcsl", text).unwrap();
     let (loaded, checked) = check_lone_with_standard(&source, "/");
     let mut workspace = checked.unwrap();

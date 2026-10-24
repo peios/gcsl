@@ -300,7 +300,9 @@ mod files;
 mod fs;
 mod graph;
 mod imports;
+
 mod invoke;
+mod keychain;
 mod language;
 mod locks;
 mod memo;
