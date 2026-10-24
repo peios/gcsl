@@ -187,6 +187,7 @@ impl Lowerer<'_> {
                 display: Box::from(""),
                 slot_names: Box::from([]),
                 attributes: Box::default(),
+                defers: false,
                 retry: 0,
                 timeout: None,
                 name_text: None,

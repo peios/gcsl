@@ -70,6 +70,7 @@ use kinds::{Extract, Taken, mixed};
 use unions::{other_fields, with_fields};
 use builtins::described;
 pub use effects::{Direct, Effects};
+use graph::GraphRun;
 pub use system::TempDirs;
 pub use text::compare_versions;
 
@@ -177,17 +178,20 @@ pub fn eval_with(
     memo: &mut MemoTables,
     extras: (Option<&Rc<Layout>>, &[Rc<str>], &dyn Effects),
 ) -> Result<Value, Diagnostic> {
-    eval_rooted(ir, (stack, memo), extras, None)
+    eval_rooted(ir, (stack, memo), extras, (None, None))
 }
 
 /// [`eval_with`], in the root context `context`, the frame of the contexts
 /// a host sets for the evaluation, which every frame of it inherits (see
-/// [Context](crate::eval::context#context)); `None` for none.
+/// [Context](crate::eval::context#context)), `None` for none; and as the run
+/// of a unit in graph mode, `graph`, if it is one (see [Graph
+/// mode](crate::eval::graph#graph-mode)), whose stop for a step's result is
+/// the error marked [`Mark::PENDING`](crate::diagnostic::Mark::PENDING).
 pub(crate) fn eval_rooted(
     ir: &Rc<Ir>,
     (stack, memo): (&mut Vec<Value>, &mut MemoTables),
     (exec_result, dirs, effects): (Option<&Rc<Layout>>, &[Rc<str>], &dyn Effects),
-    context: Option<Rc<ContextFrame>>,
+    (context, graph): (Option<Rc<ContextFrame>>, Option<&GraphRun<'_>>),
 ) -> Result<Value, Diagnostic> {
     let root = ir.root();
     let frame_size = ir.frame_size() as usize;
@@ -202,7 +206,8 @@ pub(crate) fn eval_rooted(
         helper: false,
         origin: NO_ORIGIN,
     };
-    let shared = Shared::new(exec_result, dirs, effects);
+    let mut shared = Shared::new(exec_result, dirs, effects);
+    shared.graph = graph;
     shared.context.replace(context);
     let result = Evaluator {
         ir,
@@ -340,6 +345,9 @@ struct Shared<'a> {
     /// How the run's effects reach the system (see
     /// [Effects](crate::eval::effects#effects)).
     effects: &'a dyn Effects,
+    /// The run of a unit in graph mode, if it is one (see [Graph
+    /// mode](crate::eval::graph#graph-mode)).
+    graph: Option<&'a GraphRun<'a>>,
     /// The deadlines of the calls with `#[timeout]` that are running,
     /// outermost first (see [Retry and timeout](crate::eval::retry#retry-and-timeout)).
     deadlines: RefCell<Vec<Deadline>>,
@@ -375,6 +383,7 @@ impl<'a> Shared<'a> {
             exec_result,
             dirs,
             effects,
+            graph: None,
             deadlines: RefCell::new(Vec::new()),
             earliest: Cell::new(None),
             deadlines_made: Cell::new(0),
@@ -1359,6 +1368,7 @@ pub(crate) mod builtins;
 pub mod effects;
 pub(crate) mod elements;
 pub(crate) mod files;
+pub mod graph;
 pub(crate) mod kinds;
 pub(crate) mod memo;
 pub(crate) mod sandbox;

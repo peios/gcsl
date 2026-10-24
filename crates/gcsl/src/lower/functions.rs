@@ -319,6 +319,7 @@ impl Lowerer<'_> {
                 .unwrap_or_default(),
             // A reference's function is no function item.
             attributes: Box::default(),
+            defers: false,
             retry: 0,
             timeout: None,
             name_text: None,
@@ -440,6 +441,7 @@ impl Lowerer<'_> {
             display,
             slot_names: resolution.slot_names.clone().into_boxed_slice(),
             attributes: self.resolution.attributes(function).into(),
+            defers: self.resolution.defers(function),
             retry: retry_of(self.resolution.attributes(function)),
             timeout: timeout_of(self.resolution.attributes(function)),
             name_text: resolution

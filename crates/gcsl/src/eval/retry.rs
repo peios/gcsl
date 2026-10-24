@@ -157,7 +157,8 @@ impl Evaluator<'_> {
             .checked_add(limit)
             .unwrap_or(now + Duration::from_secs(u32::MAX.into()));
         let mut number = self.shared.deadlines_made.get().wrapping_add(1);
-        if number == 0 || number == u32::MAX {
+        // Never 0, nor one of the numbers the other marks are.
+        if ErrorMark::deadline(number).deadline_number().is_none() {
             number = 1;
         }
         self.shared.deadlines_made.set(number);

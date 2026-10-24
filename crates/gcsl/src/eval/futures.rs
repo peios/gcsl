@@ -43,6 +43,7 @@ use crate::ir::{IrKind, IrNode, IrRange, LazyField, LazyShapeId};
 use crate::value::{Begin, Future, FutureState, List, Record, Value};
 
 use super::{Evaluator, Flow, MIXED, depends_on_itself, mistyped, nested_too_deeply, replaced};
+use super::graph::NodeId;
 use super::kinds::{mixed, of_kind};
 use super::memo::Ambient;
 
@@ -335,6 +336,10 @@ impl Evaluator<'_> {
             Some(Begin::Done(value)) => return Ok(value),
             Some(Begin::Running) => return Err(depends_on_itself(node).into()),
             Some(Begin::Pending(captures)) => captures,
+            // A step's result the host has yet to give, or its failure (see
+            // [Graph mode](crate::eval::graph#graph-mode)).
+            Some(Begin::Host(waiting)) => return self.pause(NodeId::of(waiting), node),
+            Some(Begin::Failed(error)) => return Err(error.into()),
             None => return mistyped(node, "a future's state is in use"),
         };
         let base = self.stack.len();
@@ -344,6 +349,7 @@ impl Evaluator<'_> {
         // helper flag and the origin of the frame that made the future, in
         // the context it was made in.
         let outer = self.shared.context.replace(future.context.clone());
+        let scoped = self.enter_scope_of(&future.code, future.function, &captures);
         let result = Evaluator {
             ir: &future.code,
             stack: self.stack,
@@ -356,6 +362,7 @@ impl Evaluator<'_> {
             levels: entering,
         }
         .value(code.body);
+        self.leave_scope(scoped);
         self.shared.context.replace(outer);
         self.stack.truncate(base);
         // A `return` for the `lazy` is its value, recorded as any is, here,

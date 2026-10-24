@@ -119,10 +119,6 @@ pub(super) struct CallsChecked {
     /// What the type parameters of each generic function and `type` item
     /// belong to, made once for it.
     pub(super) ids: HashMap<GenericOwner, GenericId>,
-    /// The functions of the input that a deferring attribute is on, whose
-    /// calls a host may run as steps (see [Deferring
-    /// attributes](crate::check::attributes#deferring-attributes)).
-    pub(super) deferred: HashSet<FnId>,
     /// The arguments of the call being bound that were checked to infer its
     /// type parameters, each with its type: checked once, then only
     /// expected to fit its substituted parameter.
@@ -177,6 +173,10 @@ pub(super) struct ForLowering {
     /// The attributes of each function item that has any, by its function,
     /// in source order (see [Attributes](crate::check::attributes#attributes)).
     pub(super) fn_attributes: HashMap<FnId, Box<[Attribute]>>,
+    /// The functions of the input that a deferring attribute is on, whose
+    /// calls a host may run as steps (see [Deferring
+    /// attributes](crate::check::attributes#deferring-attributes)).
+    pub(super) deferred: HashSet<FnId>,
     /// Each record literal, a record block or `{}`, that the checker gave
     /// fields their defaults, by its id, with each such field and its default,
     /// in the order of their names' text (see "Field defaults" under
@@ -647,6 +647,14 @@ impl Resolution {
             .fn_attributes
             .get(&function)
             .map_or(&[], |attributes| attributes)
+    }
+
+    /// Whether a deferring attribute is on function `function`, so that a
+    /// host may run its calls as steps (see [Deferring
+    /// attributes](crate::check::attributes#deferring-attributes)).
+    #[must_use]
+    pub fn defers(&self, function: FnId) -> bool {
+        self.lowered.deferred.contains(&function)
     }
 
     /// The fields that the record literal `block`, a record block or `{}`,

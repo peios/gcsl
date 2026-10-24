@@ -241,6 +241,7 @@ fn one_function(display: &str) -> Rc<Ir> {
         display: Box::from(display),
         slot_names: Box::default(),
         attributes: Box::default(),
+        defers: false,
         retry: 0,
         timeout: None,
         name_text: None,

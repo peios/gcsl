@@ -35,6 +35,16 @@ impl Evaluator<'_> {
                 MemoBegin::Started(mark) => (Some(mark), mark.entering, mark.caller),
                 MemoBegin::Unkeyed(entering, caller) => (None, entering, caller),
             };
+        // Its body is a scope of its own, in graph mode, keyed by the call's
+        // callee and arguments (see [Graph mode](crate::eval::graph#graph-mode)).
+        let scoped = self.shared.graph.is_some() && {
+            let params = base..base + code.param_count as usize;
+            let given: Vec<Value> = self.stack.get(params).unwrap_or_default().to_vec();
+            let function = Value::Fn(Rc::clone(closure));
+            let mut parts: Vec<&Value> = vec![&function];
+            parts.extend(given.iter());
+            self.enter_scope(&parts)
+        };
         let result = if code.retry > 0 || code.timeout.is_some() {
             self.guarded_body((closure, code), base, (caller, entering), node)
         } else {
@@ -51,6 +61,7 @@ impl Evaluator<'_> {
             }
             .value(code.body)
         };
+        self.leave_scope(scoped);
         self.stack.truncate(base);
         // The call is no longer running: nothing more depends on it.
         if mark.is_some() {

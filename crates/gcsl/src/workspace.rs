@@ -220,12 +220,13 @@ use crate::Outcome;
 #[cfg(test)]
 use crate::check::ViewRecord;
 use crate::check::{Builtin, KnownParams, Slot, Types};
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, InternalError, Mark};
+use crate::eval::graph::{Defers, Graph, GraphRun, NodeId, run_node};
 use crate::eval::{Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::names::{Name, Names};
 use crate::session;
-use crate::source::SourceFile;
+use crate::source::{SourceFile, Span};
 use crate::types::{TyId, TypeTable};
 use crate::value::{Layout, Value};
 
@@ -374,12 +375,26 @@ fn exec_layout(names: &mut Names) -> Rc<Layout> {
     })
 }
 
+/// What running a unit in graph mode came to (see [`Workspace::run_graph`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Progress {
+    /// It finished with this value, which may hold results the host has yet
+    /// to give.
+    Done(Value),
+    /// It stopped for the result of this node, which it needs.
+    Paused(NodeId),
+}
+
 /// A file runs at most once. A failed attempt must remain a failure for every
 /// later request that needs it, without repeating any of its earlier effects.
-/// Boxing keeps this state table compact after the large IR is released.
+/// Boxing keeps this state table compact after the large IR is released. A
+/// file whose run in graph mode stopped for a step's result keeps its IR,
+/// shared, to run again from its start, its closures' code the same (see
+/// [Graph mode](crate::eval::graph#graph-mode)).
 #[derive(Debug)]
 enum FileRun {
     Pending(Box<Ir>),
+    Paused(Rc<Ir>),
     Succeeded,
     Failed(Box<Diagnostic>),
 }
@@ -555,6 +570,69 @@ impl Workspace {
         })
     }
 
+    /// Runs file `index` and every file it needs in graph mode, against
+    /// `graph`, which the host keeps for the whole evaluation, as
+    /// [`Workspace::run`] runs them otherwise (see [Graph
+    /// mode](crate::eval::graph#graph-mode)): each file a unit, numbered as
+    /// it is, `defers` saying, of a call of a function with these attributes,
+    /// a deferring one among them, whether the host takes it as a step.
+    /// [`Progress::Paused`] if a unit stopped for a step's result, to run
+    /// again, from where the run stopped, once the host has given it; else
+    /// [`Progress::Done`] with file `index`'s value, whose holes, the results
+    /// the host has yet to give, [`Graph::holes`] finds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Workspace::run`].
+    pub fn run_graph(
+        &mut self,
+        index: u32,
+        graph: &mut Graph,
+        defers: Defers<'_>,
+    ) -> Result<Progress, Vec<Diagnostic>> {
+        if let Some(node) = self.run_files(index, Some((graph, defers)))? {
+            return Ok(Progress::Paused(node));
+        }
+        Ok(Progress::Done(
+            self.values
+                .get(index as usize)
+                .cloned()
+                .unwrap_or(Value::Empty),
+        ))
+    }
+
+    /// Runs the node `id` of `graph`, a step of a unit of this workspace, as
+    /// plain GCSL runs it, its effects through `effects`, the host's effect
+    /// context for it (see [Graph mode](crate::eval::graph#graph-mode)): a
+    /// deferred call's callee with its arguments, in the context it was made
+    /// in, or an effect's built-in. The host then gives the graph what it
+    /// came to ([`Graph::resolve`]).
+    ///
+    /// # Errors
+    ///
+    /// The step's failure, in the input of the unit that made it if it is
+    /// in none of its own; and an internal error if `graph` has no node `id`.
+    pub fn evaluate(
+        &mut self,
+        graph: &Graph,
+        id: NodeId,
+        effects: &dyn Effects,
+    ) -> Result<Value, Diagnostic> {
+        let Some(node) = graph.node(id) else {
+            return Err(InternalError {
+                message: "a step the graph lacks",
+                span: Span::new(0, 0),
+            }
+            .into());
+        };
+        let context = (&mut self.frame, &mut self.memo);
+        let extras = (Some(&self.exec_result), &self.scan.dir_texts[..], effects);
+        run_node(node, context, extras).map_err(|mut error| {
+            error.input.get_or_insert(node.unit());
+            error
+        })
+    }
+
     /// Runs file `index` and every file it needs, as [`Workspace::run`]
     /// does, but those that have run already, keeping each one's value.
     ///
@@ -562,12 +640,36 @@ impl Workspace {
     ///
     /// As [`Workspace::run`].
     fn run_needed(&mut self, index: u32) -> Result<(), Vec<Diagnostic>> {
+        self.run_files(index, None).map(|_| ())
+    }
+
+    /// Runs file `index` and every file it needs, as
+    /// [`Workspace::run_needed`] does, each in graph mode, as unit number its
+    /// file's, if `graph` is given, the graph and which deferring calls the
+    /// host takes as steps (see [Graph mode](crate::eval::graph#graph-mode)).
+    /// Returns the node the run stopped for, if it stopped, the file that
+    /// stopped kept to run again from its start.
+    ///
+    /// # Errors
+    ///
+    /// As [`Workspace::run`].
+    pub(crate) fn run_files(
+        &mut self,
+        index: u32,
+        mut graph: Option<(&mut Graph, Defers<'_>)>,
+    ) -> Result<Option<NodeId>, Vec<Diagnostic>> {
         for at in self.scan.needed(index) {
             let Some(state) = self.runs.get_mut(at as usize) else {
                 continue;
             };
-            let mut ir = match mem::replace(state, FileRun::Succeeded) {
-                FileRun::Pending(ir) => ir,
+            let ir = match mem::replace(state, FileRun::Succeeded) {
+                FileRun::Pending(mut ir) => {
+                    // The slots of the files run before it, which may end
+                    // after its own, are kept (see [`Ir::reserve_frame`]).
+                    ir.reserve_frame(count(self.frame.len()));
+                    Rc::new(*ir)
+                }
+                FileRun::Paused(ir) => ir,
                 FileRun::Succeeded => continue,
                 FileRun::Failed(error) => {
                     let diagnostic = (*error).clone();
@@ -575,9 +677,6 @@ impl Workspace {
                     return Err(merge_files(vec![diagnostic], self.warnings.clone()));
                 }
             };
-            // The slots of the files run before it, which may end after its
-            // own, are kept (see [`Ir::reserve_frame`]).
-            ir.reserve_frame(count(self.frame.len()));
             let direct = Direct {
                 temp_dirs: Some(&self.temp_dirs),
             };
@@ -587,11 +686,42 @@ impl Workspace {
                 &self.scan.dir_texts[..],
                 &direct as &dyn Effects,
             );
-            match session::run_input(*ir, &mut self.frame, context) {
+            let run = graph
+                .as_mut()
+                .map(|(graph, defers)| GraphRun::new(mem::take(*graph), at, *defers));
+            let outcome =
+                session::run_input_in(&ir, &mut self.frame, context, (None, run.as_ref()));
+            let paused = match (run, graph.as_mut()) {
+                (Some(run), Some((graph, _))) => {
+                    let (left, paused) = run.finish();
+                    **graph = left;
+                    paused
+                }
+                _ => None,
+            };
+            let Some(state) = self.runs.get_mut(at as usize) else {
+                continue;
+            };
+            match outcome {
                 Ok(value) => {
                     if let Some(entry) = self.values.get_mut(at as usize) {
                         *entry = value;
                     }
+                }
+                // Stopped for a step's result: run again, from its start,
+                // once the host has given it.
+                Err(error) if error.mark == Mark::PENDING => {
+                    *state = FileRun::Paused(ir);
+                    return match paused {
+                        Some(node) => Ok(Some(node)),
+                        None => Err(vec![
+                            InternalError {
+                                message: "a unit stopped for no step",
+                                span: error.span,
+                            }
+                            .into(),
+                        ]),
+                    };
                 }
                 Err(mut error) => {
                     error.input.get_or_insert(at);
@@ -600,7 +730,7 @@ impl Workspace {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 

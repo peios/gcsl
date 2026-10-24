@@ -319,6 +319,7 @@ fn a_future_that_depends_on_itself_is_an_error() {
         display: Box::from("Future<Int>"),
         slot_names: Box::default(),
         attributes: Box::default(),
+        defers: false,
         retry: 0,
         timeout: None,
         name_text: None,

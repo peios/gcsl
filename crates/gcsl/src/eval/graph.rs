@@ -1,0 +1,967 @@
+//! Graph mode: evaluating a unit as an action graph, for a host that runs
+//! its steps (pekit2's `design/action-graph.md`).
+//!
+//! # Graph mode
+//!
+//! A host evaluates a *unit*, a file or an invocation, in graph mode,
+//! against a [`Graph`] it keeps for the whole evaluation. The graph's
+//! *nodes* are the call instances the host deals with:
+//!
+//! - a **deferred call**, a call of a closure whose code a deferring
+//!   attribute is on ([`crate::ir::FnCode::defers`]) and that the host takes
+//!   as a step (`GraphRun::defers`, from the function's attributes), made in
+//!   `Evaluator::call` before `#[retry]` or `#[timeout]` apply: its arguments
+//!   are evaluated as a call's are, and the call gives a future that stands
+//!   for its result ([`crate::value::Future::host`]), which code awaits
+//!   where it uses the result, as it awaits any future;
+//! - an **effect**, a call of an effectful built-in, `exec` and its kin, the
+//!   file system's, `File.read`, `Dir.files`, `fs.compose_dir`,
+//!   `Dir.sandbox` and `Sandbox.exec` ([`effect_builtin`]), whose arguments
+//!   are evaluated and whose result, a present value, is needed at once.
+//!   `file` and `dir`, which only read the working directory, fixed for an
+//!   evaluation, are computed as ever.
+//!
+//! So a unit performs no effect of its own. A node whose result is not
+//! given yet stops the unit where the result is needed (`Evaluator::pause`):
+//! an await of a deferred call's future, or an effect's call. The stop is an
+//! error marked [`Mark::PENDING`], which nothing but the unit's root
+//! catches, `recover` and `#[retry]` included, and which unwinds by every
+//! path an error unwinds by; the node it waits on is the run's `paused`.
+//! Once the host gives that node's result ([`Graph::resolve`]), the unit
+//! runs again from its start: everything before the stop computes again to
+//! the same values, the calls that made nodes find them, and the stop is
+//! passed. A node's failure is raised where its result is needed, as any
+//! failure there, so `recover` around it catches it; a `#[retry]` around an
+//! await raises it again, never running the step again.
+//!
+//! **Identity.** A deferred call's node is found by its *key*, a canonical
+//! encoding of its function, by its code and captures, its arguments and
+//! the flattened current context ([`encode`]): two calls of one key in an
+//! evaluation are one node. An effect's node is found by its *position*:
+//! the scope it is made in and its number among the nodes met in that
+//! scope so far. A scope is the unit's root, a memoised call's body or a
+//! `lazy`'s, each by its key and how many times its parent scope entered
+//! one of that key (`Evaluator::enter_scope`), so that a memoised call that
+//! finds its entry, skipping its body, shifts the count of no other scope.
+//! Every node met is recorded at its position with its key; an attempt that
+//! meets another key at a recorded position is the internal error
+//! "evaluation did not converge", never a loop.
+//!
+//! **Edges.** A node's *data edges* are the nodes whose results its
+//! arguments, its callee's captures and its context hold and the host has
+//! not given, its *holes* ([`Graph::holes`]): through records, lists,
+//! variants, secrets, futures not run yet, by their captures, run ones, by
+//! their values, and closures, by their captures. Its *order edge* is the
+//! node met just before it in its unit, in program order. A host that
+//! isolates a node may drop its order edge; one that does not runs it in
+//! program order.
+
+use std::cell::{Cell, RefCell};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+
+use crate::check::{Attribute, Builtin};
+use crate::diagnostic::{Diagnostic, Mark};
+use crate::ir::{FnCode, Ir, IrNode, IrRange};
+use crate::source::Span;
+use crate::value::{Closure, ContextFrame, Future, Value};
+
+use crate::CALL_LEVELS;
+
+use super::{Caller, Evaluator, Flow, MemoTables, Shared, internal};
+
+/// A node of an action graph, by its number (see [Graph mode](#graph-mode)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(u32);
+
+impl NodeId {
+    /// The node numbered `number`.
+    pub(crate) const fn of(number: u32) -> Self {
+        Self(number)
+    }
+
+    /// Its number, its index among the graph's nodes.
+    #[must_use]
+    pub const fn number(self) -> u32 {
+        self.0
+    }
+}
+
+/// What a node is (see [Graph mode](#graph-mode)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeKind {
+    /// A call of a closure whose code a deferring attribute is on.
+    Deferred,
+    /// A call of an effectful built-in.
+    Effect(Builtin),
+}
+
+/// Where a node is in its life.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeState {
+    /// Its result is not given yet.
+    Waiting,
+    /// Its result.
+    Done(Value),
+    /// Its failure.
+    Failed(Diagnostic),
+}
+
+/// One node of an action graph (see [Graph mode](#graph-mode)).
+#[derive(Debug)]
+pub struct Node {
+    /// What it is.
+    kind: NodeKind,
+    /// A deferred call's callee.
+    closure: Option<Rc<Closure>>,
+    /// Its arguments, in parameter order.
+    args: Box<[Value]>,
+    /// The context it was made in, which it runs in.
+    context: Option<Rc<ContextFrame>>,
+    /// The nodes whose results it needs that were not given when it was
+    /// made.
+    data: Box<[NodeId]>,
+    /// The node met just before it in its unit, in program order.
+    after: Option<NodeId>,
+    /// The unit that made it.
+    unit: u32,
+    /// The call that made it, of its unit's code `code`.
+    site: IrNode,
+    /// The code of the unit that made it.
+    code: Rc<Ir>,
+    /// The caller a deferred call gives its callee.
+    caller: Caller,
+    /// Where it is in its life.
+    state: NodeState,
+    /// A deferred call's future, which code awaits.
+    future: Option<Rc<Future>>,
+}
+
+impl Node {
+    /// What it is.
+    #[must_use]
+    pub const fn kind(&self) -> NodeKind {
+        self.kind
+    }
+
+    /// A deferred call's callee; `None` for an effect.
+    #[must_use]
+    pub const fn closure(&self) -> Option<&Rc<Closure>> {
+        self.closure.as_ref()
+    }
+
+    /// Its arguments, in parameter order.
+    #[must_use]
+    pub fn args(&self) -> &[Value] {
+        &self.args
+    }
+
+    /// The nodes whose results it needs that were not given when it was
+    /// made: its data edges.
+    #[must_use]
+    pub fn data(&self) -> &[NodeId] {
+        &self.data
+    }
+
+    /// The node met just before it in its unit: its order edge.
+    #[must_use]
+    pub const fn after(&self) -> Option<NodeId> {
+        self.after
+    }
+
+    /// The unit that made it.
+    #[must_use]
+    pub const fn unit(&self) -> u32 {
+        self.unit
+    }
+
+    /// Where the call that made it is, in its unit's input.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        self.site.span
+    }
+
+    /// Where it is in its life.
+    #[must_use]
+    pub const fn state(&self) -> &NodeState {
+        &self.state
+    }
+}
+
+/// The action graph of an evaluation, which a host keeps across its units'
+/// runs (see [Graph mode](#graph-mode)).
+#[derive(Debug, Default)]
+pub struct Graph {
+    /// Every node, by number.
+    nodes: Vec<Node>,
+    /// The deferred calls' nodes, by key.
+    deferred: HashMap<Box<[u8]>, NodeId>,
+    /// Every node met, by its unit and position, with the key it was met
+    /// with there.
+    positions: HashMap<Position, (Box<[u8]>, NodeId)>,
+}
+
+/// Where a node is met: its unit, and a hash of its scope's path and its
+/// number among the nodes met in that scope (see [Graph mode](#graph-mode)).
+type Position = (u32, u64);
+
+/// How a host says whether it takes a call of a function with these
+/// attributes, a deferring one among them, as a step (see [Graph
+/// mode](#graph-mode)).
+pub type Defers<'a> = &'a dyn Fn(&[Attribute]) -> bool;
+
+impl Graph {
+    /// An empty graph.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many nodes it has.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Whether it has no nodes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// The node `id`, if the graph has it.
+    #[must_use]
+    pub fn node(&self, id: NodeId) -> Option<&Node> {
+        self.nodes.get(id.0 as usize)
+    }
+
+    /// Gives the node `id`, which is waiting, what its step came to: its
+    /// value or its failure, which code then finds where it needs the result.
+    /// Returns `false`, changing nothing, if the graph has no such node or it
+    /// is not waiting.
+    pub fn resolve(&mut self, id: NodeId, outcome: Result<Value, Diagnostic>) -> bool {
+        let Some(node) = self.nodes.get_mut(id.0 as usize) else {
+            return false;
+        };
+        if node.state != NodeState::Waiting {
+            return false;
+        }
+        if let Some(future) = &node.future {
+            future.resolve(outcome.clone());
+        }
+        node.state = match outcome {
+            Ok(value) => NodeState::Done(value),
+            Err(error) => NodeState::Failed(error),
+        };
+        true
+    }
+
+    /// The nodes whose results `value` holds and that are waiting: its holes,
+    /// in the order they are found, each once (see [Graph mode](#graph-mode)).
+    #[must_use]
+    pub fn holes(&self, value: &Value) -> Vec<NodeId> {
+        let mut found = Vec::new();
+        self.holes_into(std::slice::from_ref(value), &mut found);
+        found
+    }
+
+    /// Pushes the holes of `values` onto `found`, each once, walking a work
+    /// list rather than recursing, and each shared record, list, closure or
+    /// future once.
+    fn holes_into(&self, values: &[Value], found: &mut Vec<NodeId>) {
+        let mut pending: Vec<Value> = values.to_vec();
+        let mut seen: HashSet<usize> = HashSet::new();
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::Record(record) => {
+                    if seen.insert(Rc::as_ptr(&record).cast::<()>() as usize) {
+                        pending.extend(record.values.iter().cloned());
+                    }
+                }
+                Value::List(list) => pending.extend(list.values().iter().cloned()),
+                Value::Variant(variant) => pending.push(variant.payload.clone()),
+                Value::Secret(secret) => pending.push(secret.value.clone()),
+                Value::Fn(closure) => {
+                    if seen.insert(Rc::as_ptr(&closure).cast::<()>() as usize) {
+                        pending.extend(closure.captures.iter().cloned());
+                    }
+                }
+                Value::Future(future) => {
+                    if !seen.insert(Rc::as_ptr(&future).cast::<()>() as usize) {
+                        continue;
+                    }
+                    if let Some(node) = future.host_node() {
+                        let id = NodeId(node);
+                        if self.is_waiting(id) && !found.contains(&id) {
+                            found.push(id);
+                        }
+                    } else if let Some(done) = future.value() {
+                        pending.push(done);
+                    } else if let Some(captures) = future.with_captures(<[Value]>::to_vec) {
+                        pending.extend(captures);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether the node `id` is waiting for its result.
+    fn is_waiting(&self, id: NodeId) -> bool {
+        self.node(id)
+            .is_some_and(|node| node.state == NodeState::Waiting)
+    }
+
+    /// The waiting nodes that `demands` need: each, and, through their data
+    /// edges, every waiting node whose result one of them needs, in no
+    /// particular order, each once (see pekit2's `design/action-graph.md`,
+    /// "Demand").
+    #[must_use]
+    pub fn needed(&self, demands: &[NodeId]) -> Vec<NodeId> {
+        let mut found: Vec<NodeId> = Vec::new();
+        let mut pending: Vec<NodeId> = demands.to_vec();
+        while let Some(id) = pending.pop() {
+            if found.contains(&id) || !self.is_waiting(id) {
+                continue;
+            }
+            found.push(id);
+            if let Some(node) = self.node(id) {
+                pending.extend(node.data.iter().copied());
+            }
+        }
+        found.sort_unstable();
+        found
+    }
+
+    /// Of `needed`, the nodes whose data edges are all given: those a host
+    /// may run now.
+    #[must_use]
+    pub fn ready(&self, needed: &[NodeId]) -> Vec<NodeId> {
+        needed
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.is_waiting(id)
+                    && self
+                        .node(id)
+                        .is_some_and(|node| node.data.iter().all(|&edge| !self.is_waiting(edge)))
+            })
+            .collect()
+    }
+}
+
+/// Whether `builtin` is an effect in graph mode (see [Graph mode](#graph-mode)):
+/// every impure built-in but `file` and `dir`, which only read the working
+/// directory.
+#[must_use]
+pub fn effect_builtin(builtin: Builtin) -> bool {
+    builtin.effect() != crate::ast::Effect::Pure && !matches!(builtin, Builtin::File | Builtin::Dir)
+}
+
+/// The scope a node is met in (see [Graph mode](#graph-mode)).
+#[derive(Debug, Default)]
+struct Scope {
+    /// Its path: a hash of its parent's, its key and its number among its
+    /// parent's scopes of that key.
+    path: u64,
+    /// How many nodes have been met in it.
+    met: u32,
+    /// How many scopes of each key it has entered.
+    entered: HashMap<u64, u32>,
+}
+
+/// One run of a unit in graph mode (see [Graph mode](#graph-mode)), shared by
+/// its frames.
+pub(crate) struct GraphRun<'g> {
+    /// The evaluation's graph, the host's, for the run.
+    graph: RefCell<Graph>,
+    /// The unit running.
+    unit: u32,
+    /// Whether the host takes a call of a function with these attributes, a
+    /// deferring attribute among them, as a step.
+    defers: Defers<'g>,
+    /// The node the run stopped for, once it has.
+    paused: Cell<Option<NodeId>>,
+    /// The node met last, in program order.
+    last: Cell<Option<NodeId>>,
+    /// The scopes being run, innermost last.
+    scopes: RefCell<Vec<Scope>>,
+}
+
+impl std::fmt::Debug for GraphRun<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphRun")
+            .field("unit", &self.unit)
+            .field("paused", &self.paused.get())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'g> GraphRun<'g> {
+    /// A run of unit `unit` against `graph`, the host deciding by `defers`
+    /// which deferring calls are steps; [`GraphRun::finish`] gives the graph
+    /// back.
+    pub(crate) fn new(graph: Graph, unit: u32, defers: Defers<'g>) -> Self {
+        let root = Scope {
+            path: hash_of(&("unit", unit)),
+            ..Scope::default()
+        };
+        Self {
+            graph: RefCell::new(graph),
+            unit,
+            defers,
+            paused: Cell::new(None),
+            last: Cell::new(None),
+            scopes: RefCell::new(vec![root]),
+        }
+    }
+
+    /// The graph, as the run left it, and the node the run stopped for, if
+    /// it did.
+    pub(crate) fn finish(self) -> (Graph, Option<NodeId>) {
+        (self.graph.into_inner(), self.paused.get())
+    }
+
+    /// The position of the next node met, in the innermost scope.
+    fn next_position(&self) -> u64 {
+        let mut scopes = self.scopes.borrow_mut();
+        let Some(scope) = scopes.last_mut() else {
+            return 0;
+        };
+        scope.met += 1;
+        hash_of(&(scope.path, scope.met))
+    }
+
+    /// Enters the scope of key `key` inside the innermost one.
+    fn enter(&self, key: u64) {
+        let mut scopes = self.scopes.borrow_mut();
+        let parent_path = scopes.last().map_or(0, |scope| scope.path);
+        let number = scopes.last_mut().map_or(0, |scope| {
+            let entered = scope.entered.entry(key).or_insert(0);
+            *entered += 1;
+            *entered
+        });
+        scopes.push(Scope {
+            path: hash_of(&(parent_path, key, number)),
+            ..Scope::default()
+        });
+    }
+
+    /// Leaves the innermost scope, but the unit's own.
+    fn leave(&self) {
+        let mut scopes = self.scopes.borrow_mut();
+        if scopes.len() > 1 {
+            scopes.pop();
+        }
+    }
+
+    /// The node met at the next position with `key`, making it if the
+    /// evaluation has none, by `new_node`; the internal error "evaluation did
+    /// not converge" if another key was met there before.
+    fn meet(
+        &self,
+        key: Box<[u8]>,
+        span: Span,
+        new_node: impl FnOnce(&Graph, Option<NodeId>) -> Node,
+    ) -> Result<NodeId, Diagnostic> {
+        let position = (self.unit, self.next_position());
+        let mut graph = self.graph.borrow_mut();
+        let found = match graph.positions.get(&position) {
+            Some((recorded, id)) if *recorded == key => Some(*id),
+            Some(_) => {
+                return Err(internal(
+                    "evaluation did not converge: a step met here changed between attempts",
+                    span,
+                ));
+            }
+            None => None,
+        };
+        let id = if let Some(id) = found {
+            id
+        } else {
+            // A deferred call of a key met elsewhere is that node; anything
+            // else met for the first time is a new one.
+            let made = new_node(&graph, self.last.get());
+            let existing = (made.kind == NodeKind::Deferred)
+                .then(|| graph.deferred.get(&key).copied())
+                .flatten();
+            let id = existing.unwrap_or_else(|| {
+                let id = NodeId(u32::try_from(graph.nodes.len()).unwrap_or(u32::MAX));
+                if made.kind == NodeKind::Deferred {
+                    graph.deferred.insert(key.clone(), id);
+                }
+                graph.nodes.push(made);
+                id
+            });
+            graph.positions.insert(position, (key, id));
+            id
+        };
+        self.last.set(Some(id));
+        Ok(id)
+    }
+}
+
+impl Evaluator<'_> {
+    /// The stop for the node `id`, waiting, at the node `node` that needs its
+    /// result: the error marked [`Mark::PENDING`], the run's `paused` the node
+    /// (see [Graph mode](#graph-mode)).
+    pub(super) fn pause<T>(&self, id: NodeId, node: &IrNode) -> Flow<T> {
+        if let Some(run) = self.shared.graph {
+            run.paused.set(Some(id));
+        }
+        let mut stop = Diagnostic::error("waiting for a step's result", node.span);
+        stop.mark = Mark::PENDING;
+        Err(stop.into())
+    }
+
+    /// Whether the call of `closure`, of code `code`, is a step the host takes,
+    /// in graph mode (see [Graph mode](#graph-mode)).
+    pub(super) fn defers(&self, code: &FnCode) -> bool {
+        code.defers
+            && self
+                .shared
+                .graph
+                .is_some_and(|run| (run.defers)(&code.attributes))
+    }
+
+    /// The call `node` of `closure`, whose code is `code`, with the arguments
+    /// `args` at depth `depth`, as a deferred call's node (see [Graph
+    /// mode](#graph-mode)): its arguments evaluated as a call's are, then the
+    /// future that stands for its result, the node's. Apart from
+    /// [`Evaluator::call`], which every call passes through, so that its frame
+    /// stays small.
+    #[inline(never)]
+    pub(super) fn defer_call(
+        &mut self,
+        (closure, code): (&Rc<Closure>, &FnCode),
+        (args, depth): (IrRange, u16),
+        node: &IrNode,
+    ) -> Flow<Value> {
+        let Some(run) = self.shared.graph else {
+            return Err(internal("a call deferred outside graph mode", node.span).into());
+        };
+        let base = self.stack.len();
+        self.stack
+            .resize(base + code.frame_size as usize, Value::Empty);
+        if let Err(unwind) = self.arguments(args, base, (closure, depth)) {
+            self.stack.truncate(base);
+            return Err(unwind);
+        }
+        let params = base..base + code.param_count as usize;
+        let given: Box<[Value]> = self.stack.get(params).unwrap_or_default().into();
+        self.stack.truncate(base);
+        let context = self.shared.context.borrow().clone();
+        let mut key = Vec::new();
+        key.push(1);
+        encode(&Value::Fn(Rc::clone(closure)), &mut key);
+        for value in &given {
+            encode(value, &mut key);
+        }
+        encode_context(context.as_ref(), &mut key);
+        let made = self.callee_caller();
+        let id = run.meet(key.into(), node.span, |graph, after| {
+            let mut data = Vec::new();
+            graph.holes_into(&given, &mut data);
+            graph.holes_into(&closure.captures, &mut data);
+            graph.holes_into(&context_values(context.as_ref()), &mut data);
+            let number = u32::try_from(graph.nodes.len()).unwrap_or(u32::MAX);
+            let future = Future::host(
+                Rc::clone(&closure.code),
+                closure.function,
+                number,
+                (made, context.clone()),
+            );
+            Node {
+                kind: NodeKind::Deferred,
+                closure: Some(Rc::clone(closure)),
+                args: given.clone(),
+                context: context.clone(),
+                data: data.into(),
+                after,
+                unit: run.unit,
+                site: *node,
+                code: Rc::clone(self.ir),
+                caller: made,
+                state: NodeState::Waiting,
+                future: Some(Rc::new(future)),
+            }
+        })?;
+        let graph = run.graph.borrow();
+        let future = graph.node(id).and_then(|found| found.future.clone());
+        match future {
+            Some(future) => Ok(Value::Future(future)),
+            None => Err(internal("a deferred call's node has no future", node.span).into()),
+        }
+    }
+
+    /// The call `node` of the effectful built-in `builtin` with the arguments
+    /// `arguments`, by parameter, as an effect's node (see [Graph
+    /// mode](#graph-mode)): its result if the host has given it, its failure
+    /// if it failed, and otherwise the stop for it. Apart from the built-in's
+    /// call, which every call passes through, so that its frame stays small.
+    #[inline(never)]
+    pub(super) fn effect_node(
+        &self,
+        builtin: Builtin,
+        arguments: &[Option<(Value, Span)>],
+        node: &IrNode,
+    ) -> Flow<Value> {
+        let given: Vec<Value> = arguments
+            .iter()
+            .flatten()
+            .map(|(value, _)| value.clone())
+            .collect();
+        let given = &given[..];
+        let Some(run) = self.shared.graph else {
+            return Err(internal("an effect made a node outside graph mode", node.span).into());
+        };
+        let context = self.shared.context.borrow().clone();
+        let mut key = Vec::new();
+        key.push(2);
+        key.extend_from_slice(builtin.name().as_bytes());
+        key.push(0);
+        for value in given {
+            encode(value, &mut key);
+        }
+        encode_context(context.as_ref(), &mut key);
+        let id = run.meet(key.into(), node.span, |graph, after| {
+            let mut data = Vec::new();
+            graph.holes_into(given, &mut data);
+            Node {
+                kind: NodeKind::Effect(builtin),
+                closure: None,
+                args: given.into(),
+                context: context.clone(),
+                data: data.into(),
+                after,
+                unit: run.unit,
+                site: *node,
+                code: Rc::clone(self.ir),
+                caller: self.caller,
+                state: NodeState::Waiting,
+                future: None,
+            }
+        })?;
+        let state = run.graph.borrow().node(id).map(|found| found.state.clone());
+        match state {
+            Some(NodeState::Done(value)) => Ok(value),
+            Some(NodeState::Failed(error)) => Err(error.into()),
+            Some(NodeState::Waiting) => self.pause(id, node),
+            None => Err(internal("an effect's node is missing", node.span).into()),
+        }
+    }
+
+    /// Enters, in graph mode, the scope of the memoised call or `lazy` body
+    /// whose key is `parts` encoded, returning whether it did, so that the
+    /// caller leaves it again (see [Graph mode](#graph-mode)).
+    pub(super) fn enter_scope(&self, parts: &[&Value]) -> bool {
+        let Some(run) = self.shared.graph else {
+            return false;
+        };
+        let mut key = Vec::new();
+        for value in parts {
+            encode(value, &mut key);
+        }
+        run.enter(hash_of(&key));
+        true
+    }
+
+    /// Enters, in graph mode, the scope of the body of the function `function`
+    /// of `code` with the captures `captures`, a `lazy`'s, returning whether it
+    /// did (see [Graph mode](#graph-mode)).
+    pub(super) fn enter_scope_of(
+        &self,
+        code: &Rc<crate::ir::Ir>,
+        function: crate::ast::FnId,
+        captures: &[Value],
+    ) -> bool {
+        let Some(run) = self.shared.graph else {
+            return false;
+        };
+        let mut key = vec![b'L'];
+        key.extend_from_slice(&(Rc::as_ptr(code) as usize).to_le_bytes());
+        key.extend_from_slice(&function.index().to_le_bytes());
+        for value in captures {
+            encode(value, &mut key);
+        }
+        run.enter(hash_of(&key));
+        true
+    }
+
+    /// Leaves the scope [`Evaluator::enter_scope`] entered, if it did.
+    pub(super) fn leave_scope(&self, entered: bool) {
+        if let (true, Some(run)) = (entered, self.shared.graph) {
+            run.leave();
+        }
+    }
+}
+
+/// Runs `node`, a node of an action graph, as a host asks (see [Graph
+/// mode](#graph-mode)): a deferred call's callee, given its arguments, in
+/// the context it was made in, with `#[retry]` and `#[timeout]` as its code
+/// says; or an effect's built-in, applied to its arguments. Either runs as
+/// plain GCSL runs it, its effects through `effects`, on `stack` above what
+/// it holds and with `memo` as its memo tables, `exec_result` the layout of
+/// `exec`'s result and `dirs` the run's directories.
+///
+/// # Errors
+///
+/// The step's failure, as a diagnostic.
+pub(crate) fn run_node(
+    node: &Node,
+    (stack, memo): (&mut Vec<Value>, &mut MemoTables),
+    (exec_result, dirs, effects): (
+        Option<&Rc<crate::value::Layout>>,
+        &[Rc<str>],
+        &dyn super::Effects,
+    ),
+) -> Result<Value, Diagnostic> {
+    let shared = Shared::new(exec_result, dirs, effects);
+    shared.context.replace(node.context.clone());
+    let base = stack.len();
+    let span = node.site.span;
+    let result = match (node.kind, &node.closure) {
+        (NodeKind::Deferred, Some(closure)) => {
+            let Some(code) = closure.code.find_function(closure.function) else {
+                return Err(internal("a step's callee is no function of its code", span));
+            };
+            stack.resize(base + code.frame_size as usize, Value::Empty);
+            for (slot, value) in stack.iter_mut().skip(base).zip(node.args.iter()) {
+                *slot = value.clone();
+            }
+            let mut evaluator = Evaluator {
+                ir: &closure.code,
+                stack,
+                base,
+                captures: &closure.captures,
+                callee: Some(closure),
+                memo,
+                shared: &shared,
+                caller: node.caller,
+                levels: CALL_LEVELS,
+            };
+            if code.retry > 0 || code.timeout.is_some() {
+                evaluator
+                    .guarded_call(closure, base, (node.caller, CALL_LEVELS), &node.site)
+                    .map_err(|unwind| unwind.into_error(span))
+            } else {
+                evaluator
+                    .value(code.body)
+                    .or_else(|unwind| unwind.returned(span))
+            }
+        }
+        (NodeKind::Effect(builtin), None) => {
+            let mut arguments: [Option<(Value, Span)>; Builtin::MAX_PARAMS] = Default::default();
+            for (entry, value) in arguments.iter_mut().zip(node.args.iter()) {
+                *entry = Some((value.clone(), span));
+            }
+            Evaluator {
+                ir: &node.code,
+                stack,
+                base,
+                captures: &[],
+                callee: None,
+                memo,
+                shared: &shared,
+                caller: node.caller,
+                levels: CALL_LEVELS,
+            }
+            .apply_builtin(builtin, arguments, &node.site)
+            .map_err(|unwind| unwind.into_error(span))
+        }
+        _ => return Err(internal("a step of another shape", span)),
+    };
+    stack.truncate(base);
+    result
+}
+
+/// A hash of `value`, for a scope's path and a position.
+fn hash_of(value: &impl Hash) -> u64 {
+    let mut state = DefaultHasher::new();
+    value.hash(&mut state);
+    state.finish()
+}
+
+/// The values the context `context` binds, its nearest binding of each.
+fn context_values(context: Option<&Rc<ContextFrame>>) -> Vec<Value> {
+    flattened(context)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
+/// The context `context` flattened: each key it binds, sorted, with its
+/// nearest binding's value.
+fn flattened(context: Option<&Rc<ContextFrame>>) -> Vec<(crate::names::Name, Value)> {
+    let mut found: Vec<(crate::names::Name, Value)> = Vec::new();
+    let mut at = context;
+    while let Some(frame) = at {
+        for (key, value) in &frame.binds {
+            if !found.iter().any(|(had, _)| had == key) {
+                found.push((*key, value.clone()));
+            }
+        }
+        at = frame.outer.as_ref();
+    }
+    found.sort_by_key(|(key, _)| *key);
+    found
+}
+
+/// Appends the flattened context `context` to the key `out`: its bindings,
+/// never a frame's identity, which is new each time a `with` runs.
+fn encode_context(context: Option<&Rc<ContextFrame>>, out: &mut Vec<u8>) {
+    let bound = flattened(context);
+    out.push(b'c');
+    out.extend_from_slice(&u32::try_from(bound.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for (key, value) in &bound {
+        out.extend_from_slice(&key.index().to_le_bytes());
+        encode(value, out);
+    }
+}
+
+/// Appends a canonical encoding of `value` to the key `out` (see [Graph
+/// mode](#graph-mode)): equal for two values a deferred call cannot tell
+/// apart, whatever the attempt. A `Float` by its bits, every NaN one and
+/// `-0.0` as `0.0`, so that the equality is reflexive; a record's fields
+/// sorted by name; a closure by its code, the IR's address and the
+/// function's number, and its captures; a future a host has yet to give by
+/// its node, one run by its value, one not run by its code and captures; a
+/// secret by its identity, as secrets compare.
+pub(crate) fn encode(value: &Value, out: &mut Vec<u8>) {
+    let mut pending: Vec<Value> = vec![value.clone()];
+    while let Some(value) = pending.pop() {
+        encode_one(value, out, &mut pending);
+    }
+}
+
+/// Appends `value`'s own part of the encoding to `out`, and pushes what it
+/// holds onto `pending`, in reverse, for [`encode`].
+fn encode_one(value: Value, out: &mut Vec<u8>, pending: &mut Vec<Value>) {
+    match value {
+        Value::Int(n) => {
+            out.push(b'i');
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Float(x) => {
+            out.push(b'f');
+            let bits = if x.is_nan() {
+                f64::NAN.to_bits()
+            } else if x == 0.0 {
+                0
+            } else {
+                x.to_bits()
+            };
+            out.extend_from_slice(&bits.to_le_bytes());
+        }
+        Value::Bool(b) => out.extend_from_slice(&[b'b', u8::from(b)]),
+        Value::Str(s) => {
+            out.push(b's');
+            write_text(out, &s);
+        }
+        Value::Quantity(quantity, amount) => {
+            out.push(b'q');
+            write_text(out, &format!("{quantity:?}"));
+            out.extend_from_slice(&amount.to_le_bytes());
+        }
+        Value::Empty => out.push(b'e'),
+        Value::Record(record) => encode_record(&record, out, pending),
+        Value::List(list) => {
+            out.push(b'l');
+            write_count(out, list.len());
+            pending.extend(list.values().iter().rev().cloned());
+        }
+        Value::Fn(closure) => {
+            out.push(b'F');
+            out.extend_from_slice(&(Rc::as_ptr(&closure.code) as usize).to_le_bytes());
+            out.extend_from_slice(&closure.function.index().to_le_bytes());
+            write_count(out, closure.captures.len());
+            pending.extend(closure.captures.iter().rev().cloned());
+        }
+        Value::Future(future) => encode_future(&future, out, pending),
+        Value::Builtin(builtin) => {
+            out.push(b'B');
+            write_text(out, builtin.name());
+        }
+        Value::Tag(tag) => {
+            out.push(b't');
+            out.extend_from_slice(&tag.key.index().to_le_bytes());
+        }
+        Value::Variant(variant) => {
+            out.push(b'v');
+            out.extend_from_slice(&variant.tag.key.index().to_le_bytes());
+            pending.push(variant.payload.clone());
+        }
+        Value::Secret(secret) => {
+            out.push(b'S');
+            out.push(u8::from(secret.revealed));
+            write_text(out, &secret.identity);
+        }
+        Value::File(file) => {
+            out.push(b'p');
+            write_text(out, &file.path);
+            write_text(out, file.identity.as_deref().unwrap_or(""));
+        }
+        Value::Dir(dir) => {
+            out.push(b'd');
+            write_text(out, &dir.path);
+            write_text(out, dir.identity.as_deref().unwrap_or(""));
+        }
+        Value::Sandbox(sandbox) => {
+            out.push(b'x');
+            write_text(out, &sandbox.root);
+        }
+    }
+}
+
+/// Appends the length of `text` and `text` to `out`.
+fn write_text(out: &mut Vec<u8>, text: &str) {
+    write_count(out, text.len());
+    out.extend_from_slice(text.as_bytes());
+}
+
+/// Appends `count` to `out`, as four bytes.
+fn write_count(out: &mut Vec<u8>, count: usize) {
+    out.extend_from_slice(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
+}
+
+/// Appends a record's part of the encoding to `out`, its fields' names
+/// sorted, and pushes its fields' values onto `pending`, for [`encode`].
+fn encode_record(record: &crate::value::Record, out: &mut Vec<u8>, pending: &mut Vec<Value>) {
+    out.push(b'r');
+    let mut fields: Vec<(&str, &Value)> = record
+        .layout
+        .texts
+        .iter()
+        .map(|name| &**name)
+        .zip(record.values.iter())
+        .collect();
+    fields.sort_by_key(|&(name, _)| name);
+    write_count(out, fields.len());
+    for &(name, _) in &fields {
+        write_text(out, name);
+    }
+    pending.extend(fields.into_iter().rev().map(|(_, value)| value.clone()));
+}
+
+/// Appends a future's part of the encoding to `out`, and pushes what it
+/// holds onto `pending`, for [`encode`]: one a host has yet to give by its
+/// node, one run by its value, one not run by its code and captures.
+fn encode_future(future: &Future, out: &mut Vec<u8>, pending: &mut Vec<Value>) {
+    if let Some(node) = future.host_node() {
+        out.push(b'H');
+        out.extend_from_slice(&node.to_le_bytes());
+    } else if let Some(done) = future.value() {
+        out.push(b'D');
+        pending.push(done);
+    } else {
+        out.push(b'P');
+        out.extend_from_slice(&(Rc::as_ptr(&future.code) as usize).to_le_bytes());
+        out.extend_from_slice(&future.function.index().to_le_bytes());
+        if let Some(captures) = future.with_captures(<[Value]>::to_vec) {
+            write_count(out, captures.len());
+            pending.extend(captures.into_iter().rev());
+        }
+    }
+}

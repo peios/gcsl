@@ -363,7 +363,7 @@ impl Checker<'_> {
             );
             return;
         }
-        self.calls.deferred.insert(function);
+        self.lowering.deferred.insert(function);
     }
 
     /// Reports the result type `ret`, written at `written`, of `function`, if
@@ -376,7 +376,7 @@ impl Checker<'_> {
         ret: TyId,
         written: Option<TypeExprId>,
     ) {
-        if !self.calls.deferred.contains(&function)
+        if !self.lowering.deferred.contains(&function)
             || ret == TyId::ERROR
             || self.types.laziness(ret) != Laziness::Present
         {

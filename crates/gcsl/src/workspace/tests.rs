@@ -298,6 +298,7 @@ mod errors;
 mod fileroot;
 mod files;
 mod fs;
+mod graph;
 mod imports;
 mod invoke;
 mod language;

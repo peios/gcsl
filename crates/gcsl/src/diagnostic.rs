@@ -129,16 +129,20 @@ impl Mark {
     pub(crate) const INTERNAL: Mark = Mark(u32::MAX);
     /// A failure of an operation on a secret.
     pub(crate) const SECRET: Mark = Mark(u32::MAX - 1);
+    /// A unit of an evaluation in graph mode stopping for a step's result,
+    /// which only its root catches (see [Graph
+    /// mode](crate::eval::graph#graph-mode)).
+    pub(crate) const PENDING: Mark = Mark(u32::MAX - 2);
 
     /// The passing of deadline number `number`, which is neither 0 nor one
-    /// of the last two `u32`s.
+    /// of the last three `u32`s.
     pub(crate) const fn deadline(number: u32) -> Mark {
         Mark(number)
     }
 
     /// The number of the deadline whose passing the error is, if it is one.
     pub(crate) const fn deadline_number(self) -> Option<u32> {
-        if self.0 == 0 || self.0 >= u32::MAX - 1 {
+        if self.0 == 0 || self.0 >= u32::MAX - 2 {
             None
         } else {
             Some(self.0)

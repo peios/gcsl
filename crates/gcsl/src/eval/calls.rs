@@ -314,6 +314,7 @@ use super::builtins::{enum_builtin, secret_builtin};
 use super::kinds::{as_function, float_to_int, into_callee, mixed};
 use super::elements::element_builtin;
 use super::files::{dir_files, inside, make_file, read_file};
+use super::graph::effect_builtin;
 use super::sandbox::{sandbox_entry, sandbox_exec};
 use super::system::{exec, file_system, write_file};
 use super::text::{join, sort_versions, split, string_list, strip_prefix, strip_suffix, trim};
@@ -338,6 +339,11 @@ impl Evaluator<'_> {
         };
         if self.past_deadline() {
             return self.timed_out(node);
+        }
+        // A step the host takes, in graph mode (see [Graph
+        // mode](crate::eval::graph#graph-mode)).
+        if self.defers(code) {
+            return self.defer_call((&closure, code), (args, depth), node);
         }
         if code.kind == FnKind::Memo {
             return self.memo_call((&closure, code), (args, depth), node);
@@ -573,6 +579,25 @@ impl Evaluator<'_> {
             };
             *entry = Some((value, span));
         }
+        // An effect is a node, in graph mode (see [Graph
+        // mode](crate::eval::graph#graph-mode)).
+        if self.shared.graph.is_some() && effect_builtin(builtin) {
+            return self.effect_node(builtin, &arguments, node);
+        }
+        self.apply_builtin(builtin, arguments, node)
+    }
+
+    /// Applies the built-in `builtin`, for its call `node`, to `arguments`,
+    /// each parameter's, with its span, as [`Evaluator::call_builtin`] says,
+    /// once they are evaluated: or, for an effect's node of an action graph,
+    /// as given (see [Graph mode](crate::eval::graph#graph-mode)).
+    #[inline(never)]
+    pub(super) fn apply_builtin(
+        &mut self,
+        builtin: Builtin,
+        arguments: [Option<(Value, Span)>; Builtin::MAX_PARAMS],
+        node: &IrNode,
+    ) -> Flow<Value> {
         let [first, second] = arguments;
         let second = second.map(|(value, _)| value);
         match (builtin, first, second) {

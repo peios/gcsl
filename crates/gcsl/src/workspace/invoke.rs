@@ -1039,7 +1039,7 @@ impl Workspace {
         );
         let mut warnings = self.warnings.clone();
         warnings.extend(own);
-        match session::run_input_in(ir, &mut self.frame, context, root) {
+        match session::run_input_in(&Rc::new(ir), &mut self.frame, context, (root, None)) {
             Ok(value) => Ok(Outcome { value, warnings }),
             Err(error) => {
                 let errors = invoked_here(vec![error], call, at);

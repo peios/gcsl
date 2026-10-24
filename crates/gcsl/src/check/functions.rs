@@ -463,7 +463,7 @@ impl Checker<'_> {
             // host may give its calls' results later (see [Deferring
             // attributes](crate::check::attributes#deferring-attributes)).
             if let Some(ret_expr) = decl.ret
-                && !self.calls.deferred.contains(&function)
+                && !self.lowering.deferred.contains(&function)
             {
                 result = self.inferred_result((ret_expr, ret), decl.body, &returns);
             }

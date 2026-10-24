@@ -238,6 +238,7 @@ use crate::Outcome;
 use crate::ast::{Ast, TypeStore};
 use crate::check::{CheckOutput, Scope};
 use crate::diagnostic::{self, Diagnostic};
+use crate::eval::graph::GraphRun;
 use crate::eval::{self, Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::lower;
@@ -547,24 +548,24 @@ pub(crate) fn run_input(
     frame: &mut Vec<Value>,
     context: RunContext,
 ) -> Result<Value, Diagnostic> {
-    run_input_in(ir, frame, context, None)
+    run_input_in(&Rc::new(ir), frame, context, (None, None))
 }
 
-/// [`run_input`], in the root context `root`, the frame of the contexts a
-/// host sets for the run (see [`eval::eval_rooted`]).
+/// [`run_input`], of `ir`, in the root context `root`, the frame of the
+/// contexts a host sets for the run, and as the run of a unit in graph mode,
+/// `graph`, if it is one (see [`eval::eval_rooted`]).
 pub(crate) fn run_input_in(
-    ir: Ir,
+    ir: &Rc<Ir>,
     frame: &mut Vec<Value>,
     (memo, exec_result, dirs, effects): RunContext,
-    root: Option<Rc<ContextFrame>>,
+    (root, graph): (Option<Rc<ContextFrame>>, Option<&GraphRun<'_>>),
 ) -> Result<Value, Diagnostic> {
-    let ir = Rc::new(ir);
     let frame_size = ir.frame_size() as usize;
     if frame.len() < frame_size {
         frame.resize(frame_size, Value::Empty);
     }
     let extras = (exec_result, dirs, effects);
-    eval::eval_rooted(&ir, (frame, memo), extras, root)
+    eval::eval_rooted(ir, (frame, memo), extras, (root, graph))
 }
 
 /// What [`run_input`] runs an input with besides its frame: the memo tables

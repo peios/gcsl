@@ -40,6 +40,7 @@ use std::rc::Rc;
 
 use crate::ast::FnId;
 use crate::check::Builtin;
+use crate::diagnostic::Diagnostic;
 use crate::ir::Ir;
 use crate::names::Name;
 use crate::strings::{FieldName, Quoted};
@@ -383,6 +384,11 @@ pub(crate) enum FutureState {
     Running,
     /// Run: the value it yielded, which every later await yields.
     Done(Value),
+    /// A step's result that a host has yet to give, the step its node of
+    /// the action graph, by number (see [Graph mode](crate::eval::graph#graph-mode)).
+    Host(u32),
+    /// A step's failure, which a host gave, and which every await raises.
+    Failed(Box<Diagnostic>),
 }
 
 /// What an await finds when it starts to await a [`Future`], from
@@ -395,6 +401,11 @@ pub(crate) enum Begin {
     /// The future had not run: its captured values, taken out, and it is
     /// now running. The await must end it with [`Future::finish`].
     Pending(Box<[Value]>),
+    /// The future is a step's result that a host has yet to give, the step
+    /// its node, by number.
+    Host(u32),
+    /// The future is a step's failure.
+    Failed(Diagnostic),
 }
 
 /// A future: the function of a `lazy` in a program's IR, with the values it
@@ -512,6 +523,70 @@ impl Future {
         }
     }
 
+    /// A future that stands for the result of the step that node number
+    /// `node` of an action graph is, a call of the function `function` of
+    /// `code`, made by `made` in `context`, until a host gives it (see
+    /// [Graph mode](crate::eval::graph#graph-mode)).
+    pub(crate) fn host(
+        code: Rc<Ir>,
+        function: FnId,
+        node: u32,
+        (made, context): (Caller, Option<Rc<ContextFrame>>),
+    ) -> Self {
+        Self {
+            code,
+            function,
+            state: RefCell::new(FutureState::Host(node)),
+            made,
+            context,
+        }
+    }
+
+    /// The number of the node of an action graph whose result the future
+    /// stands for, while a host has yet to give it.
+    #[must_use]
+    pub(crate) fn host_node(&self) -> Option<u32> {
+        match self.state.try_borrow().as_deref() {
+            Ok(FutureState::Host(node)) => Some(*node),
+            _ => None,
+        }
+    }
+
+    /// Gives the future, a step's result, what its step came to: its value,
+    /// which every await then yields, or its failure, which every await
+    /// raises. Returns `false`, changing nothing, if the future is no step's
+    /// waiting result.
+    pub(crate) fn resolve(&self, outcome: Result<Value, Diagnostic>) -> bool {
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            return false;
+        };
+        if !matches!(*state, FutureState::Host(_)) {
+            return false;
+        }
+        *state = match outcome {
+            Ok(value) => FutureState::Done(value),
+            Err(error) => FutureState::Failed(Box::new(error)),
+        };
+        true
+    }
+
+    /// The values the future holds while it has not run, its captures, for
+    /// a walk of a value through it; none once it has run or for a step's.
+    pub(crate) fn with_captures<T>(&self, f: impl FnOnce(&[Value]) -> T) -> Option<T> {
+        match self.state.try_borrow().as_deref() {
+            Ok(FutureState::Pending(captures)) => Some(f(captures)),
+            _ => None,
+        }
+    }
+
+    /// The value the future yielded, if it has run.
+    pub(crate) fn value(&self) -> Option<Value> {
+        match self.state.try_borrow().as_deref() {
+            Ok(FutureState::Done(value)) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     /// The future's type as text, `Future<Int>`: what it displays as,
     /// whether it has run or not. Empty if `function` is not one of
     /// `code`'s, which the evaluator never builds.
@@ -538,9 +613,24 @@ impl Future {
         if let FutureState::Done(value) = &*state {
             return Some(Begin::Done(value.clone()));
         }
+        match &*state {
+            FutureState::Host(node) => return Some(Begin::Host(*node)),
+            FutureState::Failed(error) => return Some(Begin::Failed((**error).clone())),
+            _ => {}
+        }
         Some(match std::mem::replace(&mut *state, FutureState::Running) {
             FutureState::Pending(captures) => Begin::Pending(captures),
             FutureState::Running => Begin::Running,
+            // Handled above; put back unchanged if they were reached.
+            FutureState::Host(node) => {
+                *state = FutureState::Host(node);
+                Begin::Host(node)
+            }
+            FutureState::Failed(error) => {
+                let raised = (*error).clone();
+                *state = FutureState::Failed(error);
+                Begin::Failed(raised)
+            }
             // Handled above; put back unchanged if it were reached.
             FutureState::Done(value) => {
                 *state = FutureState::Done(value.clone());
@@ -570,7 +660,7 @@ impl Future {
         match self.state.get_mut() {
             FutureState::Pending(captures) => captures,
             FutureState::Done(value) => std::slice::from_mut(value),
-            FutureState::Running => &mut [],
+            FutureState::Running | FutureState::Host(_) | FutureState::Failed(_) => &mut [],
         }
     }
 
@@ -580,6 +670,8 @@ impl Future {
             Ok(FutureState::Pending(_)) => "pending",
             Ok(FutureState::Running) | Err(_) => "running",
             Ok(FutureState::Done(_)) => "done",
+            Ok(FutureState::Host(_)) => "waiting",
+            Ok(FutureState::Failed(_)) => "failed",
         }
     }
 }

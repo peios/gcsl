@@ -106,7 +106,7 @@ pub struct Name(u32);
 
 impl Name {
     /// The name as an index into its table.
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
 }

@@ -1853,6 +1853,10 @@ pub struct FnCode {
     /// how to run it, through any of its closures
     /// ([`crate::value::Closure::attributes`]).
     pub attributes: Box<[Attribute]>,
+    /// Whether a deferring attribute is on it, so that a host may run its
+    /// calls as steps (see the checker's [Deferring
+    /// attributes](crate::check::attributes#deferring-attributes)).
+    pub defers: bool,
     /// How many more times a call that fails runs its body, by the
     /// function's `#[retry]`: 0 without one.
     pub retry: u32,

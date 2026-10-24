@@ -889,6 +889,7 @@ fn a_dotted_update_is_two_levels_taller_for_each_step() {
         display: Box::from("fn(): {}"),
         slot_names: Box::default(),
         attributes: Box::default(),
+        defers: false,
         retry: 0,
         timeout: None,
         name_text: None,
