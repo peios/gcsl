@@ -515,7 +515,7 @@ impl Workspace {
             })
             .collect();
         let names: Vec<Name> = bound.iter().map(|&(name, _, _)| name).collect();
-        self.lower_built(&bound, |all| composition(all, &names, at.1), at)
+        self.lower_built(&bound, |all| composition(all, &names, at.1), (at, None))
     }
 
     /// The top-level field or `def` of file `file` named `name`, as
@@ -941,18 +941,39 @@ impl Workspace {
         (known, root): (Option<Rc<KnownParams>>, Option<Rc<ContextFrame>>),
     ) -> Result<Outcome, InvokeError> {
         let at = (definition.file, definition.span);
+        let lowered = self.lower_definition_call(
+            (definition, invoked),
+            (def_type, definition_cell),
+            (known, root.as_ref()),
+        )?;
+        self.run_built(lowered, at, root)
+    }
+
+    /// Checks and lowers the call [`Workspace::call_definition`] runs, as
+    /// [`Workspace::lower_built`] does, the contexts the root frame `root`
+    /// binds met at its top level.
+    ///
+    /// # Errors
+    ///
+    /// As [`Workspace::lower_built`].
+    pub(super) fn lower_definition_call(
+        &mut self,
+        (definition, invoked): (&Definition, Invocation),
+        (def_type, definition_cell): ((Slot, TyId), (Slot, TyId)),
+        (known, root): (Option<Rc<KnownParams>>, Option<&Rc<ContextFrame>>),
+    ) -> Result<(Ir, Vec<Diagnostic>), InvokeError> {
+        let at = (definition.file, definition.span);
         let bound = (
             self.scan.names.intern(INVOKED_DEF_TYPE),
             self.scan.names.intern(INVOKED_DEFINITION),
         );
         let cells = [(bound.0, def_type, known), (bound.1, definition_cell, None)];
         let path = &definition.path;
-        let lowered = self.lower_built(
+        self.lower_built(
             &cells,
             |names| invocation(names, (path, invoked), bound, at.1),
-            at,
-        )?;
-        self.run_built(lowered, at, root)
+            (at, root),
+        )
     }
 
     /// Checks and lowers a call built rather than parsed, the input `build`
@@ -982,7 +1003,7 @@ impl Workspace {
         &mut self,
         bound: &[BoundCell],
         build: impl FnOnce(Names) -> Ast,
-        at: (u32, Span),
+        (at, root): ((u32, Span), Option<&Rc<ContextFrame>>),
     ) -> Result<(Ir, Vec<Diagnostic>), InvokeError> {
         let call = count(self.scan.files.len());
         let ast = build(mem::take(&mut self.scan.names));
@@ -991,7 +1012,13 @@ impl Workspace {
             .map(|(name, (slot, ty), known)| (*name, *slot, *ty, known.clone()));
         let scope = Scope::of_slots(self.slot_names.clone()).with_fields(fields);
         let place = self.scan.place(at.0);
+        // What the host binds at the root meets the call's needs (see the
+        // checker's [Needs](crate::check::needs#needs)).
+        let root_keys: Vec<Name> = root
+            .map(|frame| frame.binds.iter().map(|&(key, _)| key).collect())
+            .unwrap_or_default();
         let lowered = Checker::with_scope(&ast, scope, &mut self.types)
+            .with_root_contexts(root_keys)
             .check()
             .and_then(|mut output| {
                 output.checked.resolution.set_place(place);

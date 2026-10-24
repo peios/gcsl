@@ -131,6 +131,9 @@ pub(super) struct ContextsChecked {
     /// The uses of functions whose needs are not known yet, inside their own
     /// bodies or groups.
     uses: Vec<MemberUse>,
+    /// The contexts the root of the input's run binds, which the host sets,
+    /// by their keys: met at the top level as a `with` there meets them.
+    pub(super) root: Vec<Name>,
 }
 
 impl Checker<'_> {
@@ -176,7 +179,9 @@ impl Checker<'_> {
     /// expression being checked, inside the function its needs are charged
     /// to, or anywhere at the top level.
     pub(super) fn is_covered(&self, key: Name) -> bool {
-        self.covered_in(self.need_target()).contains(&key)
+        let target = self.need_target();
+        self.covered_in(target).contains(&key)
+            || (target.is_none() && self.contexts.root.contains(&key))
     }
 
     /// Charges `needs`, what a read or a call at `span` needs, for the
@@ -188,9 +193,15 @@ impl Checker<'_> {
         }
         let target = self.need_target();
         let covered = self.covered_in(target);
+        // At the top level, what the host binds at the root meets a need too.
+        let root: &[Name] = if target.is_none() {
+            &self.contexts.root
+        } else {
+            &[]
+        };
         let unmet: Vec<Need> = needs
             .iter()
-            .filter(|need| !met(need, covered))
+            .filter(|need| !met(need, covered) && !met(need, root))
             .cloned()
             .collect();
         if let Some(frame) = target.and_then(|at| self.functions.get_mut(at)) {

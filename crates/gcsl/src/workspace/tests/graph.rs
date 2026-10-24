@@ -390,3 +390,65 @@ fn a_step_s_inputs_are_what_a_host_keys_and_stages_it_by() {
     assert!(inputs.code_files.contains(&file));
     assert!(inputs.code_files.len() > 1);
 }
+
+/// A workspace of a deferring def-type `build`, a definition of it, and
+/// a def-type `bumped` that needs a context with no default.
+const TARGETS: [(&str, &str); 2] = [
+    ("workspace.gcsl", ""),
+    (
+        "app.gcsl",
+        "#[attribute] #[defers] type step = {}\n\
+         context bump: Int\n\
+         #[def_type] #[step]\n\
+         def build(name: String, f: fn(): {v: Int}) -> {v: Int} { f() }\n\
+         def build main() { v = 1 }\n\
+         #[def_type]\n\
+         def bumped(name: String, f: fn(): Int) -> Int { f() + ^bump }\n\
+         def bumped one() { 1 }",
+    ),
+];
+
+#[test]
+fn a_prepared_invocation_is_a_unit_that_runs_until_it_is_done() {
+    let mut workspace = rooted(&TARGETS).unwrap();
+    let call = workspace.prepare_call(("build", "main"), &[], &[]).unwrap();
+    let mut graph = Graph::new();
+    // The invocation is a step: the def-type defers.
+    let Progress::Done(value) = workspace.run_prepared(&call, &mut graph, &every).unwrap() else {
+        panic!("not done");
+    };
+    let holes = graph.holes(&value);
+    assert_eq!(holes.len(), 1);
+    let step = graph.node(holes[0]).unwrap();
+    assert_eq!(step.unit(), call.unit());
+    let direct = crate::eval::Direct { temp_dirs: None };
+    let outcome = workspace.evaluate(&graph, holes[0], &direct);
+    assert_eq!(
+        outcome.as_ref().map(ToString::to_string),
+        Ok("{v = 1}".to_owned())
+    );
+    assert!(graph.resolve(holes[0], outcome));
+    assert!(graph.holes(&value).is_empty());
+    // Run again, it finds the same step, given.
+    let again = workspace.run_prepared(&call, &mut graph, &every).unwrap();
+    assert!(matches!(again, Progress::Done(_)));
+    assert_eq!(graph.len(), 1);
+}
+
+#[test]
+fn what_the_host_binds_at_the_root_meets_an_invocation_s_needs() {
+    let mut workspace = rooted(&TARGETS).unwrap();
+    let bump = vec![("bump".to_owned(), Value::Int(2))];
+    let outcome = workspace
+        .invoke_with(("bumped", "one"), &[], &bump)
+        .unwrap();
+    assert_eq!(outcome.value, Value::Int(3));
+    // Without it, the call needs what nothing gives.
+    let mut workspace = rooted(&TARGETS).unwrap();
+    match workspace.invoke_with(("bumped", "one"), &[], &[]) {
+        Err(InvokeError::Diagnostics(errors)) => {
+            assert_eq!(errors[0].message, "context `bump` has no value here");
+        }
+        other => panic!("{other:?}"),
+    }
+}

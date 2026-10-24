@@ -451,6 +451,10 @@ pub struct Workspace {
     /// ([`Workspace::set_temp_root`]; see the module documentation, "The
     /// standard library").
     temp_dirs: TempDirs,
+    /// How many calls have been prepared to run in graph mode, each a unit
+    /// numbered after every file (see [Prepared
+    /// calls](crate::workspace::graph#prepared-calls)).
+    calls_prepared: u32,
     /// The table the files' types are interned into.
     types: TypeTable,
     /// The name of every slot of the frame, the last variable's in it, for
@@ -819,6 +823,7 @@ pub(crate) mod checking;
 pub(crate) mod context;
 pub(crate) mod declared;
 pub(crate) mod files;
+pub mod graph;
 pub(crate) mod imports;
 pub(crate) mod input;
 pub(crate) mod invoke;

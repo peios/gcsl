@@ -1998,6 +1998,15 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// This checker, its input run in a root context the host sets that binds
+    /// the contexts of the keys `root`: met at its top level as a `with`
+    /// there meets them (see [Needs](crate::check::needs#needs)).
+    #[must_use]
+    pub fn with_root_contexts(mut self, root: Vec<Name>) -> Self {
+        self.contexts.root = root;
+        self
+    }
+
     /// A checker for `ast` whose outermost block starts with the variables
     /// of `scope` already declared. `scope` must come from checking earlier
     /// input interned into the same [`crate::names::Names`] as `ast` and the

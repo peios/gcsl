@@ -495,20 +495,50 @@ pub(super) fn check_scan_recording(
         let failed = Failed::of(scan, (types, checked), (errors, warnings));
         return (Err(failed), recorded);
     }
+    let cells = (cell_types, cell_slots, cell_known);
+    let workspace = assembled(
+        scan,
+        (runs, checked, warnings.into_iter().flatten().collect()),
+        (slot_names, tails),
+        (types, cells, for_later),
+    );
+    #[cfg(test)]
     let workspace = Workspace {
+        view_records,
+        ..workspace
+    };
+    (Ok(workspace), recorded)
+}
+
+/// Each file's run and types, and the warnings, of a check (see
+/// [`assembled`]).
+type FileResults = (Vec<FileRun>, Vec<Option<Types>>, Vec<Diagnostic>);
+
+/// The workspace a check that found nothing wrong made, of the scan
+/// `scan`, each file's run, types and the warnings, the slots' names and
+/// each file's own, the type table, the cells' tables, and what later
+/// files read of the earlier ones.
+fn assembled(
+    mut scan: Scan,
+    (runs, checked, warnings): FileResults,
+    (slot_names, slot_tails): (Vec<Name>, Vec<(usize, Vec<Name>)>),
+    (types, (cell_types, cell_slots, cell_known), for_later): (TypeTable, CellTables, ForLater),
+) -> Workspace {
+    Workspace {
         values: vec![Value::Empty; scan.files.len()],
         // Built before `scan` moves; its names are interned already.
         exec_result: exec_layout(&mut scan.names),
         temp_dirs: TempDirs::new(),
+        calls_prepared: 0,
         scan,
         runs,
         checked,
-        warnings: warnings.into_iter().flatten().collect(),
+        warnings,
         // The driver writes the built-in functions' cells, the first slots,
         // as it lays the frame out, before any file runs.
         frame: builtin_cells(),
         slot_names,
-        slot_tails: tails,
+        slot_tails,
         memo: MemoTables::new(),
         types,
         cell_types,
@@ -516,9 +546,8 @@ pub(super) fn check_scan_recording(
         cell_known,
         for_later,
         #[cfg(test)]
-        view_records,
-    };
-    (Ok(workspace), recorded)
+        view_records: Vec::new(),
+    }
 }
 
 /// Scans `sources` placed as `placing` says, beside the standard library,
