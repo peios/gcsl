@@ -528,3 +528,65 @@ fn a_fetched_file_is_named_by_its_url_s_last_segment() {
     assert_eq!(fetched_name("https://x.org"), "download");
     assert_eq!(fetched_name("https://x.org/a/.."), "download");
 }
+
+/// A gzipped tar archive of `top/a.txt` and `top/sub/b.txt`, made with
+/// `tar`, or `None` where it cannot run, which `archive.unpack` needs: its
+/// path.
+fn archive_of_top(name: &str, compress: &str) -> Option<String> {
+    let dir = fs_scratch(name);
+    std::fs::create_dir_all(format!("{dir}/src/top/sub")).unwrap();
+    std::fs::write(format!("{dir}/src/top/a.txt"), "a\n").unwrap();
+    std::fs::write(format!("{dir}/src/top/sub/b.txt"), "b\n").unwrap();
+    let archive = format!("{dir}/top.tar{compress}");
+    let made = std::process::Command::new("tar")
+        .arg("--create")
+        .arg("--auto-compress")
+        .arg("--file")
+        .arg(&archive)
+        .arg("--directory")
+        .arg(format!("{dir}/src"))
+        .arg("top")
+        .status()
+        .is_ok_and(|status| status.success());
+    made.then_some(archive)
+}
+
+#[test]
+fn an_archive_unpacks_into_a_directory_of_its_own() {
+    for compress in ["", ".gz", ".xz"] {
+        let Some(archive) = archive_of_top(&format!("unpack{compress}"), compress) else {
+            return;
+        };
+        let text = format!(
+            "import archive\n\
+             let whole = archive.unpack(file(\"{archive}\"))\n\
+             let stripped = archive.unpack(file(\"{archive}\"), strip = 1)\n\
+             = [whole.file(\"top/a.txt\").read(), stripped.file(\"sub/b.txt\").read(), \
+             \"{{len(stripped.files())}}\"]"
+        );
+        assert_eq!(
+            lone(&text).unwrap(),
+            "[\"a\\n\", \"b\\n\", \"2\"]",
+            "{compress}"
+        );
+    }
+    let Some(archive) = archive_of_top("unpack-errors", "") else {
+        return;
+    };
+    let negative = lone_error(&format!(
+        "import archive\nx = archive.unpack(file(\"{archive}\"), strip = -1)"
+    ));
+    assert!(
+        negative.message.ends_with("`strip` is 0 or more"),
+        "{}",
+        negative.message
+    );
+    let missing = lone_error("import archive\nx = archive.unpack(file(\"/nonexistent/x.tar\"))");
+    assert!(
+        missing
+            .message
+            .starts_with("`archive.unpack` could not unpack `/nonexistent/x.tar`"),
+        "{}",
+        missing.message
+    );
+}

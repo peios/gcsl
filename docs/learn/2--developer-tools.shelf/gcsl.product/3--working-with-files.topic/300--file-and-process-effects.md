@@ -167,6 +167,24 @@ Plain GCSL runs `curl` to download and `sha256sum` to check, so both must
 be installed. A build tool such as pekit keeps fetched files by their
 digests, and downloads each one only once.
 
+## Unpacking archives
+
+The `archive` module's `unpack(archive, strip)` makes a directory of what
+a tar archive holds, compressed with gzip, xz, bzip2, or zstd, or not at
+all. `strip` leaves off the first components of each path, as
+`tar --strip-components` does, which removes the single top-level
+directory most source archives have:
+
+```text
+import archive
+let zlib = archive.unpack(fetch("https://zlib.net/fossils/zlib-1.3.1.tar.gz",
+    sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"), strip = 1)
+zlib.file("zlib.h")
+```
+
+Plain GCSL runs `tar` to unpack. A build tool such as pekit unpacks
+archives itself and keeps the result, so each archive is unpacked once.
+
 ## Directories
 
 A `Dir` is a tree of files: an unpacked archive, a toolchain, or what a

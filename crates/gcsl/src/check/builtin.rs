@@ -136,6 +136,11 @@ pub enum Builtin {
     /// with `""`, downloaded only to fail with the digest it has, for its
     /// pin. A host may answer it from a store of files by digest. Impure.
     Fetch,
+    /// `archive_unpack(archive: File, strip: Int) -> Dir`: a new directory
+    /// of what the tar archive `archive` holds, compressed or not, the first
+    /// `strip` components of each path left off, the `archive` module's
+    /// `unpack`. A host may answer it itself. Impure.
+    ArchiveUnpack,
     /// `exec_secret(argv: List<String>, options: {cwd, env, panic, secrets,
     /// until}) -> Secret<{status: Int, stderr: String, stdout: String}>`:
     /// runs a program as `exec` does, given the revealed secrets of
@@ -211,7 +216,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 48] = [
+    pub const ALL: [Builtin; 49] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -247,6 +252,7 @@ impl Builtin {
         Builtin::File,
         Builtin::FileRead,
         Builtin::Fetch,
+        Builtin::ArchiveUnpack,
         Builtin::ExecSecret,
         Builtin::Dir,
         Builtin::DirFiles,
@@ -323,6 +329,7 @@ impl Builtin {
             Builtin::File => "file",
             Builtin::FileRead => "file_read",
             Builtin::Fetch => "fetch",
+            Builtin::ArchiveUnpack => "archive_unpack",
             Builtin::ExecSecret => "exec_secret",
             Builtin::Dir => "dir",
             Builtin::DirFiles => "dir_files",
@@ -382,6 +389,7 @@ impl Builtin {
             | Builtin::File
             | Builtin::FileRead
             | Builtin::Fetch
+            | Builtin::ArchiveUnpack
             | Builtin::ExecSecret
             | Builtin::Dir
             | Builtin::DirFiles
@@ -407,6 +415,7 @@ impl Builtin {
             Builtin::File
                 | Builtin::FileRead
                 | Builtin::Fetch
+                | Builtin::ArchiveUnpack
                 | Builtin::Dir
                 | Builtin::DirFiles
                 | Builtin::DirFile
@@ -459,6 +468,7 @@ impl Builtin {
             Builtin::File | Builtin::Dir => &["path"],
             Builtin::FileRead => &["f"],
             Builtin::Fetch => &["url", "sha256"],
+            Builtin::ArchiveUnpack => &["archive", "strip"],
             Builtin::CompareVersions => &["a", "b"],
             Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
             Builtin::FsCopy => &["from", "to"],
@@ -494,6 +504,7 @@ impl Builtin {
             | Builtin::File
             | Builtin::FileRead
             | Builtin::Fetch
+            | Builtin::ArchiveUnpack
             | Builtin::ExecSecret
             | Builtin::Dir
             | Builtin::DirFiles
@@ -572,6 +583,7 @@ impl Builtin {
             | Builtin::File
             | Builtin::FileRead
             | Builtin::Fetch
+            | Builtin::ArchiveUnpack
             | Builtin::ExecSecret
             | Builtin::Dir
             | Builtin::DirFiles
@@ -636,6 +648,7 @@ impl Builtin {
             Builtin::File => "fn(path: String) -> File",
             Builtin::FileRead => "fn(f: File) -> String",
             Builtin::Fetch => "fn(url: String, sha256: String) -> File",
+            Builtin::ArchiveUnpack => "fn(archive: File, strip: Int) -> Dir",
             Builtin::Dir => "fn(path: String) -> Dir",
             Builtin::DirFiles => "fn(d: Dir) -> List<File>",
             Builtin::DirFile => "fn(d: Dir, path: String): File",
@@ -671,45 +684,7 @@ impl Builtin {
             Builtin::Int => ([TyId::FLOAT, UNUSED], TyId::INT),
             Builtin::Float => ([TyId::INT, UNUSED], TyId::FLOAT),
             Builtin::Exec | Builtin::ExecLive | Builtin::ExecSecret => {
-                // A program's words and environment are plain: a secret is
-                // given to one only by `exec_secret`'s `secrets`.
-                let argv = types.list(TyId::STRING);
-                let [status, stdout, stderr] = Builtin::EXEC_FIELDS.map(|text| names.intern(text));
-                let result = types.record([
-                    (status, TyId::INT),
-                    (stdout, TyId::STRING),
-                    (stderr, TyId::STRING),
-                ]);
-                let environment = types.record_with_rest([], Some(TyId::STRING), Vec::new());
-                if self == Builtin::ExecSecret {
-                    let [cwd, env, panic, secrets, until] =
-                        Builtin::EXEC_SECRET_OPTIONS.map(|text| names.intern(text));
-                    let revealed = types.revealed(TyId::STRING);
-                    let given = types.record_with_rest([], Some(revealed), Vec::new());
-                    let options = types.record([
-                        (cwd, TyId::STRING),
-                        (env, environment),
-                        (panic, TyId::BOOL),
-                        (secrets, given),
-                        (until, TyId::STRING),
-                    ]);
-                    let secret = types.secret(result);
-                    let params = [
-                        (Some(names.intern("argv")), argv),
-                        (Some(names.intern("options")), options),
-                    ];
-                    return types.fn_type(params, secret, self.effect());
-                }
-                let [cwd, env, interactive, panic, until] =
-                    Builtin::EXEC_OPTIONS.map(|text| names.intern(text));
-                let options = types.record([
-                    (cwd, TyId::STRING),
-                    (env, environment),
-                    (interactive, TyId::BOOL),
-                    (panic, TyId::BOOL),
-                    (until, TyId::STRING),
-                ]);
-                ([argv, options], result)
+                return self.exec_ty(types, names);
             }
             Builtin::Panic => ([TyId::STRING, UNUSED], types.never()),
             Builtin::Split => ([TyId::STRING, TyId::STRING], types.list(TyId::STRING)),
@@ -721,6 +696,7 @@ impl Builtin {
             Builtin::File => ([TyId::STRING, UNUSED], TyId::FILE),
             Builtin::FileRead => ([TyId::FILE, UNUSED], TyId::STRING),
             Builtin::Fetch => ([TyId::STRING, TyId::STRING], TyId::FILE),
+            Builtin::ArchiveUnpack => ([TyId::FILE, TyId::INT], TyId::DIR),
             Builtin::Dir => ([TyId::STRING, UNUSED], TyId::DIR),
             Builtin::DirFiles => ([TyId::DIR, UNUSED], types.list(TyId::FILE)),
             Builtin::DirFile => ([TyId::DIR, TyId::STRING], TyId::FILE),
@@ -769,6 +745,55 @@ impl Builtin {
             .iter()
             .zip(param_types)
             .map(|(&text, ty)| (Some(names.intern(text)), ty));
+        types.fn_type(params, result, self.effect())
+    }
+
+    /// The type of `exec`, `exec_live` or `exec_secret`, which this is, as
+    /// [`Builtin::ty`] gives it: its words, its options, and its result,
+    /// a secret one for `exec_secret`.
+    fn exec_ty(self, types: &mut TypeTable, names: &mut Names) -> TyId {
+        // A program's words and environment are plain: a secret is
+        // given to one only by `exec_secret`'s `secrets`.
+        let argv = types.list(TyId::STRING);
+        let [status, stdout, stderr] = Builtin::EXEC_FIELDS.map(|text| names.intern(text));
+        let result = types.record([
+            (status, TyId::INT),
+            (stdout, TyId::STRING),
+            (stderr, TyId::STRING),
+        ]);
+        let environment = types.record_with_rest([], Some(TyId::STRING), Vec::new());
+        if self == Builtin::ExecSecret {
+            let [cwd, env, panic, secrets, until] =
+                Builtin::EXEC_SECRET_OPTIONS.map(|text| names.intern(text));
+            let revealed = types.revealed(TyId::STRING);
+            let given = types.record_with_rest([], Some(revealed), Vec::new());
+            let options = types.record([
+                (cwd, TyId::STRING),
+                (env, environment),
+                (panic, TyId::BOOL),
+                (secrets, given),
+                (until, TyId::STRING),
+            ]);
+            let secret = types.secret(result);
+            let params = [
+                (Some(names.intern("argv")), argv),
+                (Some(names.intern("options")), options),
+            ];
+            return types.fn_type(params, secret, self.effect());
+        }
+        let [cwd, env, interactive, panic, until] =
+            Builtin::EXEC_OPTIONS.map(|text| names.intern(text));
+        let options = types.record([
+            (cwd, TyId::STRING),
+            (env, environment),
+            (interactive, TyId::BOOL),
+            (panic, TyId::BOOL),
+            (until, TyId::STRING),
+        ]);
+        let params = [
+            (Some(names.intern("argv")), argv),
+            (Some(names.intern("options")), options),
+        ];
         types.fn_type(params, result, self.effect())
     }
 }

@@ -1,0 +1,16 @@
+# The archive module: a module of GCSL's standard library, compiled into
+# every build and loaded by a run that imports it (`import archive`).
+#
+# - `unpack(archive, strip)`: a new directory of what the tar archive
+#   `archive` holds, gzip, xz, bzip2 or zstd compressed or not, the first
+#   `strip` components of each path left off, as `tar --strip-components`
+#   leaves them; by default none. It runs `tar`, which must be installed. A
+#   build tool such as pekit unpacks it itself, and keeps what it unpacked,
+#   so an archive is unpacked once. It fails at its call: it is
+#   `#[track_caller]`.
+import builtins
+
+#[track_caller]
+def unpack(archive: File, strip: Int = 0) -> Dir {
+    builtins.archive_unpack(archive, strip)
+}

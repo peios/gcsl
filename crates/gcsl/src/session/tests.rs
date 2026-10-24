@@ -273,9 +273,9 @@ fn a_session_runs_the_standard_library_first() {
     // The standard files are its first inputs, and the built-in
     // functions' cells its first slots, written as the frame was laid
     // out.
-    assert_eq!(first(), 3);
+    assert_eq!(first(), 4);
     assert_eq!(
-        session.source(2).map(SourceFile::name),
+        session.source(3).map(SourceFile::name),
         Some("<stdlib>/prelude.gcsl")
     );
     assert!(session.source(first()).is_none());
@@ -339,8 +339,8 @@ fn a_conflict_with_the_prelude_names_its_file() {
     assert_eq!(error.message, "field `len` is defined in two files");
     assert_eq!(error.input, None);
     let inputs: Vec<Option<u32>> = error.labels.iter().map(|label| label.input).collect();
-    assert_eq!(inputs, [Some(2), None]);
-    let prelude = session.source(2).unwrap();
+    assert_eq!(inputs, [Some(3), None]);
+    let prelude = session.source(3).unwrap();
     assert_eq!(prelude.slice(error.labels[0].span), "len");
 }
 
@@ -1447,9 +1447,9 @@ fn a_union_variable_is_used_by_later_inputs() {
 #[test]
 fn a_session_runs_exec_panic_and_sh() {
     let mut session = Session::new();
-    // The forty-eight built-in functions' cells are its first slots.
+    // The forty-nine built-in functions' cells are its first slots.
     assert_eq!(
-        &session.frame[..48],
+        &session.frame[..49],
         Builtin::ALL.map(Value::Builtin).as_slice()
     );
     // On the first input, and on later ones, through a variable.
@@ -1518,7 +1518,7 @@ fn a_session_has_the_string_built_ins_and_path() {
     // Every standard module was loaded as it started, each a scope of
     // its own, in path order.
     assert_eq!(
-        session.source(1).map(SourceFile::name),
+        session.source(2).map(SourceFile::name),
         Some("<stdlib>/path.gcsl")
     );
     // `split` on the first input.
@@ -1689,9 +1689,9 @@ fn a_session_is_in_its_working_directory() {
 #[test]
 fn a_session_has_fs_and_owns_its_temporary_directories() {
     let mut session = Session::new();
-    // Loaded as the session started, its first input.
+    // Loaded as the session started, its second input, after `archive`.
     assert_eq!(
-        session.source(0).map(SourceFile::name),
+        session.source(1).map(SourceFile::name),
         Some("<stdlib>/fs.gcsl")
     );
     // `import fs` then a read, in that input and a later one.

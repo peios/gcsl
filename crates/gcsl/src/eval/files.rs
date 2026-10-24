@@ -73,6 +73,16 @@
 //! for the author to pin it. A host that keeps files by their digests, as
 //! pekit does, answers a call itself, from its store when it holds the
 //! digest, so that a pinned file is downloaded once.
+//!
+//! # Unpacking
+//!
+//! `archive.unpack(a, strip)`, the built-in `archive_unpack` (`unpack`),
+//! makes a new temporary directory of the run of what the tar archive `a`
+//! holds, gzip, xz, bzip2 or zstd compressed or not, the first `strip`
+//! components of each path left off, an entry with no more left out. It
+//! runs `tar` through the run's [`Effects`], owners and the time of each file
+//! not kept. A host may answer it itself, as pekit does, from its store when
+//! it has unpacked the same archive before.
 
 use std::collections::HashSet;
 use std::fs;
@@ -538,4 +548,55 @@ pub(super) fn fetch(url: &str, sha256: &str, effects: &dyn Effects, node: &IrNod
         .into());
     }
     Ok(entry(false, Rc::from(path)))
+}
+
+/// Applies `archive_unpack`, for the call `node`, to `archive` and `strip`
+/// (see [Unpacking](#unpacking)): a new directory of what it holds.
+pub(super) fn unpack(
+    archive: &File,
+    strip: i64,
+    effects: &dyn Effects,
+    node: &IrNode,
+) -> Flow<Value> {
+    let fail = |message: String| Err(Diagnostic::error(message, node.span).into());
+    let path = &*archive.path;
+    if strip < 0 {
+        return fail(format!(
+            "`archive.unpack` of `{path}` cannot leave off {strip} components: `strip` is 0 or \
+             more"
+        ));
+    }
+    let source = match effects.host_path(path) {
+        Ok(source) => source,
+        Err(reason) => return fail(format!("`archive.unpack` cannot use `{path}`: {reason}")),
+    };
+    let Some(made) = effects.temp_dir() else {
+        return mistyped(node, "`archive.unpack` called in a run without an owner");
+    };
+    let root = match made {
+        Ok(root) => root,
+        Err(reason) => {
+            return fail(format!(
+                "`archive.unpack` could not create a temporary directory: {reason}"
+            ));
+        }
+    };
+    let target = match effects.host_path(&root) {
+        Ok(target) => target,
+        Err(reason) => return fail(format!("`archive.unpack` cannot use `{root}`: {reason}")),
+    };
+    let mut tar = Command::new("tar");
+    tar.arg("--extract")
+        .arg("--file")
+        .arg(&source)
+        .arg("--directory")
+        .arg(&target)
+        .arg(format!("--strip-components={strip}"))
+        .args(["--no-same-owner", "--touch"]);
+    if let Err(reason) = run_through(effects, tar) {
+        return fail(format!(
+            "`archive.unpack` could not unpack `{path}`: {reason}"
+        ));
+    }
+    Ok(entry(true, Rc::from(root)))
 }

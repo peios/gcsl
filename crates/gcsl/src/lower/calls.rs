@@ -76,6 +76,7 @@ impl Lowerer<'_> {
             | Builtin::File
             | Builtin::FileRead
             | Builtin::Fetch
+            | Builtin::ArchiveUnpack
             | Builtin::ExecSecret
             | Builtin::Dir
             | Builtin::DirFiles
