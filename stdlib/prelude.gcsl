@@ -371,7 +371,6 @@ def (xs: List<T>) unique<T>(): List<T> { builtins.list_unique(xs) }
 #[track_caller]
 def (xs: List<T>) contains<T>(x: T): Bool { builtins.list_contains(xs, x) }
 
-
 # Building. A build tool, such as pekit, runs the calls of a function marked
 # `#[hermetic]` as cached steps, each in a sandbox holding only its
 # arguments; plain GCSL runs them at once, as any call. `#[scratch]` gives a
