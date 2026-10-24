@@ -472,3 +472,133 @@ fn dump_ast_shows_definitions_and_references() {
         "{dump}"
     );
 }
+
+/// A workspace of a def-type at its root, `build`, definitions of it in
+/// `pkgs/` at two depths, and `app.gcsl`, in `image/`, of `app`.
+fn globbed(app: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "workspace.gcsl",
+            "#[def_type]\n\
+             def build(name: String, f: fn(): String): String { \"{name}: {f()}\" }"
+                .to_owned(),
+        ),
+        (
+            "pkgs/top.gcsl",
+            "def build top() { \"in pkgs\" }".to_owned(),
+        ),
+        ("pkgs/a/a.gcsl", "def build x() { \"a\" }".to_owned()),
+        (
+            "pkgs/b/b.gcsl",
+            "def build y() { \"b\" }\ndef build y2() { \"b2\" }".to_owned(),
+        ),
+        (
+            "pkgs/b/deep/d.gcsl",
+            "def build z() { \"deep\" }".to_owned(),
+        ),
+        (
+            "pkgs/.hidden/h.gcsl",
+            "def build h() { \"hidden\" }".to_owned(),
+        ),
+        ("image/app.gcsl", app.to_owned()),
+    ]
+}
+
+/// The files of `files`, borrowed.
+fn borrowed<'a>(files: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    files
+        .iter()
+        .map(|(path, text)| (*path, text.as_str()))
+        .collect()
+}
+
+#[test]
+fn a_def_type_s_definitions_are_imported_from_every_directory_a_glob_names() {
+    let cases = [
+        // Directly in each directory under `pkgs/`, not deeper, nor in it.
+        (
+            "import build * from pkgs/*\nv = [build x(), build y(), build y2()]",
+            "{v = [\"x: a\", \"y: b\", \"y2: b2\"]}",
+        ),
+        // At any depth under it.
+        (
+            "import build * from pkgs/**\nv = [build x(), build z()]",
+            "{v = [\"x: a\", \"z: deep\"]}",
+        ),
+        // In the directory itself, as `import * from` would.
+        (
+            "import build * from pkgs\nv = build top()",
+            "{v = \"top: in pkgs\"}",
+        ),
+        // The root's directories; none of them is `pkgs/b`.
+        (
+            "import build * from *\nv = build top()",
+            "{v = \"top: in pkgs\"}",
+        ),
+        // A glob that finds none is no error.
+        ("import build * from pkgs/a/*\nv = 1", "{v = 1}"),
+    ];
+    for (app, expected) in cases {
+        let files = globbed(app);
+        assert_eq!(
+            value(&borrowed(&files), "image/app.gcsl"),
+            expected,
+            "{app}"
+        );
+    }
+    // Only the definitions: one depth only, and nothing else of the files.
+    for (app, message) in [
+        (
+            "import build * from pkgs/*\nv = build z()",
+            "`build` has no definition `z`",
+        ),
+        (
+            "import build * from pkgs/*\nv = build top()",
+            "`build` has no definition `top`",
+        ),
+        (
+            "import build * from pkgs/**\nv = build h()",
+            "`build` has no definition `h`",
+        ),
+    ] {
+        let files = globbed(app);
+        assert_eq!(
+            messages(&borrowed(&files), "image/app.gcsl"),
+            [message],
+            "{app}"
+        );
+    }
+}
+
+#[test]
+fn definitions_a_glob_imports_twice_are_an_error_at_the_import() {
+    let mut files = globbed("import build * from pkgs/*\nv = build y()");
+    files.push(("pkgs/c/c.gcsl", "def build x() { \"c\" }".to_owned()));
+    let files = borrowed(&files);
+    assert_eq!(
+        messages(&files, "image/app.gcsl"),
+        ["field `build x` is defined in two files"]
+    );
+}
+
+#[test]
+fn an_import_of_definitions_names_a_def_type_and_directories() {
+    for (app, message) in [
+        ("import nope * from pkgs/*\nv = 1", "`nope` is no def-type"),
+        (
+            "import build * from pkgs/a/a/*\nv = 1",
+            "a glob names directories, and `pkgs/a/a` is a file",
+        ),
+        (
+            "import build * from pkgs/none/*\nv = 1",
+            "no module `pkgs/none`",
+        ),
+    ] {
+        let files = globbed(app);
+        assert_eq!(
+            messages(&borrowed(&files), "image/app.gcsl"),
+            [message],
+            "{app}"
+        );
+    }
+}

@@ -287,12 +287,17 @@ impl Index {
             }
             ImportForm::Whole(None) => module,
             ImportForm::Members(members) => {
-                let shown: Vec<&str> = ast
+                let shown: Vec<String> = ast
                     .import_members(members)
                     .iter()
-                    .map(|member| match member {
-                        ImportMember::Named { name, .. } => self.scan.names.get(name.name),
-                        ImportMember::All(_) => "*",
+                    .map(|member| match *member {
+                        ImportMember::Named { name, .. } => {
+                            self.scan.names.get(name.name).to_owned()
+                        }
+                        ImportMember::All(_) => "*".to_owned(),
+                        ImportMember::DefType { def, .. } => {
+                            format!("{} *", ast.show_def_type(def).0)
+                        }
                     })
                     .collect();
                 format!("{} from {module}", shown.join(", "))

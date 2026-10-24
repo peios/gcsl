@@ -1,6 +1,7 @@
 //! Tests of the parser: named-argument shorthand and imports.
 
 use super::*;
+use crate::ast::{DefTypeRole, ImportGlob};
 
 #[test]
 fn a_name_alone_after_a_named_argument_is_shorthand() {
@@ -255,5 +256,69 @@ fn import_member_errors() {
     assert_eq!(
         message("import a, b c"),
         "expected `,` or `from`, found `c`"
+    );
+}
+
+#[test]
+fn an_import_of_a_def_type_s_definitions_prints_as_written() {
+    for text in [
+        "import package * from pkgs",
+        "import package * from pkgs/*",
+        "import package * from pkgs/**",
+        "import package * from *",
+        "import package * from **",
+        "import pekit.package * from pkgs/dev.peios/*",
+    ] {
+        assert_eq!(shape(text), text, "{text}");
+    }
+    // The member is a use of the def-type, of its own role, its path
+    // empty; the glob is the import's.
+    let ast = parse_text("import package * from pkgs/**").unwrap();
+    let ItemKind::Import(id) = ast.item(ast.items(ast.root())[0]).kind else {
+        panic!("expected an import");
+    };
+    let decl = ast.import_decl(id);
+    assert_eq!(decl.glob, ImportGlob::Descendants);
+    assert_eq!(decl.path_at, Span::new(22, 29));
+    let ImportForm::Members(range) = decl.form else {
+        panic!("expected members");
+    };
+    let [ImportMember::DefType { def, span }] = ast.import_members(range) else {
+        panic!("expected a def-type member");
+    };
+    assert_eq!(*span, Span::new(7, 16));
+    assert_eq!(ast.def_type(*def).role, DefTypeRole::Import);
+    assert!(ast.path(ast.def_type(*def).path).is_empty());
+}
+
+#[test]
+fn an_import_of_a_def_type_s_definitions_has_one_member_and_globs_have_it() {
+    assert_eq!(
+        error("import package *, x from pkgs"),
+        (
+            "a def-type's `*` is imported alone, as in `import package * from pkgs/*`".to_owned(),
+            Span::new(16, 17)
+        )
+    );
+    let glob = "a glob imports the definitions of one def-type, as in `import package * from \
+                pkgs/*`";
+    assert_eq!(message("import x from pkgs/*"), glob);
+    assert_eq!(message("import * from pkgs/**"), glob);
+    assert_eq!(
+        error("import package * from pkgs/***"),
+        ("a glob is `*` or `**`".to_owned(), Span::new(27, 30))
+    );
+    assert_eq!(
+        message("import a/b * from pkgs"),
+        "a def-type is a name, or names joined by `.`"
+    );
+    assert_eq!(
+        message("import package * pkgs"),
+        "expected `from`, found `pkgs`"
+    );
+    // A path ending in `/` with no glob after it is the usual error.
+    assert_eq!(
+        message("import package * from pkgs/"),
+        "expected a module name before and after each `/`"
     );
 }

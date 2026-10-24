@@ -555,7 +555,7 @@ pub(super) fn name_namespaces(scan: &mut Scan) -> bool {
             // A definition's and a meta's leaf in the namespace of the metas
             // of the def-type's definitions in its directory.
             let meta = match def.role {
-                DefTypeRole::Reference => None,
+                DefTypeRole::Reference | DefTypeRole::Import => None,
                 DefTypeRole::Definition | DefTypeRole::Meta => {
                     let path: Vec<&str> = file
                         .ast
@@ -572,6 +572,13 @@ pub(super) fn name_namespaces(scan: &mut Scan) -> bool {
     }
     let mut leaves = false;
     for (index, id, text, meta) in found {
+        // An import of a def-type's definitions is resolved by its key, once
+        // the trees are made again.
+        let imports = scan
+            .files
+            .get(index as usize)
+            .is_some_and(|file| file.ast.def_type(id).role == DefTypeRole::Import);
+        leaves |= imports;
         let key = scan.names.intern(&text);
         let meta =
             meta.map(|(meta_key, leaf)| (scan.names.intern(&meta_key), scan.names.intern(&leaf)));

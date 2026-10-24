@@ -149,6 +149,48 @@ pub struct Scan {
 }
 
 impl Scan {
+    /// The directories below `dir`: those directly in it, or, if `deep`,
+    /// those at any depth below it, in path order, a hidden one, whose name
+    /// starts with `.`, and everything below it left out (see [Imports of
+    /// definitions](crate::workspace::imports#imports-of-definitions)).
+    #[must_use]
+    pub fn dirs_below(&self, dir: u32, deep: bool) -> Vec<u32> {
+        let hidden = |at: &Dir| {
+            at.path
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name.starts_with('.'))
+        };
+        let mut found: Vec<u32> = (0u32..)
+            .zip(&self.dirs)
+            .filter(|(_, below)| {
+                if hidden(below) {
+                    return false;
+                }
+                let mut at = below.parent;
+                while let Some(parent) = at {
+                    if parent == dir {
+                        return true;
+                    }
+                    let Some(above) = self.dirs.get(parent as usize) else {
+                        return false;
+                    };
+                    if !deep || hidden(above) {
+                        return false;
+                    }
+                    at = above.parent;
+                }
+                false
+            })
+            .map(|(index, _)| index)
+            .collect();
+        found.sort_by(|&a, &b| {
+            let path = |at: u32| self.dirs.get(at as usize).map_or("", |d| d.path.as_str());
+            path(a).cmp(path(b))
+        });
+        found
+    }
+
     /// The lexical and syntax errors of every file, each naming its file by
     /// its input number, in path then source order (see [Syntax
     /// errors](crate::workspace::parse#syntax-errors)).

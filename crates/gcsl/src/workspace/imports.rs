@@ -54,6 +54,33 @@
 //! one-file form of the cycle error, "`app.gcsl` needs itself"; files
 //! importing each other are the cycle error of [Order](crate::workspace::needs#order).
 //!
+//! # Imports of definitions
+//!
+//! `import package * from pkgs/*` (see the parser's
+//! [Imports](crate::parser::imports#imports)) binds the definitions of the
+//! def-type its member names, `package`, in each directory its path and
+//! glob name (`def_type_import`): the one the path names, or every
+//! directory directly in it, or at any depth below it
+//! ([`Scan::dirs_below`]), a hidden one, its name starting with `.`, and
+//! what is below it left out, as discovery leaves them out of a workspace
+//! read from a disk; a nested workspace is no directory of this one. The
+//! def-type is found as a definition's is, in the importing file's view,
+//! its key named with the definitions' (`name_namespaces`), so the import
+//! binds once the trees are made again: an alias of the namespace's key
+//! for each directory whose tree has the namespace, which the file's view
+//! merges, so that `package dev.peios.kernel` reads the definition of
+//! whichever directory has it. Two of them that define one path are the
+//! conflict of the view, "field `package x` is defined in two files", at
+//! the import, labelled with each definition. A name that is no def-type
+//! is "`x` is no def-type", a path that names nothing the usual error, a
+//! glob on a file's path "a glob names directories, and `a/b` is a file";
+//! a glob that finds no definition is no error, as an `import *` of an
+//! empty module is not. A failed import leaves the file blind, as a failed
+//! `*` does, so that no reference through it is reported again. The
+//! import's `DT` is a mention of the def-type, so the file needs its
+//! declaration however many definitions it finds; through the aliases, it
+//! needs the files of the definitions it reads.
+//!
 //! A reference that ends on a cell reads that cell's slot: a `def`'s is its
 //! function's slot, since the merged node of a `def` is never written. A
 //! record read whole (a directory, a file, a file's part of a shared node,
@@ -66,7 +93,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Ast, ImportDecl, ImportForm, ImportMember, ItemId, ItemKind, PathSegment};
+use crate::ast::{
+    Ast, DefTypeId, ImportDecl, ImportForm, ImportGlob, ImportMember, ItemId, ItemKind, PathSegment,
+};
 use crate::check::Fileroot;
 use crate::diagnostic::Diagnostic;
 use crate::lexer;
@@ -160,6 +189,15 @@ pub(super) fn imports(
                 let decl = file.ast.import_decl(id);
                 let path = file.ast.path(decl.path);
                 let before = own_errors.len();
+                if let Some((def, span)) = def_type_member(&file.ast, decl) {
+                    let at = (file, item, decl);
+                    def_type_import(scan, &modules, at, (def, span), aliases, &mut own_errors);
+                    if own_errors.len() > before {
+                        failed_imports.push((item, None));
+                        blind = true;
+                    }
+                    return;
+                }
                 let resolved = module(scan, &modules, path, &mut both);
                 let module_of = resolved.as_ref().ok().copied();
                 if let Some(target @ (Target::Dir(_) | Target::File(_))) = module_of {
@@ -245,7 +283,8 @@ pub(super) fn import_binds(ast: &Ast, decl: &ImportDecl) -> (Vec<Name>, bool) {
             for member in ast.import_members(range) {
                 match *member {
                     ImportMember::Named { name, alias } => names.push(alias.unwrap_or(name).name),
-                    ImportMember::All(_) => star = true,
+                    // Names under a namespace's key, unknown from the import.
+                    ImportMember::All(_) | ImportMember::DefType { .. } => star = true,
                 }
             }
             (names, star)
@@ -536,6 +575,8 @@ pub(super) fn contents(scan: &Scan, dir: Option<u32>) -> String {
 /// implicit import of the prelude, and the types it imports, by member or
 /// `*`, into `types` (see [Types](crate::workspace::declared#types)): a member that is both a root
 /// and a type binds both, and one that is neither is "`lib` has no `x`".
+/// An import of a def-type's definitions is resolved apart, by its key
+/// (`def_type_import`).
 pub(super) fn members(
     scan: &Scan,
     (file, item, decl): (&File, ItemId, &ImportDecl),
@@ -606,41 +647,153 @@ pub(super) fn members(
                             );
                         }
                     }
+                    ImportMember::DefType { .. } => {}
                     ImportMember::All(star) => {
-                        if let Target::File(of) = target
-                            && scan.files.get(of as usize).is_some_and(is_value_file)
-                        {
-                            errors.push(Diagnostic::error(
-                                "a value file has no members to import",
-                                star,
-                            ));
-                            continue;
-                        }
-                        for root in target_roots(scan, target) {
-                            if let Some(child) = scan.target_child(target, root) {
-                                aliases.push(Alias {
-                                    name: root,
-                                    span: star,
-                                    item: Some(item),
-                                    target: child,
-                                    whole: false,
-                                    implicit,
-                                    inherited: false,
-                                });
-                            }
-                        }
-                        for decl in scan.target_types(target) {
-                            if let Some(name) = scan.type_name(decl) {
-                                types.push(TypeImport {
-                                    name,
-                                    span: star,
-                                    decl,
-                                });
-                            }
-                        }
+                        let at = (item, star, implicit);
+                        star_aliases(scan, target, at, (&mut *aliases, &mut *types), errors);
                     }
                 }
             }
+        }
+    }
+}
+
+/// Binds every root of `target` into `aliases`, and every type of it into
+/// `types`, for the `*`, written at `star`, of the import `item`, implicit
+/// if it is the prelude's: a value file has none, "a value file has no
+/// members to import".
+fn star_aliases(
+    scan: &Scan,
+    target: Target,
+    (item, star, implicit): (ItemId, Span, bool),
+    (aliases, types): (&mut Vec<Alias>, &mut Vec<TypeImport>),
+    errors: &mut Vec<Diagnostic>,
+) {
+    if let Target::File(of) = target
+        && scan.files.get(of as usize).is_some_and(is_value_file)
+    {
+        errors.push(Diagnostic::error(
+            "a value file has no members to import",
+            star,
+        ));
+        return;
+    }
+    for root in target_roots(scan, target) {
+        if let Some(child) = scan.target_child(target, root) {
+            aliases.push(Alias {
+                name: root,
+                span: star,
+                item: Some(item),
+                target: child,
+                whole: false,
+                implicit,
+                inherited: false,
+            });
+        }
+    }
+    for decl in scan.target_types(target) {
+        if let Some(name) = scan.type_name(decl) {
+            types.push(TypeImport {
+                name,
+                span: star,
+                decl,
+            });
+        }
+    }
+}
+
+/// The def-type member of the import `decl` of `ast`, `DT *`, with where it
+/// is written, if it has one, its only member.
+fn def_type_member(ast: &Ast, decl: &ImportDecl) -> Option<(DefTypeId, Span)> {
+    let ImportForm::Members(range) = decl.form else {
+        return None;
+    };
+    ast.import_members(range)
+        .iter()
+        .find_map(|member| match *member {
+            ImportMember::DefType { def, span } => Some((def, span)),
+            _ => None,
+        })
+}
+
+/// Binds the definitions of the def-type that `used`, the one member of
+/// the import `item` of `file`, `decl`, written at `written`, names, in
+/// each directory its path and glob name (see [Imports of
+/// definitions](#imports-of-definitions)): for each, the root of the
+/// def-type's namespace in it, as an alias of its key, which the file's view
+/// merges. A def-type the file does not see is "`x` is no def-type"; a path
+/// that names nothing, the usual error; a glob on a file's path "a glob
+/// names directories, and `a/b` is a file".
+fn def_type_import(
+    scan: &Scan,
+    modules: &Modules,
+    (file, item, decl): (&File, ItemId, &ImportDecl),
+    (used, written): (DefTypeId, Span),
+    aliases: &mut Vec<Alias>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let ast = &file.ast;
+    let Some(key) = ast.def_type(used).key else {
+        let shown: Vec<&str> = ast
+            .def_type_names(used)
+            .into_iter()
+            .map(|name| scan.names.get(name))
+            .collect();
+        let message = format!("`{}` is no def-type", shown.join("."));
+        errors.push(Diagnostic::error(message, written));
+        return;
+    };
+    let path = ast.path(decl.path);
+    let base = if path.is_empty() {
+        modules.dirs.get("").map(|&dir| Target::Dir(dir))
+    } else {
+        match module(scan, modules, path, &mut Vec::new()) {
+            Ok(target) => Some(target),
+            Err(error) => {
+                errors.extend(error);
+                return;
+            }
+        }
+    };
+    let targets = match (base, decl.glob) {
+        (Some(target @ (Target::Dir(_) | Target::File(_))), ImportGlob::Exact) => vec![target],
+        (Some(Target::Dir(dir)), glob) => scan
+            .dirs_below(dir, glob == ImportGlob::Descendants)
+            .into_iter()
+            .map(Target::Dir)
+            .collect(),
+        (Some(Target::File(_)), _) => {
+            let shown: Vec<&str> = path
+                .iter()
+                .filter_map(PathSegment::name)
+                .map(|name| scan.names.get(name))
+                .collect();
+            let shown = shown.join("/");
+            errors.push(Diagnostic::error(
+                format!("a glob names directories, and `{shown}` is a file"),
+                written,
+            ));
+            return;
+        }
+        _ => {
+            errors.push(Diagnostic::error(
+                "what this path names holds no definitions to import",
+                written,
+            ));
+            return;
+        }
+    };
+    for target in targets {
+        if let Some(child) = scan.target_child(target, key) {
+            aliases.push(Alias {
+                name: key,
+                span: written,
+                item: Some(item),
+                target: child,
+                whole: false,
+                implicit: false,
+                inherited: false,
+            });
         }
     }
 }
@@ -681,7 +834,9 @@ pub(super) fn fileroot_member_import(scan: &Scan, member: ImportMember) -> Diagn
             };
             (read_as, name.span)
         }
-        ImportMember::All(star) => (Fileroot::Caller, star),
+        ImportMember::All(star) | ImportMember::DefType { span: star, .. } => {
+            (Fileroot::Caller, star)
+        }
     };
     Diagnostic::error(
         format!(

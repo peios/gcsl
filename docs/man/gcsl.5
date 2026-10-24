@@ -322,11 +322,14 @@ Imports reach other directories or files by root-relative paths:
     import helper as run_helper from lib/helpers
     import * from lib/helpers
     import pkgs/net.busybox.busybox as busybox
+    import package * from pkgs/*
 .fi
 .PP
 A path separates directories with /, and names each directory or file as it is, dots included.
 A whole import is named after the path's last part unless it gives a name with as, so a last part that is not a plain name needs one.
 An imported directory exposes its own merged declarations, not an automatic recursive import of its children.
+import DT * from PATH imports every definition of the definition type DT, and nothing else, from what PATH names; PATH/* reads every directory directly in PATH, PATH/** every directory at any depth below it, and * or ** alone the workspace root's, skipping hidden directories and what is below them.
+Two of those directories defining one name is an error at the import; finding none is not.
 A file and directory with the same module name are ambiguous.
 A file outside any workspace can import standard modules only.
 Hidden names, symbolic-link directories, and nested workspace trees are excluded from workspace discovery.

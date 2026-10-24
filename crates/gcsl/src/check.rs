@@ -2573,7 +2573,7 @@ impl<'a> Checker<'a> {
     /// the callee it is: a reference calls it, so a generic def-type is read
     /// as a generic function called (see [Variant
     /// def-types](crate::check::deftypes#variant-def-types)).
-    fn check_def_type_expr(&mut self, dt: ExprId) -> TyId {
+    pub(super) fn check_def_type_expr(&mut self, dt: ExprId) -> TyId {
         let outer = self.calls.callee.replace(dt);
         let ty = self.check_expr(dt);
         self.calls.callee = outer;

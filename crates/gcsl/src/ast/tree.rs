@@ -15,11 +15,11 @@ use super::{
     Annotate, Arg, ArgRange, AttributeUse, ContextDecl, DefTypeId, DefTypeRole, DefTypeUse,
     Element, ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind,
     FieldTyRange, FnDecl, FnId, ForDecl, ForHead, ForId, GenericOwner, Generics, ImportDecl,
-    ImportForm, ImportId, ImportMember, ImportMemberRange, Item, ItemId, ItemKind, ItemRange,
-    Label, LabelId, MethodDecl, NoAnnotation, Param, ParamRange, ParamTy, ParamTyRange, PartRange,
-    PathDisplay, PathRange, PathSegment, Pretty, RecoverDecl, RecoverId, SegmentKind, StrPart,
-    Syntax, TypeArena, TypeArgRange, TypeExpr, TypeExprId, TypeExprKind, TypeLink, TypeProblem,
-    TypeStore, WithBinding, WithRange, WrittenType, next_id, symbol_span,
+    ImportForm, ImportGlob, ImportId, ImportMember, ImportMemberRange, Item, ItemId, ItemKind,
+    ItemRange, Label, LabelId, MethodDecl, NoAnnotation, Param, ParamRange, ParamTy, ParamTyRange,
+    PartRange, PathDisplay, PathRange, PathSegment, Pretty, RecoverDecl, RecoverId, SegmentKind,
+    StrPart, Syntax, TypeArena, TypeArgRange, TypeExpr, TypeExprId, TypeExprKind, TypeLink,
+    TypeProblem, TypeStore, WithBinding, WithRange, WrittenType, next_id, symbol_span,
 };
 
 /// A complete syntax tree: the arenas, the file's body, the names and the
@@ -535,6 +535,24 @@ impl Ast {
             .join("/")
     }
 
+    /// Shows the path of the import `decl` as it is written, its glob
+    /// included: `pkgs/net.busybox.busybox`, `pkgs/*`, or `*` alone (see
+    /// the parser's [Imports](crate::parser::imports#imports)).
+    #[must_use]
+    pub fn show_import_path(&self, decl: &ImportDecl) -> String {
+        let path = self.show_module_path(self.path(decl.path));
+        let glob = match decl.glob {
+            ImportGlob::Exact => return path,
+            ImportGlob::Children => "*",
+            ImportGlob::Descendants => "**",
+        };
+        if path.is_empty() {
+            glob.to_owned()
+        } else {
+            format!("{path}/{glob}")
+        }
+    }
+
     /// Shows `segments`, the path of a definition or a reference made with a
     /// def-type, `PATH`, or a prefix of one, as it is written: its names
     /// joined by `.`, each as its source spells it, `+` and all, as in
@@ -881,6 +899,8 @@ impl Ast {
                 start: members_start,
                 len: 1,
             }),
+            glob: ImportGlob::Exact,
+            path_at: nowhere,
         });
         let item = ItemId(next_id(self.items.len()));
         self.items.push(Item {

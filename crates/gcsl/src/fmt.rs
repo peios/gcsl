@@ -412,7 +412,7 @@ impl Facts {
         for item in ast.item_arena() {
             match item.kind {
                 ItemKind::Import(id) => {
-                    let path = crate::ast::path_span(ast.path(ast.import_decl(id).path));
+                    let path = ast.import_decl(id).path_at;
                     self.verbatim.push((path.start as usize, path.end as usize));
                 }
                 ItemKind::Rebind { path, .. } => {

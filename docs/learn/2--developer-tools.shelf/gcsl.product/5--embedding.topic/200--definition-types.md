@@ -30,6 +30,38 @@ does. Definitions live in the definition type's namespace, separate from
 ordinary values of the same path. Their public paths merge through
 workspace directories and imports like other public declarations.
 
+## Importing every definition of a type
+
+A definition is visible in its own directory and the directories below
+it. To use many definitions from elsewhere without one import each, import
+every definition of one type from a set of directories:
+
+```text
+workspace.gcsl          # declares the definition type `package`
+pkgs/net.busybox.busybox/build.gcsl   # def package net.busybox.busybox()
+pkgs/dev.peios.kernel/build.gcsl      # def package dev.peios.kernel()
+image/build.gcsl        # import package * from pkgs/*
+```
+
+`import package * from pkgs/*` brings in every `package` definition from
+each directory directly inside `pkgs/`, so `image/build.gcsl` can refer to
+`package dev.peios.kernel` and `package net.busybox.busybox` by name. The
+end of the path says which directories it reads:
+
+| Path | Directories read |
+| --- | --- |
+| `pkgs` | `pkgs/` itself, as `import * from pkgs` would |
+| `pkgs/*` | every directory directly inside `pkgs/` |
+| `pkgs/**` | every directory at any depth below `pkgs/` |
+| `*` or `**` | the same, below the workspace's root |
+
+Only the definitions of that type are imported, nothing else from the
+files. Hidden directories, whose names start with `.`, are skipped, and so
+is everything below them. If two of the directories define the same name,
+that's an error at the import, naming both definitions, so a new package
+can never silently replace another. Finding no definitions at all isn't
+an error.
+
 ## Definitions made with a variant
 
 A definition type can take a variant of an [enum](~gcsl/records-and-types)

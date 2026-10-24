@@ -437,6 +437,10 @@ pub enum DefTypeRole {
     Reference,
     /// The meta of a definition, `defmeta DT PATH { ... }`.
     Meta,
+    /// An import of every definition of the def-type, `import DT * from
+    /// PATH` (see the parser's [Imports](crate::parser::imports#imports)):
+    /// its PATH is empty.
+    Import,
 }
 
 /// A use of a def-type, a definition made with it, `def DT PATH(PARAMS)
@@ -515,6 +519,15 @@ pub enum ImportMember {
     /// `*`, written at the span: every root of what the path names, each
     /// bound as itself.
     All(Span),
+    /// `DT *`, the import's one member: every definition of the def-type
+    /// `DT`, the use `def`, in what the path names, written at the span,
+    /// `DT` through `*`.
+    DefType {
+        /// The def-type's use, of [`DefTypeRole::Import`].
+        def: DefTypeId,
+        /// Where it is written.
+        span: Span,
+    },
 }
 
 impl ImportMember {
@@ -526,7 +539,7 @@ impl ImportMember {
                 Some(alias) => Some(alias),
                 None => Some(name),
             },
-            ImportMember::All(_) => None,
+            ImportMember::All(_) | ImportMember::DefType { .. } => None,
         }
     }
 
@@ -539,9 +552,24 @@ impl ImportMember {
                 Some(alias) => name.span.join(alias.span),
                 None => name.span,
             },
-            ImportMember::All(span) => span,
+            ImportMember::All(span) | ImportMember::DefType { span, .. } => span,
         }
     }
+}
+
+/// Which directories an import's path names (see the parser's
+/// [Imports](crate::parser::imports#imports)): the one it names, every
+/// directory directly in it, `pkgs/*`, or every directory at any depth
+/// below it, `pkgs/**`. Only an import of a def-type's definitions has a
+/// glob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImportGlob {
+    /// No glob: what the path names.
+    Exact,
+    /// `PATH/*`: every directory directly in it.
+    Children,
+    /// `PATH/**`: every directory at any depth below it.
+    Descendants,
 }
 
 /// The members of one `from` import: a contiguous range of the member pool
@@ -573,6 +601,11 @@ pub struct ImportDecl {
     pub path: PathRange,
     /// What the import binds.
     pub form: ImportForm,
+    /// Which directories the path names, by its glob, if it has one.
+    pub glob: ImportGlob,
+    /// Where the path is written, its glob included: `pkgs/*`, or `*`
+    /// alone.
+    pub path_at: Span,
 }
 
 /// A loop: a `for` expression of any form, or a `do` loop (see

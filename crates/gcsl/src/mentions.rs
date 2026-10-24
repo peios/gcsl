@@ -224,8 +224,9 @@ use std::collections::HashMap;
 use std::mem;
 
 use crate::ast::{
-    Ast, DefTypeId, ExprId, ExprKind, FnId, ForHead, ForId, ItemId, ItemKind, ItemRange, PathRange,
-    PathSegment, SegmentKind, StrPart, TypeExprId, TypeExprKind,
+    Ast, DefTypeId, ExprId, ExprKind, FnId, ForHead, ForId, ImportForm, ImportId, ImportMember,
+    ItemId, ItemKind, ItemRange, PathRange, PathSegment, SegmentKind, StrPart, TypeExprId,
+    TypeExprKind,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -1752,7 +1753,10 @@ impl Walker<'_> {
                     self.expr(value);
                 }
             }
-            // An import has no expression to walk. The names it binds are
+            // An import of a def-type's definitions reads its def-type, as a
+            // definition does.
+            ItemKind::Import(id) => self.import(id),
+            // Another import has no expression to walk. The names it binds are
             // the scope's: a workspace's resolves them ([`Resolve::root`]
             // finds an imported name after the declarations of the
             // directory chain, with which it cannot share a name), and a
@@ -1761,14 +1765,26 @@ impl Walker<'_> {
             // is a type's, read only in type positions (see
             // [Types](#types)).
             // What the parser could not parse mentions nothing.
-            ItemKind::Import(_)
-            | ItemKind::Type { .. }
+            ItemKind::Type { .. }
             | ItemKind::Enum { .. }
             | ItemKind::Variant { .. }
             | ItemKind::Context { .. }
             | ItemKind::Error => {}
             ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } => {
                 self.def_type_def(def, value);
+            }
+        }
+    }
+
+    /// Walks the import `id`: the `DT` of its def-type member, `import DT *
+    /// from PATH`, if it has one, a read of the def-type.
+    fn import(&mut self, id: ImportId) {
+        let ImportForm::Members(range) = self.ast.import_decl(id).form else {
+            return;
+        };
+        for member in self.ast.import_members(range) {
+            if let ImportMember::DefType { def, .. } = *member {
+                self.expr(self.ast.def_type(def).dt);
             }
         }
     }

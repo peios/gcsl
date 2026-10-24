@@ -109,7 +109,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::ItemId;
 use crate::diagnostic::Diagnostic;
-use crate::names::Name;
+use crate::names::{self, Name};
 use crate::source::Span;
 
 use super::{
@@ -959,12 +959,13 @@ pub(super) fn report_conflicts(
     while let Some(view) = at
         && let Some(node) = nodes.get(view as usize)
     {
-        path.push(scan.names.get(node.name));
+        path.push(node.name);
         at = node.parent;
     }
     path.reverse();
-    path.push(scan.names.get(name));
-    let shown = path.join(".");
+    path.push(name);
+    // A definition's path under its namespace's key is shown as written.
+    let shown = names::show_path(&scan.names, &path);
     for (later_at, later) in parts.iter().enumerate() {
         let earlier = parts
             .get(..later_at)
@@ -1037,7 +1038,8 @@ pub(super) fn conflict_between(
             None => error,
         }
     };
-    if !earlier.chain {
+    // Both sides imported by one import, a glob's, are labelled once.
+    if !earlier.chain && (later.chain || imported_at(&earlier) != imported_at(&later)) {
         error = context_in(error, index, imported_at(&earlier)?, "imported here");
     }
     if let Some((earlier_file, earlier_path, earlier_item)) = scan.part_spans(earlier.target) {

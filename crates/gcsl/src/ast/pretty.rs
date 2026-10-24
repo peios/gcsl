@@ -179,7 +179,7 @@ impl<A: Annotate> Pretty<'_, A> {
         let ast = self.ast;
         let name = |name: ImportName| ast.names().get(name.name);
         f.write_str("import ")?;
-        let path = ast.show_module_path(ast.path(decl.path));
+        let path = ast.show_import_path(decl);
         match decl.form {
             ImportForm::Whole(alias) => {
                 write!(f, "{path}")?;
@@ -203,6 +203,9 @@ impl<A: Annotate> Pretty<'_, A> {
                             }
                         }
                         ImportMember::All(_) => f.write_str("*")?,
+                        ImportMember::DefType { def, .. } => {
+                            write!(f, "{} *", ast.show_def_type(def).0)?;
+                        }
                     }
                 }
                 write!(f, " from {path}")?;

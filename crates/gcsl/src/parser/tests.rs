@@ -184,7 +184,7 @@ fn import_shape(ast: &Ast, import: ImportId, out: &mut String) {
     let name = |name: ImportName| ast.names().get(name.name).to_owned();
     let as_alias = |alias: Option<ImportName>| alias.map(|a| format!(" as {}", name(a)));
     let decl = ast.import_decl(import);
-    let path = ast.show_module_path(ast.path(decl.path));
+    let path = ast.show_import_path(decl);
     out.push_str("import ");
     match decl.form {
         ImportForm::Whole(alias) => {
@@ -200,6 +200,7 @@ fn import_shape(ast: &Ast, import: ImportId, out: &mut String) {
                         name(n) + &as_alias(alias).unwrap_or_default()
                     }
                     ImportMember::All(_) => "*".to_owned(),
+                    ImportMember::DefType { def, .. } => format!("{} *", ast.show_def_type(def).0),
                 })
                 .collect();
             out.push_str(&members.join(", "));

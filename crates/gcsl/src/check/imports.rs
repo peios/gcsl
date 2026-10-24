@@ -155,7 +155,7 @@
 //! through the top level's frame as a directory's committed declarations
 //! are.
 
-use crate::ast::{Effect, ExprId, ExprKind, ItemId, ItemKind};
+use crate::ast::{Effect, ExprId, ExprKind, ImportForm, ImportMember, ItemId, ItemKind};
 use crate::diagnostic::Diagnostic;
 use crate::mentions::{Need, Resolve};
 use crate::names::Name;
@@ -179,6 +179,17 @@ impl<'a> Checker<'a> {
     /// where they are used (see [Imports](#imports)): the item itself
     /// checks nothing.
     pub(super) fn check_import(&mut self, id: ItemId, span: Span) {
+        // An import of a def-type's definitions reads the def-type, which
+        // the workspace has found one, as a definition does.
+        if let ItemKind::Import(decl) = self.ast.item(id).kind
+            && let ImportForm::Members(range) = self.ast.import_decl(decl).form
+        {
+            for member in self.ast.import_members(range) {
+                if let ImportMember::DefType { def, .. } = *member {
+                    self.check_def_type_expr(self.ast.def_type(def).dt);
+                }
+            }
+        }
         let Some(workspace) = self.workspace else {
             self.errors.push(Diagnostic::error(
                 "`import` needs a workspace: no `workspace.gcsl` above this file",

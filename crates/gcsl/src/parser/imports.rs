@@ -7,7 +7,10 @@
 //! ```text
 //! IMPORT  = "import" PATH ("as" NAME)?
 //!         | "import" MEMBER ("," MEMBER)* "from" PATH
+//!         | "import" DT "*" "from" (PATH ("/" GLOB)? | GLOB)
 //! MEMBER  = NAME ("as" NAME)? | "*"
+//! DT      = NAME ("." NAME)*
+//! GLOB    = "*" | "**"                       (its stars glued to the path)
 //! PATH    = SEGMENT ("/" SEGMENT)*          (one run of glued tokens, below)
 //! SEGMENT = a run of ASCII letters, digits, `_`, `-`, `+` and `.`
 //! ```
@@ -63,10 +66,26 @@
 //! "`import *` needs `from` and a path", and a second `*` in one list "`*`
 //! is imported more than once". Whether the path names anything is the
 //! workspace's business, and outside a workspace the checker's.
+//!
+//! **Definitions of a def-type.** `import package * from pkgs/*` imports
+//! every definition of the def-type `package` in what its path names
+//! (`Parser::parse_def_type_import`): its one member, a use of the
+//! def-type of the role [`DefTypeRole::Import`], its path empty, written
+//! `DT *`. A path may end in a glob, `PATH/*`, every directory directly in
+//! it, or `PATH/**`, every one at any depth below it, its `*`s glued to
+//! the `/`, or be a glob alone, `*` or `**`, the root's
+//! ([`ImportGlob`], `Parser::parse_from_path`); the path and its glob are
+//! where the import's path is written ([`ImportDecl::path_at`]), which the
+//! formatter keeps as written. A `DT` of anything but names joined by `.`
+//! is "a def-type is a name, or names joined by `.`"; another member with
+//! it, "a def-type's `*` is imported alone, as in `import package * from
+//! pkgs/*`"; a glob in any other import, "a glob imports the definitions of
+//! one def-type, as in ..."; and three `*`s or more, "a glob is `*` or
+//! `**`".
 
 use crate::ast::{
-    ImportDecl, ImportForm, ImportMember, ImportName, Item, ItemId, ItemKind, PathSegment,
-    SegmentKind,
+    DefTypeRole, DefTypeUse, ImportDecl, ImportForm, ImportGlob, ImportMember, ImportName, Item,
+    ItemId, ItemKind, PathRange, PathSegment, SegmentKind,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Token, TokenKind};
@@ -76,6 +95,15 @@ use super::{
     EMPTY_MODULE_SEGMENT, MODULE_SEGMENT, ParseResult, Parser, QUOTED_MODULE_PATH, Reported,
     SINGLE_MEMBER,
 };
+
+/// The error for a glob in an import of anything but a def-type's
+/// definitions.
+const GLOB_NEEDS_DEF_TYPE: &str =
+    "a glob imports the definitions of one def-type, as in `import package * from pkgs/*`";
+
+/// The error for a def-type of an import that is no name or names joined
+/// by `.`.
+const DEF_TYPE_NAME: &str = "a def-type is a name, or names joined by `.`";
 
 impl Parser<'_> {
     /// Parses an import item of the file's body, starting at its keyword,
@@ -98,6 +126,9 @@ impl Parser<'_> {
             end = end.join(path_span);
             let alias = self.parse_import_alias(&mut end)?;
             let next = self.peek();
+            if alias.is_none() && next.kind == TokenKind::Star {
+                return self.parse_def_type_import(keyword, base, path_span);
+            }
             if next.kind != TokenKind::Comma && !self.is_from(next) {
                 if alias.is_none() {
                     self.unnamed_import(base)?;
@@ -107,6 +138,8 @@ impl Parser<'_> {
                 let decl = ImportDecl {
                     path,
                     form: ImportForm::Whole(alias),
+                    glob: ImportGlob::Exact,
+                    path_at: path_span,
                 };
                 return Ok(self.finish_import(decl, keyword.span.join(end)));
             }
@@ -134,7 +167,30 @@ impl Parser<'_> {
             }
         }
         self.parse_import_members(&mut members)?;
+        let (path, glob, path_span) = self.parse_from_path()?;
+        if glob != ImportGlob::Exact {
+            return Err(self.error(GLOB_NEEDS_DEF_TYPE, path_span));
+        }
+        let range = self.builder.push_import_members(&members);
+        let decl = ImportDecl {
+            path,
+            form: ImportForm::Members(range),
+            glob,
+            path_at: path_span,
+        };
+        Ok(self.finish_import(decl, keyword.span.join(path_span)))
+    }
+
+    /// Reads the path after an import's `from`, the next token, and the glob
+    /// ending it, if any (see [Imports](#imports)): a path, `PATH/*` or
+    /// `PATH/**`, or `*` or `**` alone, the root's; the path, the glob and
+    /// the span of both.
+    pub(super) fn parse_from_path(&mut self) -> ParseResult<(PathRange, ImportGlob, Span)> {
         let path_start = self.peek();
+        if path_start.kind == TokenKind::Star {
+            let (glob, span) = self.parse_glob(path_start.span.start)?;
+            return Ok((self.builder.push_path(&[]), glob, span));
+        }
         let names_a_path = matches!(
             path_start.kind,
             TokenKind::Ident(_) | TokenKind::Str(_) | TokenKind::StrStart(_)
@@ -143,15 +199,130 @@ impl Parser<'_> {
             return Err(self.expected_path_after_from());
         }
         let base = self.path.len();
-        let path_span = self.parse_module_path(path_start, "after `from`")?;
+        // A path ending in `/` that a `*` follows, glued, ends in a glob.
+        let (glued, end) = self.module_run();
+        let globbed = self
+            .source
+            .slice(Span::new(path_start.span.start, end))
+            .ends_with('/')
+            && self.peek_at(glued).kind == TokenKind::Star
+            && self.peek_at(glued).span.start == end;
+        let path_span = self.parse_path_run(path_start, "after `from`", globbed)?;
         let path = self.builder.push_path(&self.path[base..]);
         self.path.truncate(base);
-        let range = self.builder.push_import_members(&members);
+        if !globbed {
+            return Ok((path, ImportGlob::Exact, path_span));
+        }
+        let (glob, glob_span) = self.parse_glob(path_span.start)?;
+        Ok((path, glob, path_span.join(glob_span)))
+    }
+
+    /// Reads a glob, `*` or `**`, its stars glued to each other, the next
+    /// token its first, the path it ends starting at `start`; what it is
+    /// and the span from `start` through it. More stars are "a glob is `*`
+    /// or `**`".
+    pub(super) fn parse_glob(&mut self, start: u32) -> ParseResult<(ImportGlob, Span)> {
+        let first = self.peek();
+        self.advance();
+        let mut end = first.span;
+        let mut glued = 1;
+        loop {
+            let next = self.peek();
+            if next.kind != TokenKind::Star || next.span.start != end.end {
+                break;
+            }
+            self.advance();
+            end = next.span;
+            glued += 1;
+        }
+        let span = Span::new(start, end.end);
+        match glued {
+            1 => Ok((ImportGlob::Children, span)),
+            2 => Ok((ImportGlob::Descendants, span)),
+            _ => Err(self.error("a glob is `*` or `**`", first.span.join(end))),
+        }
+    }
+
+    /// Reads `import DT * from PATH`, the `DT` read onto the path stack from
+    /// `base`, written at `dt_span`, of the item starting at `keyword`, the
+    /// next token the `*`: an import of every definition of the def-type
+    /// `DT` (see [Imports](#imports)). `DT` is a name or names joined by
+    /// `.`; the member stands alone, "a def-type's `*` is imported alone"
+    /// otherwise.
+    pub(super) fn parse_def_type_import(
+        &mut self,
+        keyword: Token,
+        base: usize,
+        dt_span: Span,
+    ) -> ParseResult<ItemId> {
+        let star = self.peek();
+        self.advance();
+        let written: Vec<PathSegment> = self.path[base..].to_vec();
+        self.path.truncate(base);
+        let mut segments = Vec::new();
+        for segment in written {
+            let Some(name) = segment.name() else {
+                return Err(self.error(DEF_TYPE_NAME, segment.span));
+            };
+            let text = self.names.get(name).to_owned();
+            let mut start = segment.span.start;
+            for part in text.split('.') {
+                if !lexer::is_identifier(part) {
+                    return Err(self.error(DEF_TYPE_NAME, segment.span));
+                }
+                let len = u32::try_from(part.len()).unwrap_or(u32::MAX);
+                segments.push(PathSegment {
+                    kind: SegmentKind::Name(self.names.intern(part)),
+                    span: Span::new(start, start + len),
+                });
+                start += len + 1;
+            }
+        }
+        if segments.len() != 1 && self.path_has_slash(dt_span) {
+            return Err(self.error(DEF_TYPE_NAME, dt_span));
+        }
+        let next = self.peek();
+        if next.kind == TokenKind::Comma {
+            return Err(self.error(
+                "a def-type's `*` is imported alone, as in `import package * from pkgs/*`",
+                next.span,
+            ));
+        }
+        if !self.is_from(next) {
+            let found = self.describe(next);
+            return Err(self.error(format!("expected `from`, found {found}"), next.span));
+        }
+        self.advance();
+        let dt = self.path_expr(&segments)?;
+        let empty = self.builder.push_path(&[]);
+        let span = dt_span.join(star.span);
+        let def = self.builder.push_def_type(DefTypeUse {
+            role: DefTypeRole::Import,
+            dt,
+            variant: None,
+            path: empty,
+            read: None,
+            key: None,
+            meta: None,
+            meta_read: None,
+            span,
+        });
+        let (path, glob, path_span) = self.parse_from_path()?;
+        let range = self
+            .builder
+            .push_import_members(&[ImportMember::DefType { def, span }]);
         let decl = ImportDecl {
             path,
             form: ImportForm::Members(range),
+            glob,
+            path_at: path_span,
         };
         Ok(self.finish_import(decl, keyword.span.join(path_span)))
+    }
+
+    /// Whether the source written at `span` holds a `/`.
+    fn path_has_slash(&self, span: Span) -> bool {
+        self.source.slice(span).contains('/')
     }
 
     /// Reads the rest of a `from` import's member list after its first
@@ -169,7 +340,7 @@ impl Parser<'_> {
             if next.kind != TokenKind::Comma {
                 if let Some(star) = members.iter().find_map(|member| match member {
                     ImportMember::All(span) => Some(*span),
-                    ImportMember::Named { .. } => None,
+                    ImportMember::Named { .. } | ImportMember::DefType { .. } => None,
                 }) {
                     return Err(self.error("`import *` needs `from` and a path", star));
                 }
@@ -228,6 +399,18 @@ impl Parser<'_> {
     /// segments `pkgs` and `net.busybox.busybox`. `after` says where the
     /// path is, for the error when `first` cannot start one.
     pub(super) fn parse_module_path(&mut self, first: Token, after: &str) -> ParseResult<Span> {
+        self.parse_path_run(first, after, false)
+    }
+
+    /// Reads a module path as [`Parser::parse_module_path`] does, but, if
+    /// `globbed`, its run ends in the `/` before a glob, which ends no
+    /// segment: the span covers the path without that `/`.
+    pub(super) fn parse_path_run(
+        &mut self,
+        first: Token,
+        after: &str,
+        globbed: bool,
+    ) -> ParseResult<Span> {
         match first.kind {
             TokenKind::Str(_) | TokenKind::StrStart(_) => {
                 return Err(self.error(QUOTED_MODULE_PATH, first.span));
@@ -246,6 +429,7 @@ impl Parser<'_> {
             }
         }
         let (glued, end) = self.module_run();
+        let end = if globbed { end - 1 } else { end };
         let span = Span::new(first.span.start, end);
         let text = self.source.slice(span).to_owned();
         let mut start = span.start;
