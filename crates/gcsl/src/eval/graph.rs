@@ -73,6 +73,7 @@ use std::time::Instant;
 use crate::CALL_LEVELS;
 
 use super::plain::{Plain, from_plain, to_plain};
+use super::calls::raised_in_tracked;
 use super::{Caller, Evaluator, Flow, MemoTables, Shared, internal};
 
 /// A node of an action graph, by its number (see [Graph mode](#graph-mode)).
@@ -309,45 +310,30 @@ impl Graph {
         found
     }
 
-    /// Pushes the holes of `values` onto `found`, each once, walking a work
-    /// list rather than recursing, and each shared record, list, closure or
-    /// future once.
-    fn holes_into(&self, values: &[Value], found: &mut Vec<NodeId>) {
-        let mut pending: Vec<Value> = values.to_vec();
-        let mut seen: HashSet<usize> = HashSet::new();
-        while let Some(value) = pending.pop() {
-            match value {
-                Value::Record(record) => {
-                    if seen.insert(Rc::as_ptr(&record).cast::<()>() as usize) {
-                        pending.extend(record.values.iter().cloned());
-                    }
-                }
-                Value::List(list) => pending.extend(list.values().iter().cloned()),
-                Value::Variant(variant) => pending.push(variant.payload.clone()),
-                Value::Secret(secret) => pending.push(secret.value.clone()),
-                Value::Fn(closure) => {
-                    if seen.insert(Rc::as_ptr(&closure).cast::<()>() as usize) {
-                        pending.extend(closure.captures.iter().cloned());
-                    }
-                }
-                Value::Future(future) => {
-                    if !seen.insert(Rc::as_ptr(&future).cast::<()>() as usize) {
-                        continue;
-                    }
-                    if let Some(node) = future.host_node() {
-                        let id = NodeId(node);
-                        if self.is_waiting(id) && !found.contains(&id) {
-                            found.push(id);
-                        }
-                    } else if let Some(done) = future.value() {
-                        pending.push(done);
-                    } else if let Some(captures) = future.with_captures(<[Value]>::to_vec) {
-                        pending.extend(captures);
-                    }
-                }
-                _ => {}
+    /// The failures of the steps whose results `value` holds, in the order
+    /// they are found: what a host reports once `value` has no holes, since
+    /// each is a failure no code met.
+    #[must_use]
+    pub fn failures(&self, value: &Value) -> Vec<Diagnostic> {
+        let mut found = Vec::new();
+        futures_in(std::slice::from_ref(value), |future| {
+            if let Some(failure) = future.failure() {
+                found.push(failure);
             }
-        }
+        });
+        found
+    }
+
+    /// Pushes the holes of `values` onto `found`, each once.
+    fn holes_into(&self, values: &[Value], found: &mut Vec<NodeId>) {
+        futures_in(values, |future| {
+            if let Some(node) = future.host_node() {
+                let id = NodeId(node);
+                if self.is_waiting(id) && !found.contains(&id) {
+                    found.push(id);
+                }
+            }
+        });
     }
 
     /// Whether the node `id` is waiting for its result.
@@ -799,6 +785,8 @@ pub(crate) struct StepCall {
     caller: Caller,
     /// The call that made it.
     site: IrNode,
+    /// The input of the code the call is in.
+    made_in: u32,
 }
 
 impl StepCall {
@@ -810,6 +798,7 @@ impl StepCall {
             context: node.context.clone(),
             caller: node.caller,
             site: node.site,
+            made_in: node.code.input(),
         })
     }
 }
@@ -821,8 +810,9 @@ impl StepCall {
 ///
 /// # Errors
 ///
-/// The step's failure, or the stop for a step's result, marked
-/// [`Mark::PENDING`].
+/// The step's failure, located as a call's is, in its input: at the call, in
+/// the code that made it, for a `#[track_caller]` callee's own, else where it
+/// was raised; or the stop for a step's result, marked [`Mark::PENDING`].
 pub(crate) fn run_step_call(
     call: &StepCall,
     (stack, memo): (&mut Vec<Value>, &mut MemoTables),
@@ -831,7 +821,19 @@ pub(crate) fn run_step_call(
 ) -> Result<Value, Diagnostic> {
     let mut shared = Shared::new(extras.0, extras.1, extras.2);
     shared.graph = Some(run);
-    call_step(call, (stack, memo), &shared, false)
+    call_step(call, (stack, memo), &shared, false).map_err(|mut error| {
+        if error.mark == Mark::PENDING || error.input.is_some() {
+            return error;
+        }
+        if raised_in_tracked(&error, &call.closure) {
+            error.span = call.site.span;
+            error.labels.retain(|label| label.input.is_some());
+            error.input = Some(call.made_in);
+        } else {
+            error.input = Some(call.closure.code.input());
+        }
+        error
+    })
 }
 
 /// Calls `call`'s callee with its arguments in its parameter slots, on
@@ -1179,6 +1181,43 @@ fn encode_future(future: &Future, out: &mut Vec<u8>, pending: &mut Vec<Value>) {
         if let Some(captures) = future.with_captures(<[Value]>::to_vec) {
             write_count(out, captures.len());
             pending.extend(captures.into_iter().rev());
+        }
+    }
+}
+
+/// Calls `visit` on every future `values` hold, through the values of those
+/// that have run, each once, walking a work list rather than recursing, and
+/// each shared record, list, closure or future once.
+fn futures_in(values: &[Value], mut visit: impl FnMut(&Future)) {
+    let mut pending: Vec<Value> = values.to_vec();
+    let mut seen: HashSet<usize> = HashSet::new();
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Record(record) => {
+                if seen.insert(Rc::as_ptr(&record).cast::<()>() as usize) {
+                    pending.extend(record.values.iter().cloned());
+                }
+            }
+            Value::List(list) => pending.extend(list.values().iter().cloned()),
+            Value::Variant(variant) => pending.push(variant.payload.clone()),
+            Value::Secret(secret) => pending.push(secret.value.clone()),
+            Value::Fn(closure) => {
+                if seen.insert(Rc::as_ptr(&closure).cast::<()>() as usize) {
+                    pending.extend(closure.captures.iter().cloned());
+                }
+            }
+            Value::Future(future) => {
+                if !seen.insert(Rc::as_ptr(&future).cast::<()>() as usize) {
+                    continue;
+                }
+                visit(&future);
+                if let Some(done) = future.value() {
+                    pending.push(done);
+                } else if let Some(captures) = future.with_captures(<[Value]>::to_vec) {
+                    pending.extend(captures);
+                }
+            }
+            _ => {}
         }
     }
 }

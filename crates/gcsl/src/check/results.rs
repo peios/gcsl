@@ -382,6 +382,41 @@ pub struct Attribute {
     pub args: Box<[(Box<str>, Constant)]>,
 }
 
+/// How many more times a call of a function with `attributes` runs its body
+/// once it fails, by its `#[retry]`: 0 without one (see
+/// [Attributes](crate::check::attributes#attributes)). A host that runs the
+/// function's calls itself, as steps, reads it so.
+#[must_use]
+pub fn retry_of(attributes: &[Attribute]) -> u32 {
+    attributes
+        .iter()
+        .filter(|attribute| attribute.id == AttributeId::Builtin("retry"))
+        .find_map(|attribute| match attribute.args.first() {
+            Some((_, Constant::Int(times))) => u32::try_from(*times).ok(),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+/// How long a call of a function with `attributes` may run, by its
+/// `#[timeout]`, if it has one (see
+/// [Attributes](crate::check::attributes#attributes)). A host that runs the
+/// function's calls itself, as steps, reads it so.
+#[must_use]
+pub fn timeout_of(attributes: &[Attribute]) -> Option<std::time::Duration> {
+    attributes
+        .iter()
+        .filter(|attribute| attribute.id == AttributeId::Builtin("timeout"))
+        .find_map(|attribute| match attribute.args.first() {
+            Some((_, Constant::Quantity(Quantity::Duration, nanoseconds))) => {
+                u64::try_from(*nanoseconds)
+                    .ok()
+                    .map(std::time::Duration::from_nanos)
+            }
+            _ => None,
+        })
+}
+
 /// The result of a successful check: the types and the resolution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checked {

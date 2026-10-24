@@ -51,7 +51,10 @@ The host keeps a `Graph` for the whole evaluation and drives it:
    made before, and continues past the point where it stopped.
 
 A step's failure is raised where its result is used, so a `recover`
-around that use catches it, as with any failure.
+around that use catches it, as with any failure. A finished value can
+also hold a failed step's result that no code used. Once
+`graph.holes(&value)` is empty, `graph.failures(&value)` lists those
+failures so that you can report them.
 
 Effects that aren't inside a step are steps too: in graph mode, a unit
 never runs a program or touches a file itself. Each such effect becomes a
@@ -73,7 +76,10 @@ one. Give the result back with `Workspace::from_plain` and
 `graph.resolve`, and run the step again; it carries on to its next
 effect. One GCSL thread can drive as many running programs as you have
 workers. A step's own `#[retry]` and `#[timeout]` are left to you, since
-you see every attempt.
+you see every attempt: read them from its attributes with
+`check::retry_of` and `check::timeout_of`, as GCSL itself does. To run a
+failed step again from its start, call `graph.forget_unit` with its unit
+first, so that its effects are made again rather than found failed.
 
 ## Keys, inputs, and isolation
 

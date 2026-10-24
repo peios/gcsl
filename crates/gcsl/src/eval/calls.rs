@@ -868,7 +868,7 @@ impl Evaluator<'_> {
 /// Whether `error`, with no input recorded on it, was raised in the body of
 /// `closure`'s function, marked `#[track_caller]` (see [Located at the
 /// call](#located-at-the-call)): its span inside the body's.
-pub(super) fn raised_in_tracked(error: &Diagnostic, closure: &Closure) -> bool {
+pub(crate) fn raised_in_tracked(error: &Diagnostic, closure: &Closure) -> bool {
     let tracked = closure
         .attributes()
         .iter()

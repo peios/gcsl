@@ -69,19 +69,16 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// The step's failure, in the input of the unit that made the node if it
-    /// is in none of its own; and an internal error if the node is no
-    /// deferred call's.
+    /// The step's failure, located as a call's is: where it was raised, or
+    /// at the call for a `#[track_caller]` callee's own; and an internal error
+    /// if the node is no deferred call's.
     pub fn run_step(
         &mut self,
         graph: &mut Graph,
         id: NodeId,
         host: GraphHost<'_>,
     ) -> Result<Progress, Diagnostic> {
-        let (call, unit) = match graph.node(id) {
-            Some(node) => (StepCall::of(node), node.unit()),
-            None => (None, 0),
-        };
+        let call = graph.node(id).and_then(StepCall::of);
         let Some(call) = call else {
             return Err(internal("a step that is no deferred call's"));
         };
@@ -104,10 +101,7 @@ impl Workspace {
                 Some(node) => Ok(Progress::Paused(node)),
                 None => Err(internal("a step stopped for no step")),
             },
-            Err(mut error) => {
-                error.input.get_or_insert(unit);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 

@@ -617,3 +617,51 @@ fn a_step_s_unit_forgotten_runs_afresh_with_new_effects() {
     };
     assert_ne!(first, second);
 }
+
+#[test]
+fn a_failed_step_a_value_holds_is_found() {
+    let (mut workspace, file) = lone_workspace("#[step] fn s() -> Int { 1 }\n= [s()]");
+    let mut graph = Graph::new();
+    let Progress::Done(value) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
+        panic!("not done");
+    };
+    let step = graph.holes(&value)[0];
+    assert!(graph.failures(&value).is_empty());
+    let failure = Diagnostic::error("it broke", Span::new(0, 0));
+    assert!(graph.resolve(step, Err(failure)));
+    assert!(graph.holes(&value).is_empty());
+    assert_eq!(graph.failures(&value)[0].message, "it broke");
+}
+
+#[test]
+fn a_step_s_failure_is_in_the_file_of_the_code_that_raised_it() {
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "lib.gcsl",
+            "#[attribute] #[defers] type step = {}\n\
+             #[def_type] #[step]\n\
+             def build(name: String, f: fn(): {v: Int}) -> {v: Int} { panic(\"boom in lib\") }",
+        ),
+        ("app.gcsl", "def build main() { v = 1 }"),
+    ];
+    let mut workspace = rooted(&files).unwrap();
+    let lib = workspace.file("lib.gcsl").unwrap();
+    let call = workspace.prepare_call(("build", "main"), &[], &[]).unwrap();
+    let mut graph = Graph::new();
+    let Progress::Done(value) = workspace.run_prepared(&call, &mut graph, every()).unwrap() else {
+        panic!("not done");
+    };
+    let step = graph.holes(&value)[0];
+    let inline = GraphHost {
+        defers: &|_: &[crate::check::Attribute]| false,
+        effects: &crate::eval::Direct { temp_dirs: None },
+    };
+    let error = workspace.run_step(&mut graph, step, inline).unwrap_err();
+    assert_eq!(error.message, "boom in lib");
+    // In the file of the def-type's body, not the invocation's.
+    assert_eq!(error.input, Some(lib));
+    let text = files[1].1;
+    let at = &text[error.span.start as usize..error.span.end as usize];
+    assert_eq!(at, "panic(\"boom in lib\")");
+}

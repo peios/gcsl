@@ -190,7 +190,7 @@ pub use builtin::{Builtin, Typing};
 use builtin::builtin_types;
 pub use results::{
     Attribute, CheckOutput, Checked, Constant, FieldSchedule, Fileroot, MadeAt, ParamDefault,
-    Place, Slot, TypeAnnotation, Types, VarRef, VariantTag,
+    Place, Slot, TypeAnnotation, Types, VarRef, VariantTag, retry_of, timeout_of,
 };
 use results::OtherTypes;
 pub use resolution::{

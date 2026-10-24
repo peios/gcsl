@@ -10,7 +10,8 @@ use crate::source::Span;
 use crate::types::FnTy;
 use crate::value::ValueKind;
 
-use super::{Lowerer, REFERENCE_DEFINITION, read, retry_of, timeout_of};
+use super::{Lowerer, REFERENCE_DEFINITION, read};
+use crate::check::{retry_of, timeout_of};
 
 impl Lowerer<'_> {
     /// Lowers `id`, of kind `kind`, which is a variable use, a function

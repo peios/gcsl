@@ -414,14 +414,11 @@
 
 use std::collections::HashMap;
 
-use crate::ast::AttributeId;
 use crate::ast::{
     Ast, BinaryOp, ExprId, ExprKind, FnId, ForId, ItemId, ItemKind, ItemRange, PathSegment,
     SegmentKind, UnaryOp,
 };
-use crate::check::{
-    Attribute, AwaitMark, Checked, Constant, JumpTarget, Resolution, Slot, Types, VarRef,
-};
+use crate::check::{AwaitMark, Checked, JumpTarget, Resolution, Slot, Types, VarRef};
 use crate::mentions::FieldNode;
 
 /// How a field of a record block is loaded: its slot, the kind of its value
@@ -452,8 +449,7 @@ use crate::source::Span;
 /// definition, after the def-type's (`Lowerer::lower_def_type_ref`).
 pub(crate) const REFERENCE_DEFINITION: u32 = 1;
 use crate::types::{TyId, TypeTable};
-use crate::value::{Layout, Quantity, ValueKind, int_to_float};
-use std::time::Duration;
+use crate::value::{Layout, ValueKind, int_to_float};
 
 /// Lowers `ast`, whose types and resolution are `checked`, with its types
 /// interned into `types`, to IR, recording that it is session input number
@@ -1120,32 +1116,4 @@ fn integer_operator(op: BinaryOp) -> Option<fn(Operands) -> IrKind> {
         BinaryOp::Rem => IrKind::IntRem,
         _ => return None,
     })
-}
-
-/// How many more times a call of a function with `attributes` runs its body
-/// once it fails, by its `#[retry]`: 0 without one (see the checker's
-/// "Attributes").
-fn retry_of(attributes: &[Attribute]) -> u32 {
-    attributes
-        .iter()
-        .filter(|attribute| attribute.id == AttributeId::Builtin("retry"))
-        .find_map(|attribute| match attribute.args.first() {
-            Some((_, Constant::Int(times))) => u32::try_from(*times).ok(),
-            _ => None,
-        })
-        .unwrap_or(0)
-}
-
-/// How long a call of a function with `attributes` may run, by its
-/// `#[timeout]`, if it has one (see the checker's "Attributes").
-fn timeout_of(attributes: &[Attribute]) -> Option<Duration> {
-    attributes
-        .iter()
-        .filter(|attribute| attribute.id == AttributeId::Builtin("timeout"))
-        .find_map(|attribute| match attribute.args.first() {
-            Some((_, Constant::Quantity(Quantity::Duration, nanoseconds))) => {
-                u64::try_from(*nanoseconds).ok().map(Duration::from_nanos)
-            }
-            _ => None,
-        })
 }

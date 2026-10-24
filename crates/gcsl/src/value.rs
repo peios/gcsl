@@ -579,6 +579,14 @@ impl Future {
         }
     }
 
+    /// The failure the future raised, if it has run and failed.
+    pub(crate) fn failure(&self) -> Option<Diagnostic> {
+        match self.state.try_borrow().as_deref() {
+            Ok(FutureState::Failed(error)) => Some((**error).clone()),
+            _ => None,
+        }
+    }
+
     /// The value the future yielded, if it has run.
     pub(crate) fn value(&self) -> Option<Value> {
         match self.state.try_borrow().as_deref() {
