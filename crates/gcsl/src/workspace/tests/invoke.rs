@@ -749,3 +749,40 @@ fn a_request_error_names_the_only_one_there_is() {
         "`package` has no definition `c`; note: its definitions are `a`, `b`"
     );
 }
+
+#[test]
+fn the_prelude_s_build_is_listed_once_the_workspace_builds_with_it() {
+    let listed = |files: &[(&str, &str)]| -> Vec<(String, Vec<String>)> {
+        rooted(files)
+            .unwrap()
+            .def_types()
+            .unwrap()
+            .into_iter()
+            .map(|def| {
+                let paths = def.definitions.into_iter().map(|d| d.path).collect();
+                (def.path, paths)
+            })
+            .collect()
+    };
+    // Not until a definition is made with it.
+    assert!(listed(&[("workspace.gcsl", ""), ("app.gcsl", "x = 1")]).is_empty());
+    assert_eq!(
+        listed(&[
+            ("workspace.gcsl", ""),
+            ("app/build.gcsl", "def build hello() { 1 }")
+        ]),
+        [("build".to_owned(), vec!["hello".to_owned()])]
+    );
+    // A workspace's own `build` is the only one.
+    let files = [
+        (
+            "workspace.gcsl",
+            "#[def_type] def build(name: String, f: fn(): Int): Int { f() }",
+        ),
+        ("app/build.gcsl", "def build hello() { 1 }"),
+    ];
+    let def_types = rooted(&files).unwrap().def_types().unwrap();
+    assert_eq!(def_types.len(), 1);
+    assert_eq!(def_types[0].definitions[0].path, "hello");
+    assert!(def_types[0].file >= 1);
+}

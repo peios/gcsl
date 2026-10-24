@@ -1,7 +1,7 @@
 //! Invoking definitions and functions of a workspace, as a host does.
 
 use std::mem;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::{Outcome, session};
@@ -25,8 +25,10 @@ use super::{
 };
 
 impl Workspace {
-    /// Every def-type of the workspace's own files, the standard files'
-    /// aside, with every definition made with it, a def-type with none
+    /// Every def-type of the workspace's own files, and each of the
+    /// standard files' that the workspace makes a definition with and
+    /// declares none of the path of, the prelude's `build`, with every
+    /// definition made with it, a def-type of the workspace's with none
     /// included, in path order of their files, then in source order (see
     /// the module documentation, "Def-types by name"). A definition is
     /// found in whichever file it is, whichever files see it, and listed
@@ -674,6 +676,34 @@ impl Workspace {
 
     /// Every def-type of the workspace's own files, with its definitions,
     /// as [`Workspace::def_types`] lists them, duplicates and all.
+    /// The paths of the def-types the workspace's own files declare, each
+    /// as its declaration writes it, `package`.
+    fn own_def_type_paths(&self) -> HashSet<String> {
+        let names = &self.scan.names;
+        let mut paths = HashSet::new();
+        for file in self.scan.files.iter().skip(self.scan.standard as usize) {
+            let ast = &file.ast;
+            for &item in ast.items(ast.root()) {
+                if let ItemKind::Field {
+                    path,
+                    function: true,
+                    ..
+                } = ast.item(item).kind
+                    && ast.is_def_type(item)
+                {
+                    let shown: Vec<&str> = ast
+                        .path(path)
+                        .iter()
+                        .filter_map(PathSegment::name)
+                        .map(|name| names.get(name))
+                        .collect();
+                    paths.insert(shown.join("."));
+                }
+            }
+        }
+        paths
+    }
+
     pub(super) fn found_def_types(&self) -> Vec<FoundDefType> {
         let names = &self.scan.names;
         let text = |segments: &[PathSegment]| {
@@ -693,16 +723,23 @@ impl Workspace {
         // Each definition, by its namespace's key: the def-type it is made
         // with may be declared in a file after its own.
         let mut definitions: Vec<(Name, Definition, ItemId)> = Vec::new();
+        // The paths of the workspace's own def-types, which shadow the
+        // standard library's, the prelude's `build`.
+        let standard = self.scan.standard as usize;
+        let own = self.own_def_type_paths();
         let files = (0u32..).zip(&self.scan.files);
-        for (index, file) in files.skip(self.scan.standard as usize) {
+        for (index, file) in files {
             let ast = &file.ast;
+            let is_standard = (index as usize) < standard;
             for &item in ast.items(ast.root()) {
                 match ast.item(item).kind {
                     ItemKind::Field {
                         path,
                         function: true,
                         ..
-                    } if ast.is_def_type(item) => {
+                    } if ast.is_def_type(item)
+                        && !(is_standard && own.contains(&text(ast.path(path)))) =>
+                    {
                         // One whose definitions are made with a variant is
                         // none: they are reached by references alone.
                         let variant = self
@@ -771,6 +808,11 @@ impl Workspace {
                 def_type.items.push(item);
             }
         }
+        // A standard library's def-type, the prelude's `build`, is the
+        // workspace's only once it makes a definition with it.
+        found.retain(|def_type| {
+            def_type.listed.file >= self.scan.standard || !def_type.listed.definitions.is_empty()
+        });
         found
     }
 
