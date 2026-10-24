@@ -43,7 +43,11 @@ contribute a runtime value.
 
 ## Sources
 
-The principal implementation is in `crates/gcsl/src/lexer.rs`,
-`parser.rs`, `workspace.rs`, `check.rs`, `lower.rs`, and `eval.rs`.
-Each module documents its internal invariants. The implementation here is
-not the separate Tree-sitter grammar used for highlighting.
+The principal implementation is in `crates/gcsl/src/`: the lexer in
+`lexer.rs`, and the parser, workspace, checker, lowering and evaluator
+each in a root module (`parser.rs`, `workspace.rs`, `check.rs`,
+`lower.rs`, `eval.rs`) with a directory of topic modules beside it, such
+as `check/records.rs` or `eval/futures.rs`. Each root documents its
+internal invariants and lists its modules, and each module documents its
+part. The implementation here is not the separate Tree-sitter grammar
+used for highlighting.
