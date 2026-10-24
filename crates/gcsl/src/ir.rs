@@ -1071,6 +1071,17 @@ pub enum IrKind {
     LoadCapture(u32, ValueKind),
     /// Yields the closure being run: a function's reference to itself.
     LoadCallee,
+    /// A variant of an enum as a value, `Toolchain::C` (see the checker's
+    /// "Enums"), of kind `Fn`: its key, its enum's, and how it is shown, an
+    /// index into the IR's string table.
+    Tag {
+        /// Its key.
+        key: Name,
+        /// Its enum's key.
+        of: Name,
+        /// How it is shown.
+        shown: ConstId,
+    },
     /// `fileroot.caller`: yields the text of the running frame's caller, the
     /// directory of the file whose code made the call the frame runs for,
     /// and records it as a dependency of the memoised calls it can affect
@@ -1187,6 +1198,7 @@ impl IrKind {
             }
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Tag { .. }
             | IrKind::Caller
             | IrKind::Helper => (None, &[], NONE),
             IrKind::IntNeg(operand)
@@ -1322,6 +1334,7 @@ impl IrKind {
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Tag { .. }
             | IrKind::Caller
             | IrKind::Helper
             | IrKind::MakeFuture { .. }
@@ -1428,6 +1441,7 @@ impl IrKind {
             IrKind::Top(_, ValueKind::Fn) => "fn",
             IrKind::Top(..) => "top",
             IrKind::LoadCallee => "load-callee",
+            IrKind::Tag { .. } => "tag",
             IrKind::Caller => "caller",
             IrKind::Helper => "helper",
             IrKind::MakeFuture { .. } => "make-future",
@@ -1521,6 +1535,7 @@ impl IrNode {
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Tag { .. }
             | IrKind::Caller
             | IrKind::Helper
             | IrKind::MakeFuture { .. }
@@ -2104,7 +2119,10 @@ impl Ir {
                 | IrKind::As { kind, .. }
                 | IrKind::Catch { kind, .. }
                 | IrKind::Top(_, kind) => kind,
-                IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Meta(_) => ValueKind::Fn,
+                IrKind::MakeClosure { .. }
+                | IrKind::LoadCallee
+                | IrKind::Meta(_)
+                | IrKind::Tag { .. } => ValueKind::Fn,
                 IrKind::MakeFuture { .. } => ValueKind::Deferred,
             };
         }
@@ -2732,6 +2750,7 @@ impl Pretty<'_> {
     fn test(&self, f: &mut fmt::Formatter<'_>, test: &ValueTest) -> fmt::Result {
         match test {
             ValueTest::Pass => f.write_str("*"),
+            ValueTest::Enum(key) => write!(f, "enum {}", self.names.get(*key)),
             ValueTest::Kind(kind) => f.write_str(match kind {
                 ValueKind::Int => "int",
                 ValueKind::Float => "float",

@@ -39,23 +39,28 @@ fn body(ast: &Ast, range: ItemRange, out: &mut String) {
 /// One item of a body, as [`shape`] writes it: a `break`, `continue` or
 /// `return` as it is written, its label after its keyword and its
 /// value after a space.
+/// Writes the `break`, `continue` or `return` item `id`, of `jump`.
+fn jump_item(ast: &Ast, id: ItemId, jump: Jump, out: &mut String) {
+    out.push_str(match ast.item(id).kind {
+        ItemKind::Break(_) => "break",
+        ItemKind::Return(_) => "return",
+        _ => "continue",
+    });
+    if let Some(label) = jump.label {
+        out.push('\'');
+        out.push_str(ast.names().get(label.name));
+    }
+    if let Some(value) = jump.value {
+        out.push(' ');
+        expr(ast, value, out);
+    }
+}
+
 fn body_item(ast: &Ast, id: ItemId, out: &mut String) {
     match ast.item(id).kind {
         ItemKind::Error => out.push_str("<error>"),
         ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => {
-            out.push_str(match ast.item(id).kind {
-                ItemKind::Break(_) => "break",
-                ItemKind::Return(_) => "return",
-                _ => "continue",
-            });
-            if let Some(label) = jump.label {
-                out.push('\'');
-                out.push_str(ast.names().get(label.name));
-            }
-            if let Some(value) = jump.value {
-                out.push(' ');
-                expr(ast, value, out);
-            }
+            jump_item(ast, id, jump, out);
         }
         ItemKind::Let {
             path,
@@ -125,6 +130,7 @@ fn body_item(ast: &Ast, id: ItemId, out: &mut String) {
             out.push_str(" = ");
             type_name(ast, ty, out);
         }
+        ItemKind::Enum { .. } | ItemKind::Variant { .. } => enum_item(ast, id, out),
         ItemKind::DefTypeDef { def, value } => {
             use std::fmt::Write as _;
             // As written: `def`, the def-type, the path, the parameters'
@@ -208,6 +214,55 @@ fn path_shape(ast: &Ast, path: PathRange, out: &mut String) {
     }
 }
 
+/// Writes the item `id`, an enum or a variant, as it is written.
+fn enum_item(ast: &Ast, id: ItemId, out: &mut String) {
+    let (written, ty) = match ast.item(id).kind {
+        ItemKind::Enum { name, bound, .. } => {
+            (format!("enum {} extensible", ast.names().get(name)), bound)
+        }
+        ItemKind::Variant {
+            of, name, payload, ..
+        } => {
+            let mut of_text = String::new();
+            type_name(ast, of, &mut of_text);
+            (
+                format!("enum {of_text}::{}", ast.names().get(name)),
+                payload,
+            )
+        }
+        _ => return,
+    };
+    out.push_str(&written);
+    if let Some(ty) = ty {
+        out.push('<');
+        type_name(ast, ty, out);
+        out.push('>');
+    }
+}
+
+/// Writes an interpolated string, each expression in it in angle brackets.
+fn interp_shape(ast: &Ast, parts: crate::ast::PartRange, out: &mut String) {
+    out.push('"');
+    for &part in ast.parts(parts) {
+        match part {
+            StrPart::Lit(text) => out.push_str(ast.strings().get(text)),
+            StrPart::Expr(inner) => {
+                out.push('<');
+                expr(ast, inner, out);
+                out.push('>');
+            }
+        }
+    }
+    out.push('"');
+}
+
+/// Writes a variant as a value, `of::name`.
+fn variant_expr(ast: &Ast, (of, name): (TypeExprId, Name), out: &mut String) {
+    type_name(ast, of, out);
+    out.push_str("::");
+    out.push_str(ast.names().get(name));
+}
+
 fn type_args(ast: &Ast, args: TypeArgRange, out: &mut String) {
     out.push('<');
     for (index, &arg) in ast.type_args(args).iter().enumerate() {
@@ -248,6 +303,7 @@ fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
         TypeExprKind::Ref(_)
         | TypeExprKind::Instance { .. }
         | TypeExprKind::Param(_)
+        | TypeExprKind::Enum { .. }
         | TypeExprKind::Invalid => out.push('?'),
         TypeExprKind::Fn {
             params,
@@ -325,20 +381,7 @@ fn expr(ast: &Ast, id: ExprId, out: &mut String) {
         kind @ (ExprKind::Duration(_) | ExprKind::Size(_)) => out.push_str(&quantity(kind)),
         ExprKind::Bool(value) => write!(out, "{value}").unwrap(),
         ExprKind::Str(text) => write!(out, "\"{}\"", ast.strings().get(text)).unwrap(),
-        ExprKind::Interp(parts) => {
-            out.push('"');
-            for &part in ast.parts(parts) {
-                match part {
-                    StrPart::Lit(text) => out.push_str(ast.strings().get(text)),
-                    StrPart::Expr(inner) => {
-                        out.push('<');
-                        expr(ast, inner, out);
-                        out.push('>');
-                    }
-                }
-            }
-            out.push('"');
-        }
+        ExprKind::Interp(parts) => interp_shape(ast, parts, out),
         ExprKind::If {
             cond,
             then,
@@ -415,6 +458,7 @@ fn expr(ast: &Ast, id: ExprId, out: &mut String) {
         ExprKind::List(elements) => list_shape(ast, elements, out),
         ExprKind::Index { expr: inner, index } => index_shape(ast, (inner, index), out),
         ExprKind::For(id) => for_shape(ast, id, out),
+        ExprKind::Variant { of, name } => variant_expr(ast, (of, name), out),
         ExprKind::DefTypeRef(def) => {
             let (def_type, path) = ast.show_def_type(def);
             write!(out, "({def_type} {path})").unwrap();

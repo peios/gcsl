@@ -386,6 +386,8 @@ pub enum TokenKind {
     Colon,
     /// `:=`
     ColonEq,
+    /// `::`, between an enum and its variant, `Toolchain::C`.
+    ColonColon,
     /// `->`, which marks an impure function's return type.
     Arrow,
     /// `->>`, which marks a memoised impure function's return type.
@@ -479,6 +481,7 @@ impl TokenKind {
             TokenKind::Ge => Some(">="),
             TokenKind::Colon => Some(":"),
             TokenKind::ColonEq => Some(":="),
+            TokenKind::ColonColon => Some("::"),
             TokenKind::Arrow => Some("->"),
             TokenKind::MemoArrow => Some("->>"),
             TokenKind::Eq => Some("="),
@@ -1068,6 +1071,7 @@ impl<'a> Lexer<'a> {
                 (TokenKind::EqEqEq, 3)
             }
             b'=' => with_eq(TokenKind::Eq, TokenKind::EqEq),
+            b':' if self.peek_at(1) == Some(b':') => (TokenKind::ColonColon, 2),
             b':' => with_eq(TokenKind::Colon, TokenKind::ColonEq),
             b'<' => with_eq(TokenKind::Lt, TokenKind::Le),
             b'>' => with_eq(TokenKind::Gt, TokenKind::Ge),

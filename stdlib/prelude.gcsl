@@ -82,3 +82,22 @@ def sh_live(script: String) -> String {
     }
     result.stdout
 }
+
+# Variants of enums: `kind.matches(value)` is whether `value`, a value of an
+# enum, is of the variant `kind`, and `kind.payload(value)` its payload, a
+# runtime error if it is another variant's. So a variant passed as a value,
+# `Toolchain::C`, is a key: `get<T>(kind: Variant<Toolchain, T>)` can find a
+# value of it and take out its `T`.
+def (kind: Variant<E, T>) matches<E, T>(value: E): Bool {
+    builtins.variant_matches(kind, value)
+}
+def (kind: Variant<E, T>) payload<E, T>(value: E): T {
+    builtins.variant_payload(kind, value)
+}
+
+# Partial records: `partial.matches(full)` is whether every field `partial`
+# holds equals `full`'s of its name, as `{ arch = "x86_64" }` matches every
+# platform whose `arch` is "x86_64".
+def (partial: Partial<T>) matches<T>(full: T): Bool {
+    builtins.partial_matches(partial, full)
+}

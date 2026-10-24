@@ -1556,6 +1556,16 @@ pub enum ExprKind {
     /// the list of what their iterations contribute. Its details are in
     /// the `for` arena (see [`Ast::for_decl`]).
     For(ForId),
+    /// A variant as a value, `ENUM::NAME`, as in `Toolchain::C`: the enum
+    /// a type written by its name or qualified, which the expansion of the
+    /// tree's types resolves as any is (see [Enums](#enums)). The name
+    /// ends the expression's span.
+    Variant {
+        /// The enum, as a type expression.
+        of: TypeExprId,
+        /// The variant's name.
+        name: Name,
+    },
     /// A def-type reference, `DT PATH`, as in `package dev.peios.testpkg`:
     /// the function that calls the def-type with the definition's path, the
     /// definition and its own arguments (see [Def-types](#def-types)). Its
@@ -1641,6 +1651,7 @@ impl Expr {
             | ExprKind::If { .. }
             | ExprKind::Paren(_)
             | ExprKind::Name(_)
+            | ExprKind::Variant { .. }
             | ExprKind::Block { .. }
             | ExprKind::Field { .. }
             | ExprKind::Ascribe { .. }
@@ -1797,6 +1808,34 @@ pub enum ItemKind {
         /// The type it stands for.
         ty: TypeExprId,
     },
+    /// `enum NAME extensible<BOUND>` or `enum NAME extensible`: declares
+    /// `NAME` in the file's namespace of types, a nominal type whose values
+    /// are the variants any module adds to it, each with a payload that fits
+    /// `BOUND`, if it has one (see [Enums](#enums)). Only ever an item of a
+    /// file's outermost block. It has no expression.
+    Enum {
+        /// The name declared, always an identifier.
+        name: Name,
+        /// Where the name is written.
+        name_span: Span,
+        /// The bound every variant's payload fits, if it has one.
+        bound: Option<TypeExprId>,
+    },
+    /// `enum ENUM::NAME<PAYLOAD>` or `enum ENUM::NAME`: adds the variant
+    /// `NAME` to the enum `ENUM`, a type written by its name or qualified,
+    /// whose payload is of type `PAYLOAD`, `{}` without one (see
+    /// [Enums](#enums)). Only ever an item of a file's outermost block. It
+    /// has no expression.
+    Variant {
+        /// The enum, as a type expression.
+        of: TypeExprId,
+        /// The variant's name, always an identifier.
+        name: Name,
+        /// Where the name is written.
+        name_span: Span,
+        /// Its payload's type, if it is written.
+        payload: Option<TypeExprId>,
+    },
     /// `def DT PATH(PARAMS) BODY`: a definition made with the def-type `DT`,
     /// as in `def package dev.peios.testpkg() { ... }` (see
     /// [Def-types](#def-types)). It binds nothing a variable or a field
@@ -1849,7 +1888,11 @@ impl ItemKind {
             | ItemKind::DefTypeDef { value, .. }
             | ItemKind::DefMeta { value, .. } => Some(value),
             ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => jump.value,
-            ItemKind::Import(_) | ItemKind::Type { .. } | ItemKind::Error => None,
+            ItemKind::Import(_)
+            | ItemKind::Type { .. }
+            | ItemKind::Enum { .. }
+            | ItemKind::Variant { .. }
+            | ItemKind::Error => None,
         }
     }
 }
@@ -1943,6 +1986,16 @@ pub enum TypeExprKind {
     /// definitions in a tree, which each use of the type substitutes its
     /// arguments in (see [Types](#types)). Never written.
     Param(u8),
+    /// The enum whose key is `key`, named `name`: the definition of an
+    /// enum's declaration in a [`TypeStore`], a type of its own, and of each
+    /// use of it (see [Types](#types)). Never written.
+    Enum {
+        /// Its key, a name no source can write that is its identity
+        /// ([`crate::names::enum_key`]).
+        key: Name,
+        /// Its name, as it is declared.
+        name: Name,
+    },
     /// A type that names nothing it can, put in place of a written one by
     /// the expansion of a tree's types ([`Ast::expand_types`]): its error,
     /// if it is this one's to report, is among the tree's problems
@@ -2201,6 +2254,7 @@ impl TypeArena {
                 kind @ (TypeExprKind::Named(_)
                 | TypeExprKind::Ref(_)
                 | TypeExprKind::Param(_)
+                | TypeExprKind::Enum { .. }
                 | TypeExprKind::Invalid) => kind,
             },
         };
@@ -2317,6 +2371,7 @@ impl TypeArena {
             | TypeExprKind::Path(_)
             | TypeExprKind::PathApplied { .. }
             | TypeExprKind::Ref(_)
+            | TypeExprKind::Enum { .. }
             | TypeExprKind::Invalid => None,
         };
         let done = match kind {
@@ -2395,6 +2450,7 @@ impl TypeArena {
             | TypeExprKind::Path(_)
             | TypeExprKind::Ref(_)
             | TypeExprKind::Param(_)
+            | TypeExprKind::Enum { .. }
             | TypeExprKind::Invalid => Vec::new(),
         }
     }
@@ -2712,6 +2768,31 @@ impl TypeStore {
             .extend(std::iter::repeat_n((u32::MAX, nothing), count));
         self.arities.resize(self.decls.len(), 0);
         first
+    }
+
+    /// The enum the declaration numbered `decl` is, by its key and its
+    /// name, if it is an enum's (see [Types](#types)).
+    #[must_use]
+    pub fn enum_of(&self, decl: u32) -> Option<(Name, Name)> {
+        match self.arena.kind(self.root(decl)?) {
+            TypeExprKind::Enum { key, name } => Some((key, name)),
+            _ => None,
+        }
+    }
+
+    /// Defines the declaration `decl` as the enum of the key `key`, named
+    /// `name`, declared at `span`, an [`TypeExprKind::Enum`]: a type of its
+    /// own, which nothing it refers to defines (see [Types](#types)).
+    pub fn declare_enum(&mut self, decl: u32, (key, name): (Name, Name), span: Span) {
+        let first = next_id(self.arena.len());
+        let root = self.arena.alloc(TypeExpr {
+            kind: TypeExprKind::Enum { key, name },
+            span,
+        });
+        self.heights.resize(self.arena.len(), 1);
+        if let Some(entry) = self.decls.get_mut(decl as usize) {
+            *entry = (first, root);
+        }
     }
 
     /// Records that the declaration numbered `decl` has `arity` type
@@ -3787,6 +3868,7 @@ impl Ast {
             | TypeExprKind::Path(_)
             | TypeExprKind::Ref(_)
             | TypeExprKind::Param(_)
+            | TypeExprKind::Enum { .. }
             | TypeExprKind::Invalid => {}
         }
         first
@@ -4535,6 +4617,7 @@ impl Ast {
                 | ExprKind::Bool(_)
                 | ExprKind::Str(_)
                 | ExprKind::Name(_)
+                | ExprKind::Variant { .. }
                 | ExprKind::Error => return node,
                 ExprKind::Interp(parts) => {
                     let first = self.parts(parts).iter().find_map(|&part| match part {
@@ -4883,6 +4966,43 @@ impl<A: Annotate> Pretty<'_, A> {
         Ok(())
     }
 
+    /// Writes the head of the item `id`, a `type`, an `enum` or a variant.
+    fn type_item(&self, f: &mut fmt::Formatter<'_>, id: ItemId) -> fmt::Result {
+        let ast = self.ast;
+        match ast.item(id).kind {
+            ItemKind::Type { name, ty, .. } => {
+                write!(f, "type {} ", ast.names().get(name))?;
+                self.type_expr(f, ty)?;
+                self.annotation.annotate_type(id, f)
+            }
+            ItemKind::Enum { name, bound, .. } => {
+                write!(f, "enum {} extensible", ast.names().get(name))?;
+                match bound {
+                    Some(bound) => {
+                        f.write_str(" ")?;
+                        self.type_expr(f, bound)
+                    }
+                    None => Ok(()),
+                }
+            }
+            ItemKind::Variant {
+                of, name, payload, ..
+            } => {
+                f.write_str("enum variant ")?;
+                self.type_expr(f, of)?;
+                write!(f, "::{}", ast.names().get(name))?;
+                match payload {
+                    Some(payload) => {
+                        f.write_str(" ")?;
+                        self.type_expr(f, payload)
+                    }
+                    None => Ok(()),
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn item(&self, f: &mut fmt::Formatter<'_>, id: ItemId, depth: usize) -> fmt::Result {
         let item = self.ast.item(id);
         let ast = self.ast;
@@ -4958,10 +5078,8 @@ impl<A: Annotate> Pretty<'_, A> {
                 self.import(f, ast.import_decl(id))?;
                 return write!(f, " @{})", item.span);
             }
-            ItemKind::Type { name, ty, .. } => {
-                write!(f, "type {} ", ast.names().get(name))?;
-                self.type_expr(f, ty)?;
-                self.annotation.annotate_type(id, f)?;
+            ItemKind::Type { .. } | ItemKind::Enum { .. } | ItemKind::Variant { .. } => {
+                self.type_item(f, id)?;
                 return write!(f, " @{})", item.span);
             }
             ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } => {
@@ -5081,7 +5199,10 @@ impl WrittenType<'_> {
     fn type_expr(&self, f: &mut fmt::Formatter<'_>, id: TypeExprId) -> fmt::Result {
         let names = self.names;
         match self.ast.written_type(id) {
-            TypeExprKind::Named(name) => f.write_str(names.get(name)),
+            // An enum, a declaration's definition, is written by its name.
+            TypeExprKind::Named(name) | TypeExprKind::Enum { name, .. } => {
+                f.write_str(names.get(name))
+            }
             TypeExprKind::Path(path) => self.path(f, path),
             TypeExprKind::Record(fields) => {
                 f.write_str("{")?;
@@ -5430,6 +5551,15 @@ impl<A: Annotate> Pretty<'_, A> {
             ExprKind::Float(value) => write!(f, "float {value:?}"),
             ExprKind::Duration(value) => write!(f, "duration {value}"),
             ExprKind::Size(value) => write!(f, "size {value}"),
+            ExprKind::Variant { of, name, .. } => {
+                f.write_str("variant ")?;
+                WrittenType {
+                    ast: self.ast,
+                    names: self.ast.names(),
+                }
+                .type_expr(f, of)?;
+                write!(f, "::{}", self.ast.names().get(name))
+            }
             ExprKind::Bool(value) => write!(f, "bool {value}"),
             ExprKind::Str(id) => write!(f, "str {}", Quoted(self.ast.strings().get(id))),
             ExprKind::Interp(_) => f.write_str("interp"),
@@ -5571,6 +5701,7 @@ impl<A: Annotate> Pretty<'_, A> {
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
             | ExprKind::Name(_)
+            | ExprKind::Variant { .. }
             | ExprKind::DefTypeRef(_)
             | ExprKind::Error => {}
             ExprKind::Unary { operand, .. }

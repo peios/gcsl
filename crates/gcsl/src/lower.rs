@@ -737,6 +737,8 @@ impl Lowerer<'_> {
                 | ItemKind::Spread(_)
                 | ItemKind::Import(_)
                 | ItemKind::Type { .. }
+                | ItemKind::Enum { .. }
+                | ItemKind::Variant { .. }
                 | ItemKind::DefTypeDef { .. }
                 | ItemKind::DefMeta { .. },
             )
@@ -765,6 +767,28 @@ impl Lowerer<'_> {
                 ItemKind::Field { .. } | ItemKind::Spread(_)
             )
         })
+    }
+
+    /// Lowers `value`, an expression item that is no block's result: it is
+    /// evaluated for effect only, so it must be `{}` or a unit-like list,
+    /// unless it is a bare `await` or a call the checker discards, whose
+    /// value is discarded whatever it is. A unit-like `for` discards its
+    /// body's values rather than build a list.
+    fn lower_statement(&mut self, value: ExprId) -> Result<IrId, InternalError> {
+        Ok(
+            if self.is_await(value) || self.resolution.is_discarded(value) {
+                self.lower_expr(value)?
+            } else if let Some((for_id, span)) = self.discarded_for(value) {
+                let kind = self.kind(value)?;
+                let kind = self.lower_for(for_id, (kind, false), span)?;
+                self.builder.alloc(kind, span)
+            } else if matches!(self.kind(value)?, ValueKind::List | ValueKind::Mixed) {
+                // A unit-like list, or a union of unit-like members.
+                self.lower_expr(value)?
+            } else {
+                self.lower_operand(value, ValueKind::Record)?
+            },
+        )
     }
 
     /// Lowers a body whose value is of kind `kind` to a `Block`, which the
@@ -822,10 +846,12 @@ impl Lowerer<'_> {
                     self.item_stack.push(store);
                 }
                 ItemKind::Spread(value) => self.lower_spread(id, value, item.span)?,
-                // An import computes nothing at its point: what it names
-                // is read where it is mentioned. Nor does a `type`, which
-                // has no existence at runtime.
-                ItemKind::Import(_) | ItemKind::Type { .. } => {}
+                // An import computes nothing at its point, nor a type,
+                // which has no existence at runtime.
+                ItemKind::Import(_)
+                | ItemKind::Type { .. }
+                | ItemKind::Enum { .. }
+                | ItemKind::Variant { .. } => {}
                 ItemKind::Error => return Err(unparsed(item.span)),
                 ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => {
                     let node = self.lower_jump(id, jump)?;
@@ -846,23 +872,7 @@ impl Lowerer<'_> {
                     });
                 }
                 ItemKind::Expr(value) => {
-                    // Evaluated for effect only, so it must be `{}` or a
-                    // unit-like list, unless it is a bare `await` or a call
-                    // the checker discards, whose value is discarded
-                    // whatever it is. A unit-like `for` discards its body's
-                    // values rather than build a list.
-                    let statement = if self.is_await(value) || self.resolution.is_discarded(value) {
-                        self.lower_expr(value)?
-                    } else if let Some((for_id, span)) = self.discarded_for(value) {
-                        let kind = self.kind(value)?;
-                        let kind = self.lower_for(for_id, (kind, false), span)?;
-                        self.builder.alloc(kind, span)
-                    } else if matches!(self.kind(value)?, ValueKind::List | ValueKind::Mixed) {
-                        // A unit-like list, or a union of unit-like members.
-                        self.lower_expr(value)?
-                    } else {
-                        self.lower_operand(value, ValueKind::Record)?
-                    };
+                    let statement = self.lower_statement(value)?;
                     self.item_stack.push(statement);
                 }
             }
@@ -1964,6 +1974,17 @@ impl Lowerer<'_> {
                 return self.lower_reference_past(def, kind, span);
             }
             (ExprKind::DefTypeRef(def), _) => self.lower_def_type_ref(id, def, kind)?,
+            (ExprKind::Variant { .. }, _) => {
+                let tag = self.resolution.variant(id).ok_or(InternalError {
+                    message: "a variant as a value the check did not resolve",
+                    span,
+                })?;
+                IrKind::Tag {
+                    key: tag.key,
+                    of: tag.of,
+                    shown: self.builder.push_string(&tag.shown),
+                }
+            }
             (ExprKind::Error | ExprKind::NoField(_) | ExprKind::Unclosed { .. }, _) => {
                 return Err(unparsed(span));
             }
@@ -2761,7 +2782,10 @@ impl Lowerer<'_> {
             | Builtin::FsTempDir
             | Builtin::FsWrite
             | Builtin::SortVersions
-            | Builtin::ExecLive => Err(InternalError {
+            | Builtin::ExecLive
+            | Builtin::VariantMatches
+            | Builtin::VariantPayload
+            | Builtin::PartialMatches => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),
@@ -3322,8 +3346,13 @@ impl Lowerer<'_> {
             }
             (ValueKind::List, BinaryOp::Same, _) => IrKind::ListSame(operands),
             (ValueKind::List, BinaryOp::NotSame, _) => IrKind::ListNotSame(operands),
-            (ValueKind::Mixed, BinaryOp::Same, _) => IrKind::ValueSame(operands),
-            (ValueKind::Mixed, BinaryOp::NotSame, _) => IrKind::ValueNotSame(operands),
+            // The checker lets `==` compare no union and no function: two
+            // of one enum, of a variant and payload each, or two variants,
+            // which compare as wholes (see the checker's "Enums").
+            (ValueKind::Mixed, BinaryOp::Same, _)
+            | (ValueKind::Mixed | ValueKind::Fn, BinaryOp::Eq, _) => IrKind::ValueSame(operands),
+            (ValueKind::Mixed, BinaryOp::NotSame, _)
+            | (ValueKind::Mixed | ValueKind::Fn, BinaryOp::Ne, _) => IrKind::ValueNotSame(operands),
             (
                 ValueKind::Bool
                 | ValueKind::Record
@@ -3587,7 +3616,7 @@ impl Lowerer<'_> {
         let mut pending = vec![&resolution.test];
         while let Some(test) = pending.pop() {
             match test {
-                ValueTest::Pass | ValueTest::Kind(_) => {}
+                ValueTest::Pass | ValueTest::Kind(_) | ValueTest::Enum(_) => {}
                 ValueTest::Record(fields) => {
                     for (name, field) in fields {
                         self.builder

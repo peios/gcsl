@@ -3474,6 +3474,18 @@ pub enum Builtin {
     /// standard error are also copied, line by line as they arrive, to this
     /// process's standard error (see [`crate::eval`]). Impure.
     ExecLive,
+    /// `variant_matches<E, T>(kind: Variant<E, T>, value: E): Bool`:
+    /// whether `value`, a value of an enum, is of the variant `kind` (see
+    /// [Enums](#enums)), the prelude's `kind.matches(value)`.
+    VariantMatches,
+    /// `variant_payload<E, T>(kind: Variant<E, T>, value: E): T`: the
+    /// payload of `value`, of the variant `kind`, and a runtime error if it
+    /// is another's, the prelude's `kind.payload(value)`.
+    VariantPayload,
+    /// `partial_matches<T>(partial: Partial<T>, full: T): Bool`: whether
+    /// every field `partial` holds equals `full`'s of its name (see [Partial
+    /// records](#partial-records)), the prelude's `partial.matches(full)`.
+    PartialMatches,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -3497,7 +3509,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 24] = [
+    pub const ALL: [Builtin; 27] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -3522,6 +3534,9 @@ impl Builtin {
         Builtin::SortVersions,
         Builtin::Show,
         Builtin::ExecLive,
+        Builtin::VariantMatches,
+        Builtin::VariantPayload,
+        Builtin::PartialMatches,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -3561,6 +3576,9 @@ impl Builtin {
             Builtin::SortVersions => "sort_versions",
             Builtin::Show => "show",
             Builtin::ExecLive => "exec_live",
+            Builtin::VariantMatches => "variant_matches",
+            Builtin::VariantPayload => "variant_payload",
+            Builtin::PartialMatches => "partial_matches",
         }
     }
 
@@ -3594,7 +3612,10 @@ impl Builtin {
             | Builtin::CompareVersions
             | Builtin::SortVersions
             | Builtin::Show
-            | Builtin::ExecLive => None,
+            | Builtin::ExecLive
+            | Builtin::VariantMatches
+            | Builtin::VariantPayload
+            | Builtin::PartialMatches => None,
         }
     }
 
@@ -3619,6 +3640,8 @@ impl Builtin {
             Builtin::FsWrite => &["p", "contents"],
             Builtin::SortVersions => &["vs"],
             Builtin::Show => &["value"],
+            Builtin::VariantMatches | Builtin::VariantPayload => &["kind", "value"],
+            Builtin::PartialMatches => &["partial", "full"],
         }
     }
 
@@ -3656,7 +3679,10 @@ impl Builtin {
             | Builtin::Fields
             | Builtin::CompareVersions
             | Builtin::SortVersions
-            | Builtin::Show => Effect::Pure,
+            | Builtin::Show
+            | Builtin::VariantMatches
+            | Builtin::VariantPayload
+            | Builtin::PartialMatches => Effect::Pure,
         }
     }
 
@@ -3686,7 +3712,10 @@ impl Builtin {
             | Builtin::FsTempDir
             | Builtin::FsWrite
             | Builtin::SortVersions
-            | Builtin::ExecLive => Typing::Ordinary,
+            | Builtin::ExecLive
+            | Builtin::VariantMatches
+            | Builtin::VariantPayload
+            | Builtin::PartialMatches => Typing::Ordinary,
         }
     }
 
@@ -3722,6 +3751,9 @@ impl Builtin {
             Builtin::FsTempDir => "fn() -> String",
             Builtin::FsWrite => "fn(p: String, contents: String) -> {}",
             Builtin::SortVersions => "fn(vs: List<String>): List<String>",
+            Builtin::VariantMatches => "fn<E, T>(kind: Variant<E, T>, value: E): Bool",
+            Builtin::VariantPayload => "fn<E, T>(kind: Variant<E, T>, value: E): T",
+            Builtin::PartialMatches => "fn<T>(partial: Partial<T>, full: T): Bool",
         }
     }
 
@@ -3769,6 +3801,9 @@ impl Builtin {
             // TEMPORARY (alias rule): the opaque type, until a polymorphic one (see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/)).
             Builtin::Len | Builtin::Show => return types.builtin(self),
+            Builtin::VariantMatches | Builtin::VariantPayload | Builtin::PartialMatches => {
+                return self.generic_ty(types, names);
+            }
         };
         let params = self
             .params()
@@ -3776,6 +3811,45 @@ impl Builtin {
             .zip(param_types)
             .map(|(&text, ty)| (Some(names.intern(text)), ty));
         types.fn_type(params, result, self.effect())
+    }
+}
+
+impl Builtin {
+    /// The type of a generic built-in's value, interned into `types`, its
+    /// type parameters' and parameters' names into `names` (see
+    /// [Generics](#generics)): `variant_matches` and `variant_payload` of
+    /// `E` and `T`, `partial_matches` of `T`; `Error` for any other.
+    fn generic_ty(self, types: &mut TypeTable, names: &mut Names) -> TyId {
+        let partial = self == Builtin::PartialMatches;
+        let parameters: &[&str] = if partial { &["T"] } else { &["E", "T"] };
+        let generic = types.new_generic(parameters.iter().map(|text| names.intern(text)).collect());
+        let [first, second] = match self.params() {
+            &[first, second] => [first, second].map(|text| names.intern(text)),
+            _ => return TyId::ERROR,
+        };
+        let ty = if partial {
+            let full = types.param(generic, 0);
+            let record = types.partial(full);
+            types.fn_type(
+                [(Some(first), record), (Some(second), full)],
+                TyId::BOOL,
+                Effect::Pure,
+            )
+        } else {
+            let (of, payload) = (types.param(generic, 0), types.param(generic, 1));
+            let kind = types.variant(of, payload);
+            let result = if self == Builtin::VariantMatches {
+                TyId::BOOL
+            } else {
+                payload
+            };
+            types.fn_type(
+                [(Some(first), kind), (Some(second), of)],
+                result,
+                Effect::Pure,
+            )
+        };
+        types.generic_fn(ty, generic)
     }
 }
 
@@ -3973,11 +4047,56 @@ struct ForLowering {
     /// Each call of a method, by its id, with its receiver: see
     /// [`Resolution::method_receiver`].
     method_calls: HashMap<ExprId, ExprId>,
+    /// Each variant as a value, by its id: see [`Resolution::variant`].
+    variants: HashMap<ExprId, VariantTag>,
+}
+
+/// A variant as a value, as lowering makes it a constant (see
+/// [Enums](#enums)): its key, its enum's, and how it is shown,
+/// `Toolchain::C`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VariantTag {
+    /// Its key, its identity ([`crate::names::variant_key`]).
+    pub key: Name,
+    /// Its enum's key ([`crate::names::enum_key`]).
+    pub of: Name,
+    /// How it is shown, its enum's name and its own.
+    pub shown: Box<str>,
 }
 
 /// Where a method's name is declared, in the input checked (`None`) or
 /// another, if that is known (see [Methods](#methods)).
 pub(crate) type MethodSite = Option<(Option<u32>, Span)>;
+
+/// The names of the built-in types applied to type arguments, each if the
+/// program's table holds it.
+#[derive(Clone, Copy, Debug)]
+struct Constructors {
+    /// `Future`, which applied to a type is a future of it.
+    future: Option<Name>,
+    /// `Present`, which applied to a type is it with every bare type in it
+    /// present.
+    present: Option<Name>,
+    /// `List`, which applied to a type is a list of it.
+    list: Option<Name>,
+    /// `Variant`, for `Variant<E, T>` (see [Enums](#enums)).
+    variant: Option<Name>,
+    /// `Partial`, for `Partial<T>` (see [Partial records](#partial-records)).
+    partial: Option<Name>,
+}
+
+impl Constructors {
+    /// The names `names` holds.
+    fn of(names: &Names) -> Self {
+        Self {
+            future: names.lookup("Future"),
+            present: names.lookup("Present"),
+            list: names.lookup("List"),
+            variant: names.lookup("Variant"),
+            partial: names.lookup("Partial"),
+        }
+    }
+}
 
 /// A method a call of its name may mean (see [Methods](#methods)).
 #[derive(Clone, Copy, Debug)]
@@ -4319,6 +4438,8 @@ pub struct Resolution {
     /// Each call of a method, by its id, with its receiver, its callee's
     /// parameter 0 (see [Methods](#methods)).
     method_calls: HashMap<ExprId, ExprId>,
+    /// Each variant as a value, by its id (see [Enums](#enums)).
+    variants: HashMap<ExprId, VariantTag>,
     /// The attributes of each function item that has any, by its function,
     /// in source order (see [Attributes](#attributes)).
     fn_attributes: HashMap<FnId, Box<[Attribute]>>,
@@ -4412,6 +4533,13 @@ impl Resolution {
     #[must_use]
     pub fn call_defaults(&self, id: ExprId) -> &[(u32, ParamDefault)] {
         self.call_defaults.get(&id).map_or(&[], |defaults| defaults)
+    }
+
+    /// The variant the expression `id` is, a variant as a value (see
+    /// [Enums](#enums)), which lowering makes a constant.
+    #[must_use]
+    pub fn variant(&self, id: ExprId) -> Option<&VariantTag> {
+        self.variants.get(&id)
     }
 
     /// The receiver of the call `id`, if it is a method's (see
@@ -4727,6 +4855,7 @@ impl Resolution {
             metas: Vec::new(),
             call_defaults: HashMap::new(),
             method_calls: HashMap::new(),
+            variants: HashMap::new(),
             fn_attributes: HashMap::new(),
             record_fills: HashMap::new(),
         }
@@ -5935,11 +6064,114 @@ pub(crate) fn check_types(ast: &Ast, types: &mut TypeTable, sees_broken: bool) -
     checker.errors
 }
 
+/// Resolves the bounds of the enums of `ast`, each by its item and its key
+/// (see [Enums](#enums)), interning into `types`, which records each: one
+/// erroneous is no bound, its error reported. Returns the errors found.
+pub(crate) fn check_enum_bounds(
+    ast: &Ast,
+    types: &mut TypeTable,
+    enums: &[(ItemId, Name)],
+) -> Vec<Diagnostic> {
+    let mut checker = Checker::new(ast, types);
+    for &(item, key) in enums {
+        let ItemKind::Enum { bound, .. } = ast.item(item).kind else {
+            continue;
+        };
+        let bound = bound
+            .map(|bound| checker.resolve_type(bound, Bareness::Present))
+            .filter(|&bound| bound != TyId::ERROR);
+        checker.types.set_enum_bound(key, bound);
+    }
+    checker.errors
+}
+
+/// A variant's item, its enum's key and name, if what it names is an enum,
+/// and its own key (see [Enums](#enums)).
+pub(crate) type VariantItem = (ItemId, Option<(Name, Name)>, Name);
+
+/// Resolves the payloads of the variants of `ast`, each by its item, its
+/// enum's key and name, if what it names is an enum, and its own key (see
+/// [Enums](#enums)), every enum's bound being known: each payload must fit
+/// its enum's bound, "the payload of `Toolchain::C` must fit `{*: File |
+/// Dir}`"; a variant of an enum one earlier of the file has the name of is
+/// "variant `Toolchain::C` is declared twice", and a variant of what is no
+/// enum "`Int` is not an enum". Records each payload, `Error` for one in
+/// error, in `types`. Returns the errors found.
+pub(crate) fn check_variant_payloads(
+    ast: &Ast,
+    types: &mut TypeTable,
+    variants: &[VariantItem],
+) -> Vec<Diagnostic> {
+    let mut checker = Checker::new(ast, types);
+    let mut declared: Vec<(Name, Name, Span)> = Vec::new();
+    for &(item, enum_of, key) in variants {
+        let ItemKind::Variant {
+            of,
+            name,
+            name_span,
+            payload,
+        } = ast.item(item).kind
+        else {
+            continue;
+        };
+        let Some((enum_key, enum_name)) = enum_of else {
+            let ty = checker.resolve_type(of, Bareness::Present);
+            if ty != TyId::ERROR {
+                let shown = checker.in_message(ty);
+                checker.errors.push(Diagnostic::error(
+                    format!("{shown} is not an enum"),
+                    ast.type_expr(of).span,
+                ));
+            }
+            continue;
+        };
+        let names = ast.names();
+        let shown = format!("{}::{}", names.get(enum_name), names.get(name));
+        if let Some(&(_, _, first)) = declared
+            .iter()
+            .find(|&&(of, earlier, _)| of == enum_key && earlier == name)
+        {
+            checker.errors.push(
+                Diagnostic::error(format!("variant `{shown}` is declared twice"), name_span)
+                    .with_context(first, "first declared here"),
+            );
+            continue;
+        }
+        declared.push((enum_key, name, name_span));
+        let ty = match payload {
+            Some(payload) => checker.resolve_type(payload, Bareness::Present),
+            None => TyId::EMPTY,
+        };
+        let ty = match checker.types.enum_bound(enum_key) {
+            Some(bound) if ty != TyId::ERROR && !checker.types.fits_bound(ty, bound) => {
+                let (found, bound_shown) = (checker.in_message(ty), checker.in_message(bound));
+                let at = payload.map_or(name_span, |payload| ast.type_expr(payload).span);
+                checker.errors.push(
+                    Diagnostic::error(
+                        format!("the payload of `{shown}` must fit {bound_shown}"),
+                        at,
+                    )
+                    .with_label(format!("this is {found}"))
+                    .with_note(format!(
+                        "`{}` bounds its variants' payloads as it is declared",
+                        names.get(enum_name)
+                    )),
+                );
+                TyId::ERROR
+            }
+            _ => ty,
+        };
+        checker.types.set_variant_payload(key, ty);
+    }
+    checker.errors
+}
+
 /// The names of the built-in types: those of [`BuiltinTypes`], and the
 /// type constructors, `List`, `Future` and `Present`. A `type` may not be
 /// named like one: "`Int` is a built-in type".
-pub(crate) const BUILTIN_TYPE_NAMES: [&str; 9] = [
-    "Int", "Float", "Bool", "String", "Duration", "Size", "List", "Future", "Present",
+pub(crate) const BUILTIN_TYPE_NAMES: [&str; 11] = [
+    "Int", "Float", "Bool", "String", "Duration", "Size", "List", "Future", "Present", "Variant",
+    "Partial",
 ];
 
 /// The name of the checker's attribute that retries a call.
@@ -6259,15 +6491,8 @@ pub struct Checker<'a> {
     /// records it alone would need are erroneous.
     checking_shadowed: bool,
     builtin_types: BuiltinTypes,
-    /// The name `Future`, which applied to a type is a future of it, if the
-    /// program mentions it.
-    future_name: Option<Name>,
-    /// The name `Present`, which applied to a type is it with every bare
-    /// type in it present, if the program mentions it.
-    present_name: Option<Name>,
-    /// The name `List`, which applied to a type is a list of it, if the
-    /// program mentions it.
-    list_name: Option<Name>,
+    /// The names of the built-in types applied to type arguments.
+    constructors: Constructors,
     /// TEMPORARY (alias rule): the expression that may be a reference to a built-in function whose
     /// typing is special while it is checked: the callee of the call being checked, or the
     /// initialiser of the top-level field or `let` of one name being checked (see
@@ -6456,9 +6681,7 @@ impl<'a> Checker<'a> {
             shadowed_items: Vec::new(),
             checking_shadowed: false,
             builtin_types: builtin_types(names),
-            future_name: names.lookup("Future"),
-            present_name: names.lookup("Present"),
-            list_name: names.lookup("List"),
+            constructors: Constructors::of(names),
             alias_site: None,
             call_site: None,
             element_types: Vec::new(),
@@ -6524,7 +6747,6 @@ impl<'a> Checker<'a> {
         self.quiet.failed |= self.ast.syntax() != Syntax::Clean;
         // A workspace has checked the file's `type` items already, before
         // any file's check ([`check_types`]): they are resolved quietly.
-        self.check_declarations();
         self.declare_top_level();
         let ty = self.check_body(root, None);
         // Finalisation: an integer result with no context defaults to Int.
@@ -6608,6 +6830,7 @@ impl<'a> Checker<'a> {
                 metas: self.metas,
                 call_defaults: self.lowering.call_defaults,
                 method_calls: self.lowering.method_calls,
+                variants: self.lowering.variants,
                 fn_attributes: self.lowering.fn_attributes,
                 record_fills: self.lowering.record_fills,
             },
@@ -6778,7 +7001,11 @@ impl<'a> Checker<'a> {
                 // A definition, and a meta, is placed as the walk reaches it,
                 // whether or not it is a top-level function
                 // (`Checker::reach_top_fn`).
-                ItemKind::Type { .. } | ItemKind::DefTypeDef { .. } | ItemKind::DefMeta { .. } => {}
+                ItemKind::Type { .. }
+                | ItemKind::Enum { .. }
+                | ItemKind::Variant { .. }
+                | ItemKind::DefTypeDef { .. }
+                | ItemKind::DefMeta { .. } => {}
                 ItemKind::Result(value) => {
                     let ty = self.expression_item(value, true, result_expected);
                     if self.result_item(item.span, (value, ty), (first_field, next)) {
@@ -7139,6 +7366,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Spread(_)
             | ItemKind::Import(_)
             | ItemKind::Type { .. }
+            | ItemKind::Enum { .. }
+            | ItemKind::Variant { .. }
             | ItemKind::DefTypeDef { .. }
             | ItemKind::DefMeta { .. }
             | ItemKind::Error => false,
@@ -11685,7 +11914,10 @@ impl<'a> Checker<'a> {
     /// computed before its own item ([`Checker::computed_early`]), or a
     /// `type`, which never runs.
     fn runs_elsewhere(&self, position: usize, kind: ItemKind) -> bool {
-        matches!(kind, ItemKind::Type { .. }) || self.computed_early(position)
+        matches!(
+            kind,
+            ItemKind::Type { .. } | ItemKind::Enum { .. } | ItemKind::Variant { .. }
+        ) || self.computed_early(position)
     }
 
     /// Whether the item at `position` of the outermost block is a top-level
@@ -12510,6 +12742,11 @@ impl<'a> Checker<'a> {
     fn resolve_written(&mut self, id: TypeExprId, mode: Bareness) -> TyId {
         let ty = *self.ast.type_expr(id);
         match ty.kind {
+            // An enum, nominal, bare as a name is.
+            TypeExprKind::Enum { key, name } => {
+                let ty = self.types.enum_type(key, name);
+                self.bare(ty, mode)
+            }
             // A type parameter in scope, which no bareness wraps.
             TypeExprKind::Named(name)
                 if let Some((owner, index)) = self.ast.type_param(id, name) =>
@@ -12832,7 +13069,7 @@ impl<'a> Checker<'a> {
     fn is_future(&self, ty: TypeExprId) -> bool {
         matches!(
             self.ast.type_expr(ty).kind,
-            TypeExprKind::Applied { name, .. } if Some(name) == self.future_name
+            TypeExprKind::Applied { name, .. } if Some(name) == self.constructors.future
         )
     }
 
@@ -12876,9 +13113,11 @@ impl<'a> Checker<'a> {
     /// Whether `name` is `Future`, `Present` or `List`, which take a type
     /// argument.
     fn is_type_constructor(&self, name: Name) -> bool {
-        Some(name) == self.future_name
-            || Some(name) == self.present_name
-            || Some(name) == self.list_name
+        Some(name) == self.constructors.future
+            || Some(name) == self.constructors.present
+            || Some(name) == self.constructors.list
+            || Some(name) == self.constructors.variant
+            || Some(name) == self.constructors.partial
     }
 
     /// Whether a type written as `ty` is *bare*, so that the bare type rule
@@ -12893,9 +13132,12 @@ impl<'a> Checker<'a> {
             TypeExprKind::Named(_)
             | TypeExprKind::Path(_)
             | TypeExprKind::PathApplied { .. }
+            | TypeExprKind::Enum { .. }
             | TypeExprKind::Record(_)
             | TypeExprKind::List(_) => true,
-            TypeExprKind::Applied { name, .. } => Some(name) == self.list_name,
+            TypeExprKind::Applied { name, .. } => {
+                Some(name) == self.constructors.list || Some(name) == self.constructors.partial
+            }
             TypeExprKind::Union { .. } => !self.has_future_member(ty),
             TypeExprKind::Fn { .. }
             | TypeExprKind::Ref(_)
@@ -12923,7 +13165,16 @@ impl<'a> Checker<'a> {
         args: TypeArgRange,
         mode: Bareness,
     ) -> TyId {
-        let builtin = [self.list_name, self.future_name, self.present_name].contains(&Some(name));
+        if Some(name) == self.constructors.variant {
+            return self.resolve_variant_type(span, args);
+        }
+        let builtin = [
+            self.constructors.list,
+            self.constructors.future,
+            self.constructors.present,
+            self.constructors.partial,
+        ]
+        .contains(&Some(name));
         let &[arg] = self.ast.type_args(args) else {
             for &arg in self.ast.type_args(args) {
                 self.resolve_type(arg, Bareness::Present);
@@ -12937,22 +13188,91 @@ impl<'a> Checker<'a> {
             }
             return TyId::ERROR;
         };
-        if Some(name) == self.list_name {
+        if Some(name) == self.constructors.list {
             return self.resolve_list(arg, mode);
         }
+        if Some(name) == self.constructors.partial {
+            return self.resolve_partial(arg);
+        }
         let arg = self.resolve_type(arg, Bareness::Present);
-        if Some(name) == self.future_name {
+        if Some(name) == self.constructors.future {
             return if arg == TyId::ERROR {
                 TyId::ERROR
             } else {
                 self.types.future(arg)
             };
         }
-        if Some(name) == self.present_name {
+        if Some(name) == self.constructors.present {
             return arg;
         }
         self.unknown_applied(name, span);
         TyId::ERROR
+    }
+
+    /// `Variant<E, T>`, written at `span` with the type arguments `args`
+    /// (see [Enums](#enums)): the type of a variant of the enum `E` whose
+    /// payload is a `T`, both resolved with every bare type present; `Error`
+    /// (reported) for other than two arguments, "type `Variant` takes 2 type
+    /// arguments, given 1", and for an `E` that is no enum nor a type
+    /// parameter.
+    fn resolve_variant_type(&mut self, span: Span, args: TypeArgRange) -> TyId {
+        let resolved: Vec<TyId> = self
+            .ast
+            .type_args(args)
+            .iter()
+            .map(|&arg| self.resolve_type(arg, Bareness::Present))
+            .collect();
+        let &[of, payload] = &resolved[..] else {
+            let message = format!(
+                "type `Variant` takes 2 type arguments, given {}",
+                args.len()
+            );
+            self.errors.push(Diagnostic::error(message, span));
+            return TyId::ERROR;
+        };
+        if of == TyId::ERROR || payload == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        // An enum, or a type parameter a call binds to one.
+        if !matches!(
+            self.types.kind(of),
+            TyKind::Enum { .. } | TyKind::Param { .. }
+        ) {
+            let shown = self.in_message(of);
+            let at = self
+                .ast
+                .type_args(args)
+                .first()
+                .map_or(span, |&first| self.ast.type_expr(first).span);
+            self.errors.push(Diagnostic::error(
+                format!("`Variant`'s first type argument must be an enum, not {shown}"),
+                at,
+            ));
+            return TyId::ERROR;
+        }
+        self.types.variant(of, payload)
+    }
+
+    /// `Partial<T>` of the type written as `arg`, resolved with every bare
+    /// type present (see [Partial records](#partial-records)): `Error`
+    /// (reported) for a type that is no record type, or one with a
+    /// rest-field.
+    fn resolve_partial(&mut self, arg: TypeExprId) -> TyId {
+        let record = self.resolve_type(arg, Bareness::Present);
+        if record == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        // A type parameter a call binds to a record type is one too.
+        let param = matches!(self.types.kind(record), TyKind::Param { .. });
+        if !param && (!self.types.is_record(record) || self.types.record_rest(record).is_some()) {
+            let shown = self.in_message(record);
+            self.errors.push(Diagnostic::error(
+                format!("`Partial` takes a record type with no rest-field, not {shown}"),
+                self.ast.type_expr(arg).span,
+            ));
+            return TyId::ERROR;
+        }
+        self.types.partial(record)
     }
 
     /// Reports the applied type of the name `name`, written at `span`, that
@@ -14494,6 +14814,7 @@ impl<'a> Checker<'a> {
             ExprKind::Int(_) => TyId::UNTYPED_INT,
             ExprKind::Float(_) => TyId::FLOAT,
             ExprKind::Duration(_) => TyId::DURATION,
+            ExprKind::Variant { of, name } => self.check_variant(id, (of, name)),
             ExprKind::Size(_) => TyId::SIZE,
             ExprKind::Bool(_) => TyId::BOOL,
             ExprKind::Str(_) => TyId::STRING,
@@ -15847,13 +16168,14 @@ impl<'a> Checker<'a> {
     fn inferred(&mut self, ty: TypeExprId, declared: TyId, value: BodyValue) -> TyId {
         // The fields of a record type, or the element type of a list type.
         let (fields, element) = match self.ast.type_expr(ty).kind {
-            // A bare union is inferred at its top only, as a name is.
-            TypeExprKind::Named(_) => (None, None),
+            // A bare union is inferred at its top only, as a name is, and
+            // an enum.
+            TypeExprKind::Named(_) | TypeExprKind::Enum { .. } => (None, None),
             TypeExprKind::Union { .. } if self.is_bare(ty) => (None, None),
             TypeExprKind::Record(fields) => (Some(fields), None),
             TypeExprKind::List(element) => (None, Some(element)),
             TypeExprKind::Applied { name, args, .. }
-                if Some(name) == self.list_name
+                if Some(name) == self.constructors.list
                     && let &[element] = self.ast.type_args(args) =>
             {
                 (None, Some(element))
@@ -16401,9 +16723,11 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Declares the input's top-level functions, its methods among them,
-    /// as it starts, and checks its methods' declarations.
+    /// Checks what the input declares, as it starts, and declares its
+    /// top-level functions, its methods among them, and checks its methods'
+    /// declarations.
     fn declare_top_level(&mut self) {
+        self.check_declarations();
         self.declare_top_fns();
         self.calls.earlier_methods = self.find_earlier_methods();
         self.check_methods();
@@ -16456,6 +16780,106 @@ impl<'a> Checker<'a> {
                     );
                     break;
                 }
+            }
+        }
+    }
+
+    /// Types the variant as a value `id`, `of::name`, the name written at
+    /// the end of it (see [Enums](#enums)): `Variant<E, T>` of the enum `of`
+    /// resolves to and the payload of the one variant of the name the input
+    /// sees, recorded for lowering; `Error` (reported) for an `of` that is no
+    /// enum, "`Int` is not an enum", a name no variant the input sees has,
+    /// "no variant `C` of `Toolchain`", noting those it sees, and one
+    /// several files declare, "variant `Toolchain::C` is declared in two
+    /// files", labelled at each.
+    #[inline(never)]
+    fn check_variant(&mut self, id: ExprId, (of, name): (TypeExprId, Name)) -> TyId {
+        let text = self.ast.names().get(name);
+        let name_span = self.ast.written_name(self.ast.get(id).span.end, text);
+        let enum_ty = self.resolve_type(of, Bareness::Present);
+        if enum_ty == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        let names = self.ast.names();
+        let TyKind::Enum {
+            key,
+            name: enum_name,
+        } = *self.types.kind(enum_ty)
+        else {
+            let shown = self.in_message(enum_ty);
+            self.errors.push(Diagnostic::error(
+                format!("{shown} is not an enum"),
+                self.ast.type_expr(of).span,
+            ));
+            return TyId::ERROR;
+        };
+        let shown = format!("{}::{}", names.get(enum_name), names.get(name));
+        let found = self
+            .workspace
+            .map_or(&[][..], |workspace| workspace.variants(key, name));
+        match found {
+            [] => {
+                let seen = self
+                    .workspace
+                    .map(|workspace| workspace.variant_names(key))
+                    .unwrap_or_default();
+                let listed: Vec<String> = seen
+                    .iter()
+                    .map(|&variant| format!("`{}`", names.get(variant)))
+                    .collect();
+                let note = if listed.is_empty() {
+                    format!("`{}` has no variant visible here", names.get(enum_name))
+                } else {
+                    format!(
+                        "`{}` has the variants {} here",
+                        names.get(enum_name),
+                        listed.join(", ")
+                    )
+                };
+                self.errors.push(
+                    Diagnostic::error(
+                        format!(
+                            "no variant `{}` of `{}`",
+                            names.get(name),
+                            names.get(enum_name)
+                        ),
+                        name_span,
+                    )
+                    .with_note(note),
+                );
+                TyId::ERROR
+            }
+            [one] => {
+                let payload = self.types.variant_payload(one.key).unwrap_or(TyId::ERROR);
+                // A variant in error is reported where it is declared: the
+                // check fails quietly.
+                if payload == TyId::ERROR {
+                    self.quiet.failed = true;
+                    return TyId::ERROR;
+                }
+                let tag = VariantTag {
+                    key: one.key,
+                    of: key,
+                    shown: shown.into(),
+                };
+                self.lowering.variants.insert(id, tag);
+                self.types.variant(enum_ty, payload)
+            }
+            several => {
+                let mut error = Diagnostic::error(
+                    format!("variant `{shown}` is declared in two files"),
+                    name_span,
+                );
+                for seen in several {
+                    let site = seen
+                        .declared
+                        .and_then(|declared| self.workspace?.variant_site(declared));
+                    if let Some((file, span)) = site {
+                        error = error.with_context_in(file, span, "declared here");
+                    }
+                }
+                self.errors.push(error);
+                TyId::ERROR
             }
         }
     }
@@ -18622,7 +19046,7 @@ impl<'a> Checker<'a> {
             );
             return false;
         }
-        if self.types.contains_fn(target) {
+        if self.types.holds_untestable(target) {
             self.errors.push(
                 Diagnostic::error(format!("`{keyword}` cannot test a function type"), span)
                     .with_note(
@@ -19215,7 +19639,15 @@ impl<'a> Checker<'a> {
             }
             // Functions have no equality, even inside records.
             Some(ty) if self.types.contains_fn(ty) => {
-                let message = if self.types.fn_sig(ty).is_some() {
+                let unbounded = matches!(self.types.kind(ty), &TyKind::Enum { key, .. }
+                    if self.types.enum_bound(key).is_none());
+                let message = if unbounded {
+                    format!(
+                        "cannot compare {}: its variants' payloads are not bounded, so they may \
+                         hold functions",
+                        self.in_message(ty)
+                    )
+                } else if self.types.fn_sig(ty).is_some() {
                     "cannot compare functions".to_owned()
                 } else {
                     format!(
@@ -19288,7 +19720,8 @@ impl<'a> Checker<'a> {
                 || self.types.is_record(lhs_ty)
                 || self.types.list_element(lhs_ty).is_some()
                 || self.types.fn_sig(lhs_ty).is_some()
-                || self.types.union_members(lhs_ty).is_some())
+                || self.types.union_members(lhs_ty).is_some()
+                || matches!(self.types.kind(lhs_ty), TyKind::Enum { .. }))
         {
             Some(lhs_ty)
         } else {
@@ -20200,6 +20633,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Return(_)
             | ItemKind::Import(_)
             | ItemKind::Type { .. }
+            | ItemKind::Enum { .. }
+            | ItemKind::Variant { .. }
             | ItemKind::DefTypeDef { .. }
             | ItemKind::DefMeta { .. }
             | ItemKind::Error => {}
@@ -21067,6 +21502,7 @@ impl<'a> Checker<'a> {
             | ExprKind::Str(_)
             | ExprKind::Interp(_)
             | ExprKind::Name(_)
+            | ExprKind::Variant { .. }
             | ExprKind::Field { .. }
             | ExprKind::Ascribe { .. }
             | ExprKind::Is { .. }
@@ -21126,6 +21562,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Return(_)
             | ItemKind::Import(_)
             | ItemKind::Type { .. }
+            | ItemKind::Enum { .. }
+            | ItemKind::Variant { .. }
             | ItemKind::DefTypeDef { .. }
             | ItemKind::DefMeta { .. }
             | ItemKind::Error => {}
@@ -21147,12 +21585,15 @@ impl<'a> Checker<'a> {
             | TyKind::Either(_)
             | TyKind::Union(_)
             | TyKind::Provisional { .. }
+            | TyKind::Variant { .. }
+            | TyKind::Partial(_)
             // TEMPORARY (alias rule): see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/).
             | TyKind::Builtin(_) => {
                 format!("`{shown}`")
             }
-            TyKind::Int
+            TyKind::Enum { .. }
+            | TyKind::Int
             | TyKind::Float
             | TyKind::Bool
             | TyKind::String

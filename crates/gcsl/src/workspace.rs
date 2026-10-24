@@ -942,7 +942,8 @@ use crate::ast::{
 use crate::check::ViewRecord;
 use crate::check::{
     BUILTIN_ATTRIBUTES, BUILTIN_TYPE_NAMES, Builtin, CheckOutput, Checker, Fileroot, KnownParams,
-    Place, Record, Scope, Slot, Types, check_types,
+    Place, Record, Scope, Slot, Types, VariantItem, check_enum_bounds, check_types,
+    check_variant_payloads,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError, Severity};
 use crate::eval::{MemoTables, TempDirs};
@@ -1133,6 +1134,48 @@ pub struct File {
     /// Its view of methods: the `def` methods of other files it sees, by
     /// their names (see [Methods](#methods)).
     pub method_view: HashMap<Name, Vec<MethodRef>>,
+    /// Its view of variants: the variants it sees, its own and other
+    /// files', by the key of their enum and their name, each by its index
+    /// in [`Scan::variants`], or, of a session's earlier input, its key
+    /// alone (see [Enums](#enums)).
+    pub variant_view: HashMap<(Name, Name), Vec<SeenVariant>>,
+}
+
+/// A variant a file sees (see [Enums](#enums)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeenVariant {
+    /// Its key, its identity ([`names::variant_key`]).
+    pub key: Name,
+    /// Its declaration, by its index in [`Scan::variants`]; `None` for an
+    /// earlier input's of a session, whose source is not this one.
+    pub declared: Option<u32>,
+}
+
+/// What a session's input inherits of the earlier inputs' types: each type
+/// with its declaration's number in the store, and each variant.
+type Inheriting<'a> = (&'a [(Name, u32)], &'a [InheritedVariant]);
+
+/// A variant a session's input inherits from the earlier inputs: its enum's
+/// key, its name and its own key (see [Enums](#enums)).
+pub(crate) type InheritedVariant = (Name, Name, Name);
+
+/// A variant one of a scan's files declares (see [Enums](#enums)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeclaredVariant {
+    /// Its file.
+    pub file: u32,
+    /// Its `enum` item.
+    pub item: ItemId,
+    /// Its name.
+    pub name: Name,
+    /// Where its name is written.
+    pub span: Span,
+    /// Its enum, as written, in its file's tree.
+    pub of: TypeExprId,
+    /// Its enum, by its key and its name, if what it writes is one.
+    pub enum_of: Option<(Name, Name)>,
+    /// Its key, its identity ([`names::variant_key`]).
+    pub key: Name,
 }
 
 /// A method of a file of a scan, by the file and its position among the
@@ -1210,6 +1253,7 @@ impl File {
             failed_imports: Vec::new(),
             method_modules: Vec::new(),
             method_view: HashMap::new(),
+            variant_view: HashMap::new(),
         }
     }
 
@@ -1249,8 +1293,9 @@ pub struct DeclaredType {
     pub name: Name,
     /// Where the name is written.
     pub span: Span,
-    /// The type it stands for, in its file's tree.
-    pub ty: TypeExprId,
+    /// The type it stands for, in its file's tree; `None` for an enum,
+    /// which is a type of its own (see the checker's "Enums").
+    pub ty: Option<TypeExprId>,
 }
 
 /// A type a file imports by member, `import NAME from PATH`, or by `*`
@@ -1521,6 +1566,13 @@ pub struct Scan {
     /// source order: but one named like a built-in type, and a second of
     /// one name in one file, which the checker reports (see [Types](#types)).
     pub types: Vec<DeclaredType>,
+    /// The variants of enums every file declares, in path order, each
+    /// file's in source order (see [Enums](#enums)).
+    pub variants: Vec<DeclaredVariant>,
+    /// The variants a session's input inherits from the earlier inputs, each
+    /// by its enum's key and its name, with its own key (see
+    /// [Enums](#enums)).
+    inherited_variants: Vec<InheritedVariant>,
     /// The types of each directory, by its index: its files' declarations,
     /// as indices in `types`, in order, the first of each name.
     dir_types: Vec<Vec<u32>>,
@@ -2736,7 +2788,7 @@ fn scan_into(
         placed,
         library,
         (names, loaded),
-        (&mut TypeStore::new(), &[]),
+        (&mut TypeStore::new(), (&[], &[])),
         (&[], None),
     )
 }
@@ -2745,7 +2797,9 @@ fn scan_into(
 /// the scan holds once it succeeds ([`Scan::type_store`]) and which is given
 /// back to `store` if it fails, and with `inherited`, the types a session's
 /// input inherits from the earlier inputs, each with its declaration's
-/// number in `store` (see [Types](#types)); and for a session's input, with
+/// number in `store` (see [Types](#types)), and the variants, each by its
+/// enum's key and its name with its own key (see [Enums](#enums)); and for
+/// a session's input, with
 /// `def_types`, the def-types it inherits from the earlier inputs, by path
 /// with their namespaces' keys, and its number among the session's inputs
 /// (see [Def-types](#def-types)).
@@ -2753,7 +2807,7 @@ fn scan_into_with(
     (sources, placing): (&[SourceFile], Placing),
     library: Library,
     (names, loaded): (&mut Names, &mut Vec<usize>),
-    (store, inherited): (&mut TypeStore, &[(Name, u32)]),
+    (store, (inherited, variants)): (&mut TypeStore, Inheriting<'_>),
     def_types: (&[(Vec<Name>, Name)], Option<u32>),
 ) -> Result<Scan, Vec<Diagnostic>> {
     let mut scan = Scan {
@@ -2783,6 +2837,8 @@ fn scan_into_with(
         type_store: mem::take(store),
         type_base: 0,
         inherited_types: inherited.to_vec(),
+        variants: Vec::new(),
+        inherited_variants: variants.to_vec(),
         inherited_def_types: def_types.0.to_vec(),
         input_number: def_types.1,
         syntax_errors: Vec::new(),
@@ -3052,6 +3108,7 @@ fn unscan(scan: &mut Scan, mark: TypeStoreMark, dropped: &[(u32, usize)]) {
     scan.defs.clear();
     scan.part_base.clear();
     scan.types.clear();
+    scan.variants.clear();
     scan.dir_types.clear();
     scan.type_store.truncate(mark);
     scan.type_base = 0;
@@ -5304,6 +5361,38 @@ impl Scan {
         self.types.get(decl as usize).map(|declared| declared.name)
     }
 
+    /// The enums file `index` declares, each by its item and its key (see
+    /// [Enums](#enums)).
+    fn file_enums(&self, index: u32) -> Vec<(ItemId, Name)> {
+        let Some(file) = self.files.get(index as usize) else {
+            return Vec::new();
+        };
+        file.types
+            .iter()
+            .filter_map(|&decl| {
+                let declared = self.types.get(decl as usize)?;
+                declared.ty.is_none().then_some(())?;
+                let (key, _) = self
+                    .type_store
+                    .enum_of(self.type_base.saturating_add(decl))?;
+                Some((declared.item, key))
+            })
+            .collect()
+    }
+
+    /// What declares what file `file` declares, for the keys of its enums
+    /// and variants ([`names::enum_key`]): its path, or `input N` for a
+    /// session's input, every input of a session sharing one file's place.
+    pub(crate) fn origin(&self, file: u32) -> String {
+        match self.input_number {
+            Some(number) if file >= self.standard => format!("input {number}"),
+            _ => self
+                .files
+                .get(file as usize)
+                .map_or_else(String::new, |file| file.path.clone()),
+        }
+    }
+
     /// The name of the type `decl`, an index in [`Scan::types`], as text.
     fn show_type(&self, decl: u32) -> &str {
         self.type_name(decl).map_or("", |name| self.names.get(name))
@@ -5679,27 +5768,12 @@ fn type_views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
 /// directory and of each directory above it, and of every file of each
 /// module it imports, a directory's own files or a file, each once.
 fn method_views(scan: &mut Scan) {
-    let mut by_dir: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (index, file) in (0u32..).zip(&scan.files) {
-        by_dir.entry(file.dir).or_default().push(index);
-    }
+    let by_dir = files_by_dir(scan);
     let mut views = Vec::with_capacity(scan.files.len());
-    for (index, file) in (0u32..).zip(&scan.files) {
-        let mut sources: Vec<u32> = scan
-            .chain(file.dir)
-            .flat_map(|dir| by_dir.get(&dir).into_iter().flatten().copied())
-            .collect();
-        for &module in &file.method_modules {
-            match module {
-                Target::Dir(dir) => sources.extend(by_dir.get(&dir).into_iter().flatten()),
-                Target::File(other) => sources.push(other),
-                _ => {}
-            }
-        }
-        let mut seen: HashSet<u32> = HashSet::new();
+    for index in 0..count(scan.files.len()) {
         let mut view: HashMap<Name, Vec<MethodRef>> = HashMap::new();
-        for source in sources {
-            if source == index || !seen.insert(source) {
+        for source in visible_files(scan, index, &by_dir) {
+            if source == index {
                 continue;
             }
             let Some(other) = scan.files.get(source as usize) else {
@@ -5719,6 +5793,141 @@ fn method_views(scan: &mut Scan) {
     for (file, view) in scan.files.iter_mut().zip(views) {
         file.method_view = view;
     }
+}
+
+/// The files of each directory, by its index.
+fn files_by_dir(scan: &Scan) -> HashMap<u32, Vec<u32>> {
+    let mut by_dir: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (index, file) in (0u32..).zip(&scan.files) {
+        by_dir.entry(file.dir).or_default().push(index);
+    }
+    by_dir
+}
+
+/// The files whose methods and variants file `index` sees (see
+/// [Methods](#methods)), each once, in order, the file itself first: the
+/// files of its directory and of each directory above it, and of each
+/// module it imports, a directory's own files or a file. `by_dir` lists
+/// each directory's files.
+fn visible_files(scan: &Scan, index: u32, by_dir: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
+    let Some(file) = scan.files.get(index as usize) else {
+        return Vec::new();
+    };
+    let mut sources: Vec<u32> = vec![index];
+    sources.extend(
+        scan.chain(file.dir)
+            .flat_map(|dir| by_dir.get(&dir).into_iter().flatten().copied()),
+    );
+    for &module in &file.method_modules {
+        match module {
+            Target::Dir(dir) => sources.extend(by_dir.get(&dir).into_iter().flatten()),
+            Target::File(other) => sources.push(other),
+            _ => {}
+        }
+    }
+    let mut seen: HashSet<u32> = HashSet::new();
+    sources.retain(|&source| seen.insert(source));
+    sources
+}
+
+/// Makes each file's view of variants ([`File::variant_view`], see
+/// [Enums](#enums)), once the variants are found: the variants of the
+/// files it sees ([`visible_files`]) and, for a session's input, the
+/// earlier inputs', by their enum and name, each key once.
+fn variant_views(scan: &mut Scan) {
+    let by_dir = files_by_dir(scan);
+    let mut views = Vec::with_capacity(scan.files.len());
+    for index in 0..count(scan.files.len()) {
+        let seen: HashSet<u32> = visible_files(scan, index, &by_dir).into_iter().collect();
+        let mut view: HashMap<(Name, Name), Vec<SeenVariant>> = HashMap::new();
+        for (at, variant) in (0u32..).zip(&scan.variants) {
+            if let Some((of, _)) = variant.enum_of
+                && seen.contains(&variant.file)
+            {
+                let entry = view.entry((of, variant.name)).or_default();
+                if !entry.iter().any(|seen| seen.key == variant.key) {
+                    entry.push(SeenVariant {
+                        key: variant.key,
+                        declared: Some(at),
+                    });
+                }
+            }
+        }
+        // A session's input sees its earlier inputs' variants too, but of
+        // a name it declares a variant of, which shadows theirs.
+        if index >= scan.standard {
+            for &(of, name, key) in &scan.inherited_variants {
+                let entry = view.entry((of, name)).or_default();
+                if entry.is_empty() {
+                    entry.push(SeenVariant {
+                        key,
+                        declared: None,
+                    });
+                }
+            }
+        }
+        views.push(view);
+    }
+    for (file, view) in scan.files.iter_mut().zip(views) {
+        file.variant_view = view;
+    }
+}
+
+/// Finds every variant of an enum the scan's files declare (see
+/// [Enums](#enums)), once their types are defined, each with its enum, by
+/// the declaration the file's view of types names by what it writes, if
+/// that is an enum's, and its key, made of its enum's and of its file.
+fn declare_variants(scan: &mut Scan) {
+    let mut found = Vec::new();
+    for index in 0..count(scan.files.len()) {
+        let Some(file) = scan.files.get(index as usize) else {
+            continue;
+        };
+        let variants: Vec<(ItemId, TypeExprId, Name, Span)> = file
+            .ast
+            .items(file.ast.root())
+            .iter()
+            .filter_map(|&item| match file.ast.item(item).kind {
+                ItemKind::Variant {
+                    of,
+                    name,
+                    name_span,
+                    ..
+                } => Some((item, of, name, name_span)),
+                _ => None,
+            })
+            .collect();
+        if variants.is_empty() {
+            continue;
+        }
+        let links = scan.type_links(index);
+        let origin = scan.origin(index);
+        for (item, of, name, span) in variants {
+            let enum_of =
+                links
+                    .iter()
+                    .find(|&&(at, _)| at == of)
+                    .and_then(|(_, link)| match link {
+                        TypeLink::Decl(decl) => scan.type_store.enum_of(*decl),
+                        TypeLink::Error(_) => None,
+                    });
+            let of_text =
+                enum_of.map_or_else(String::new, |(key, _)| scan.names.get(key).to_owned());
+            let text = names::variant_key(scan.names.get(name), &of_text, &origin);
+            let key = scan.names.intern(&text);
+            found.push(DeclaredVariant {
+                file: index,
+                item,
+                name,
+                span,
+                of,
+                enum_of,
+                key,
+            });
+        }
+    }
+    scan.variants = found;
+    variant_views(scan);
 }
 
 /// The conflict in file `index`'s view of types of the type `name` between
@@ -5777,9 +5986,18 @@ fn define_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
         ) else {
             continue;
         };
-        scan.type_store
-            .declare(base.saturating_add(at), (&file.ast, decl.ty), links);
+        if let Some(ty) = decl.ty {
+            scan.type_store
+                .declare(base.saturating_add(at), (&file.ast, ty), links);
+        } else {
+            let origin = scan.origin(decl.file);
+            let text = names::enum_key(scan.names.get(decl.name), &origin);
+            let key = scan.names.intern(&text);
+            scan.type_store
+                .declare_enum(base.saturating_add(at), (key, decl.name), decl.span);
+        }
     }
+    declare_variants(scan);
     // What each declaration refers to of the scan's own: the store's
     // earlier declarations, a session's earlier inputs', are settled.
     let edges: Vec<Vec<u32>> = (0..count(scan.types.len()))
@@ -6588,6 +6806,37 @@ impl<'a> Context<'a> {
     pub(crate) fn method(&self, name: Name, index: u32) -> Option<&'a CheckedMethod> {
         let found = self.file.method_view.get(&name)?.get(index as usize)?;
         self.methods.get(found)
+    }
+
+    /// The variants named `name` of the enum of the key `of` that the file
+    /// sees (see [Enums](#enums)): one, or several declared in different
+    /// files, which is an error of any use.
+    pub(crate) fn variants(&self, of: Name, name: Name) -> &'a [SeenVariant] {
+        self.file
+            .variant_view
+            .get(&(of, name))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The names of the variants of the enum of the key `of` that the file
+    /// sees, sorted, for a note.
+    pub(crate) fn variant_names(&self, of: Name) -> Vec<Name> {
+        let mut found: Vec<Name> = self
+            .file
+            .variant_view
+            .keys()
+            .filter(|&&(enum_key, _)| enum_key == of)
+            .map(|&(_, name)| name)
+            .collect();
+        found.sort_unstable();
+        found
+    }
+
+    /// Where the variant the scan's [`Scan::variants`] has as number
+    /// `declared` is declared: its file and its name's span.
+    pub(crate) fn variant_site(&self, declared: u32) -> Option<(u32, Span)> {
+        let variant = self.scan.variants.get(declared as usize)?;
+        Some((variant.file, variant.span))
     }
 
     /// Whether the file sees a method named `name` of another file (see
@@ -7542,6 +7791,55 @@ fn check_type_items(scan: &mut Scan, names: &mut Names, types: &mut TypeTable) -
         let found = check_types(&file.ast, types, sees_broken);
         *names = file.ast.replace_names(Names::new());
         errors.extend(in_file(found, index));
+    }
+    errors.extend(check_enum_items((scan, 0), names, types));
+    errors
+}
+
+/// Resolves the bounds of every enum of the scan's files from number `from`
+/// on, and then every variant's payload, once their `type` items are
+/// checked (see
+/// [Enums](#enums)), lent the workspace's `names`, interning into `types`,
+/// which records them. Returns the errors found, each in its file.
+fn check_enum_items(
+    (scan, from): (&mut Scan, u32),
+    names: &mut Names,
+    types: &mut TypeTable,
+) -> Vec<Diagnostic> {
+    let mut errors = Vec::new();
+    let enums: Vec<Vec<(ItemId, Name)>> = (0..count(scan.files.len()))
+        .map(|index| scan.file_enums(index))
+        .collect();
+    let mut variants: Vec<Vec<VariantItem>> = vec![Vec::new(); scan.files.len()];
+    for variant in &scan.variants {
+        if let Some(entry) = variants.get_mut(variant.file as usize) {
+            entry.push((variant.item, variant.enum_of, variant.key));
+        }
+    }
+    for pass in [false, true] {
+        for (index, file) in (0u32..).zip(&mut scan.files).skip(from as usize) {
+            let (Some(enums), Some(variants)) =
+                (enums.get(index as usize), variants.get(index as usize))
+            else {
+                continue;
+            };
+            let empty = if pass {
+                variants.is_empty()
+            } else {
+                enums.is_empty()
+            };
+            if empty || file.ast.syntax() == Syntax::Unbalanced {
+                continue;
+            }
+            file.ast.replace_names(mem::take(names));
+            let found = if pass {
+                check_variant_payloads(&file.ast, types, variants)
+            } else {
+                check_enum_bounds(&file.ast, types, enums)
+            };
+            *names = file.ast.replace_names(Names::new());
+            errors.extend(in_file(found, index));
+        }
     }
     errors
 }
@@ -10141,12 +10439,25 @@ pub(crate) struct Earlier<'a> {
     /// Their def-types that no later input shadowed, each by its path, with
     /// its namespace's key (see [Def-types](#def-types)).
     pub(crate) def_types: &'a [(Vec<Name>, Name)],
+    /// Their variants that no later input shadowed, each by its enum's key
+    /// and its name, with its own key (see [Enums](#enums)).
+    pub(crate) variants: &'a [(Name, Name, Name)],
 }
 
-/// What a later input inherits of a session's input once it has run: its
-/// imports, its view of types and the def-types it declares, each by its
-/// path with its namespace's key (see [`check_input`]).
-pub(crate) type Inherited = (Vec<Alias>, Vec<(Name, u32)>, Vec<(Vec<Name>, Name)>);
+/// What a later input inherits of a session's input once it has run (see
+/// [`check_input`]).
+#[derive(Debug, Default)]
+pub(crate) struct Inherited {
+    /// Its imports.
+    pub(crate) imports: Vec<Alias>,
+    /// Its view of types.
+    pub(crate) types: Vec<(Name, u32)>,
+    /// The def-types it declares, each by its path with its namespace's key.
+    pub(crate) def_types: Vec<(Vec<Name>, Name)>,
+    /// The variants it declares, each by its enum's key and its name, with
+    /// its own key.
+    pub(crate) variants: Vec<InheritedVariant>,
+}
 
 /// [`check_input`] up to its check, whose outcome `then` is given with the
 /// input's tree, its names in it, and the types: what lowering is done by,
@@ -10177,10 +10488,16 @@ fn check_input_then<R>(
         placed,
         Library::EVERY,
         (names, &mut loaded),
-        (store, earlier.types),
+        (store, (earlier.types, earlier.variants)),
         (earlier.def_types, Some(input)),
     )
     .map_err(|errors| being_run(errors, count(loaded.len())))?;
+    // The input's enums and variants, the standard files' being known since
+    // the session started.
+    let mut lent = mem::take(&mut scan.names);
+    let standard_files = scan.standard;
+    let enum_errors = check_enum_items((&mut scan, standard_files), &mut lent, types);
+    scan.names = lent;
     // In the session's root, as its start located the standard files.
     scan.locate(standard.dirs.first().map_or("/", |root| root));
     let index = scan.standard;
@@ -10224,12 +10541,13 @@ fn check_input_then<R>(
             session: true,
             ..context
         };
-        let declared = if file.mentions.types.is_empty() {
+        let mut declared = if file.mentions.types.is_empty() {
             Vec::new()
         } else {
             // A session's input with a syntax error is not checked.
             check_types(&file.ast, types, false)
         };
+        declared.extend(enum_errors.iter().cloned());
         let checked = Checker::in_workspace(&file.ast, scope, types, &context).check();
         let checked = match (declared.is_empty(), checked) {
             (true, checked) => checked,
@@ -10238,25 +10556,31 @@ fn check_input_then<R>(
         };
         Some(then(&file.ast, checked, types))
     });
-    let mut imports = Vec::new();
-    let mut view = Vec::new();
-    let mut def_types = Vec::new();
+    let mut inherited = Inherited::default();
     if let Some(file) = scan.files.get_mut(index as usize) {
         *names = file.ast.replace_names(Names::new());
-        imports.extend(file.aliases.iter().filter(|a| !a.implicit).map(|a| Alias {
-            span: Span::new(0, 0),
-            item: None,
-            inherited: true,
-            ..*a
-        }));
-        view.extend(file.type_view.iter().map(|(&name, &decl)| (name, decl)));
-        view.sort_unstable();
-        def_types = declared_def_types(file, names, input);
+        inherited
+            .imports
+            .extend(file.aliases.iter().filter(|a| !a.implicit).map(|a| Alias {
+                span: Span::new(0, 0),
+                item: None,
+                inherited: true,
+                ..*a
+            }));
+        inherited
+            .types
+            .extend(file.type_view.iter().map(|(&name, &decl)| (name, decl)));
+        inherited.types.sort_unstable();
+        inherited.def_types = declared_def_types(file, names, input);
     }
+    inherited.variants = scan
+        .variants
+        .iter()
+        .filter(|variant| variant.file == index)
+        .filter_map(|variant| Some((variant.enum_of?.0, variant.name, variant.key)))
+        .collect();
     *store = mem::take(&mut scan.type_store);
-    finished
-        .map(|r| (r, (imports, view, def_types)))
-        .ok_or_else(Vec::new)
+    finished.map(|r| (r, inherited)).ok_or_else(Vec::new)
 }
 
 /// The def-types `file`, session input number `input` whose names are
@@ -10312,6 +10636,7 @@ pub(crate) fn check_beside_prelude(
         types: &[],
         store: &mut TypeStore::new(),
         def_types: &[],
+        variants: &[],
     };
     // A session's first input, after the standard files.
     let input = count(crate::STANDARD.len());

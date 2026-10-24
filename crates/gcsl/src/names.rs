@@ -25,6 +25,20 @@
 //! holding `<` and `@` but no `#` is neither kind of namespace key, so a
 //! method's binding is never mistaken for one.
 //!
+//! # Enum keys
+//!
+//! An enum is nominal (see the checker's "Enums"), and so is each of its
+//! variants, so each has an identity a type or a value carries: a *key*, a
+//! name no source can write, of its name and of what declares it, the path
+//! of its file, or `input N` for a session's input. A key is the same for
+//! every scan of one file, so that the standard library's enums, which
+//! every input of a session scans again, are one enum in all of them, and
+//! a value of an earlier input is of the enum a later one names. An enum's
+//! key is [`enum_key`]'s, a variant's [`variant_key`]'s, which holds its
+//! enum's, so that two enums' variants of one name are two. A key holds no
+//! `#` before digits and a `.`, so it is no namespace key, and does not
+//! start `<method `, so it is no method's binding.
+//!
 //! # Namespace keys
 //!
 //! The definitions made with a def-type (`def package x() { ... }`) are kept
@@ -238,6 +252,22 @@ pub fn binding_method(text: &str) -> Option<&str> {
     let inner = text.strip_prefix("<method ")?.strip_suffix('>')?;
     let (name, ordinal) = inner.rsplit_once('@')?;
     (!ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit())).then_some(name)
+}
+
+/// The text of the key of the enum `name` that `origin` declares, the path
+/// of its file, or `input N` for a session's input (see [Enum
+/// keys](#enum-keys)): `<enum Toolchain@stdlib/toolchain.gcsl>`.
+#[must_use]
+pub fn enum_key(name: &str, origin: &str) -> String {
+    format!("<enum {name}@{origin}>")
+}
+
+/// The text of the key of the variant `name` of the enum whose key's text is
+/// `of` that `origin` declares (see [Enum keys](#enum-keys)):
+/// `<variant C of <enum Toolchain@stdlib/toolchain.gcsl>@stdlib/toolchain.gcsl>`.
+#[must_use]
+pub fn variant_key(name: &str, of: &str, origin: &str) -> String {
+    format!("<variant {name} of {of}@{origin}>")
 }
 
 /// The path of names `path`, as a diagnostic shows it: joined by `.`, but a

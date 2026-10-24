@@ -932,17 +932,17 @@ use crate::ast::FnId;
 use crate::check::{Builtin, Slot};
 use crate::diagnostic::{Diagnostic, Mark as ErrorMark};
 use crate::ir::{
-    ArgValue, CatchId, Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField,
-    LazyShapeId, ListShape, MetaAt, Operands, RestShape, ShapeId, ShapedOperands, StepAt, StepMode,
-    UpdatePathId, UpdateStep,
+    ArgValue, CatchId, Cmp, ConstId, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId,
+    LazyField, LazyShapeId, ListShape, MetaAt, Operands, RestShape, ShapeId, ShapedOperands,
+    StepAt, StepMode, UpdatePathId, UpdateStep,
 };
 use crate::names::Name;
 use crate::source::Span;
 use crate::strings::FieldName;
 use crate::types::ValueTest;
 use crate::value::{
-    Begin, Caller, Closure, Future, FutureState, Layout, List, Quantity, Record, Value, ValueKind,
-    int_to_float,
+    Begin, Caller, Closure, Future, FutureState, Layout, List, Quantity, Record, Tag, Value,
+    ValueKind, Variant, int_to_float,
 };
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
@@ -1178,6 +1178,9 @@ enum Callee {
     Closure(Rc<Closure>),
     /// A built-in function.
     Builtin(Builtin),
+    /// A variant of an enum, which a call of makes a value of its enum of
+    /// its argument (see the checker's "Enums").
+    Tag(Rc<Tag>),
 }
 
 /// What every frame of an evaluation shares besides the value stack and the
@@ -1302,6 +1305,7 @@ impl Evaluator<'_> {
             IrKind::Top(slot, ValueKind::Fn) => self.top_function_value(slot, node),
             IrKind::Top(slot, kind) => self.top_value(slot, kind, node),
             IrKind::LoadCallee | IrKind::MakeClosure { .. } => self.closure_value(node),
+            IrKind::Tag { key, of, shown } => Ok(Value::Tag(self.tag((key, of, shown)))),
             IrKind::Meta(function) => self.meta_value(function, node),
             IrKind::Call {
                 callee,
@@ -1457,6 +1461,7 @@ impl Evaluator<'_> {
         match self.top_function(slot, node)? {
             Callee::Closure(closure) => Ok(Value::Fn(closure)),
             Callee::Builtin(builtin) => Ok(Value::Builtin(builtin)),
+            Callee::Tag(tag) => Ok(Value::Tag(tag)),
         }
     }
 
@@ -1507,6 +1512,8 @@ impl Evaluator<'_> {
             // A cell of the top level holding a built-in function: the
             // prelude's `int`, say, read from inside a function.
             Some(&Value::Builtin(builtin)) => Ok(Callee::Builtin(builtin)),
+            // A variant a top-level field holds.
+            Some(Value::Tag(tag)) => Ok(Callee::Tag(Rc::clone(tag))),
             _ => Err(not_made(node).into()),
         }
     }
@@ -1552,6 +1559,7 @@ impl Evaluator<'_> {
         match self.meta(function, node)? {
             Callee::Closure(closure) => Ok(Value::Fn(closure)),
             Callee::Builtin(builtin) => Ok(Value::Builtin(builtin)),
+            Callee::Tag(tag) => Ok(Value::Tag(tag)),
         }
     }
 
@@ -2076,6 +2084,7 @@ impl Evaluator<'_> {
         let closure = match self.function(callee)? {
             Callee::Closure(closure) => closure,
             Callee::Builtin(builtin) => return self.call_builtin(builtin, args, node),
+            Callee::Tag(tag) => return self.call_tag(tag, args, node),
         };
         let Some(code) = closure.code.find_function(closure.function) else {
             return mistyped(node, "a closure of a function its IR lacks");
@@ -2317,6 +2326,50 @@ impl Evaluator<'_> {
     /// ([`string_list`]) work on their strings as Rust's `str` does,
     /// `compare_versions` ([`compare_versions`]) gives `-1`, `0` or `1` by
     /// version order, `sort_versions` ([`sort_versions`]) sorts by it, and
+    /// A new temporary directory, for the call `node` of `fs_temp_dir`:
+    /// removed with everything in it when the run's owner drops it.
+    fn temp_dir(&self, node: &IrNode) -> Flow<Value> {
+        let Some(temp_dirs) = self.shared.temp_dirs else {
+            return mistyped(node, "`fs.temp_dir` called in a run without an owner");
+        };
+        match temp_dirs.make() {
+            Ok(dir) => Ok(Value::Str(Rc::from(dir))),
+            Err(reason) => Err(Diagnostic::error(
+                format!("`fs.temp_dir` could not create a temporary directory: {reason}"),
+                node.span,
+            )
+            .into()),
+        }
+    }
+
+    /// The tag of the `Tag` node `(key, of, shown)`: a variant as a value.
+    fn tag(&self, (key, of, shown): (Name, Name, ConstId)) -> Rc<Tag> {
+        Rc::new(Tag {
+            key,
+            of,
+            shown: Rc::clone(self.ir.string(shown)),
+        })
+    }
+
+    /// The value of the enum of `tag`'s variant whose payload is the one
+    /// argument `args` hold, for the `Call` `node` of the variant (see the
+    /// checker's "Enums").
+    #[inline(never)]
+    fn call_tag(&mut self, tag: Rc<Tag>, args: IrRange, node: &IrNode) -> Flow<Value> {
+        let &[arg] = self.ir.items(args) else {
+            return mistyped(node, "a variant called with other than one argument");
+        };
+        let IrKind::Arg {
+            value: ArgValue::Node(value),
+            ..
+        } = self.ir.get(arg).kind
+        else {
+            return mistyped(node, "a variant's argument is not a node's value");
+        };
+        let payload = self.value(value)?;
+        Ok(Value::Variant(Rc::new(Variant { tag, payload })))
+    }
+
     /// the file system's, `fs_exists`, `fs_read`, `fs_mkdir`, `fs_copy`
     /// ([`file_system`]), `fs_temp_dir` ([`TempDirs::make`]) and `fs_write`
     /// ([`write_file`]), touch the file system at absolute paths, each
@@ -2404,24 +2457,17 @@ impl Evaluator<'_> {
             (Builtin::FsWrite, Some((Value::Str(p), _)), Some(Value::Str(contents))) => {
                 write_file(&p, &contents, node)
             }
-            (Builtin::FsTempDir, None, None) => {
-                let Some(temp_dirs) = self.shared.temp_dirs else {
-                    return mistyped(node, "`fs.temp_dir` called in a run without an owner");
-                };
-                match temp_dirs.make() {
-                    Ok(dir) => Ok(Value::Str(Rc::from(dir))),
-                    Err(reason) => Err(Diagnostic::error(
-                        format!("`fs.temp_dir` could not create a temporary directory: {reason}"),
-                        node.span,
-                    )
-                    .into()),
-                }
-            }
+            (Builtin::FsTempDir, None, None) => self.temp_dir(node),
             (
                 Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir | Builtin::FsCopy,
                 Some((Value::Str(p), _)),
                 to,
             ) => file_system(builtin, &p, to.as_ref(), node),
+            (
+                Builtin::VariantMatches | Builtin::VariantPayload | Builtin::PartialMatches,
+                Some((first, _)),
+                Some(second),
+            ) => enum_builtin(builtin, (&first, &second), node),
             _ => mistyped(
                 node,
                 "a built-in function called through a value with an argument of another kind",
@@ -2769,6 +2815,7 @@ impl Evaluator<'_> {
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_function),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
             IrKind::LoadCallee => self.callee(node).map(Callee::Closure),
+            IrKind::Tag { key, of, shown } => Ok(Callee::Tag(self.tag((key, of, shown)))),
             IrKind::Top(slot, _) => self.top_function(slot, node),
             IrKind::MakeClosure { function, captures } => {
                 self.make_closure(function, captures).map(Callee::Closure)
@@ -3312,6 +3359,7 @@ impl Evaluator<'_> {
             }
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where an Int was expected"),
         }
@@ -3532,6 +3580,7 @@ impl Evaluator<'_> {
             }
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a Float was expected"),
         }
@@ -3627,6 +3676,7 @@ impl Evaluator<'_> {
             }
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a Bool was expected"),
         }
@@ -3774,6 +3824,7 @@ impl Evaluator<'_> {
             }
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a String was expected"),
         }
@@ -3858,6 +3909,7 @@ impl Evaluator<'_> {
             | IrKind::Update { .. } => mistyped(node, "list node where a record was expected"),
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a record was expected"),
         }
@@ -4024,6 +4076,8 @@ impl Evaluator<'_> {
             | Value::List(_)
             | Value::Fn(_)
             | Value::Builtin(_)
+            | Value::Tag(_)
+            | Value::Variant(_)
             | Value::Future(_) => {
                 return mistyped(node, "an update of a value that is not a record");
             }
@@ -4939,6 +4993,17 @@ fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize) {
             text.hash(state);
         }
         Value::Empty => state.write_u8(4),
+        Value::Tag(tag) => {
+            state.write_u8(11);
+            tag.key.hash(state);
+        }
+        Value::Variant(variant) => {
+            state.write_u8(12);
+            variant.tag.key.hash(state);
+            if depth > 0 {
+                hash_value(&variant.payload, state, depth - 1);
+            }
+        }
         Value::Record(record) => {
             state.write_u8(5);
             state.write_usize(record.values.len());
@@ -5355,6 +5420,7 @@ fn passes(test: &ValueTest, value: &Value) -> bool {
         ValueTest::Any(alternatives) => alternatives
             .iter()
             .any(|alternative| passes(alternative, value)),
+        ValueTest::Enum(key) => matches!(value, Value::Variant(variant) if variant.tag.of == *key),
     }
 }
 
@@ -5471,6 +5537,62 @@ fn with_fields(value: &Value) -> Option<&Record> {
     }
 }
 
+/// The call `node` of `builtin`, `variant_matches`, `variant_payload` or
+/// `partial_matches`, with the arguments `first` and `second` (see the
+/// checker's "Enums" and "Partial records"): `variant_payload` of a value
+/// of another variant than its kind is a runtime error, "the value is
+/// `Tool::Rust`, not `Tool::C`".
+fn enum_builtin(builtin: Builtin, (first, second): (&Value, &Value), node: &IrNode) -> Flow<Value> {
+    match (builtin, first, second) {
+        (Builtin::VariantMatches, Value::Tag(kind), Value::Variant(value)) => {
+            Ok(Value::Bool(value.tag.key == kind.key))
+        }
+        (Builtin::VariantPayload, Value::Tag(kind), Value::Variant(value)) => {
+            if value.tag.key == kind.key {
+                Ok(value.payload.clone())
+            } else {
+                Err(Diagnostic::error(
+                    format!("the value is `{}`, not `{}`", value.tag.shown, kind.shown),
+                    node.span,
+                )
+                .into())
+            }
+        }
+        (Builtin::PartialMatches, partial, full) => Ok(Value::Bool(partial_matches(partial, full))),
+        _ => mistyped(
+            node,
+            "an enum's built-in called with an argument of another kind",
+        ),
+    }
+}
+
+/// Whether every field `partial`, a record, holds equals the field of its
+/// name of `full`, a record, as `===` compares them: what
+/// `partial.matches(full)` is (see the checker's "Partial records"). A
+/// field `full` lacks matches nothing.
+fn partial_matches(partial: &Value, full: &Value) -> bool {
+    let Value::Record(partial) = partial else {
+        // `{}` holds no field, so matches every record.
+        return true;
+    };
+    let Value::Record(full) = full else {
+        return false;
+    };
+    partial
+        .layout
+        .names
+        .iter()
+        .zip(&partial.values)
+        .all(|(name, value)| {
+            full.layout
+                .names
+                .iter()
+                .position(|own| own == name)
+                .and_then(|at| full.values.get(at))
+                .is_some_and(|own| own == value)
+        })
+}
+
 /// What `value` is, after its indefinite article, as a failed test's label
 /// says it: "an Int", "a Float", "a Duration", "a Size", "a Bool", "a
 /// String", "a record", "a list", "a function" or "a future".
@@ -5485,6 +5607,8 @@ const fn described(value: &Value) -> &'static str {
         Value::Empty | Value::Record(_) => "a record",
         Value::List(_) => "a list",
         Value::Fn(_) | Value::Builtin(_) => "a function",
+        Value::Tag(_) => "a variant",
+        Value::Variant(_) => "a value of an enum",
         Value::Future(_) => "a future",
     }
 }
@@ -5570,6 +5694,7 @@ fn as_function(value: &Value, node: &IrNode) -> Flow<Callee> {
     match value {
         Value::Fn(closure) => Ok(Callee::Closure(Rc::clone(closure))),
         &Value::Builtin(builtin) => Ok(Callee::Builtin(builtin)),
+        Value::Tag(tag) => Ok(Callee::Tag(Rc::clone(tag))),
         _ => mistyped(node, "function load from a slot holding another type"),
     }
 }
@@ -5581,6 +5706,7 @@ fn into_callee(value: Value) -> Option<Callee> {
     match value {
         Value::Fn(closure) => Some(Callee::Closure(closure)),
         Value::Builtin(builtin) => Some(Callee::Builtin(builtin)),
+        Value::Tag(tag) => Some(Callee::Tag(tag)),
         _ => None,
     }
 }
@@ -6358,7 +6484,11 @@ fn source_of(value: &Value, node: &IrNode) -> Flow<Rc<str>> {
             Value::Fn(_) | Value::Builtin(_) => {
                 return mistyped(node, "a function given to `show`");
             }
-            Value::Int(_)
+            // A variant's source is how it is shown, `Toolchain::C`, and a
+            // value of an enum the call of it on its payload's.
+            Value::Variant(variant) => pending.push(&variant.payload),
+            Value::Tag(_)
+            | Value::Int(_)
             | Value::Float(_)
             | Value::Quantity(..)
             | Value::Bool(_)

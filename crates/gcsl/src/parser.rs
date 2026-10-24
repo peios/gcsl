@@ -1074,6 +1074,18 @@ const MISPLACED_IMPORT: &str = "`import` is only allowed at the top level of a f
 /// The contextual keyword that begins a `type` item.
 const TYPE: &str = "type";
 
+/// The word that starts an `enum` item, which is no keyword (see
+/// [Enums](#enums)).
+const ENUM: &str = "enum";
+
+/// The word after an extensible enum's name, which is no keyword (see
+/// [Enums](#enums)).
+const EXTENSIBLE: &str = "extensible";
+
+/// The error for an `enum` anywhere but at a file's top level, at its
+/// `enum`.
+const MISPLACED_ENUM: &str = "`enum` is declared only at the top level of a file";
+
 /// The error for a `type` item anywhere but in a file's outermost body.
 const MISPLACED_TYPE: &str = "`type` is declared only at the top level of a file";
 
@@ -1795,6 +1807,12 @@ impl Parser<'_> {
                     return Err(self.error(MISPLACED_TYPE, token.span));
                 }
                 self.parse_type_item(token)?
+            }
+            _ if self.starts_enum_item() => {
+                if inner {
+                    return Err(self.error(MISPLACED_ENUM, token.span));
+                }
+                self.parse_enum_item(token)?
             }
             _ if self.starts_method(self.pos) => {
                 if inner {
@@ -3379,6 +3397,164 @@ impl Parser<'_> {
             && matches!(self.peek_at(1).kind, TokenKind::Ident(_))
     }
 
+    /// Whether the tokens here start an `enum` item: the word `enum`, then
+    /// a name (see [Enums](#enums)).
+    fn starts_enum_item(&self) -> bool {
+        matches!(self.peek().kind, TokenKind::Ident(name) if self.names.get(name) == ENUM)
+            && matches!(self.peek_at(1).kind, TokenKind::Ident(_))
+    }
+
+    /// Parses an `enum` item of the file's body, starting at its `enum`,
+    /// `keyword` (see [Enums](#enums)): an enum, `enum NAME extensible`
+    /// and its bound, or a variant, `enum ENUM::NAME` and its payload.
+    fn parse_enum_item(&mut self, keyword: Token) -> ParseResult<(ItemId, u32)> {
+        self.advance();
+        let name_token = self.peek();
+        let TokenKind::Ident(name) = name_token.kind else {
+            return Err(self.error("expected the enum's name after `enum`", name_token.span));
+        };
+        let qualified = self.peek_at(1).kind == TokenKind::Dot;
+        if qualified || self.peek_at(1).kind == TokenKind::ColonColon {
+            let (of, of_height) = if qualified {
+                self.parse_type_path()?
+            } else {
+                self.advance();
+                let of = self.builder.alloc_type(TypeExpr {
+                    kind: TypeExprKind::Named(name),
+                    span: name_token.span,
+                });
+                (of, LEAF_HEIGHT)
+            };
+            let colons = self.peek();
+            if colons.kind != TokenKind::ColonColon {
+                let found = self.describe(colons);
+                return Err(self.error(
+                    format!("expected `::` and a variant's name after the enum, found {found}"),
+                    error_span(colons),
+                ));
+            }
+            self.advance();
+            let variant = self.peek();
+            let TokenKind::Ident(variant_name) = variant.kind else {
+                let found = self.describe(variant);
+                return Err(self.error(
+                    format!("expected the variant's name after `::`, found {found}"),
+                    error_span(variant),
+                ));
+            };
+            self.advance();
+            let (payload, height) = self.parse_enum_type_arg(of_height)?;
+            let end = payload.map_or(variant.span, |payload| self.type_span(payload));
+            let item = self.builder.alloc_item(Item {
+                kind: ItemKind::Variant {
+                    of,
+                    name: variant_name,
+                    name_span: variant.span,
+                    payload,
+                },
+                span: Span::join(keyword.span, end),
+            });
+            return Ok((item, height));
+        }
+        self.advance();
+        let word = self.peek();
+        let extensible =
+            matches!(word.kind, TokenKind::Ident(text) if self.names.get(text) == EXTENSIBLE);
+        if !extensible {
+            let found = self.describe(word);
+            return Err(self.report(
+                Diagnostic::error(
+                    format!("expected `extensible` after the enum's name, found {found}"),
+                    error_span(word),
+                )
+                .with_note("only an extensible enum is declared: `enum NAME extensible<BOUND>`"),
+            ));
+        }
+        self.advance();
+        let (bound, height) = self.parse_enum_type_arg(LEAF_HEIGHT)?;
+        let end = bound.map_or(word.span, |bound| self.type_span(bound));
+        let item = self.builder.alloc_item(Item {
+            kind: ItemKind::Enum {
+                name,
+                name_span: name_token.span,
+                bound,
+            },
+            span: Span::join(keyword.span, end),
+        });
+        Ok((item, height))
+    }
+
+    /// Parses an enum's bound or a variant's payload, `<TYPE>`, if a `<` is
+    /// next: one type, newlines allowed inside, and the `>` directly after
+    /// it. Returns it, if there is one, and the item's height, one more than
+    /// the type's, or `at_least`.
+    fn parse_enum_type_arg(&mut self, at_least: u32) -> ParseResult<(Option<TypeExprId>, u32)> {
+        let open = self.peek();
+        if open.kind != TokenKind::Lt {
+            return Ok((None, at_least));
+        }
+        self.advance();
+        self.skip_newlines();
+        let (ty, ty_height) = self.parse_type()?;
+        self.skip_newlines();
+        let close = self.peek();
+        if close.kind != TokenKind::Gt {
+            return Err(self.report(
+                Diagnostic::error("expected `>` to close the type", error_span(close))
+                    .with_context(open.span, "unclosed `<`"),
+            ));
+        }
+        self.advance();
+        Ok((Some(ty), ty_height.saturating_add(1).max(at_least)))
+    }
+
+    /// Whether the tokens here start a variant as a value, `ENUM::NAME` or
+    /// `t.ENUM::NAME`: names joined by `.`, then `::` (see [Enums](#enums)).
+    fn starts_variant(&self) -> bool {
+        let mut at = 0;
+        loop {
+            if !matches!(self.peek_at(at).kind, TokenKind::Ident(_)) {
+                return false;
+            }
+            match self.peek_at(at + 1).kind {
+                TokenKind::ColonColon => return true,
+                TokenKind::Dot => at += 2,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Parses a variant as a value, `ENUM::NAME`, which
+    /// [`Parser::starts_variant`] has found here (see [Enums](#enums)).
+    fn parse_variant_expr(&mut self) -> ParseResult<ExprId> {
+        let first = self.peek();
+        let of = if self.peek_at(1).kind == TokenKind::Dot {
+            self.parse_type_path()?.0
+        } else {
+            let TokenKind::Ident(name) = first.kind else {
+                return Err(self.error("expected an enum's name", first.span));
+            };
+            self.advance();
+            self.builder.alloc_type(TypeExpr {
+                kind: TypeExprKind::Named(name),
+                span: first.span,
+            })
+        };
+        // `::`, which `starts_variant` found.
+        self.advance();
+        let variant = self.peek();
+        let TokenKind::Ident(name) = variant.kind else {
+            let found = self.describe(variant);
+            return Err(self.error(
+                format!("expected the variant's name after `::`, found {found}"),
+                error_span(variant),
+            ));
+        };
+        self.advance();
+        let span = Span::join(first.span, variant.span);
+        self.alloc(ExprKind::Variant { of, name }, span, 1)
+    }
+
     /// Parses a `type` item of the file's body, `type NAME = TYPE`,
     /// starting at its `type`, `keyword`, which [`Parser::starts_type_item`]
     /// has found to be followed by an identifier. Returns it and its height,
@@ -4775,6 +4951,7 @@ impl Parser<'_> {
             TokenKind::True => ExprKind::Bool(true),
             TokenKind::False => ExprKind::Bool(false),
             TokenKind::Str(id) => ExprKind::Str(id),
+            TokenKind::Ident(_) if self.starts_variant() => return self.parse_variant_expr(),
             TokenKind::Ident(name) => ExprKind::Name(name),
             TokenKind::StrStart(first) => return self.parse_interpolation(first),
             TokenKind::If => return self.parse_if(),
@@ -4827,6 +5004,7 @@ impl Parser<'_> {
             | TokenKind::Import
             | TokenKind::Colon
             | TokenKind::ColonEq
+            | TokenKind::ColonColon
             | TokenKind::Arrow
             | TokenKind::MemoArrow
             | TokenKind::Eq
@@ -6130,8 +6308,10 @@ impl Parser<'_> {
             }
             _ => {
                 let at = std::mem::replace(&mut self.pos, index);
-                let item =
-                    self.starts_type_item() || self.starts_defmeta() || self.starts_path_item();
+                let item = self.starts_type_item()
+                    || self.starts_enum_item()
+                    || self.starts_defmeta()
+                    || self.starts_path_item();
                 self.pos = at;
                 item
             }
@@ -6385,6 +6565,7 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::Neg
         | TokenKind::Colon
         | TokenKind::ColonEq
+        | TokenKind::ColonColon
         | TokenKind::Arrow
         | TokenKind::MemoArrow
         | TokenKind::Eq

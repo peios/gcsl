@@ -910,6 +910,7 @@ fn lets(ast: &Ast, body: ItemRange, out: &mut Vec<ItemId>) {
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
             | ExprKind::Name(_)
+            | ExprKind::Variant { .. }
             | ExprKind::DefTypeRef(_)
             | ExprKind::Error => {}
         }
@@ -933,6 +934,8 @@ fn lets(ast: &Ast, body: ItemRange, out: &mut Vec<ItemId>) {
             | ItemKind::Continue(_)
             | ItemKind::Return(_)
             | ItemKind::Import(_)
+            | ItemKind::Enum { .. }
+            | ItemKind::Variant { .. }
             | ItemKind::Type { .. }
             | ItemKind::Error => {}
         }

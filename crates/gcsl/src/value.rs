@@ -778,6 +778,32 @@ pub enum Value {
     /// it is. Only the driver of a workspace makes one, writing each into
     /// its cell as it lays out the frame (see [`crate::workspace`]).
     Builtin(Builtin),
+    /// A variant of an enum as a value, `Toolchain::C`: of kind
+    /// [`ValueKind::Fn`], since a call of it makes a value of the enum, and
+    /// compared by which variant it is (see the checker's "Enums").
+    Tag(Rc<Tag>),
+    /// A value of an enum: a variant and its payload, compared by both.
+    Variant(Rc<Variant>),
+}
+
+/// A variant of an enum, as values carry it (see the checker's "Enums").
+#[derive(Debug, PartialEq, Eq)]
+pub struct Tag {
+    /// Its key, its identity ([`crate::names::variant_key`]).
+    pub key: Name,
+    /// Its enum's key ([`crate::names::enum_key`]).
+    pub of: Name,
+    /// How it is shown, `Toolchain::C`.
+    pub shown: Rc<str>,
+}
+
+/// A value of an enum: its variant and its payload.
+#[derive(Debug, PartialEq)]
+pub struct Variant {
+    /// The variant.
+    pub tag: Rc<Tag>,
+    /// The payload.
+    pub payload: Value,
 }
 
 impl Value {
@@ -792,8 +818,11 @@ impl Value {
             Value::Str(_) => ValueKind::String,
             Value::Empty | Value::Record(_) => ValueKind::Record,
             Value::List(_) => ValueKind::List,
-            Value::Fn(_) | Value::Builtin(_) => ValueKind::Fn,
+            Value::Fn(_) | Value::Builtin(_) | Value::Tag(_) => ValueKind::Fn,
             Value::Future(_) => ValueKind::Deferred,
+            // A value of an enum is of no kind of its own: present, of the
+            // kind a node of an enum's type has.
+            Value::Variant(_) => ValueKind::Mixed,
         }
     }
 
@@ -903,6 +932,10 @@ impl fmt::Display for Value {
             Value::Empty => f.write_str("{}"),
             Value::Fn(closure) => f.write_str(closure.display()),
             Value::Builtin(builtin) => f.write_str(builtin.display()),
+            Value::Tag(tag) => f.write_str(&tag.shown),
+            Value::Variant(variant) => {
+                write!(f, "{}({})", variant.tag.shown, variant.payload.repr())
+            }
             Value::Future(future) => f.write_str(future.display()),
             Value::Record(record) => {
                 f.write_str("{")?;

@@ -2103,7 +2103,7 @@ fn the_standard_summary_runs_in_a_workspace_and_alone() {
     assert_eq!(scan.dirs[scan.files[0].dir as usize].parent, None);
     assert_eq!(scan.order[0], 0);
     // The built-in functions' cells are the first.
-    let builtins: Vec<Option<Builtin>> = (0..25).map(|node| scan.builtin(node)).collect();
+    let builtins: Vec<Option<Builtin>> = (0..28).map(|node| scan.builtin(node)).collect();
     assert_eq!(
         builtins,
         [
@@ -2131,6 +2131,9 @@ fn the_standard_summary_runs_in_a_workspace_and_alone() {
             Some(Builtin::SortVersions),
             Some(Builtin::Show),
             Some(Builtin::ExecLive),
+            Some(Builtin::VariantMatches),
+            Some(Builtin::VariantPayload),
+            Some(Builtin::PartialMatches),
             None
         ]
     );
@@ -2722,8 +2725,8 @@ fn every_record_exec_builds_shares_the_runs_one_layout() {
         .map(|&(path, text)| SourceFile::new(path, text).unwrap())
         .collect();
     let mut workspace = check(&sources).unwrap();
-    // The driver wrote the twenty-four built-in functions' cells.
-    assert_eq!(assert_builtins_written(&workspace).len(), 24);
+    // The driver wrote the twenty-seven built-in functions' cells.
+    assert_eq!(assert_builtins_written(&workspace).len(), 27);
     let a = workspace.file("a.gcsl").unwrap();
     let b = workspace.file("b.gcsl").unwrap();
     let first = workspace.run(a).unwrap().value;
@@ -5609,6 +5612,7 @@ fn an_input_cannot_turn_the_prelude_off() {
         types: &[],
         store: &mut TypeStore::new(),
         def_types: &[],
+        variants: &[],
     };
     let errors = check_input(
         &started.standard,

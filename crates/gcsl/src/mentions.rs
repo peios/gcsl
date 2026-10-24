@@ -292,8 +292,9 @@ pub struct TypeDecl {
     pub item: ItemId,
     /// The item's position among the outermost block's items.
     pub position: usize,
-    /// The type it stands for.
-    pub ty: TypeExprId,
+    /// The type it stands for; `None` for an enum, which is a type of its
+    /// own (see the checker's "Enums").
+    pub ty: Option<TypeExprId>,
 }
 
 /// A read of a type by its name, in a type expression of a tree
@@ -778,7 +779,17 @@ pub fn scan_except(ast: &Ast, shadowed: &[bool]) -> Mentions {
                 span: name_span,
                 item,
                 position,
-                ty,
+                ty: Some(ty),
+            }),
+            // An enum is a type of its own, defined by nothing.
+            ItemKind::Enum {
+                name, name_span, ..
+            } => Some(TypeDecl {
+                name,
+                span: name_span,
+                item,
+                position,
+                ty: None,
             }),
             _ => None,
         })
@@ -1750,7 +1761,11 @@ impl Walker<'_> {
             // is a type's, read only in type positions (see
             // [Types](#types)).
             // What the parser could not parse mentions nothing.
-            ItemKind::Import(_) | ItemKind::Type { .. } | ItemKind::Error => {}
+            ItemKind::Import(_)
+            | ItemKind::Type { .. }
+            | ItemKind::Enum { .. }
+            | ItemKind::Variant { .. }
+            | ItemKind::Error => {}
             ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } => {
                 self.def_type_def(def, value);
             }
@@ -1832,6 +1847,9 @@ impl Walker<'_> {
             | ExprKind::Size(_)
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
+            // A variant is a constant: it reads no declaration (see
+            // [Types](#types)).
+            | ExprKind::Variant { .. }
             | ExprKind::Error => {}
             ExprKind::Interp(parts) => {
                 for &part in ast.parts(parts) {

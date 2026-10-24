@@ -1117,14 +1117,16 @@ impl Index {
             .and_then(|f| f.declared.iter().find(|&&(item, _)| item == declared.item))
             .map(|&(_, ty)| ty)
             .and_then(known);
-        let shown = match expansion {
-            Some(ty) => self.pretty(&format!("type {name} = "), ty),
-            None => self
+        let shown = match (expansion, declared.ty) {
+            // An enum is its own type.
+            (_, None) => format!("enum {name} extensible"),
+            (Some(ty), Some(_)) => self.pretty(&format!("type {name} = "), ty),
+            (None, Some(written)) => self
                 .scan
                 .files
                 .get(declared.file as usize)?
                 .ast
-                .show_type_with(declared.ty, &self.scan.names),
+                .show_type_with(written, &self.scan.names),
         };
         let path = self
             .scan

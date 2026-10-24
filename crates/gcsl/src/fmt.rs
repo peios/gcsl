@@ -865,8 +865,11 @@ impl<'a> Printer<'a> {
         if number_dot || (self.facts.path_ends.contains(&prev) && n == K::LParen) {
             return written;
         }
-        if matches!(p, K::Dot | K::LParen | K::LBracket)
-            || matches!(n, K::Dot | K::Comma | K::Semi | K::RParen | K::RBracket)
+        if matches!(p, K::Dot | K::LParen | K::LBracket | K::ColonColon)
+            || matches!(
+                n,
+                K::Dot | K::Comma | K::Semi | K::RParen | K::RBracket | K::ColonColon
+            )
         {
             return "";
         }
@@ -1179,6 +1182,27 @@ fn declaration_facts(input: &Input<'_>, facts: &mut Facts) {
     for method in ast.methods() {
         let start = ast.item(method.item).span.start;
         facts.methods.extend(input.token_at(start, TokenKind::Fn));
+    }
+    // An enum's bound and a variant's payload are bracketed as a type's
+    // argument is: the `<` after the name, the `>` that ends the item.
+    for &item in ast.items(ast.root()) {
+        let (open, ty) = match ast.item(item).kind {
+            // After `enum`, the name and `extensible`.
+            ItemKind::Enum {
+                bound: Some(ty), ..
+            } => (input.first_from(ast.item(item).span.start) + 3, ty),
+            ItemKind::Variant {
+                name_span,
+                payload: Some(ty),
+                ..
+            } => (input.first_from(name_span.end), ty),
+            _ => continue,
+        };
+        let close = input.first_from(ast.type_expr(ty).span.end);
+        if input.kind(open) == TokenKind::Lt && input.kind(close) == TokenKind::Gt {
+            facts.angles.insert(open);
+            facts.angles.insert(close);
+        }
     }
     let angles = &mut facts.angles;
     for generics in ast.all_generics() {

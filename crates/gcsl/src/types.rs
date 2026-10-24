@@ -472,6 +472,31 @@ pub enum TyKind {
         /// Its position among that type's parameters.
         index: u8,
     },
+    /// An extensible enum, `enum Toolchain extensible<B>`: nominal, by its
+    /// key, a subtype only of itself, and shown by its name (see
+    /// [Enums](#enums)). Its values are its variants' values.
+    Enum {
+        /// Its key, a name no source can write that is its identity
+        /// ([`crate::names::enum_key`]).
+        key: Name,
+        /// Its name, as it is declared.
+        name: Name,
+    },
+    /// `Variant<E, T>`, a variant of the enum `E` whose payload is of type
+    /// `T`, as a value (see [Enums](#enums)): called, `fn(T): E`, its
+    /// `call` type, which it is a subtype of, it makes a value of `E`.
+    Variant {
+        /// The enum, an [`TyKind::Enum`].
+        of: TyId,
+        /// The payload's type.
+        payload: TyId,
+        /// Its function type, `fn(T): E`.
+        call: TyId,
+    },
+    /// `Partial<T>` of a record type `T` with no rest-field: the records
+    /// holding any of `T`'s fields, each of its type (see [Partial
+    /// records](#partial-records)).
+    Partial(TyId),
 }
 
 /// What a generic function's type parameters belong to: one of its own,
@@ -646,6 +671,9 @@ pub enum ValueTest {
     /// Passes for a value that passes any of the tests, of which there are
     /// at least two.
     Any(Box<[ValueTest]>),
+    /// Passes for a value of the enum of this key, of any of its variants
+    /// (see [Enums](#enums)).
+    Enum(Name),
 }
 
 impl ValueTest {
@@ -654,7 +682,7 @@ impl ValueTest {
     #[must_use]
     pub fn walks(&self) -> bool {
         match self {
-            ValueTest::Pass | ValueTest::Kind(_) => false,
+            ValueTest::Pass | ValueTest::Kind(_) | ValueTest::Enum(_) => false,
             ValueTest::Record(_) | ValueTest::RecordRest { .. } | ValueTest::List(_) => true,
             ValueTest::Any(tests) => tests.iter().any(ValueTest::walks),
         }
@@ -678,6 +706,11 @@ pub struct TypeTable {
     /// The names of the type parameters of each generic function type, by
     /// its [`GenericId`]: what a [`TyKind::Param`] is shown as.
     generics: Vec<Box<[Name]>>,
+    /// The bound of each enum, by its key, if it has one (see
+    /// [Enums](#enums)).
+    enum_bounds: HashMap<Name, Option<TyId>>,
+    /// The payload's type of each variant, by its key (see [Enums](#enums)).
+    variant_payloads: HashMap<Name, TyId>,
 }
 
 impl Default for TypeTable {
@@ -696,6 +729,8 @@ impl TypeTable {
             lookup: HashMap::new(),
             provisional: Vec::new(),
             generics: Vec::new(),
+            enum_bounds: HashMap::new(),
+            variant_payloads: HashMap::new(),
         };
         // In the order of the constants' numbers.
         for kind in [
@@ -764,9 +799,11 @@ impl TypeTable {
                     || sig.meta.is_some_and(|meta| self.has_provisional(meta.ty))
                     || sig.params.iter().any(|&(_, ty)| self.has_provisional(ty))
             }
-            TyKind::Future(inner) | TyKind::Either(inner) | TyKind::List(inner) => {
-                self.has_provisional(*inner)
-            }
+            TyKind::Future(inner)
+            | TyKind::Either(inner)
+            | TyKind::List(inner)
+            | TyKind::Variant { payload: inner, .. }
+            | TyKind::Partial(inner) => self.has_provisional(*inner),
             TyKind::Union(members) => members.iter().any(|&member| self.has_provisional(member)),
             TyKind::Int
             | TyKind::Float
@@ -777,7 +814,8 @@ impl TypeTable {
             | TyKind::Error
             | TyKind::Never
             | TyKind::Builtin(_)
-            | TyKind::Param { .. } => false,
+            | TyKind::Param { .. }
+            | TyKind::Enum { .. } => false,
         };
         self.provisional.push(provisional);
         self.kinds.push(kind.clone());
@@ -846,6 +884,9 @@ impl TypeTable {
             TyKind::Union(members) => members
                 .iter()
                 .find_map(|&member| self.special_builtin(member)),
+            TyKind::Variant { payload: inner, .. } | TyKind::Partial(inner) => {
+                self.special_builtin(*inner)
+            }
             TyKind::Int
             | TyKind::Float
             | TyKind::Bool
@@ -854,7 +895,8 @@ impl TypeTable {
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
-            | TyKind::Param { .. } => None,
+            | TyKind::Param { .. }
+            | TyKind::Enum { .. } => None,
         }
     }
 
@@ -1035,6 +1077,20 @@ impl TypeTable {
             (_, TyKind::Union(members)) => members
                 .iter()
                 .any(|&member| self.may_receive(found, member, Some(generic))),
+            (
+                &TyKind::Variant { of, payload, .. },
+                &TyKind::Variant {
+                    of: of_pattern,
+                    payload: pattern,
+                    ..
+                },
+            ) => {
+                self.may_receive(of, of_pattern, Some(generic))
+                    && self.may_receive(payload, pattern, Some(generic))
+            }
+            (&TyKind::Partial(record), &TyKind::Partial(pattern)) => {
+                self.may_receive(record, pattern, Some(generic))
+            }
             _ => false,
         }
     }
@@ -1070,8 +1126,14 @@ impl TypeTable {
             &(TyKind::Future(inner)
             | TyKind::Either(inner)
             | TyKind::List(inner)
+            | TyKind::Partial(inner)
             | TyKind::Provisional { inner, .. }) => self.any_param(inner, of),
             TyKind::Union(members) => members.iter().any(|&member| self.any_param(member, of)),
+            &TyKind::Variant {
+                of: enumeration,
+                payload,
+                ..
+            } => self.any_param(enumeration, of) || self.any_param(payload, of),
             TyKind::Int
             | TyKind::Float
             | TyKind::Bool
@@ -1080,7 +1142,8 @@ impl TypeTable {
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
-            | TyKind::Builtin(_) => false,
+            | TyKind::Builtin(_)
+            | TyKind::Enum { .. } => false,
         }
     }
 
@@ -1155,6 +1218,15 @@ impl TypeTable {
                 let inner = self.substitute(inner, generic, args);
                 self.provisional(function, param, inner)
             }
+            TyKind::Variant { of, payload, .. } => {
+                let of = self.substitute(of, generic, args);
+                let payload = self.substitute(payload, generic, args);
+                self.variant(of, payload)
+            }
+            TyKind::Partial(record) => {
+                let record = self.substitute(record, generic, args);
+                self.partial(record)
+            }
             _ => ty,
         }
     }
@@ -1219,6 +1291,26 @@ impl TypeTable {
             }
             TyKind::Future(inner) | TyKind::Either(inner) | TyKind::Provisional { inner, .. } => {
                 self.bind(inner, present, generic, bound)
+            }
+            TyKind::Variant { of, payload, .. } => match *self.kind(present) {
+                TyKind::Variant {
+                    of: given_of,
+                    payload: given,
+                    ..
+                } => {
+                    let widened = self.bind(of, given_of, generic, bound);
+                    widened.or(self.bind(payload, given, generic, bound))
+                }
+                _ => None,
+            },
+            // A partial record binds from a record's fields or a partial
+            // one's, of each name both have.
+            TyKind::Partial(record) => {
+                let given = match *self.kind(present) {
+                    TyKind::Partial(given) => given,
+                    _ => present,
+                };
+                self.bind(record, given, generic, bound)
             }
             _ => None,
         }
@@ -1289,8 +1381,55 @@ impl TypeTable {
     pub fn fn_sig(&self, id: TyId) -> Option<&FnTy> {
         match self.kinds.get(id.index())? {
             TyKind::Fn(sig) => Some(sig),
+            // A variant is called as its function type.
+            &TyKind::Variant { call, .. } => self.fn_sig(call),
             _ => None,
         }
+    }
+
+    /// The type of the enum of the key `key`, named `name` (see
+    /// [Enums](#enums)), adding it to the table if it is new.
+    pub fn enum_type(&mut self, key: Name, name: Name) -> TyId {
+        self.intern(TyKind::Enum { key, name })
+    }
+
+    /// Records the bound every variant's payload of the enum of the key
+    /// `key` fits, if it has one (see [Enums](#enums)).
+    pub fn set_enum_bound(&mut self, key: Name, bound: Option<TyId>) {
+        self.enum_bounds.insert(key, bound);
+    }
+
+    /// The bound of the enum of the key `key`, if it has one; `None` too
+    /// for one whose bound is not known.
+    #[must_use]
+    pub fn enum_bound(&self, key: Name) -> Option<TyId> {
+        self.enum_bounds.get(&key).copied().flatten()
+    }
+
+    /// Records the payload's type of the variant of the key `key` (see
+    /// [Enums](#enums)).
+    pub fn set_variant_payload(&mut self, key: Name, payload: TyId) {
+        self.variant_payloads.insert(key, payload);
+    }
+
+    /// The payload's type of the variant of the key `key`, if it is known.
+    #[must_use]
+    pub fn variant_payload(&self, key: Name) -> Option<TyId> {
+        self.variant_payloads.get(&key).copied()
+    }
+
+    /// `Variant<E, T>`, the type of a variant of the enum `of` whose
+    /// payload is of type `payload`, as a value, callable as `fn(T): E`
+    /// (see [Enums](#enums)), adding it to the table if it is new.
+    pub fn variant(&mut self, of: TyId, payload: TyId) -> TyId {
+        let call = self.fn_type([(None, payload)], of, Effect::Pure);
+        self.intern(TyKind::Variant { of, payload, call })
+    }
+
+    /// `Partial<T>` of the record type `record` (see [Partial
+    /// records](#partial-records)), adding it to the table if it is new.
+    pub fn partial(&mut self, record: TyId) -> TyId {
+        self.intern(TyKind::Partial(record))
     }
 
     /// Whether `id` is a function type (or the opaque type of a special
@@ -1319,6 +1458,12 @@ impl TypeTable {
                 | TyKind::Provisional { inner, .. },
             ) => self.contains_fn(*inner),
             Some(TyKind::Union(members)) => members.iter().any(|&member| self.contains_fn(member)),
+            // A variant's payload may hold a function, unless its bound
+            // says it cannot; a variant itself compares as data.
+            Some(&TyKind::Enum { key, .. }) => self
+                .enum_bound(key)
+                .is_none_or(|bound| self.contains_fn(bound)),
+            Some(&TyKind::Partial(record)) => self.contains_fn(record),
             _ => false,
         }
     }
@@ -1514,6 +1659,14 @@ impl TypeTable {
                     .collect();
                 self.union(members)
             }
+            TyKind::Variant { of, payload, .. } => {
+                let payload = self.settle(payload, function, decisions);
+                self.variant(of, payload)
+            }
+            TyKind::Partial(record) => {
+                let record = self.settle(record, function, decisions);
+                self.partial(record)
+            }
             TyKind::Provisional { .. }
             | TyKind::Int
             | TyKind::Float
@@ -1524,7 +1677,8 @@ impl TypeTable {
             | TyKind::Error
             | TyKind::Never
             | TyKind::Builtin(_)
-            | TyKind::Param { .. } => id,
+            | TyKind::Param { .. }
+            | TyKind::Enum { .. } => id,
         }
     }
 
@@ -2075,6 +2229,31 @@ impl TypeTable {
         if let (Some(offered), Some(required)) = (self.list_element(sub), self.list_element(sup)) {
             return self.is_subtype(offered, required);
         }
+        match (self.kind(sub), self.kind(sup)) {
+            // A variant fits only a variant of its enum whose payload is
+            // its payload's type, since it both makes and unwraps one; a
+            // function, however typed, is no variant (see [Enums](#enums)).
+            (
+                &TyKind::Variant { of, payload, .. },
+                &TyKind::Variant {
+                    of: of_required,
+                    payload: required,
+                    ..
+                },
+            ) => {
+                return of == of_required
+                    && self.is_subtype(payload, required)
+                    && self.is_subtype(required, payload);
+            }
+            (_, TyKind::Variant { .. } | TyKind::Enum { .. }) => return false,
+            (_, &TyKind::Partial(required)) => return self.fits_partial(sub, required),
+            // Every field a partial record holds may be absent: it fits a
+            // record type that requires none.
+            (TyKind::Partial(_), TyKind::Record(record)) => {
+                return record.fields.is_empty() && record.rest().is_none();
+            }
+            _ => {}
+        }
         if let (Some(offered), Some(required)) = (self.fn_sig(sub), self.fn_sig(sup)) {
             // A meta is purely additive: one required must be offered, as a
             // result is, and one offered may be forgotten.
@@ -2130,6 +2309,64 @@ impl TypeTable {
                 .is_some_and(|&(offered_name, offered_ty)| {
                     offered_name == name && self.is_subtype(offered_ty, required_ty)
                 })
+        })
+    }
+
+    /// Whether a variant's payload, of the type `payload` as its declaration
+    /// writes it, fits its enum's bound, `bound` (see [Enums](#enums)): as a
+    /// record type that has exactly the fields it names, so that a record
+    /// type's fields each fit the bound's field of their name or its
+    /// rest-field, and its own rest-field fits the bound's, `{}` fitting any
+    /// record bound; any other type as a subtype does. A value of the
+    /// payload's type may still hold fields its type hides, as any record
+    /// may.
+    #[must_use]
+    pub fn fits_bound(&self, payload: TyId, bound: TyId) -> bool {
+        let (TyKind::Record(offered), TyKind::Record(required)) =
+            (self.kind(payload), self.kind(bound))
+        else {
+            return self.is_subtype(payload, bound);
+        };
+        let rest = required.rest();
+        let field_fits =
+            |name: Name, ty: TyId| match required.fields.iter().find(|&&(own, _)| own == name) {
+                Some(&(_, required_ty)) => self.is_subtype(ty, required_ty),
+                None => rest.is_some_and(|rest| self.is_subtype(ty, rest)),
+            };
+        let required_present = required
+            .fields
+            .iter()
+            .all(|&(name, _)| offered.fields.iter().any(|&(own, _)| own == name));
+        required_present
+            && offered
+                .fields
+                .iter()
+                .all(|&(name, ty)| field_fits(name, ty))
+            && offered
+                .rest()
+                .is_none_or(|own| rest.is_some_and(|rest| self.is_subtype(own, rest)))
+    }
+
+    /// Whether a value of type `sub`, present, fits `Partial<R>` of the
+    /// record type `required` (see [Partial records](#partial-records)): it
+    /// is a record, or a partial record, each field of which `required`
+    /// names is of a type that fits `required`'s.
+    fn fits_partial(&self, sub: TyId, required: TyId) -> bool {
+        let offered = match *self.kind(sub) {
+            TyKind::Partial(record) => record,
+            _ => sub,
+        };
+        let (Some(offered), Some(required)) =
+            (self.record_fields(offered), self.record_fields(required))
+        else {
+            return false;
+        };
+        offered.iter().all(|&(name, offered_ty)| {
+            required
+                .binary_search_by_key(&name, |&(field, _)| field)
+                .ok()
+                .and_then(|at| required.get(at))
+                .is_none_or(|&(_, required_ty)| self.is_subtype(offered_ty, required_ty))
         })
     }
 
@@ -2354,11 +2591,14 @@ impl TypeTable {
             &TyKind::Quantity(quantity) => Some(ValueKind::Quantity(quantity)),
             TyKind::Bool => Some(ValueKind::Bool),
             TyKind::String => Some(ValueKind::String),
-            TyKind::Record(_) => Some(ValueKind::Record),
+            TyKind::Record(_) | TyKind::Partial(_) => Some(ValueKind::Record),
             TyKind::List(_) => Some(ValueKind::List),
+            // A value of an enum is present, of the kind only it says.
+            TyKind::Enum { .. } => Some(ValueKind::Mixed),
             // TEMPORARY (alias rule): a special built-in's opaque type is a function's kind (see
             // the [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
-            TyKind::Fn(_) | TyKind::Builtin(_) => Some(ValueKind::Fn),
+            // A variant is called as a function is.
+            TyKind::Fn(_) | TyKind::Builtin(_) | TyKind::Variant { .. } => Some(ValueKind::Fn),
             // A type parameter's: any value at all, what a call binds it to.
             TyKind::Future(_) | TyKind::Either(_) | TyKind::Param { .. } => {
                 Some(ValueKind::Deferred)
@@ -2420,8 +2660,43 @@ impl TypeTable {
             (TyKind::List(a_element), TyKind::List(b_element)) => {
                 self.overlaps(*a_element, *b_element)
             }
-            (TyKind::Fn(_), TyKind::Fn(_)) => true,
+            (TyKind::Fn(_) | TyKind::Variant { .. }, TyKind::Fn(_) | TyKind::Variant { .. }) => {
+                true
+            }
+            // A partial record is a record whose fields may be absent.
+            (&TyKind::Partial(record), _) => self.overlaps(record, b),
+            (_, &TyKind::Partial(record)) => self.overlaps(a, record),
             _ => false,
+        }
+    }
+
+    /// Whether `id` is or holds a type of values `is` cannot tell apart, a
+    /// function type or a variant's, as [`TypeTable::contains_fn`] says but
+    /// for an enum, whose value is told apart by its variant alone, whatever
+    /// its payload holds (see [Enums](#enums)).
+    ///
+    /// Recurses once per level of record, list, future, union or
+    /// provisional nesting.
+    #[must_use]
+    pub fn holds_untestable(&self, id: TyId) -> bool {
+        match self.kinds.get(id.index()) {
+            Some(TyKind::Enum { .. }) => false,
+            Some(TyKind::Variant { .. }) => true,
+            Some(TyKind::Record(record)) => record
+                .fields
+                .iter()
+                .any(|&(_, field)| self.holds_untestable(field)),
+            Some(
+                TyKind::Future(inner)
+                | TyKind::Either(inner)
+                | TyKind::List(inner)
+                | TyKind::Partial(inner)
+                | TyKind::Provisional { inner, .. },
+            ) => self.holds_untestable(*inner),
+            Some(TyKind::Union(members)) => {
+                members.iter().any(|&member| self.holds_untestable(member))
+            }
+            _ => self.contains_fn(id),
         }
     }
 
@@ -2457,6 +2732,10 @@ impl TypeTable {
             } else {
                 ValueTest::Any(tests.into_boxed_slice())
             };
+        }
+        // An enum's value is told apart by its variant's enum alone.
+        if let &TyKind::Enum { key, .. } = self.kind(ty) {
+            return ValueTest::Enum(key);
         }
         let Some(kind) = self.value_kind(ty) else {
             return ValueTest::Pass;
@@ -2675,6 +2954,26 @@ impl Display<'_> {
     }
 }
 
+impl Display<'_> {
+    /// Writes the type, an enum, by its name, a variant's, `Variant<E, T>`,
+    /// or a partial record's, `Partial<T>`.
+    fn enum_like(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.table.kind(self.id) {
+            TyKind::Enum { name, .. } => f.write_str(self.names.get(*name)),
+            TyKind::Variant { of, payload, .. } => {
+                write!(
+                    f,
+                    "Variant<{}, {}>",
+                    self.nested(*of),
+                    self.nested(*payload)
+                )
+            }
+            TyKind::Partial(record) => write!(f, "Partial<{}>", self.nested(*record)),
+            _ => Ok(()),
+        }
+    }
+}
+
 impl fmt::Display for Display<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.table.kind(self.id) {
@@ -2694,6 +2993,7 @@ impl fmt::Display for Display<'_> {
             TyKind::Builtin(builtin) => write!(f, "builtin {}", builtin.name()),
             TyKind::Future(inner) => write!(f, "Future<{}>", self.nested(*inner)),
             TyKind::List(element) => write!(f, "List<{}>", self.nested(*element)),
+            TyKind::Enum { .. } | TyKind::Variant { .. } | TyKind::Partial(_) => self.enum_like(f),
             TyKind::Provisional { inner, .. } => {
                 let shown = self.nested(*inner);
                 // A function type's return type, or a union's last member,

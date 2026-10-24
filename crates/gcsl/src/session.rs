@@ -290,6 +290,10 @@ pub struct Session {
     /// shadowed, each by its path, with its namespace's key, which the next
     /// input inherits (see [Def-types](#def-types)).
     def_types: Vec<(Vec<Name>, Name)>,
+    /// The variants of the committed inputs that no later one has shadowed,
+    /// each by its enum's key and its name, with its own key, which the next
+    /// input inherits.
+    variants: Vec<workspace::InheritedVariant>,
 }
 
 impl Default for Session {
@@ -323,6 +327,7 @@ impl Session {
                 type_store: TypeStore::new(),
                 declared_types: Vec::new(),
                 def_types: Vec::new(),
+                variants: Vec::new(),
             },
             Err(diagnostics) => Self {
                 names: Names::new(),
@@ -339,6 +344,7 @@ impl Session {
                 type_store: TypeStore::new(),
                 declared_types: Vec::new(),
                 def_types: Vec::new(),
+                variants: Vec::new(),
             },
         }
     }
@@ -412,8 +418,9 @@ impl Session {
             types: &self.declared_types,
             store: &mut self.type_store,
             def_types: &self.def_types,
+            variants: &self.variants,
         };
-        let (ir, output, (mut imports, declared_types, def_types)) = workspace::check_input(
+        let (ir, output, inherited) = workspace::check_input(
             &standard,
             (source, earlier),
             (&mut self.names, &mut self.types),
@@ -432,14 +439,26 @@ impl Session {
                 // A name the input bound that its scan could not see, as a
                 // spread's, shadows an import of it too.
                 let declared: HashSet<Name> = output.scope.names().skip(self.scope.len()).collect();
-                imports.retain(|alias| !declared.contains(&alias.name));
-                self.imports = imports;
-                self.declared_types = declared_types;
+                let mut inherited = inherited;
+                inherited
+                    .imports
+                    .retain(|alias| !declared.contains(&alias.name));
+                self.imports = inherited.imports;
+                self.declared_types = inherited.types;
                 // A name the input binds shadows an earlier def-type under
                 // it, but a def-type the input declares.
                 self.def_types
                     .retain(|(path, _)| path.first().is_none_or(|name| !declared.contains(name)));
-                self.def_types.extend(def_types);
+                self.def_types.extend(inherited.def_types);
+                // A variant the input declares shadows an earlier one of its
+                // enum and name.
+                self.variants.retain(|&(of, name, _)| {
+                    !inherited
+                        .variants
+                        .iter()
+                        .any(|&(later_of, later, _)| later_of == of && later == name)
+                });
+                self.variants.extend(inherited.variants);
                 self.scope = output.scope;
                 self.value_type = output.ty;
                 self.sources.push(source.clone());
