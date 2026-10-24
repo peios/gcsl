@@ -501,6 +501,56 @@ pub struct Future {
     /// the future, which its body runs with, whoever awaits it (see
     /// [`crate::eval`], "Callers and helpers").
     pub(crate) made: Caller,
+    /// The context it was made in, which its body runs with, whoever awaits
+    /// it (see [`crate::eval`], "Context").
+    pub(crate) context: Option<Rc<ContextFrame>>,
+}
+
+/// A frame of the context, what one `with` binds (see [`crate::eval`],
+/// "Context"): each context it binds, by its declaration's key, with its
+/// value, over the context it was evaluated in.
+#[derive(Debug)]
+pub(crate) struct ContextFrame {
+    /// Its identity, new for each `with` evaluated, by which a memoised
+    /// call tells whether a read of a context is of its binding.
+    pub(crate) id: u64,
+    /// What it binds.
+    pub(crate) binds: Box<[(Name, Value)]>,
+    /// The context it was evaluated in.
+    pub(crate) outer: Option<Rc<ContextFrame>>,
+}
+
+impl ContextFrame {
+    /// The nearest binding of the context of the declaration key `key` in
+    /// the context `context`: the identity of the frame binding it and its
+    /// value; `None` if no frame does, so that its default is read.
+    pub(crate) fn find(context: Option<&Rc<Self>>, key: Name) -> Option<(u64, &Value)> {
+        let mut at = context;
+        while let Some(frame) = at {
+            if let Some((_, value)) = frame.binds.iter().find(|&&(bound, _)| bound == key) {
+                return Some((frame.id, value));
+            }
+            at = frame.outer.as_ref();
+        }
+        None
+    }
+
+    /// Every context the context `context` binds, by its declaration's key,
+    /// with the value of its nearest binding, in order of key.
+    pub(crate) fn flattened(context: Option<&Rc<Self>>) -> Vec<(Name, Value)> {
+        let mut found: Vec<(Name, Value)> = Vec::new();
+        let mut at = context;
+        while let Some(frame) = at {
+            for (key, value) in &frame.binds {
+                if !found.iter().any(|(seen, _)| seen == key) {
+                    found.push((*key, value.clone()));
+                }
+            }
+            at = frame.outer.as_ref();
+        }
+        found.sort_by_key(|&(key, _)| key);
+        found
+    }
 }
 
 /// What a running frame has of its caller (see [`crate::eval`], "Callers
@@ -528,22 +578,24 @@ impl Future {
     /// run's table of directories, and an origin no frame has.
     #[must_use]
     pub fn new(code: Rc<Ir>, function: FnId, captures: Box<[Value]>) -> Self {
-        Self::made_by(code, function, captures, Caller::default())
+        Self::made_by(code, function, captures, (Caller::default(), None))
     }
 
     /// [`Future::new`], made by a frame whose caller, helper flag and
-    /// origin are `made`, which its body runs with.
+    /// origin are `made`, in the context `context`, both of which its body
+    /// runs with.
     pub(crate) fn made_by(
         code: Rc<Ir>,
         function: FnId,
         captures: Box<[Value]>,
-        made: Caller,
+        (made, context): (Caller, Option<Rc<ContextFrame>>),
     ) -> Self {
         Self {
             code,
             function,
             state: RefCell::new(FutureState::Pending(captures)),
             made,
+            context,
         }
     }
 

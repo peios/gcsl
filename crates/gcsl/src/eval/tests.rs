@@ -3131,8 +3131,9 @@ fn start_reading(memo: &mut MemoTables, closure: &Rc<Closure>, origin: u64, dir:
         hash,
         entry,
         origin,
+        context: None,
     });
-    memo.depend(origin, Ambient::Caller(dir));
+    memo.depend(origin, &Ambient::Caller(dir));
     Mark {
         hash,
         entry,
@@ -3158,7 +3159,7 @@ fn found(
         helper: false,
         origin: NO_ORIGIN,
     };
-    match memo.lookup(closure, &[], (caller, false)) {
+    match memo.lookup(closure, &[], (caller, false), None) {
         Lookup::Done(value) => Ok(Some(value)),
         Lookup::Running => Ok(None),
         Lookup::Missing(_) => Err("missing"),

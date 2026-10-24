@@ -294,6 +294,9 @@ pub struct Session {
     /// each by its enum's key and its name, with its own key, which the next
     /// input inherits.
     variants: Vec<workspace::InheritedVariant>,
+    /// The contexts of the committed inputs that no later one has
+    /// redeclared, which the next input inherits.
+    contexts: Vec<workspace::InheritedContext>,
 }
 
 impl Default for Session {
@@ -328,6 +331,7 @@ impl Session {
                 declared_types: Vec::new(),
                 def_types: Vec::new(),
                 variants: Vec::new(),
+                contexts: Vec::new(),
             },
             Err(diagnostics) => Self {
                 names: Names::new(),
@@ -345,6 +349,7 @@ impl Session {
                 declared_types: Vec::new(),
                 def_types: Vec::new(),
                 variants: Vec::new(),
+                contexts: Vec::new(),
             },
         }
     }
@@ -419,6 +424,7 @@ impl Session {
             store: &mut self.type_store,
             def_types: &self.def_types,
             variants: &self.variants,
+            contexts: &self.contexts,
         };
         let (ir, output, inherited) = workspace::check_input(
             &standard,
@@ -459,6 +465,12 @@ impl Session {
                         .any(|&(later_of, later, _)| later_of == of && later == name)
                 });
                 self.variants.extend(inherited.variants);
+                // A context the input declares shadows an earlier one of its
+                // name.
+                self.contexts.retain(|&(name, ..)| {
+                    !inherited.contexts.iter().any(|&(later, ..)| later == name)
+                });
+                self.contexts.extend(inherited.contexts);
                 self.scope = output.scope;
                 self.value_type = output.ty;
                 self.sources.push(source.clone());

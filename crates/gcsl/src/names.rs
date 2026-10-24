@@ -25,6 +25,18 @@
 //! holding `<` and `@` but no `#` is neither kind of namespace key, so a
 //! method's binding is never mistaken for one.
 //!
+//! # Context bindings and keys
+//!
+//! A context's default (`context arch: String = "x86_64"`) is a function of
+//! its file, pure and of no parameters, bound as a method's function is, to
+//! a name no source can write, `<default of context arch@0>`
+//! ([`context_binding`]): its name and the first ordinal that makes a name
+//! the table does not hold yet. A context declaration has a key, its
+//! identity at runtime, `<context arch@stdlib/platform.gcsl>`
+//! ([`context_key`]), of its name and its file's path, or `input N` for a
+//! session's input, so that a later input's declaration of a name is not
+//! the earlier one's. Neither holds `#`, so neither is a namespace key.
+//!
 //! # Enum keys
 //!
 //! An enum is nominal (see the checker's "Enums"), and so is each of its
@@ -281,6 +293,33 @@ pub fn binding_method(text: &str) -> Option<&str> {
     let inner = text.strip_prefix("<method ")?.strip_suffix('>')?;
     let (name, ordinal) = inner.rsplit_once('@')?;
     (!ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit())).then_some(name)
+}
+
+/// The text of the name of the binding of the default of the context
+/// `name` of a file or session input, its `ordinal`-th of the name (see
+/// [Context bindings and keys](#context-bindings-and-keys)): `<default of
+/// context arch@0>`.
+#[must_use]
+pub fn context_binding(name: &str, ordinal: u32) -> String {
+    format!("<default of context {name}@{ordinal}>")
+}
+
+/// The text of the key of the declaration of the context `name` that
+/// `origin` declares, the path of its file, or `input N` for a session's
+/// input (see [Context bindings and keys](#context-bindings-and-keys)):
+/// `<context arch@stdlib/platform.gcsl>`.
+#[must_use]
+pub fn context_key(name: &str, origin: &str) -> String {
+    format!("<context {name}@{origin}>")
+}
+
+/// The name of the context whose declaration's key's text is `text`, if it
+/// is one: `arch` for `<context arch@stdlib/platform.gcsl>` (see [Context
+/// bindings and keys](#context-bindings-and-keys)).
+#[must_use]
+pub fn key_context(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix("<context ")?.strip_suffix('>')?;
+    inner.split_once('@').map(|(name, _)| name)
 }
 
 /// The text of the key of the enum `name` that `origin` declares, the path

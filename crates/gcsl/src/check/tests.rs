@@ -841,84 +841,23 @@ fn the_result_must_be_the_last_item() {
     );
 }
 
+/// The parts of a `with` of the bindings `bindings` and the body `body`,
+/// as they are evaluated: each binding's value, then the body.
+fn with_parts(ast: &Ast, (bindings, body): (crate::ast::WithRange, ExprId)) -> Vec<ExprId> {
+    let values = ast
+        .with_bindings(bindings)
+        .iter()
+        .map(|binding| binding.value);
+    values.chain([body]).collect()
+}
+
 /// Every `let` in `body` and the blocks nested in it, in the order their
 /// declarations complete.
 fn lets(ast: &Ast, body: ItemRange, out: &mut Vec<ItemId>) {
-    fn visit(ast: &Ast, id: ExprId, out: &mut Vec<ItemId>) {
-        match ast.get(id).kind {
-            ExprKind::Block { items: body, .. } => lets(ast, body, out),
-            ExprKind::Binary { lhs, rhs, .. } => {
-                visit(ast, lhs, out);
-                visit(ast, rhs, out);
-            }
-            ExprKind::Paren(inner)
-            | ExprKind::Unary { operand: inner, .. }
-            | ExprKind::Field { expr: inner, .. }
-            | ExprKind::Ascribe { expr: inner, .. }
-            | ExprKind::Is { expr: inner, .. }
-            | ExprKind::As { expr: inner, .. }
-            | ExprKind::NoField(inner) => visit(ast, inner, out),
-            ExprKind::If {
-                cond, then, else_, ..
-            } => {
-                visit(ast, cond, out);
-                visit(ast, then, out);
-                visit(ast, else_, out);
-            }
-            ExprKind::Interp(parts) => {
-                for &part in ast.parts(parts) {
-                    if let StrPart::Expr(inner) = part {
-                        visit(ast, inner, out);
-                    }
-                }
-            }
-            ExprKind::Fn(function) | ExprKind::Lazy(function) => {
-                visit(ast, ast.fn_decl(function).body, out);
-            }
-            ExprKind::Call { callee, args } | ExprKind::Unclosed { callee, args } => {
-                visit(ast, callee, out);
-                for arg in ast.args(args) {
-                    visit(ast, arg.value, out);
-                }
-            }
-            ExprKind::List(elements) => {
-                for element in ast.elements(elements) {
-                    visit(ast, element.value, out);
-                }
-            }
-            ExprKind::Index { expr, index } => {
-                visit(ast, expr, out);
-                visit(ast, index, out);
-            }
-            ExprKind::For(id) => {
-                let decl = ast.for_decl(id);
-                if let ForHead::Each {
-                    iterable, guard, ..
-                } = decl.head
-                {
-                    visit(ast, iterable, out);
-                    if let Some(guard) = guard {
-                        visit(ast, guard, out);
-                    }
-                }
-                visit(ast, decl.body, out);
-            }
-            ExprKind::Int(_)
-            | ExprKind::Float(_)
-            | ExprKind::Duration(_)
-            | ExprKind::Size(_)
-            | ExprKind::Bool(_)
-            | ExprKind::Str(_)
-            | ExprKind::Name(_)
-            | ExprKind::Variant { .. }
-            | ExprKind::DefTypeRef(_)
-            | ExprKind::Error => {}
-        }
-    }
     for &id in ast.items(body) {
         match ast.item(id).kind {
             ItemKind::Let { value, .. } => {
-                visit(ast, value, out);
+                visit_lets(ast, value, out);
                 out.push(id);
             }
             ItemKind::Rebind { value, .. }
@@ -928,9 +867,10 @@ fn lets(ast: &Ast, body: ItemRange, out: &mut Vec<ItemId>) {
             | ItemKind::Expr(value)
             | ItemKind::DefTypeDef { value, .. }
             | ItemKind::DefMeta { value, .. } => {
-                visit(ast, value, out);
+                visit_lets(ast, value, out);
             }
-            ItemKind::Break(_)
+            ItemKind::Context { .. }
+            | ItemKind::Break(_)
             | ItemKind::Continue(_)
             | ItemKind::Return(_)
             | ItemKind::Import(_)
@@ -939,6 +879,86 @@ fn lets(ast: &Ast, body: ItemRange, out: &mut Vec<ItemId>) {
             | ItemKind::Type { .. }
             | ItemKind::Error => {}
         }
+    }
+}
+
+/// Every `let` in the blocks nested in the expression `id`, as [`lets`]
+/// finds them.
+fn visit_lets(ast: &Ast, id: ExprId, out: &mut Vec<ItemId>) {
+    match ast.get(id).kind {
+        ExprKind::Block { items: body, .. } => lets(ast, body, out),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            visit_lets(ast, lhs, out);
+            visit_lets(ast, rhs, out);
+        }
+        ExprKind::With { bindings, body } => {
+            for part in with_parts(ast, (bindings, body)) {
+                visit_lets(ast, part, out);
+            }
+        }
+        ExprKind::Paren(inner)
+        | ExprKind::Unary { operand: inner, .. }
+        | ExprKind::Field { expr: inner, .. }
+        | ExprKind::Ascribe { expr: inner, .. }
+        | ExprKind::Is { expr: inner, .. }
+        | ExprKind::As { expr: inner, .. }
+        | ExprKind::NoField(inner) => visit_lets(ast, inner, out),
+        ExprKind::If {
+            cond, then, else_, ..
+        } => {
+            visit_lets(ast, cond, out);
+            visit_lets(ast, then, out);
+            visit_lets(ast, else_, out);
+        }
+        ExprKind::Interp(parts) => {
+            for &part in ast.parts(parts) {
+                if let StrPart::Expr(inner) = part {
+                    visit_lets(ast, inner, out);
+                }
+            }
+        }
+        ExprKind::Fn(function) | ExprKind::Lazy(function) => {
+            visit_lets(ast, ast.fn_decl(function).body, out);
+        }
+        ExprKind::Call { callee, args } | ExprKind::Unclosed { callee, args } => {
+            visit_lets(ast, callee, out);
+            for arg in ast.args(args) {
+                visit_lets(ast, arg.value, out);
+            }
+        }
+        ExprKind::List(elements) => {
+            for element in ast.elements(elements) {
+                visit_lets(ast, element.value, out);
+            }
+        }
+        ExprKind::Index { expr, index } => {
+            visit_lets(ast, expr, out);
+            visit_lets(ast, index, out);
+        }
+        ExprKind::For(id) => {
+            let decl = ast.for_decl(id);
+            if let ForHead::Each {
+                iterable, guard, ..
+            } = decl.head
+            {
+                visit_lets(ast, iterable, out);
+                if let Some(guard) = guard {
+                    visit_lets(ast, guard, out);
+                }
+            }
+            visit_lets(ast, decl.body, out);
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Duration(_)
+        | ExprKind::Size(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Str(_)
+        | ExprKind::Name(_)
+        | ExprKind::Variant { .. }
+        | ExprKind::DefTypeRef(_)
+        | ExprKind::ContextRead(_)
+        | ExprKind::Error => {}
     }
 }
 

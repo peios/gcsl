@@ -753,6 +753,9 @@ pub struct TypeTable {
     enum_bounds: HashMap<Name, Option<TyId>>,
     /// The payload's type of each variant, by its key (see [Enums](#enums)).
     variant_payloads: HashMap<Name, TyId>,
+    /// The declared type of each context, by its declaration's key (see
+    /// the checker's "Context").
+    context_types: HashMap<Name, TyId>,
 }
 
 impl Default for TypeTable {
@@ -773,6 +776,7 @@ impl TypeTable {
             generics: Vec::new(),
             enum_bounds: HashMap::new(),
             variant_payloads: HashMap::new(),
+            context_types: HashMap::new(),
         };
         // In the order of the constants' numbers.
         for kind in [
@@ -1480,6 +1484,19 @@ impl TypeTable {
     #[must_use]
     pub fn enum_bound(&self, key: Name) -> Option<TyId> {
         self.enum_bounds.get(&key).copied().flatten()
+    }
+
+    /// Records the declared type of the context whose declaration's key is
+    /// `key`, `Error` for one in error (see the checker's "Context").
+    pub fn set_context_type(&mut self, key: Name, ty: TyId) {
+        self.context_types.insert(key, ty);
+    }
+
+    /// The declared type of the context whose declaration's key is `key`, if
+    /// it is known.
+    #[must_use]
+    pub fn context_type(&self, key: Name) -> Option<TyId> {
+        self.context_types.get(&key).copied()
     }
 
     /// Records the payload's type of the variant of the key `key` (see

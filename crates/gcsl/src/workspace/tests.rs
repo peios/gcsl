@@ -233,7 +233,7 @@ fn assert_imports_stored(workspace: &Workspace) {
     let types = vec![TyId::ERROR; scan.cells()];
     let builtins = assert_builtins_written(workspace);
     for (index, file) in (0u32..).zip(&scan.files) {
-        let reads = (&workspace.cell_slots[..], &[][..], &workspace.methods);
+        let reads = (&workspace.cell_slots[..], &[][..], &workspace.for_later);
         let context = Context::new(scan, index, &types, reads).unwrap();
         let mut pending: Vec<Target> = file
             .mentions
@@ -5613,6 +5613,7 @@ fn an_input_cannot_turn_the_prelude_off() {
         store: &mut TypeStore::new(),
         def_types: &[],
         variants: &[],
+        contexts: &[],
     };
     let errors = check_input(
         &started.standard,
@@ -12276,4 +12277,152 @@ fn variant_def_type_errors() {
         let found = errors(text);
         assert!(found.starts_with(message), "{text}: {found}");
     }
+}
+
+/// Contexts of platforms, as a library declares them, and a function that
+/// reads them.
+const PLATFORMS: (&str, &str) = (
+    "lib/plat.gcsl",
+    "type Platform = {arch: String, os: String}\n\
+     context arch: String = \"x86_64\"\n\
+     context host_platform: Platform = { arch = ^arch; os = \"linux\" }\n\
+     context platform: Platform = ^host_platform\n\
+     context required: Int\n\
+     def describe(): String { \"{^platform.arch}-{^platform.os}\" }\n\
+     def tool(^arch): String { \"cc-{arch}\" }\n\
+     def needs(): Int { ^required }",
+);
+
+#[test]
+fn contexts_are_read_bound_and_defaulted_where_they_are_read() {
+    let files = [
+        ("workspace.gcsl", ""),
+        PLATFORMS,
+        (
+            "app/main.gcsl",
+            "import lib/plat\n\
+             a = plat.describe()\n\
+             b = plat.describe() with { host_platform = { arch = \"aarch64\"; os = \"linux\" } }\n\
+             c = plat.describe() with { platform.arch = \"riscv64\"; platform.os = \"peios\" }\n\
+             d = with { arch = \"arm\" } { plat.describe() }\n\
+             e = plat.tool()\n\
+             f = plat.tool() with { arch = \"mips\" }\n\
+             g = plat.tool(arch = \"explicit\")\n\
+             h = plat.needs() with { required = 3 }\n\
+             i = ^platform.os",
+        ),
+    ];
+    assert_eq!(
+        rooted_text(&files, "app/main.gcsl"),
+        "{a = \"x86_64-linux\"; b = \"aarch64-linux\"; c = \"riscv64-peios\"; d = \"arm-linux\"; \
+         e = \"cc-x86_64\"; f = \"cc-mips\"; g = \"cc-explicit\"; h = 3; i = \"linux\"}"
+    );
+    // A read of one with no value is a runtime error.
+    let files = [
+        ("workspace.gcsl", ""),
+        PLATFORMS,
+        ("app/main.gcsl", "import lib/plat\nr = plat.needs()"),
+    ];
+    let mut workspace = rooted(&files).unwrap();
+    let main = workspace.file("app/main.gcsl").unwrap();
+    let error = workspace.run(main).unwrap_err().remove(0);
+    assert_eq!(error.message, "context `required` has no value here");
+}
+
+#[test]
+fn a_future_keeps_its_context_and_memoised_calls_key_on_what_they_read() {
+    let text = "context x: Int = 1\n\
+                fn m(n: Int) ->> Int { n + ^x }\n\
+                fn inner() ->> Int { ^x }\n\
+                fn outer() ->> Int { inner() * 100 }\n\
+                fn outer2() ->> Int { inner() * 1000 }\n\
+                fn later() ->> Future<Int> { lazy { ^x } }\n\
+                fn fixed() ->> Int { with { x = 7 } { inner() } }\n\
+                fn force(v: Int): Int { v }\n\
+                a = m(1)\n\
+                b = m(1) with { x = 10 }\n\
+                c = m(1)\n\
+                d = inner() with { x = 5 }\n\
+                e = outer()\n\
+                f = outer() with { x = 5 }\n\
+                g = outer2() with { x = 5 }\n\
+                h = outer2()\n\
+                i = force(later())\n\
+                j = force(later()) with { x = 42 }\n\
+                k = fixed()\n\
+                l = fixed() with { x = 9 }\n\
+                let made = lazy { ^x } with { x = 99 }\n\
+                n = force(made)";
+    let files = [("workspace.gcsl", ""), ("app/main.gcsl", text)];
+    assert_eq!(
+        rooted_text(&files, "app/main.gcsl"),
+        "{a = 2; b = 11; c = 2; d = 5; e = 100; f = 500; g = 5000; h = 1000; i = 1; j = 42; \
+         k = 7; l = 7; n = 99}"
+    );
+}
+
+#[test]
+fn context_errors() {
+    let errors = |text: &str| {
+        let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+        check_errors(&files).join("\n")
+    };
+    for (text, message) in [
+        ("r = ^nope", "no context `nope` is declared"),
+        (
+            "context arch: String = \"x\"\nr = ^arhc",
+            "no context `arhc` is declared",
+        ),
+        ("context x: Int\nr = ^x", "context `x` has no value here"),
+        (
+            "context x: Int = 1\ncontext x: Int = 2",
+            "context `x` is declared twice",
+        ),
+        ("context x: Int = \"s\"", "mismatched types"),
+        (
+            "context x: Int = 1\nr = 1 with { x = \"s\" }",
+            "mismatched types",
+        ),
+        (
+            "context p: {a: Int} = {a = 1}\nr = 1 with { p.b = 2 }",
+            "context `p` has no field `b`",
+        ),
+        (
+            "context x: Int = 1\nr = 1 with { x = 2; x = 3 }",
+            "context `x` is bound twice in this `with`",
+        ),
+        (
+            "context x: Int = 1\nr = 1 with { y = 2 }",
+            "no context `y` is declared",
+        ),
+        (
+            "fn imp() -> Int { 1 }\ncontext x: Int = imp()",
+            "the default of a context must be pure",
+        ),
+        ("context x: Nope = 1", "unknown type `Nope`"),
+        ("fn f(^nope): Int { 1 }", "no context `nope` is declared"),
+    ] {
+        let found = errors(text);
+        assert!(found.starts_with(message), "{text}: {found}");
+    }
+    // A context is declared once in a workspace.
+    let files = [
+        ("workspace.gcsl", ""),
+        ("a.gcsl", "context x: Int = 1"),
+        ("b.gcsl", "context x: Int = 2"),
+    ];
+    assert!(
+        check_errors(&files)
+            .join("\n")
+            .starts_with("context `x` is declared twice")
+    );
+}
+
+#[test]
+fn a_context_s_default_is_scheduled_with_what_it_reads() {
+    let files = [
+        ("workspace.gcsl", ""),
+        ("app.gcsl", "r = ^a\ncontext a: Int = b + 1\nb = 3\ns = ^a"),
+    ];
+    assert_eq!(rooted_text(&files, "app.gcsl"), "{r = 4; b = 3; s = 4}");
 }

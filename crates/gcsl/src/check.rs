@@ -3199,8 +3199,8 @@ use crate::ast::{
     DefTypeRole, Effect, Element, ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy,
     FieldTyKind, FieldTyRange, FnDecl, FnId, ForHead, ForId, GenericOwner, Item, ItemId, ItemKind,
     ItemRange, Jump, Label, LabelId, MetaTy, Param, PartRange, PathRange, PathSegment, SegmentKind,
-    StrPart, Syntax, TypeArgRange, TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span,
-    symbol_span,
+    StrPart, Syntax, TypeArgRange, TypeExprId, TypeExprKind, TypeProblem, UnaryOp, WithRange,
+    path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::mentions::{self, FieldLeaf, FieldTree, Mentions, Need, Resolve, Schedule};
@@ -3212,7 +3212,7 @@ use crate::types::{
     AwaitKind, DefTypeShape, FnTy, GenericId, Laziness, Meta, TyId, TyKind, TypeTable, ValueTest,
 };
 use crate::value::{Quantity, ValueKind, int_to_float};
-use crate::workspace::{AttributeLookup, Context, Target};
+use crate::workspace::{AttributeLookup, Context, ContextDefault, SeenContext, Target};
 
 /// The type of every expression in an [`Ast`], indexed by [`ExprId`].
 ///
@@ -4137,21 +4137,32 @@ struct TypeBinding {
 
 /// What the check gives lowering besides types and slots, as
 /// [`Resolution`] carries it.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ForLowering {
-    /// Each call that gives a parameter its default, by its id: see
-    /// [`Resolution::call_defaults`].
+    /// Each call that gives a parameter its default, by its id, with each
+    /// such parameter and its default, in parameter order (see
+    /// [Calls](#calls)); only a program with one has entries.
     call_defaults: HashMap<ExprId, Box<[(u32, ParamDefault)]>>,
-    /// Each function item's attributes: see [`Resolution::attributes`].
-    fn_attributes: HashMap<FnId, Box<[Attribute]>>,
-    /// Each record literal given fields' defaults, by its id: see
-    /// [`Resolution::record_fills`].
-    record_fills: RecordFills,
-    /// Each call of a method, by its id, with its receiver: see
-    /// [`Resolution::method_receiver`].
+    /// Each call of a method, by its id, with its receiver, its callee's
+    /// parameter 0 (see [Methods](#methods)).
     method_calls: HashMap<ExprId, ExprId>,
-    /// Each variant as a value, by its id: see [`Resolution::variant`].
+    /// Each variant as a value, by its id (see [Enums](#enums)).
     variants: HashMap<ExprId, VariantTag>,
+    /// Each read of a context, by its id, with its declaration's key (see
+    /// [Context](#context)).
+    context_reads: HashMap<ExprId, Name>,
+    /// Each `with`, by its id, with the key of the declaration of each
+    /// binding's context, in order (see [Context](#context)).
+    withs: HashMap<ExprId, Box<[Name]>>,
+    /// The attributes of each function item that has any, by its function,
+    /// in source order (see [Attributes](#attributes)).
+    fn_attributes: HashMap<FnId, Box<[Attribute]>>,
+    /// Each record literal, a record block or `{}`, that the checker gave
+    /// fields their defaults, by its id, with each such field and its
+    /// default, in the order of
+    /// their names' text (see [Field defaults](#field-defaults)); only a
+    /// program with one has entries.
+    record_fills: RecordFills,
 }
 
 /// A variant as a value, as lowering makes it a constant (see
@@ -4545,24 +4556,9 @@ pub struct Resolution {
     /// function, with the cell of the top level's frame that holds its
     /// meta's closure (see [Metas](#metas)).
     metas: Vec<(FnId, Slot)>,
-    /// Each call that gives a parameter its default, by its id, with each
-    /// such parameter and its default, in parameter order (see
-    /// [Calls](#calls)); only a program with one has entries.
-    call_defaults: HashMap<ExprId, Box<[(u32, ParamDefault)]>>,
-    /// Each call of a method, by its id, with its receiver, its callee's
-    /// parameter 0 (see [Methods](#methods)).
-    method_calls: HashMap<ExprId, ExprId>,
-    /// Each variant as a value, by its id (see [Enums](#enums)).
-    variants: HashMap<ExprId, VariantTag>,
-    /// The attributes of each function item that has any, by its function,
-    /// in source order (see [Attributes](#attributes)).
-    fn_attributes: HashMap<FnId, Box<[Attribute]>>,
-    /// Each record literal, a record block or `{}`, that the checker gave
-    /// fields their defaults, by its id, with each such field and its
-    /// default, in the order of
-    /// their names' text (see [Field defaults](#field-defaults)); only a
-    /// program with one has entries.
-    record_fills: RecordFills,
+    /// What the check gives lowering besides types and slots: see the
+    /// accessors.
+    lowered: ForLowering,
 }
 
 /// What a `break`, `continue` or `return` item is for (see
@@ -4646,14 +4642,32 @@ impl Resolution {
     /// other call, and for an expression that is no call.
     #[must_use]
     pub fn call_defaults(&self, id: ExprId) -> &[(u32, ParamDefault)] {
-        self.call_defaults.get(&id).map_or(&[], |defaults| defaults)
+        self.lowered
+            .call_defaults
+            .get(&id)
+            .map_or(&[], |defaults| defaults)
     }
 
     /// The variant the expression `id` is, a variant as a value (see
     /// [Enums](#enums)), which lowering makes a constant.
     #[must_use]
     pub fn variant(&self, id: ExprId) -> Option<&VariantTag> {
-        self.variants.get(&id)
+        self.lowered.variants.get(&id)
+    }
+
+    /// The key of the declaration of the context the expression `id`, a
+    /// read of one, reads (see [Context](#context)); its default's function,
+    /// if it has one, is the read's variable ([`Resolution::expr_var`]).
+    #[must_use]
+    pub fn context_read(&self, id: ExprId) -> Option<Name> {
+        self.lowered.context_reads.get(&id).copied()
+    }
+
+    /// The keys of the declarations of the contexts the `with` `id` binds,
+    /// one for each of its bindings, in order (see [Context](#context)).
+    #[must_use]
+    pub fn with_keys(&self, id: ExprId) -> Option<&[Name]> {
+        self.lowered.withs.get(&id).map(|keys| &keys[..])
     }
 
     /// The receiver of the call `id`, if it is a method's (see
@@ -4662,7 +4676,7 @@ impl Resolution {
     /// as.
     #[must_use]
     pub fn method_receiver(&self, id: ExprId) -> Option<ExprId> {
-        self.method_calls.get(&id).copied()
+        self.lowered.method_calls.get(&id).copied()
     }
 
     /// The attributes of function `function`, in source order: none for a
@@ -4670,7 +4684,8 @@ impl Resolution {
     /// [Attributes](#attributes)).
     #[must_use]
     pub fn attributes(&self, function: FnId) -> &[Attribute] {
-        self.fn_attributes
+        self.lowered
+            .fn_attributes
             .get(&function)
             .map_or(&[], |attributes| attributes)
     }
@@ -4682,7 +4697,10 @@ impl Resolution {
     /// for any other block, and for an expression that is no block.
     #[must_use]
     pub fn record_fills(&self, block: ExprId) -> &[(Name, Constant)] {
-        self.record_fills.get(&block).map_or(&[], |fills| fills)
+        self.lowered
+            .record_fills
+            .get(&block)
+            .map_or(&[], |fills| fills)
     }
 
     /// The slot written by item `id`, or [`Slot::NONE`] if it is not a
@@ -4967,11 +4985,7 @@ impl Resolution {
             tests: HashMap::new(),
             meta_reads: HashMap::new(),
             metas: Vec::new(),
-            call_defaults: HashMap::new(),
-            method_calls: HashMap::new(),
-            variants: HashMap::new(),
-            fn_attributes: HashMap::new(),
-            record_fills: HashMap::new(),
+            lowered: ForLowering::default(),
         }
     }
 
@@ -6199,6 +6213,26 @@ pub(crate) fn check_enum_bounds(
     checker.errors
 }
 
+/// Resolves the declared types of the contexts of `ast`, each by its
+/// position among the file's contexts and its declaration's key (see
+/// [Context](#context)), interning into `types`, which records each, `Error`
+/// for one in error, its error reported. Returns the errors found.
+pub(crate) fn check_context_types(
+    ast: &Ast,
+    types: &mut TypeTable,
+    contexts: &[(u32, Name)],
+) -> Vec<Diagnostic> {
+    let mut checker = Checker::new(ast, types);
+    for &(decl, key) in contexts {
+        let Some(context) = ast.contexts().get(decl as usize) else {
+            continue;
+        };
+        let ty = checker.resolve_type(context.ty, Bareness::Present);
+        checker.types.set_context_type(key, ty);
+    }
+    checker.errors
+}
+
 /// A variant's item, its enum's key and name, if what it names is an enum,
 /// and its own key (see [Enums](#enums)).
 pub(crate) type VariantItem = (ItemId, Option<(Name, Name)>, Name);
@@ -6457,6 +6491,9 @@ pub struct Checker<'a> {
     lowering: ForLowering,
     /// What the check keeps of generic functions, methods and their calls.
     calls: CallsChecked,
+    /// The contexts the `with`s around the expression being checked bind,
+    /// by their declarations' keys, innermost last (see [Context](#context)).
+    with_bound: Vec<Name>,
     /// What the input's top-level items mention, and the groups of its
     /// top-level functions (see [`crate::mentions`]).
     mentions: Mentions,
@@ -6747,6 +6784,7 @@ impl<'a> Checker<'a> {
             scope_known: scope.known,
             lowering: ForLowering::default(),
             calls: CallsChecked::default(),
+            with_bound: Vec::new(),
             mentions: Mentions::default(),
             workspace: None,
             imported_callees: HashMap::new(),
@@ -6942,11 +6980,7 @@ impl<'a> Checker<'a> {
                 tests: self.tests,
                 meta_reads: self.meta_reads,
                 metas: self.metas,
-                call_defaults: self.lowering.call_defaults,
-                method_calls: self.lowering.method_calls,
-                variants: self.lowering.variants,
-                fn_attributes: self.lowering.fn_attributes,
-                record_fills: self.lowering.record_fills,
+                lowered: self.lowering,
             },
         };
         let mut warnings = self.warnings;
@@ -7118,6 +7152,7 @@ impl<'a> Checker<'a> {
                 ItemKind::Type { .. }
                 | ItemKind::Enum { .. }
                 | ItemKind::Variant { .. }
+                | ItemKind::Context { .. }
                 | ItemKind::DefTypeDef { .. }
                 | ItemKind::DefMeta { .. } => {}
                 ItemKind::Result(value) => {
@@ -7482,6 +7517,7 @@ impl<'a> Checker<'a> {
             | ItemKind::Type { .. }
             | ItemKind::Enum { .. }
             | ItemKind::Variant { .. }
+            | ItemKind::Context { .. }
             | ItemKind::DefTypeDef { .. }
             | ItemKind::DefMeta { .. }
             | ItemKind::Error => false,
@@ -12219,11 +12255,15 @@ impl<'a> Checker<'a> {
     /// Whether the item at `position` of the outermost block, of `kind`,
     /// does not run where it is written: a top-level field whose leaf is
     /// computed before its own item ([`Checker::computed_early`]), or a
-    /// `type`, which never runs.
+    /// declaration, a `type`, an `enum` or a context without a default,
+    /// which never runs.
     fn runs_elsewhere(&self, position: usize, kind: ItemKind) -> bool {
         matches!(
             kind,
-            ItemKind::Type { .. } | ItemKind::Enum { .. } | ItemKind::Variant { .. }
+            ItemKind::Type { .. }
+                | ItemKind::Enum { .. }
+                | ItemKind::Variant { .. }
+                | ItemKind::Context { .. }
         ) || self.computed_early(position)
     }
 
@@ -13054,6 +13094,11 @@ impl<'a> Checker<'a> {
                 let ty = self.types.enum_type(key, name);
                 self.bare(ty, mode)
             }
+            // A `^NAME` parameter's, its context's declared type exactly.
+            TypeExprKind::Context(name) => match self.context_named(name, ty.span) {
+                Some(context) => self.types.context_type(context.key).unwrap_or(TyId::ERROR),
+                None => TyId::ERROR,
+            },
             // A type parameter in scope, which no bareness wraps.
             TypeExprKind::Named(name)
                 if let Some((owner, index)) = self.ast.type_param(id, name) =>
@@ -13446,10 +13491,12 @@ impl<'a> Checker<'a> {
                 Some(name) == self.constructors.list || Some(name) == self.constructors.partial
             }
             TypeExprKind::Union { .. } => !self.has_future_member(ty),
+            // A context's type is what it is declared to be.
             TypeExprKind::Fn { .. }
             | TypeExprKind::Ref(_)
             | TypeExprKind::Instance { .. }
             | TypeExprKind::Param(_)
+            | TypeExprKind::Context(_)
             | TypeExprKind::Invalid => false,
         }
     }
@@ -15122,6 +15169,8 @@ impl<'a> Checker<'a> {
             ExprKind::Float(_) => TyId::FLOAT,
             ExprKind::Duration(_) => TyId::DURATION,
             ExprKind::Variant { of, name } => self.check_variant(id, (of, name)),
+            ExprKind::ContextRead(name) => self.check_context_read(id, name),
+            ExprKind::With { bindings, body } => self.check_with(id, bindings, body),
             ExprKind::Size(_) => TyId::SIZE,
             ExprKind::Bool(_) => TyId::BOOL,
             ExprKind::Str(_) => TyId::STRING,
@@ -16508,6 +16557,7 @@ impl<'a> Checker<'a> {
             | TypeExprKind::Ref(_)
             | TypeExprKind::Instance { .. }
             | TypeExprKind::Param(_)
+            | TypeExprKind::Context(_)
             | TypeExprKind::Invalid => {
                 return declared;
             }
@@ -17024,8 +17074,23 @@ impl<'a> Checker<'a> {
             && function.effect == Effect::Pure
             && sig.effect != Effect::Pure
         {
-            let marker = function.marker;
+            let (marker, function) = (function.marker, function.fn_id);
             let label = format!("this is {}", self.in_label(callee_ty));
+            // A context's default, which has no marker of its own to change.
+            if self.is_context_default(function) {
+                self.errors.push(
+                    Diagnostic::error(
+                        "the default of a context must be pure",
+                        self.ast.get(id).span,
+                    )
+                    .with_context(self.ast.get(callee).span, label)
+                    .with_note(
+                        "a read of a context is pure, so its default is too; bind an impure \
+                         value with `with` instead",
+                    ),
+                );
+                return;
+            }
             self.errors.push(
                 Diagnostic::error(
                     "cannot call an impure function from a pure function",
@@ -17039,6 +17104,18 @@ impl<'a> Checker<'a> {
                 ),
             );
         }
+    }
+
+    /// Whether `function` is the function of a context's default, of the
+    /// input's (see [Context](#context)).
+    fn is_context_default(&self, function: FnId) -> bool {
+        self.ast.contexts().iter().any(|context| {
+            matches!(
+                self.ast.item(context.item).kind,
+                ItemKind::Let { value, .. }
+                    if self.ast.get(value).kind == ExprKind::Fn(function)
+            )
+        })
     }
 
     /// Checks what the input declares, as it starts, and declares its
@@ -17100,6 +17177,164 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+    }
+
+    /// The context named `name` that the input sees, read or bound at `span`
+    /// (see [Context](#context)); `None` (reported) if none is declared:
+    /// "no context `arch` is declared", suggesting a close name.
+    fn context_named(&mut self, name: Name, span: Span) -> Option<SeenContext> {
+        if let Some(found) = self.workspace.and_then(|workspace| workspace.context(name)) {
+            return Some(found);
+        }
+        let names = self.ast.names();
+        let text = names.get(name);
+        let declared = self
+            .workspace
+            .map(Context::context_names)
+            .unwrap_or_default();
+        // At the name, which ends the span.
+        let at = self.ast.written_name(span.end, text);
+        let suggestion = suggest::best(text, declared.iter().map(|&n| (names.get(n), 0)))
+            .map(|best| (at, best.to_owned()));
+        self.errors.push(
+            Diagnostic::error(format!("no context `{text}` is declared"), span)
+                .with_suggestion(suggestion),
+        );
+        None
+    }
+
+    /// Types the read of a context `id`, `^NAME` (see [Context](#context)):
+    /// its declared type, of the context the input sees by the name; its
+    /// default's function, if it has one, read as the read's own variable,
+    /// so that lowering calls it where no `with` binds the context: a binding
+    /// of the input's or of an earlier input's, read as a name is, or
+    /// another file's, from its slot. Recorded for lowering. A read at the
+    /// input's top level of a context with no default that no `with` around
+    /// it binds is "context `arch` has no value here", noted "no `with` sets
+    /// it, and it declares no default".
+    fn check_context_read(&mut self, id: ExprId, name: Name) -> TyId {
+        let span = self.ast.get(id).span;
+        let Some(context) = self.context_named(name, span) else {
+            return TyId::ERROR;
+        };
+        // An erroneous declaration is reported where it is.
+        let ty = self.types.context_type(context.key).unwrap_or(TyId::ERROR);
+        if ty == TyId::ERROR {
+            self.quiet.failed = true;
+            return TyId::ERROR;
+        }
+        match context.default {
+            ContextDefault::Binding(binding) => {
+                if self.use_name(id, binding, span).0 == TyId::ERROR {
+                    return TyId::ERROR;
+                }
+            }
+            ContextDefault::Foreign(Some(slot)) => self.read_import(id, slot),
+            // Its file failed its check, which is reported.
+            ContextDefault::Foreign(None) => {
+                self.quiet.failed = true;
+                return TyId::ERROR;
+            }
+            ContextDefault::None => {
+                if self.functions.is_empty() && !self.with_bound.contains(&context.key) {
+                    let text = self.ast.names().get(name);
+                    self.errors.push(
+                        Diagnostic::error(format!("context `{text}` has no value here"), span)
+                            .with_note("no `with` sets it, and it declares no default"),
+                    );
+                    return TyId::ERROR;
+                }
+            }
+        }
+        self.lowering.context_reads.insert(id, context.key);
+        ty
+    }
+
+    /// Types `id`, `BODY with { ... }`, of the bindings `bindings` and the
+    /// body `body` (see [Context](#context)): each binding's context, the
+    /// one the input sees by its name; a plain binding's value checked
+    /// against the context's type; a dotted key's, `platform.arch = v`,
+    /// against the type of the field its path names in the context's type,
+    /// a record's, "context `platform` has no field `archx`" otherwise, the
+    /// value it updates read as `^platform` is. A second plain binding of a
+    /// context, or one after a dotted key of it, is "context `platform` is
+    /// bound twice in this `with`". The body is checked with each context
+    /// bound, and its type is the `with`'s. Recorded for lowering.
+    fn check_with(&mut self, id: ExprId, bindings: WithRange, body: ExprId) -> TyId {
+        let mut keys = Vec::new();
+        let mut erroneous = false;
+        // The contexts bound plainly so far, and by a dotted key.
+        let (mut plain, mut dotted): (Vec<Name>, Vec<Name>) = (Vec::new(), Vec::new());
+        for binding in self.ast.with_bindings(bindings).to_vec() {
+            let found = self.context_named(binding.name, binding.name_span);
+            let ty = found.map_or(TyId::ERROR, |context| {
+                self.types.context_type(context.key).unwrap_or(TyId::ERROR)
+            });
+            let Some(context) = found.filter(|_| ty != TyId::ERROR) else {
+                // Its value checked alone, for what is wrong in it.
+                self.check_expr(binding.value);
+                erroneous = true;
+                continue;
+            };
+            let text = self.ast.names().get(binding.name).to_owned();
+            let segments = self.ast.path(binding.path);
+            let expected = match binding.current {
+                None => {
+                    if plain.contains(&context.key) || dotted.contains(&context.key) {
+                        self.errors.push(Diagnostic::error(
+                            format!("context `{text}` is bound twice in this `with`"),
+                            binding.name_span,
+                        ));
+                        erroneous = true;
+                    }
+                    plain.push(context.key);
+                    ty
+                }
+                Some(current) => {
+                    dotted.push(context.key);
+                    if self.check_expr(current) == TyId::ERROR {
+                        erroneous = true;
+                    }
+                    let mut at = ty;
+                    for segment in segments {
+                        let Some(field) = segment.name() else {
+                            break;
+                        };
+                        if let Some(field_ty) = self.types.field(self.types.strip(at), field) {
+                            at = field_ty;
+                        } else {
+                            let shown = self.ast.names().get(field);
+                            self.errors.push(Diagnostic::error(
+                                format!("context `{text}` has no field `{shown}`"),
+                                segment.span,
+                            ));
+                            at = TyId::ERROR;
+                            erroneous = true;
+                            break;
+                        }
+                    }
+                    at
+                }
+            };
+            let why = format!("the type of context `{text}`");
+            let site = (AwaitSite::Implicit, None);
+            if self.check_expr_expecting_at(
+                binding.value,
+                expected,
+                (binding.name_span, &why),
+                site,
+            ) == TyId::ERROR
+            {
+                erroneous = true;
+            }
+            keys.push(context.key);
+        }
+        let outer = self.with_bound.len();
+        self.with_bound.extend(keys.iter().copied());
+        let ty = self.check_expr(body);
+        self.with_bound.truncate(outer);
+        self.lowering.withs.insert(id, keys.into());
+        if erroneous { TyId::ERROR } else { ty }
     }
 
     /// Types the variant as a value `id`, `of::name`, the name written at
@@ -20984,6 +21219,7 @@ impl<'a> Checker<'a> {
             | ItemKind::Type { .. }
             | ItemKind::Enum { .. }
             | ItemKind::Variant { .. }
+            | ItemKind::Context { .. }
             | ItemKind::DefTypeDef { .. }
             | ItemKind::DefMeta { .. }
             | ItemKind::Error => {}
@@ -21831,7 +22067,8 @@ impl<'a> Checker<'a> {
     /// error).
     ///
     /// Only integer literals, parentheses, negation, `await` of a present
-    /// value, `+ - *`, blocks and `if`s with `else` can be untyped, and an
+    /// value, `+ - *`, blocks, `with`s and `if`s with `else` can be
+    /// untyped, and an
     /// untyped node's children
     /// (an `if`'s branches, not its condition) are untyped or concrete of
     /// the same kind, so the walk only ever meets those nodes. Every other
@@ -21863,12 +22100,15 @@ impl<'a> Checker<'a> {
             | ExprKind::Index { .. }
             | ExprKind::For(_)
             | ExprKind::DefTypeRef(_)
+            | ExprKind::ContextRead(_)
             | ExprKind::Error
             | ExprKind::NoField(_)
             | ExprKind::Unclosed { .. } => {}
             // An `await` of an untyped operand is one of a present value,
-            // which it passes through.
-            ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => {
+            // which it passes through, and a `with` its body.
+            ExprKind::Paren(inner)
+            | ExprKind::Unary { operand: inner, .. }
+            | ExprKind::With { body: inner, .. } => {
                 self.coerce(inner, ty);
             }
             ExprKind::Binary { lhs, rhs, .. } => {
@@ -21913,6 +22153,7 @@ impl<'a> Checker<'a> {
             | ItemKind::Type { .. }
             | ItemKind::Enum { .. }
             | ItemKind::Variant { .. }
+            | ItemKind::Context { .. }
             | ItemKind::DefTypeDef { .. }
             | ItemKind::DefMeta { .. }
             | ItemKind::Error => {}

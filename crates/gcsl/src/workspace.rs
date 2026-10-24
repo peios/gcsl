@@ -962,8 +962,8 @@ use crate::ast::{
 use crate::check::ViewRecord;
 use crate::check::{
     BUILTIN_ATTRIBUTES, BUILTIN_TYPE_NAMES, Builtin, CheckOutput, Checker, Fileroot, KnownParams,
-    Place, Record, Scope, Slot, Types, VariantItem, check_enum_bounds, check_types,
-    check_variant_payloads,
+    Place, Record, Scope, Slot, Types, VariantItem, check_context_types, check_enum_bounds,
+    check_types, check_variant_payloads,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError, Severity};
 use crate::eval::{MemoTables, TempDirs};
@@ -1173,7 +1173,11 @@ pub struct SeenVariant {
 
 /// What a session's input inherits of the earlier inputs' types: each type
 /// with its declaration's number in the store, and each variant.
-type Inheriting<'a> = (&'a [(Name, u32)], &'a [InheritedVariant]);
+type Inheriting<'a> = (
+    &'a [(Name, u32)],
+    &'a [InheritedVariant],
+    &'a [InheritedContext],
+);
 
 /// A variant a session's input inherits from the earlier inputs: its enum's
 /// key, its name and its own key (see [Enums](#enums)).
@@ -1196,6 +1200,76 @@ pub struct DeclaredVariant {
     pub enum_of: Option<(Name, Name)>,
     /// Its key, its identity ([`names::variant_key`]).
     pub key: Name,
+}
+
+/// A context one of a scan's files declares (see [Context](#context)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeclaredContext {
+    /// Its file.
+    pub file: u32,
+    /// Its position among the file's contexts ([`Ast::contexts`]).
+    pub decl: u32,
+    /// Its name.
+    pub name: Name,
+    /// Where its name is written.
+    pub span: Span,
+    /// Its declaration's key, its identity ([`names::context_key`]).
+    pub key: Name,
+    /// Its default's binding, if it has a default.
+    pub binding: Option<Name>,
+}
+
+/// A context a session's input inherits from the earlier inputs: its name,
+/// its declaration's key and its default's binding, if it has a default
+/// (see [Context](#context)).
+pub(crate) type InheritedContext = (Name, Name, Option<Name>);
+
+/// The slot of each context's default's closure, once its file is checked,
+/// by its declaration's key (see [Context](#context)).
+pub(crate) type CheckedContexts = HashMap<Name, Slot>;
+
+/// What the checks of a workspace's files found that later files read:
+/// their methods (see [Methods](#methods)) and their contexts' defaults
+/// (see [Context](#context)).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ForLater {
+    /// The methods.
+    pub(crate) methods: CheckedMethods,
+    /// The contexts' defaults.
+    pub(crate) contexts: CheckedContexts,
+}
+
+impl ForLater {
+    /// Adds what the check `output` of file `index` of `scan` found.
+    fn extend(&mut self, scan: &Scan, index: u32, output: &CheckOutput) {
+        self.methods.extend(checked_methods(scan, index, output));
+        self.contexts.extend(checked_contexts(scan, index, output));
+    }
+}
+
+/// Where a read of a context that no `with` binds finds its default (see
+/// [Context](#context)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContextDefault {
+    /// It has none.
+    None,
+    /// The binding of its function, of the file being checked or of a
+    /// session's earlier input.
+    Binding(Name),
+    /// The slot of its function, of another file of the workspace, checked
+    /// and run before the file; `None` if that file failed its check.
+    Foreign(Option<Slot>),
+}
+
+/// A context a file sees, as its checker is given it ([`Context::context`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SeenContext {
+    /// Its declaration's key, by which the type table has its type.
+    pub(crate) key: Name,
+    /// Where its default is.
+    pub(crate) default: ContextDefault,
+    /// Where its name is declared, its file and its span, if that is known.
+    pub(crate) site: Option<(u32, Span)>,
 }
 
 /// A method of a file of a scan, by the file and its position among the
@@ -1593,6 +1667,12 @@ pub struct Scan {
     /// by its enum's key and its name, with its own key (see
     /// [Enums](#enums)).
     inherited_variants: Vec<InheritedVariant>,
+    /// The contexts every file declares, in path order, each file's in
+    /// source order (see [Context](#context)).
+    pub contexts: Vec<DeclaredContext>,
+    /// The contexts a session's input inherits from the earlier inputs (see
+    /// [Context](#context)).
+    inherited_contexts: Vec<InheritedContext>,
     /// The types of each directory, by its index: its files' declarations,
     /// as indices in `types`, in order, the first of each name.
     dir_types: Vec<Vec<u32>>,
@@ -2808,7 +2888,7 @@ fn scan_into(
         placed,
         library,
         (names, loaded),
-        (&mut TypeStore::new(), (&[], &[])),
+        (&mut TypeStore::new(), (&[], &[], &[])),
         (&[], None),
     )
 }
@@ -2827,7 +2907,7 @@ fn scan_into_with(
     (sources, placing): (&[SourceFile], Placing),
     library: Library,
     (names, loaded): (&mut Names, &mut Vec<usize>),
-    (store, (inherited, variants)): (&mut TypeStore, Inheriting<'_>),
+    (store, (inherited, variants, contexts)): (&mut TypeStore, Inheriting<'_>),
     def_types: (&[(Vec<Name>, Name)], Option<u32>),
 ) -> Result<Scan, Vec<Diagnostic>> {
     let mut scan = Scan {
@@ -2859,6 +2939,8 @@ fn scan_into_with(
         inherited_types: inherited.to_vec(),
         variants: Vec::new(),
         inherited_variants: variants.to_vec(),
+        contexts: Vec::new(),
+        inherited_contexts: contexts.to_vec(),
         inherited_def_types: def_types.0.to_vec(),
         input_number: def_types.1,
         syntax_errors: Vec::new(),
@@ -5422,6 +5504,16 @@ impl Scan {
         }
     }
 
+    /// The contexts file `index` declares, as a session's later input
+    /// inherits them (see [Context](#context)).
+    fn own_contexts(&self, index: u32) -> Vec<InheritedContext> {
+        self.contexts
+            .iter()
+            .filter(|context| context.file == index)
+            .map(|context| (context.name, context.key, context.binding))
+            .collect()
+    }
+
     /// The name of the type `decl`, an index in [`Scan::types`], as text.
     fn show_type(&self, decl: u32) -> &str {
         self.type_name(decl).map_or("", |name| self.names.get(name))
@@ -5959,6 +6051,90 @@ fn declare_variants(scan: &mut Scan) {
     variant_views(scan);
 }
 
+/// Finds every context the scan's files declare (see [Context](#context)),
+/// each with its declaration's key, of its name and of its file.
+fn declare_contexts(scan: &mut Scan) {
+    let mut found = Vec::new();
+    for index in 0..count(scan.files.len()) {
+        let Some(file) = scan.files.get(index as usize) else {
+            continue;
+        };
+        let declared: Vec<(u32, Name, Span, Option<Name>)> = (0u32..)
+            .zip(file.ast.contexts())
+            .map(|(decl, context)| (decl, context.name, context.name_span, context.binding))
+            .collect();
+        if declared.is_empty() {
+            continue;
+        }
+        let origin = scan.origin(index);
+        for (decl, name, span, binding) in declared {
+            let text = names::context_key(scan.names.get(name), &origin);
+            let key = scan.names.intern(&text);
+            found.push(DeclaredContext {
+                file: index,
+                decl,
+                name,
+                span,
+                key,
+                binding,
+            });
+        }
+    }
+    scan.contexts = found;
+}
+
+/// Resolves the declared types of the contexts of the scan's files from
+/// number `from` on, once their `type` items are checked (see
+/// [Context](#context)), lent the workspace's `names`, interning into
+/// `types`, which records them; and reports each declaration of a name a
+/// file of the scan declared before it, "context `arch` is declared twice",
+/// labelled at the first. Returns the errors found, each in its file.
+fn check_context_items(
+    (scan, from): (&mut Scan, u32),
+    names: &mut Names,
+    types: &mut TypeTable,
+) -> Vec<Diagnostic> {
+    let mut errors = Vec::new();
+    let mut first: HashMap<Name, (u32, Span)> = HashMap::new();
+    for context in &scan.contexts {
+        match first.get(&context.name) {
+            Some(&(earlier, at)) if context.file >= from => {
+                let shown = names.get(context.name);
+                errors.push(context_in(
+                    Diagnostic::error(format!("context `{shown}` is declared twice"), context.span)
+                        .in_input(context.file),
+                    earlier,
+                    at,
+                    "first declared here",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                first.insert(context.name, (context.file, context.span));
+            }
+        }
+    }
+    let mut by_file: Vec<Vec<(u32, Name)>> = vec![Vec::new(); scan.files.len()];
+    for context in &scan.contexts {
+        if let Some(entry) = by_file.get_mut(context.file as usize) {
+            entry.push((context.decl, context.key));
+        }
+    }
+    for (index, file) in (0u32..).zip(&mut scan.files).skip(from as usize) {
+        let Some(contexts) = by_file.get(index as usize) else {
+            continue;
+        };
+        if contexts.is_empty() || file.ast.syntax() == Syntax::Unbalanced {
+            continue;
+        }
+        file.ast.replace_names(mem::take(names));
+        let found = check_context_types(&file.ast, types, contexts);
+        *names = file.ast.replace_names(Names::new());
+        errors.extend(in_file(found, index));
+    }
+    errors
+}
+
 /// The conflict in file `index`'s view of types of the type `name` between
 /// the later source and the earlier one (see [`type_views`]).
 fn type_conflict(
@@ -6027,6 +6203,7 @@ fn define_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
         }
     }
     declare_variants(scan);
+    declare_contexts(scan);
     // What each declaration refers to of the scan's own: the store's
     // earlier declarations, a session's earlier inputs', are settled.
     let edges: Vec<Vec<u32>> = (0..count(scan.types.len()))
@@ -6348,6 +6525,7 @@ fn find_needs(scan: &mut Scan, errors: &mut Vec<Diagnostic>) -> Vec<HashMap<u32,
         let scope = FileScope::new(scan, file);
         let mut itself = false;
         let mut first = method_needs(scan, index, file);
+        context_needs(scan, index, file, &mut first);
         let mut record = |owner: u32, span: Span, shown: &dyn Fn() -> String| {
             if owner == index {
                 return;
@@ -6501,13 +6679,21 @@ fn cycle_groups(
                 .iter()
                 .filter_map(|other| Some((*other, first.get(other)?)))
                 .min_by_key(|(_, (at, _))| at.start)?;
-            let text = match what.strip_prefix(METHOD_NEED) {
-                Some(name) => format!(
+            let text = match (
+                what.strip_prefix(METHOD_NEED),
+                what.strip_prefix(CONTEXT_NEED),
+            ) {
+                (Some(name), _) => format!(
                     "{} may call the method `{name}` of {} here",
                     path(file),
                     path(other)
                 ),
-                None => format!("{} uses `{what}` here", path(file)),
+                (None, Some(name)) => format!(
+                    "{} reads the context `{name}` of {} here",
+                    path(file),
+                    path(other)
+                ),
+                (None, None) => format!("{} uses `{what}` here", path(file)),
             };
             Some((file, *at, text))
         });
@@ -6554,6 +6740,48 @@ fn method_needs(scan: &Scan, index: u32, file: &File) -> HashMap<u32, (Span, Str
     }
     first
 }
+
+/// Adds to `first` the files file `index`, `file`, needs for its reads of
+/// contexts, each with its first such read and what it is shown as, unless
+/// an earlier need of the file is: the file declaring the context each
+/// reads, whose default the read may call (see [Context](#context)), but a
+/// session's earlier input's, and its own.
+fn context_needs(scan: &Scan, index: u32, file: &File, first: &mut HashMap<u32, (Span, String)>) {
+    for (name, span) in file.ast.context_reads() {
+        // Its own declaration, or an earlier input's, is read in place.
+        let own = scan
+            .contexts
+            .iter()
+            .any(|c| c.name == name && c.file == index);
+        let inherited = index >= scan.standard
+            && scan
+                .inherited_contexts
+                .iter()
+                .any(|&(earlier, ..)| earlier == name);
+        if own || inherited {
+            continue;
+        }
+        let Some(declared) = scan
+            .contexts
+            .iter()
+            .find(|c| c.name == name && c.binding.is_some())
+        else {
+            continue;
+        };
+        let shown = format!("{CONTEXT_NEED}{}", scan.names.get(name));
+        let entry = first
+            .entry(declared.file)
+            .or_insert_with(|| (span, shown.clone()));
+        if span.start < entry.0.start {
+            *entry = (span, shown);
+        }
+    }
+}
+
+/// What a need of a context's default is shown as, before the context's
+/// name, among the needs a cycle of files is reported with (see
+/// [Context](#context)): no field's path holds `<`.
+const CONTEXT_NEED: &str = "<context> ";
 
 /// What a need of the methods of a name is shown as, before the name, among
 /// the needs a cycle of files is reported with (see [Methods](#methods)):
@@ -6717,8 +6945,8 @@ pub(crate) struct Context<'a> {
     /// and their defaults, which a call of it through an import or by its
     /// path gives the parameters it leaves unfilled.
     cell_known: &'a [Option<Rc<KnownParams>>],
-    /// The methods of the files checked so far (see [Methods](#methods)).
-    methods: &'a CheckedMethods,
+    /// The methods and the contexts' defaults of the files checked so far.
+    for_later: &'a ForLater,
     /// Whether the file is a session's input, whose scope is the session's:
     /// its variables are read as a session's input reads them, captured
     /// by a function, not read through the top level's frame as a
@@ -6732,12 +6960,8 @@ pub(crate) struct Context<'a> {
 
 /// What a [`Context`] reads cells by: the slot each cell is read from, for
 /// each `def`'s cell what a call of it needs to know of its parameters, and
-/// the methods of the files checked.
-type CellReads<'a> = (
-    &'a [Slot],
-    &'a [Option<Rc<KnownParams>>],
-    &'a CheckedMethods,
-);
+/// the methods and the contexts' defaults of the files checked.
+type CellReads<'a> = (&'a [Slot], &'a [Option<Rc<KnownParams>>], &'a ForLater);
 
 /// What a name read as an attribute's names in a file (see the parser's
 /// [Attributes](crate::parser#attributes)).
@@ -6783,7 +7007,7 @@ impl<'a> Context<'a> {
         scan: &'a Scan,
         index: u32,
         cell_types: &'a [TyId],
-        (cell_slots, cell_known, methods): CellReads<'a>,
+        (cell_slots, cell_known, for_later): CellReads<'a>,
     ) -> Option<Self> {
         let file = scan.files.get(index as usize)?;
         Some(Self {
@@ -6794,7 +7018,7 @@ impl<'a> Context<'a> {
             cell_types,
             cell_slots,
             cell_known,
-            methods,
+            for_later,
             session: false,
             place: scan.place(index),
         })
@@ -6811,7 +7035,7 @@ impl<'a> Context<'a> {
         (0u32..)
             .zip(found)
             .filter_map(|(index, &method)| {
-                let checked = self.methods.get(&method)?.clone();
+                let checked = self.for_later.methods.get(&method)?.clone();
                 let decl = self
                     .scan
                     .files
@@ -6834,7 +7058,55 @@ impl<'a> Context<'a> {
     /// (see [Methods](#methods)).
     pub(crate) fn method(&self, name: Name, index: u32) -> Option<&'a CheckedMethod> {
         let found = self.file.method_view.get(&name)?.get(index as usize)?;
-        self.methods.get(found)
+        self.for_later.methods.get(found)
+    }
+
+    /// The context named `name` (see [Context](#context)): the file's own
+    /// declaration of it; or for a session's input, an earlier input's; or
+    /// else the first of the scan's files' (a later one is reported where
+    /// it is declared). `None` if none declares it.
+    pub(crate) fn context(&self, name: Name) -> Option<SeenContext> {
+        let declared = |context: &DeclaredContext| SeenContext {
+            key: context.key,
+            default: match context.binding {
+                None => ContextDefault::None,
+                Some(binding) if context.file == self.index => ContextDefault::Binding(binding),
+                Some(_) => {
+                    ContextDefault::Foreign(self.for_later.contexts.get(&context.key).copied())
+                }
+            },
+            site: Some((context.file, context.span)),
+        };
+        let mut scan = self.scan.contexts.iter().filter(|c| c.name == name);
+        if let Some(own) = scan.clone().find(|c| c.file == self.index) {
+            return Some(declared(own));
+        }
+        if self.index >= self.scan.standard
+            && let Some(&(_, key, binding)) = self
+                .scan
+                .inherited_contexts
+                .iter()
+                .find(|&&(earlier, ..)| earlier == name)
+        {
+            return Some(SeenContext {
+                key,
+                default: binding.map_or(ContextDefault::None, ContextDefault::Binding),
+                site: None,
+            });
+        }
+        scan.next().map(declared)
+    }
+
+    /// The names of the contexts the file sees, for suggestions (see
+    /// [Context](#context)).
+    pub(crate) fn context_names(&self) -> Vec<Name> {
+        let mut found: Vec<Name> = self.scan.contexts.iter().map(|c| c.name).collect();
+        if self.index >= self.scan.standard {
+            found.extend(self.scan.inherited_contexts.iter().map(|&(name, ..)| name));
+        }
+        found.sort_unstable();
+        found.dedup();
+        found
     }
 
     /// The variants named `name` of the enum of the key `of` that the file
@@ -7227,9 +7499,9 @@ pub struct Workspace {
     /// its parameters (see [`Context::known`]), kept for a session's inputs
     /// and for the call that invokes a definition by name.
     cell_known: Vec<Option<Rc<KnownParams>>>,
-    /// The methods of the files, checked (see [Methods](#methods)), kept for
+    /// The methods and the contexts' defaults of the files, checked, kept for
     /// a session's inputs.
-    methods: CheckedMethods,
+    for_later: ForLater,
     /// Each file's records of the nodes of its view with a leaf of it under
     /// them, by input number: kept for the tests' check that each reads
     /// only cells stored before it.
@@ -7623,7 +7895,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
     let mut checked: Vec<Option<Types>> = (0..scan.files.len()).map(|_| None).collect();
     let mut warnings = vec![Vec::new(); scan.files.len()];
     let mut errors = check_type_items(&mut scan, &mut names, &mut types);
-    let mut methods = CheckedMethods::new();
+    let mut for_later = ForLater::default();
     // The files whose check failed, or that need one that did: those are
     // not checked, since their errors would follow from the first; and
     // those with syntax errors (see [Syntax errors](#syntax-errors)).
@@ -7646,7 +7918,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
         // with the file's own slots added.
         let scope = Committed::scope(&scan, &scopes, file, mem::take(&mut slot_names));
         let start = scope.len();
-        let reads = (&cell_slots[..], &cell_known[..], &methods);
+        let reads = (&cell_slots[..], &cell_known[..], &for_later);
         let compiled = Context::new(&scan, index, &cell_types, reads).map(|context| {
             check_file((&scan, index), &context, (scope, &mut types), &mut recorded)
         });
@@ -7661,7 +7933,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
         keep_view_records(&mut view_records, index, compiled.as_ref());
         let result = match compiled {
             Some(Ok((ir, output))) => {
-                methods.extend(checked_methods(&scan, index, &output));
+                for_later.extend(&scan, index, &output);
                 if let Some(dir) = scopes.get_mut(file.dir as usize) {
                     dir.commit(&output.scope, start, (keep, poison));
                 }
@@ -7694,7 +7966,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
             }
         }
     }
-    let tables = (&scopes[..], (&cell_slots[..], &cell_known[..], &methods));
+    let tables = (&scopes[..], (&cell_slots[..], &cell_known[..], &for_later));
     let lent = (&mut names, &mut types, &mut recorded);
     record_blocked(&mut scan, tables, lent);
     scan.names = names;
@@ -7721,7 +7993,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
         cell_types,
         cell_slots,
         cell_known,
-        methods,
+        for_later,
         #[cfg(test)]
         view_records,
     };
@@ -7827,7 +8099,21 @@ fn check_type_items(scan: &mut Scan, names: &mut Names, types: &mut TypeTable) -
         *names = file.ast.replace_names(Names::new());
         errors.extend(in_file(found, index));
     }
-    errors.extend(check_enum_items((scan, 0), names, types));
+    errors.extend(check_declared_items((scan, 0), names, types));
+    errors
+}
+
+/// The enums and variants ([`check_enum_items`]) and the contexts
+/// ([`check_context_items`]) of the scan's files from number `from` on,
+/// checked once their `type` items are. Returns the errors found, each in
+/// its file.
+fn check_declared_items(
+    (scan, from): (&mut Scan, u32),
+    names: &mut Names,
+    types: &mut TypeTable,
+) -> Vec<Diagnostic> {
+    let mut errors = check_enum_items((scan, from), names, types);
+    errors.extend(check_context_items((scan, from), names, types));
     errors
 }
 
@@ -8074,6 +8360,20 @@ fn checked_methods(
                 method,
             };
             Some((at, CheckedMethod { slot, ty, known }))
+        })
+        .collect()
+}
+
+/// The defaults of the contexts of file `index` of `scan` as its check
+/// `output` found them (see [Context](#context)): each by its binding in
+/// the scope it leaves, by its declaration's key.
+fn checked_contexts(scan: &Scan, index: u32, output: &CheckOutput) -> Vec<(Name, Slot)> {
+    scan.contexts
+        .iter()
+        .filter(|context| context.file == index)
+        .filter_map(|context| {
+            let (slot, ..) = output.scope.function_binding(context.binding?)?;
+            Some((context.key, slot))
         })
         .collect()
 }
@@ -10342,8 +10642,9 @@ pub(crate) struct Standard {
     /// For each of its cells that is a `def`'s, what a call of it needs to
     /// know of its parameters.
     cell_known: Vec<Option<Rc<KnownParams>>>,
-    /// The methods of the standard files, checked.
-    methods: CheckedMethods,
+    /// The methods and the contexts' defaults of the standard files,
+    /// checked.
+    for_later: ForLater,
     /// The table of the directories of the run ([`Scan::locate`]): the
     /// session's root, the working directory it started in, first, at index
     /// 0, where every input is, both its `fileroot.this` and its
@@ -10404,7 +10705,7 @@ pub(crate) fn start(root: &str) -> Result<Started, Vec<Diagnostic>> {
         cell_types,
         cell_slots,
         cell_known,
-        methods,
+        for_later,
         ..
     } = workspace;
     Ok(Started {
@@ -10413,7 +10714,7 @@ pub(crate) fn start(root: &str) -> Result<Started, Vec<Diagnostic>> {
             cell_types,
             cell_slots,
             cell_known,
-            methods,
+            for_later,
             dirs: scan.dir_texts,
         },
         names: scan.names,
@@ -10486,6 +10787,9 @@ pub(crate) struct Earlier<'a> {
     /// Their variants that no later input shadowed, each by its enum's key
     /// and its name, with its own key (see [Enums](#enums)).
     pub(crate) variants: &'a [(Name, Name, Name)],
+    /// Their contexts that no later input shadowed (see
+    /// [Context](#context)).
+    pub(crate) contexts: &'a [InheritedContext],
 }
 
 /// What a later input inherits of a session's input once it has run (see
@@ -10501,6 +10805,8 @@ pub(crate) struct Inherited {
     /// The variants it declares, each by its enum's key and its name, with
     /// its own key.
     pub(crate) variants: Vec<InheritedVariant>,
+    /// The contexts it declares.
+    pub(crate) contexts: Vec<InheritedContext>,
 }
 
 /// [`check_input`] up to its check, whose outcome `then` is given with the
@@ -10532,7 +10838,7 @@ fn check_input_then<R>(
         placed,
         Library::EVERY,
         (names, &mut loaded),
-        (store, (earlier.types, earlier.variants)),
+        (store, (earlier.types, earlier.variants, earlier.contexts)),
         (earlier.def_types, Some(input)),
     )
     .map_err(|errors| being_run(errors, count(loaded.len())))?;
@@ -10540,7 +10846,7 @@ fn check_input_then<R>(
     // the session started.
     let mut lent = mem::take(&mut scan.names);
     let standard_files = scan.standard;
-    let enum_errors = check_enum_items((&mut scan, standard_files), &mut lent, types);
+    let enum_errors = check_declared_items((&mut scan, standard_files), &mut lent, types);
     scan.names = lent;
     // In the session's root, as its start located the standard files.
     scan.locate(standard.dirs.first().map_or("/", |root| root));
@@ -10579,7 +10885,7 @@ fn check_input_then<R>(
     };
     file.ast.replace_names(file_names);
     let finished = scan.files.get(index as usize).and_then(|file| {
-        let reads = (&cell_slots[..], &cell_known[..], &standard.methods);
+        let reads = (&cell_slots[..], &cell_known[..], &standard.for_later);
         let context = Context::new(&scan, index, &cell_types, reads)?;
         let context = Context {
             session: true,
@@ -10623,6 +10929,7 @@ fn check_input_then<R>(
         .filter(|variant| variant.file == index)
         .filter_map(|variant| Some((variant.enum_of?.0, variant.name, variant.key)))
         .collect();
+    inherited.contexts = scan.own_contexts(index);
     *store = mem::take(&mut scan.type_store);
     finished.map(|r| (r, inherited)).ok_or_else(Vec::new)
 }
@@ -10681,6 +10988,7 @@ pub(crate) fn check_beside_prelude(
         store: &mut TypeStore::new(),
         def_types: &[],
         variants: &[],
+        contexts: &[],
     };
     // A session's first input, after the standard files.
     let input = count(crate::STANDARD.len());

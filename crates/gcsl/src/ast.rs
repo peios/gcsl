@@ -729,6 +729,33 @@ impl ParamRange {
     }
 }
 
+/// The bindings of a `with`: a contiguous range of the pool of `with`
+/// bindings of the [`Ast`] that allocated it. Resolve it with
+/// [`Ast::with_bindings`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WithRange {
+    start: u32,
+    len: u32,
+}
+
+/// One binding of a `with`, `NAME = VALUE`, `NAME.PATH = VALUE` or the
+/// shorthand `NAME` (see the parser's [Context](crate::parser#context)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WithBinding {
+    /// The context's name.
+    pub name: Name,
+    /// Where it is written.
+    pub name_span: Span,
+    /// The rest of a dotted key's path, the fields after the name, set in
+    /// the context's value; empty for a plain one.
+    pub path: PathRange,
+    /// The value, the variable of the name for the shorthand.
+    pub value: ExprId,
+    /// For a dotted key, the read of the context's value the key updates,
+    /// `^NAME`, written nowhere; `None` for a plain one.
+    pub current: Option<ExprId>,
+}
+
 /// The arguments of a call: a contiguous range of the argument pool of the
 /// [`Ast`] that allocated it. Resolve it with [`Ast::args`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -857,6 +884,26 @@ pub struct MethodDecl {
     /// Whether it is declared with `def`, visible beyond its file, rather
     /// than with `fn`.
     pub public: bool,
+}
+
+/// A context a file declares, `context NAME: TYPE = DEFAULT` or `context
+/// NAME: TYPE` (see the parser's [Context](crate::parser#context)): with a
+/// default, its item is the `let` of its binding, a name no source can
+/// write ([`crate::names::context_binding`]), whose value is its default's
+/// function, pure and of no parameters, returning its type; without one,
+/// an [`ItemKind::Context`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextDecl {
+    /// Its item.
+    pub item: ItemId,
+    /// Its name.
+    pub name: Name,
+    /// Where the name is written.
+    pub name_span: Span,
+    /// Its type.
+    pub ty: TypeExprId,
+    /// Its default's binding, if it has a default.
+    pub binding: Option<Name>,
 }
 
 /// What has type parameters: a generic function item, `fn NAME<T, U>(...)`
@@ -1576,6 +1623,19 @@ pub enum ExprKind {
     /// definition and its own arguments (see [Def-types](#def-types)). Its
     /// details are in the def-type arena (see [`Ast::def_type`]).
     DefTypeRef(DefTypeId),
+    /// A read of a context, `^NAME`, as in `^arch` (see the parser's
+    /// [Context](crate::parser#context)). The name ends the expression's
+    /// span.
+    ContextRead(Name),
+    /// `BODY with { NAME = VALUE; ... }`, or `with { ... } { BODY }`: the
+    /// body evaluated with the contexts the bindings name bound (see the
+    /// parser's [Context](crate::parser#context)).
+    With {
+        /// The bindings, in source order (see [`Ast::with_bindings`]).
+        bindings: WithRange,
+        /// What is evaluated with them.
+        body: ExprId,
+    },
     /// What the parser put in place of source it could not parse, or of a
     /// lexical error's token (see the parser's [Errors and
     /// recovery](crate::parser#errors-and-recovery)): its error is
@@ -1669,6 +1729,8 @@ impl Expr {
             | ExprKind::Index { .. }
             | ExprKind::For(_)
             | ExprKind::DefTypeRef(_)
+            | ExprKind::ContextRead(_)
+            | ExprKind::With { .. }
             | ExprKind::Error
             | ExprKind::NoField(_)
             | ExprKind::Unclosed { .. } => None,
@@ -1826,6 +1888,19 @@ pub enum ItemKind {
         /// The bound every variant's payload fits, if it has one.
         bound: Option<TypeExprId>,
     },
+    /// `context NAME: TYPE`, a context with no default (see the parser's
+    /// [Context](crate::parser#context)); one with a default is the `let`
+    /// of its default's function under a binding no source can write
+    /// ([`ContextDecl`]). Only ever an item of a file's outermost block. It
+    /// has no expression.
+    Context {
+        /// The context's name, always an identifier.
+        name: Name,
+        /// Where the name is written.
+        name_span: Span,
+        /// Its type.
+        ty: TypeExprId,
+    },
     /// `enum ENUM::NAME<PAYLOAD>` or `enum ENUM::NAME`: adds the variant
     /// `NAME` to the enum `ENUM`, a type written by its name or qualified,
     /// whose payload is of type `PAYLOAD`, `{}` without one (see
@@ -1880,7 +1955,8 @@ pub enum ItemKind {
 impl ItemKind {
     /// The expression the item holds, if it has one: every item's but a
     /// `break`'s, `continue`'s or `return`'s without a value, an import's,
-    /// a `type`'s and an error item's.
+    /// a `type`'s, an `enum`'s, a context's without a default and an error
+    /// item's.
     #[must_use]
     pub const fn value(self) -> Option<ExprId> {
         match self {
@@ -1897,6 +1973,7 @@ impl ItemKind {
             | ItemKind::Type { .. }
             | ItemKind::Enum { .. }
             | ItemKind::Variant { .. }
+            | ItemKind::Context { .. }
             | ItemKind::Error => None,
         }
     }
@@ -2001,6 +2078,10 @@ pub enum TypeExprKind {
         /// Its name, as it is declared.
         name: Name,
     },
+    /// The declared type of the context `NAME`, of a parameter written
+    /// `(^NAME)` with no type (see the parser's
+    /// [Context](crate::parser#context)), which the checker resolves.
+    Context(Name),
     /// A type that names nothing it can, put in place of a written one by
     /// the expansion of a tree's types ([`Ast::expand_types`]): its error,
     /// if it is this one's to report, is among the tree's problems
@@ -2260,6 +2341,7 @@ impl TypeArena {
                 | TypeExprKind::Ref(_)
                 | TypeExprKind::Param(_)
                 | TypeExprKind::Enum { .. }
+                | TypeExprKind::Context(_)
                 | TypeExprKind::Invalid) => kind,
             },
         };
@@ -2293,13 +2375,12 @@ impl TypeArena {
         };
         let kind = match kind {
             TypeExprKind::Param(index) => {
-                let done = match args.get(usize::from(index)) {
-                    Some(&arg) => arg,
-                    None => self.alloc(TypeExpr {
-                        kind: TypeExprKind::Invalid,
-                        span,
-                    }),
+                let invalid = TypeExpr {
+                    kind: TypeExprKind::Invalid,
+                    span,
                 };
+                let done =
+                    (args.get(usize::from(index)).copied()).unwrap_or_else(|| self.alloc(invalid));
                 memo.insert(root, done);
                 return done;
             }
@@ -2362,13 +2443,13 @@ impl TypeArena {
                 (new != element).then_some(TypeExprKind::List(new))
             }
             TypeExprKind::Union { lhs, rhs, bar } => {
-                let (new_lhs, new_rhs) = (
+                let new = (
                     self.substitute(lhs, args, memo),
                     self.substitute(rhs, args, memo),
                 );
-                (new_lhs != lhs || new_rhs != rhs).then_some(TypeExprKind::Union {
-                    lhs: new_lhs,
-                    rhs: new_rhs,
+                (new != (lhs, rhs)).then_some(TypeExprKind::Union {
+                    lhs: new.0,
+                    rhs: new.1,
                     bar,
                 })
             }
@@ -2377,6 +2458,7 @@ impl TypeArena {
             | TypeExprKind::PathApplied { .. }
             | TypeExprKind::Ref(_)
             | TypeExprKind::Enum { .. }
+            | TypeExprKind::Context(_)
             | TypeExprKind::Invalid => None,
         };
         let done = match kind {
@@ -2456,6 +2538,7 @@ impl TypeArena {
             | TypeExprKind::Ref(_)
             | TypeExprKind::Param(_)
             | TypeExprKind::Enum { .. }
+            | TypeExprKind::Context(_)
             | TypeExprKind::Invalid => Vec::new(),
         }
     }
@@ -3000,6 +3083,7 @@ pub struct AstBuilder {
     fns: Vec<FnDecl>,
     params: Vec<Param>,
     args: Vec<Arg>,
+    with_bindings: Vec<WithBinding>,
     elements: Vec<Element>,
     fors: Vec<ForDecl>,
     labels: Vec<Label>,
@@ -3011,6 +3095,7 @@ pub struct AstBuilder {
     attribute_uses: Vec<AttributeUse>,
     generics: Vec<Generics>,
     methods: Vec<MethodDecl>,
+    contexts: Vec<ContextDecl>,
     def_types: Vec<DefTypeUse>,
     no_prelude: Option<Span>,
     syntax: Syntax,
@@ -3136,6 +3221,7 @@ pub struct BuilderMark {
     fns: usize,
     params: usize,
     args: usize,
+    with_bindings: usize,
     elements: usize,
     fors: usize,
     labels: usize,
@@ -3297,6 +3383,17 @@ impl AstBuilder {
         }
     }
 
+    /// Appends `bindings` to the pool of `with` bindings as one `with`'s
+    /// and returns their range.
+    pub fn push_with_bindings(&mut self, bindings: &[WithBinding]) -> WithRange {
+        let start = next_id(self.with_bindings.len());
+        self.with_bindings.extend_from_slice(bindings);
+        WithRange {
+            start,
+            len: next_id(bindings.len()),
+        }
+    }
+
     /// Appends `args` to the argument pool as one call's arguments and
     /// returns their range. A trailing argument must be the last.
     pub fn push_args(&mut self, args: &[Arg]) -> ArgRange {
@@ -3358,6 +3455,11 @@ impl AstBuilder {
     /// Records a method of the outermost block.
     pub fn push_method(&mut self, method: MethodDecl) {
         self.methods.push(method);
+    }
+
+    /// Records `context`, a context the file declares.
+    pub fn push_context(&mut self, context: ContextDecl) {
+        self.contexts.push(context);
     }
 
     /// The number of type expressions made so far: the number of the next.
@@ -3447,6 +3549,7 @@ impl AstBuilder {
             fns: self.fns.len(),
             params: self.params.len(),
             args: self.args.len(),
+            with_bindings: self.with_bindings.len(),
             elements: self.elements.len(),
             fors: self.fors.len(),
             labels: self.labels.len(),
@@ -3473,6 +3576,7 @@ impl AstBuilder {
         self.fns.truncate(mark.fns);
         self.params.truncate(mark.params);
         self.args.truncate(mark.args);
+        self.with_bindings.truncate(mark.with_bindings);
         self.elements.truncate(mark.elements);
         self.fors.truncate(mark.fors);
         self.labels.truncate(mark.labels);
@@ -3490,6 +3594,7 @@ impl AstBuilder {
             GenericOwner::Type(item) => item.0 < items,
         });
         self.methods.retain(|method| method.item.0 < items);
+        self.contexts.retain(|context| context.item.0 < items);
     }
 
     /// Returns the node `id`.
@@ -3552,6 +3657,7 @@ impl AstBuilder {
             fns: self.fns,
             params: self.params,
             args: self.args,
+            with_bindings: self.with_bindings,
             elements: self.elements,
             fors: self.fors,
             labels: self.labels,
@@ -3563,6 +3669,7 @@ impl AstBuilder {
             attribute_uses: self.attribute_uses,
             generics: self.generics,
             methods: self.methods,
+            contexts: self.contexts,
             def_types: self.def_types,
             no_prelude: self.no_prelude,
             syntax: self.syntax,
@@ -3588,6 +3695,7 @@ pub struct Ast {
     fns: Vec<FnDecl>,
     params: Vec<Param>,
     args: Vec<Arg>,
+    with_bindings: Vec<WithBinding>,
     elements: Vec<Element>,
     fors: Vec<ForDecl>,
     labels: Vec<Label>,
@@ -3607,6 +3715,8 @@ pub struct Ast {
     generics: Vec<Generics>,
     /// The methods of the outermost block, in source order.
     methods: Vec<MethodDecl>,
+    /// The contexts the outermost block declares, in source order.
+    contexts: Vec<ContextDecl>,
     /// The def-type definitions and references, in the order they were
     /// parsed (see [Def-types](#def-types)).
     def_types: Vec<DefTypeUse>,
@@ -3874,6 +3984,7 @@ impl Ast {
             | TypeExprKind::Ref(_)
             | TypeExprKind::Param(_)
             | TypeExprKind::Enum { .. }
+            | TypeExprKind::Context(_)
             | TypeExprKind::Invalid => {}
         }
         first
@@ -3990,6 +4101,14 @@ impl Ast {
     pub fn args(&self, range: ArgRange) -> &[Arg] {
         let start = range.start as usize;
         &self.args[start..start + range.len as usize]
+    }
+
+    /// The bindings of a `with` (see the parser's
+    /// [Context](crate::parser#context)).
+    #[must_use]
+    pub fn with_bindings(&self, range: WithRange) -> &[WithBinding] {
+        let start = range.start as usize;
+        &self.with_bindings[start..start + range.len as usize]
     }
 
     /// The number of arguments of every call in the tree: the length of
@@ -4135,6 +4254,26 @@ impl Ast {
     #[must_use]
     pub fn method(&self, item: ItemId) -> Option<&MethodDecl> {
         self.methods.iter().find(|method| method.item == item)
+    }
+
+    /// The contexts the file declares, in source order.
+    #[must_use]
+    pub fn contexts(&self) -> &[ContextDecl] {
+        &self.contexts
+    }
+
+    /// Every read of a context in the tree, `^NAME`, a dotted key's of a
+    /// `with` and a `^NAME` parameter's default among them, by the name and
+    /// the read's span, in the order the parser made them.
+    #[must_use]
+    pub fn context_reads(&self) -> Vec<(Name, Span)> {
+        self.exprs
+            .iter()
+            .filter_map(|expr| match expr.kind {
+                ExprKind::ContextRead(name) => Some((name, expr.span)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The type parameters of every generic function and `type` item, in the
@@ -4629,7 +4768,19 @@ impl Ast {
                 | ExprKind::Str(_)
                 | ExprKind::Name(_)
                 | ExprKind::Variant { .. }
+                | ExprKind::ContextRead(_)
                 | ExprKind::Error => return node,
+                // The body before the bindings after it, `f() with {...}`,
+                // and the bindings before it, `with {...} {...}`: the
+                // earliest of its parts.
+                ExprKind::With { bindings, body } => self
+                    .with_bindings(bindings)
+                    .iter()
+                    .flat_map(|binding| [binding.current, Some(binding.value)])
+                    .flatten()
+                    .chain([body])
+                    .min_by_key(|part| part.0)
+                    .unwrap_or(body),
                 ExprKind::Interp(parts) => {
                     let first = self.parts(parts).iter().find_map(|&part| match part {
                         StrPart::Expr(expr) => Some(expr),
@@ -5014,6 +5165,42 @@ impl<A: Annotate> Pretty<'_, A> {
         }
     }
 
+    /// Writes the head of the `let` item `id` of `path`, a `let mut` if
+    /// `mutable`, a `fn` if `function`: a method and a context's default
+    /// shown by their names, not their bindings'.
+    fn let_head(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        id: ItemId,
+        (path, mutable, function): (PathRange, bool, bool),
+    ) -> fmt::Result {
+        let ast = self.ast;
+        let keyword = match (mutable, function) {
+            (_, true) => "fn",
+            (true, false) => "let mut",
+            (false, false) => "let",
+        };
+        let context = ast.contexts().iter().find(|context| context.item == id);
+        match (ast.method(id), context) {
+            (Some(method), _) => {
+                let keyword = if method.public { "def" } else { "fn" };
+                write!(f, "{keyword} method {}", ast.names().get(method.name))
+            }
+            (None, Some(context)) => {
+                self.context_head(f, context.name, context.ty)?;
+                f.write_str(" =")
+            }
+            (None, None) => write!(f, "{keyword} {}", ast.show_path(ast.path(path))),
+        }
+    }
+
+    /// Writes a context's declaration, of `name` and the type `ty`, but its
+    /// default: `context arch : String`.
+    fn context_head(&self, f: &mut fmt::Formatter<'_>, name: Name, ty: TypeExprId) -> fmt::Result {
+        write!(f, "context {} : ", self.ast.names().get(name))?;
+        self.type_expr(f, ty)
+    }
+
     fn item(&self, f: &mut fmt::Formatter<'_>, id: ItemId, depth: usize) -> fmt::Result {
         let item = self.ast.item(id);
         let ast = self.ast;
@@ -5028,19 +5215,7 @@ impl<A: Annotate> Pretty<'_, A> {
                 mutable,
                 function,
             } => {
-                let keyword = match (mutable, function) {
-                    (_, true) => "fn",
-                    (true, false) => "let mut",
-                    (false, false) => "let",
-                };
-                // A method is shown by its name, not its binding's.
-                match ast.method(id) {
-                    Some(method) => {
-                        let keyword = if method.public { "def" } else { "fn" };
-                        write!(f, "{keyword} method {}", ast.names().get(method.name))?;
-                    }
-                    None => write!(f, "{keyword} {}", ast.show_path(ast.path(path)))?,
-                }
+                self.let_head(f, id, (path, mutable, function))?;
                 if let Some(ty) = ty {
                     f.write_str(" : ")?;
                     self.type_expr(f, ty)?;
@@ -5091,6 +5266,10 @@ impl<A: Annotate> Pretty<'_, A> {
             }
             ItemKind::Type { .. } | ItemKind::Enum { .. } | ItemKind::Variant { .. } => {
                 self.type_item(f, id)?;
+                return write!(f, " @{})", item.span);
+            }
+            ItemKind::Context { name, ty, .. } => {
+                self.context_head(f, name, ty)?;
                 return write!(f, " @{})", item.span);
             }
             ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } => {
@@ -5214,6 +5393,7 @@ impl WrittenType<'_> {
             TypeExprKind::Named(name) | TypeExprKind::Enum { name, .. } => {
                 f.write_str(names.get(name))
             }
+            TypeExprKind::Context(name) => write!(f, "^{}", self.names.get(name)),
             TypeExprKind::Path(path) => self.path(f, path),
             TypeExprKind::Record(fields) => {
                 f.write_str("{")?;
@@ -5612,6 +5792,8 @@ impl<A: Annotate> Pretty<'_, A> {
                 let (def_type, path) = self.ast.show_def_type(def);
                 write!(f, "def-type-ref {def_type} {path}")
             }
+            ExprKind::ContextRead(name) => write!(f, "context ^{}", self.ast.names().get(name)),
+            ExprKind::With { .. } => f.write_str("with"),
             ExprKind::Error => f.write_str("error"),
             ExprKind::NoField(_) => f.write_str(". <missing>"),
             ExprKind::Unclosed { .. } => f.write_str("unclosed call"),
@@ -5679,6 +5861,34 @@ impl<A: Annotate> Pretty<'_, A> {
         Ok(())
     }
 
+    /// Writes the bindings, `bindings`, and the body, `body`, of a `with`,
+    /// each on a line of its own at `depth`: a binding as `(bind NAME`, its
+    /// dotted path, then its read of what it updates, if it is dotted, and
+    /// its value.
+    fn with_parts(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        (bindings, body): (WithRange, ExprId),
+        depth: usize,
+    ) -> fmt::Result {
+        for binding in self.ast.with_bindings(bindings) {
+            let name = self.ast.names().get(binding.name);
+            write!(f, "\n{:indent$}(bind {name}", "", indent = depth * 2)?;
+            for segment in self.ast.path(binding.path) {
+                if let Some(field) = segment.name() {
+                    write!(f, ".{}", self.ast.names().get(field))?;
+                }
+            }
+            for part in binding.current.into_iter().chain([binding.value]) {
+                f.write_str("\n")?;
+                self.node(f, part, depth + 1)?;
+            }
+            f.write_str(")")?;
+        }
+        f.write_str("\n")?;
+        self.node(f, body, depth)
+    }
+
     fn node(&self, f: &mut fmt::Formatter<'_>, id: ExprId, depth: usize) -> fmt::Result {
         let expr = self.ast.get(id);
         if let ExprKind::DefTypeRef(def) = expr.kind
@@ -5714,6 +5924,7 @@ impl<A: Annotate> Pretty<'_, A> {
             | ExprKind::Name(_)
             | ExprKind::Variant { .. }
             | ExprKind::DefTypeRef(_)
+            | ExprKind::ContextRead(_)
             | ExprKind::Error => {}
             ExprKind::Unary { operand, .. }
             | ExprKind::Paren(operand)
@@ -5725,6 +5936,7 @@ impl<A: Annotate> Pretty<'_, A> {
                 f.write_str("\n")?;
                 self.node(f, operand, depth + 1)?;
             }
+            ExprKind::With { bindings, body } => self.with_parts(f, (bindings, body), depth + 1)?,
             ExprKind::Binary { lhs, rhs, .. }
             | ExprKind::Index {
                 expr: lhs,

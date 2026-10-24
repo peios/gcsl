@@ -203,6 +203,43 @@ Break'NAME and continue'NAME target a loop.
 Return'NAME leaves the named loop or block with a single result, not its accumulated list.
 An unlabeled return leaves a function or lazy body.
 No jump crosses a function boundary.
+.SH CONTEXT
+.B context
+.I NAME
+.B :
+.I TYPE
+.B =
+.I DEFAULT
+declares a context, a value that reaches every call without being passed; the default may be left out.
+A context name is declared once in a workspace and is visible in every file without an import.
+.BI ^ NAME
+reads the context's current value.
+.I EXPR
+.B with {
+.I NAME
+.B =
+.I VALUE
+.B }
+evaluates the call or field access
+.I EXPR
+with the context set, and so does every call it makes; it must be on the line where
+.I EXPR
+ends.
+.B with { ... } { ... }
+sets contexts for a block.
+A dotted name,
+.BR "with { platform.arch = ... }" ,
+sets one field of a record context.
+A parameter written
+.BI ^ NAME
+defaults to the context of that name, and takes its type if none is written.
+A default is pure and is evaluated where the context is read, in the context of the read.
+Reading a context with no default that no
+.B with
+sets is an error.
+A
+.B lazy
+keeps the context it was made in.
 .SH WORKSPACES AND IMPORTS
 The file workspace.gcsl marks a root and is ordinary source.
 Each directory shares its public fields, def functions, and types among its files.

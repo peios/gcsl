@@ -1846,3 +1846,16 @@ fn definitions_made_with_a_variant_persist_for_later_inputs() {
     value(&mut session, "def K::A y() { 2 }");
     assert_eq!(value(&mut session, "K::A y()"), Value::Int(2));
 }
+
+#[test]
+fn contexts_persist_for_later_inputs_and_a_later_declaration_shadows() {
+    let mut session = Session::new();
+    value(&mut session, "context n: Int = 1");
+    assert_eq!(value(&mut session, "^n"), Value::Int(1));
+    value(&mut session, "fn f(): Int { ^n * 10 }");
+    assert_eq!(value(&mut session, "f() with { n = 2 }"), Value::Int(20));
+    // A later declaration is another context: `f` reads the one it saw.
+    value(&mut session, "context n: Int = 5");
+    assert_eq!(value(&mut session, "^n"), Value::Int(5));
+    assert_eq!(value(&mut session, "f()"), Value::Int(10));
+}

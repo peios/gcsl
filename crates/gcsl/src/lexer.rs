@@ -388,6 +388,8 @@ pub enum TokenKind {
     ColonEq,
     /// `::`, between an enum and its variant, `Toolchain::C`.
     ColonColon,
+    /// `^`, before a context's name, `^arch`.
+    Caret,
     /// `->`, which marks an impure function's return type.
     Arrow,
     /// `->>`, which marks a memoised impure function's return type.
@@ -482,6 +484,7 @@ impl TokenKind {
             TokenKind::Colon => Some(":"),
             TokenKind::ColonEq => Some(":="),
             TokenKind::ColonColon => Some("::"),
+            TokenKind::Caret => Some("^"),
             TokenKind::Arrow => Some("->"),
             TokenKind::MemoArrow => Some("->>"),
             TokenKind::Eq => Some("="),
@@ -1067,6 +1070,7 @@ impl<'a> Lexer<'a> {
             b'.' => (TokenKind::Dot, 1),
             b',' => (TokenKind::Comma, 1),
             b'|' => (TokenKind::Pipe, 1),
+            b'^' => (TokenKind::Caret, 1),
             b'=' if self.peek_at(1) == Some(b'=') && self.peek_at(2) == Some(b'=') => {
                 (TokenKind::EqEqEq, 3)
             }

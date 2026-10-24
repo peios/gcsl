@@ -865,12 +865,13 @@ impl<'a> Printer<'a> {
         if number_dot || (self.facts.path_ends.contains(&prev) && n == K::LParen) {
             return written;
         }
-        if matches!(p, K::Dot | K::LParen | K::LBracket | K::ColonColon)
-            || matches!(
-                n,
-                K::Dot | K::Comma | K::Semi | K::RParen | K::RBracket | K::ColonColon
-            )
-        {
+        if matches!(
+            p,
+            K::Dot | K::LParen | K::LBracket | K::ColonColon | K::Caret
+        ) || matches!(
+            n,
+            K::Dot | K::Comma | K::Semi | K::RParen | K::RBracket | K::ColonColon
+        ) {
             return "";
         }
         match (p, n) {
@@ -1288,6 +1289,29 @@ mod tests {
                 "def Tool::C gcc() {\n    1\n}\n",
             ),
             ("r = t.Tool :: C  gcc()\n", "r = t.Tool::C gcc()\n"),
+        ]);
+    }
+
+    #[test]
+    fn a_context_s_caret_is_glued_to_its_name() {
+        check(&[
+            (
+                "context  arch : String = \"x\"\n",
+                "context arch: String = \"x\"\n",
+            ),
+            ("r = ^ arch\n", "r = ^arch\n"),
+            (
+                "fn f( ^ arch ): String { arch }\n",
+                "fn f(^arch): String { arch }\n",
+            ),
+            (
+                "r = f()  with { arch = \"y\" }\n",
+                "r = f() with { arch = \"y\" }\n",
+            ),
+            (
+                "r = with { arch = \"y\" }  { f() }\n",
+                "r = with { arch = \"y\" } { f() }\n",
+            ),
         ]);
     }
 

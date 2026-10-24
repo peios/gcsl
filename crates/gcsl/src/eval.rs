@@ -941,8 +941,8 @@ use crate::source::Span;
 use crate::strings::FieldName;
 use crate::types::ValueTest;
 use crate::value::{
-    Begin, Caller, Closure, Future, FutureState, Layout, List, Quantity, Record, Tag, Value,
-    ValueKind, Variant, int_to_float,
+    Begin, Caller, Closure, ContextFrame, Future, FutureState, Layout, List, Quantity, Record, Tag,
+    Value, ValueKind, Variant, int_to_float,
 };
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
@@ -1206,6 +1206,9 @@ struct Shared<'a> {
     earliest: Cell<Option<Instant>>,
     /// The number of the last deadline made.
     deadlines_made: Cell<u32>,
+    /// The context the frame running is evaluated in, innermost frame first
+    /// (see [Context](#context)): `None`, binding nothing, at the root.
+    context: RefCell<Option<Rc<ContextFrame>>>,
 }
 
 impl<'a> Shared<'a> {
@@ -1224,6 +1227,7 @@ impl<'a> Shared<'a> {
             deadlines: RefCell::new(Vec::new()),
             earliest: Cell::new(None),
             deadlines_made: Cell::new(0),
+            context: RefCell::new(None),
         }
     }
 }
@@ -1306,6 +1310,8 @@ impl Evaluator<'_> {
             IrKind::Top(slot, kind) => self.top_value(slot, kind, node),
             IrKind::LoadCallee | IrKind::MakeClosure { .. } => self.closure_value(node),
             IrKind::Tag { key, of, shown } => Ok(Value::Tag(self.tag((key, of, shown)))),
+            IrKind::ContextRead { .. } | IrKind::With { .. } => self.context_node(node),
+            IrKind::ContextBind { .. } => mistyped(node, CONTEXT_BIND),
             IrKind::Meta(function) => self.meta_value(function, node),
             IrKind::Call {
                 callee,
@@ -1581,7 +1587,7 @@ impl Evaluator<'_> {
         // An origin not given yet is no running memoised call's.
         if self.caller.origin != NO_ORIGIN {
             self.memo
-                .depend(self.caller.origin, Ambient::Caller(self.caller.dir));
+                .depend(self.caller.origin, &Ambient::Caller(self.caller.dir));
         }
         self.shared
             .dirs
@@ -1650,6 +1656,117 @@ impl Evaluator<'_> {
         }))
     }
 
+    /// Evaluates `node`, a read of a context or a `with` (see
+    /// [Context](#context)), as a value of any kind.
+    fn context_node(&mut self, node: &IrNode) -> Flow<Value> {
+        match node.kind {
+            IrKind::ContextRead {
+                key,
+                default,
+                depth,
+                ..
+            } => self.context_read(key, (default, depth), node),
+            IrKind::With { parts, .. } => self.with(parts, node),
+            _ => mistyped(node, "a node evaluated as a context's that is none"),
+        }
+    }
+
+    /// The value of the read `node` of the context of the declaration key
+    /// `key` (see [Context](#context)): its nearest binding's in the running
+    /// context; with none, the value its default's function, `default`,
+    /// returns, called with no arguments as a call at depth `depth` would
+    /// be; with no default either, "context `arch` has no value here".
+    /// Recorded as a dependency of the running memoised calls it can affect
+    /// (see [Memoised functions](#memoised-functions), "Ambient inputs").
+    #[inline(never)]
+    fn context_read(
+        &mut self,
+        key: Name,
+        (default, depth): (IrId, u16),
+        node: &IrNode,
+    ) -> Flow<Value> {
+        let context = self.shared.context.borrow().clone();
+        self.memo.depend_context(key, context.as_ref());
+        if let Some((_, value)) = ContextFrame::find(context.as_ref(), key) {
+            return Ok(value.clone());
+        }
+        if self.ir.get(default).kind == IrKind::Empty {
+            let name = self
+                .ir
+                .name_text(key)
+                .and_then(crate::names::key_context)
+                .unwrap_or_default();
+            return Err(Diagnostic::error(
+                format!("context `{name}` has no value here"),
+                node.span,
+            )
+            .with_note("no `with` sets it, and it declares no default")
+            .into());
+        }
+        let Callee::Closure(closure) = self.function(default)? else {
+            return mistyped(node, "a context's default that is no closure");
+        };
+        let Some(code) = closure.code.find_function(closure.function) else {
+            return mistyped(node, "a closure of a function its IR lacks");
+        };
+        let entering = self.levels + usize::from(depth) + CALL_LEVELS;
+        if entering + code.height as usize > MAX_DEPTH {
+            return Err(nested_too_deeply(node).into());
+        }
+        let base = self.stack.len();
+        self.stack
+            .resize(base + code.frame_size as usize, Value::Empty);
+        let passed = self.callee_caller();
+        let result = Evaluator {
+            ir: &closure.code,
+            stack: self.stack,
+            base,
+            captures: &closure.captures,
+            callee: Some(&closure),
+            memo: self.memo,
+            shared: self.shared,
+            caller: passed,
+            levels: entering,
+        }
+        .value(code.body);
+        self.stack.truncate(base);
+        match result.or_else(|unwind| unwind.returned(node.span)) {
+            Err(mut error) if error.input.is_none() && closure.code.input() != self.ir.input() => {
+                error.input = Some(closure.code.input());
+                Err(error.into())
+            }
+            result => result.map_err(Unwind::from),
+        }
+    }
+
+    /// Evaluates the `with` `node`, of the bindings and then the body
+    /// `parts` (see [Context](#context)): each binding's value, in order, in
+    /// the running context, and then the body, as a value, in a new frame of
+    /// the context binding them over the running one, which is restored
+    /// after, whatever the body does.
+    #[inline(never)]
+    fn with(&mut self, parts: IrRange, node: &IrNode) -> Flow<Value> {
+        let Some((&body, binds)) = self.ir.items(parts).split_last() else {
+            return mistyped(node, "a `with` with no body");
+        };
+        let mut bound = Vec::with_capacity(binds.len());
+        for &item in binds {
+            let IrKind::ContextBind { key, value } = self.ir.get(item).kind else {
+                return mistyped(node, "a `with` binding that is none");
+            };
+            bound.push((key, self.value(value)?));
+        }
+        let frame = ContextFrame {
+            id: self.memo.new_context_frame(),
+            binds: bound.into_boxed_slice(),
+            outer: self.shared.context.borrow().clone(),
+        };
+        let outer = self.shared.context.replace(Some(Rc::new(frame)));
+        let result = self.value(body);
+        self.shared.context.replace(outer);
+        result
+    }
+
     /// Builds a future of `function` capturing the values of `captures`,
     /// read in this frame, as [`Evaluator::make_closure`] builds a closure:
     /// one allocation for the captured values and one for the future, which
@@ -1674,13 +1791,16 @@ impl Evaluator<'_> {
         }
         let made = self.shared_caller();
         if reads_caller || made.helper {
-            self.memo.depend(made.origin, Ambient::Caller(made.dir));
+            self.memo.depend(made.origin, &Ambient::Caller(made.dir));
         }
+        // Its body may read any context it captures (see [Context](#context)).
+        self.memo.depend_contexts();
+        let context = self.shared.context.borrow().clone();
         Ok(Value::Future(Rc::new(Future::made_by(
             Rc::clone(self.ir),
             function,
             values.into_boxed_slice(),
-            made,
+            (made, context),
         ))))
     }
 
@@ -2021,7 +2141,9 @@ impl Evaluator<'_> {
         self.stack
             .resize(base + code.frame_size as usize, Value::Empty);
         // The body runs as if where it was written, with the caller, the
-        // helper flag and the origin of the frame that made the future.
+        // helper flag and the origin of the frame that made the future, in
+        // the context it was made in.
+        let outer = self.shared.context.replace(future.context.clone());
         let result = Evaluator {
             ir: &future.code,
             stack: self.stack,
@@ -2034,6 +2156,7 @@ impl Evaluator<'_> {
             levels: entering,
         }
         .value(code.body);
+        self.shared.context.replace(outer);
         self.stack.truncate(base);
         // A `return` for the `lazy` is its value, recorded as any is, here,
         // inside the running mark; no other stop leaves its body: the
@@ -2569,7 +2692,11 @@ impl Evaluator<'_> {
         // dependencies on to the running calls of that origin, as a read
         // in it would.
         let inherited = self.caller.helper;
-        let hash = match self.memo.lookup(closure, key, (caller, inherited)) {
+        let context = self.shared.context.borrow().clone();
+        let hash = match self
+            .memo
+            .lookup(closure, key, (caller, inherited), context.as_ref())
+        {
             Lookup::Missing(hash) => hash,
             Lookup::Done(value) => {
                 self.stack.truncate(base);
@@ -2602,11 +2729,13 @@ impl Evaluator<'_> {
             caller
         };
         let entry = self.memo.start(closure, hash, key);
+        let context = self.shared.context.borrow().clone();
         self.memo.running.push(Running {
             closure: Rc::as_ptr(closure),
             hash,
             entry,
             origin: caller.origin,
+            context,
         });
         Ok(MemoBegin::Started(Mark {
             hash,
@@ -2816,6 +2945,12 @@ impl Evaluator<'_> {
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
             IrKind::LoadCallee => self.callee(node).map(Callee::Closure),
             IrKind::Tag { key, of, shown } => Ok(Callee::Tag(self.tag((key, of, shown)))),
+            IrKind::ContextRead { .. } | IrKind::With { .. } => {
+                match into_callee(self.context_node(node)?) {
+                    Some(callee) => Ok(callee),
+                    None => mistyped(node, "a context's value that is no function"),
+                }
+            }
             IrKind::Top(slot, _) => self.top_function(slot, node),
             IrKind::MakeClosure { function, captures } => {
                 self.make_closure(function, captures).map(Callee::Closure)
@@ -3292,6 +3427,8 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
+            | IrKind::ContextRead { .. }
+            | IrKind::With { .. }
             | IrKind::MakeFuture { .. } => self.shared_amount(id, node),
             IrKind::ListLen(list) => self.list_len(list),
             IrKind::Block { items, result } => {
@@ -3362,6 +3499,7 @@ impl Evaluator<'_> {
             | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where an Int was expected"),
+            IrKind::ContextBind { .. } => mistyped(node, CONTEXT_BIND),
         }
     }
 
@@ -3388,7 +3526,21 @@ impl Evaluator<'_> {
                 kind: ValueKind::Deferred,
                 ..
             }
+            | IrKind::ContextRead {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::With {
+                kind: ValueKind::Deferred,
+                ..
+            }
             | IrKind::MakeFuture { .. } => mistyped(node, taken.deferred),
+            IrKind::ContextRead { .. } | IrKind::With { .. } => {
+                match (taken.owned)(self.context_node(node)?) {
+                    Some(value) => Ok(value),
+                    None => mistyped(node, "a context's value of another kind than its node"),
+                }
+            }
             IrKind::Load(slot, _) => self.slot_as(slot, node, taken.borrowed),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, taken.borrowed),
             IrKind::Top(slot, _) => self.top_as(slot, node, taken.borrowed),
@@ -3516,6 +3668,8 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
+            | IrKind::ContextRead { .. }
+            | IrKind::With { .. }
             | IrKind::MakeFuture { .. } => self.shared_as(node, &FLOAT),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a Float was expected"),
             IrKind::Block { items, result } => {
@@ -3583,6 +3737,7 @@ impl Evaluator<'_> {
             | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a Float was expected"),
+            IrKind::ContextBind { .. } => mistyped(node, CONTEXT_BIND),
         }
     }
 
@@ -3612,6 +3767,8 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
+            | IrKind::ContextRead { .. }
+            | IrKind::With { .. }
             | IrKind::MakeFuture { .. } => self.shared_as(node, &BOOL),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a Bool was expected"),
             IrKind::Is { .. } => self.is_test(node),
@@ -3679,6 +3836,7 @@ impl Evaluator<'_> {
             | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a Bool was expected"),
+            IrKind::ContextBind { .. } => mistyped(node, CONTEXT_BIND),
         }
     }
 
@@ -3760,6 +3918,8 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
+            | IrKind::ContextRead { .. }
+            | IrKind::With { .. }
             | IrKind::MakeFuture { .. } => self.shared_as(node, &STRING),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a String was expected"),
             IrKind::Block { items, result } => {
@@ -3827,6 +3987,7 @@ impl Evaluator<'_> {
             | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a String was expected"),
+            IrKind::ContextBind { .. } => mistyped(node, CONTEXT_BIND),
         }
     }
 
@@ -3843,6 +4004,8 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
+            | IrKind::ContextRead { .. }
+            | IrKind::With { .. }
             | IrKind::MakeFuture { .. } => self.shared_as(node, &RECORD),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a record was expected"),
             IrKind::Store(slot, value) => self.store(slot, value, node),
@@ -3912,6 +4075,7 @@ impl Evaluator<'_> {
             | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a record was expected"),
+            IrKind::ContextBind { .. } => mistyped(node, CONTEXT_BIND),
         }
     }
 
@@ -4229,6 +4393,10 @@ const DEFERRED_STRING: &str = "a node that may be a future where a String was ex
 const DEFERRED_RECORD: &str = "a node that may be a future where a record was expected";
 const DEFERRED_FUNCTION: &str = "a node that may be a future where a function was expected";
 
+/// The internal error of evaluating a binding of a `with` alone (see
+/// [Context](#context)).
+const CONTEXT_BIND: &str = "a binding of a `with` evaluated alone";
+
 /// The internal error of a typed walker meeting a node of a union whose
 /// members are of different kinds, which only the general walker
 /// evaluates (see [`mixed`]).
@@ -4461,6 +4629,9 @@ pub struct MemoTables {
     /// [Memoised functions](#memoised-functions), "Ambient inputs"). Empty
     /// between evaluations.
     running: Vec<Running>,
+    /// The last identity given to a frame of the context (see
+    /// [Context](#context)): each is new.
+    context_frames: u64,
 }
 
 /// The origin of a caller that has none yet (see [Callers and
@@ -4472,8 +4643,8 @@ const NO_ORIGIN: u64 = 0;
 
 /// A memoised call that is running, on [`MemoTables`]'s stack of them: its
 /// entry, by its closure, its arguments' hash and its identity, as [`Mark`]
-/// finds it, and the origin of its caller.
-#[derive(Clone, Copy, Debug)]
+/// finds it, the origin of its caller and the context it runs in.
+#[derive(Clone, Debug)]
 struct Running {
     /// The address of the closure, which finds its table.
     closure: *const Closure,
@@ -4483,24 +4654,50 @@ struct Running {
     entry: u64,
     /// The origin of the call's caller.
     origin: u64,
+    /// The context it runs in (see [Context](#context)).
+    context: Option<Rc<ContextFrame>>,
+}
+
+/// Where a running memoised call's entry is: its closure's address, its
+/// key's hash and its identity.
+type RunningAt = (*const Closure, u64, u64);
+
+impl Running {
+    /// Where its entry is.
+    const fn at(&self) -> RunningAt {
+        (self.closure, self.hash, self.entry)
+    }
 }
 
 /// An ambient input of a memoised call (see [Memoised
 /// functions](#memoised-functions), "Ambient inputs"): a kind of input the
 /// call does not take as an argument but may read, with the value it read.
-/// Today the caller is the only one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq)]
 enum Ambient {
     /// `fileroot.caller`: the caller's directory, by its index in the run's
     /// table, which is its value: two files of one directory have one.
     Caller(u32),
+    /// A read of a context, `^arch` (see [Context](#context)): its
+    /// declaration's key, with the value its nearest binding gave it, or
+    /// `None` for one read from no binding, whose default's value depends on
+    /// what that reads, recorded as its own reads.
+    Context(Name, Option<Value>),
+    /// Every context bound, by its declaration's key, with its value, in
+    /// order of key: what a future made in the call may read once it has
+    /// returned.
+    Contexts(Rc<[(Name, Value)]>),
 }
 
 impl Ambient {
-    /// Whether a call whose caller is `caller` has this value of the input.
-    fn holds(self, caller: Caller) -> bool {
+    /// Whether a call whose caller is `caller`, in the context `context`,
+    /// has this value of the input.
+    fn holds(&self, caller: Caller, context: Option<&Rc<ContextFrame>>) -> bool {
         match self {
-            Ambient::Caller(dir) => dir == caller.dir,
+            Ambient::Caller(dir) => *dir == caller.dir,
+            Ambient::Context(key, value) => {
+                ContextFrame::find(context, *key).map(|(_, found)| found) == value.as_ref()
+            }
+            Ambient::Contexts(all) => ContextFrame::flattened(context)[..] == all[..],
         }
     }
 }
@@ -4527,6 +4724,7 @@ impl MemoTables {
             origins: 0,
             entries: 0,
             running: Vec::new(),
+            context_frames: 0,
         }
     }
 
@@ -4550,27 +4748,85 @@ impl MemoTables {
     /// inputs"): those whose caller the reading frame's is, passed on by
     /// helpers from the first of them, whose caller was set from a file.
     /// With no memoised call running, nothing is looked up.
-    fn depend(&mut self, origin: u64, ambient: Ambient) {
-        for running in &self.running {
-            if running.origin != origin {
-                continue;
-            }
-            let entry = self
-                .tables
-                .get_mut(&running.closure)
-                .and_then(|table| table.buckets.get_mut(&running.hash))
-                .and_then(|bucket| {
-                    bucket
-                        .entries_mut()
-                        .iter_mut()
-                        .find(|entry| entry.id == running.entry)
-                });
-            if let Some(entry) = entry
-                && !entry.deps.contains(&ambient)
-            {
-                entry.deps = entry.deps.iter().copied().chain([ambient]).collect();
-            }
+    fn depend(&mut self, origin: u64, ambient: &Ambient) {
+        let found: Vec<RunningAt> = self
+            .running
+            .iter()
+            .filter(|running| running.origin == origin)
+            .map(Running::at)
+            .collect();
+        for at in found {
+            self.record(at, ambient);
         }
+    }
+
+    /// Records a read of the context of the declaration key `key` in the
+    /// context `context` as a dependency of every running memoised call
+    /// that shares the read's binding of it: whose context's nearest
+    /// binding of it is the same frame's, or, for a read of its default,
+    /// none (see [Context](#context)), with the value read, once each.
+    fn depend_context(&mut self, key: Name, context: Option<&Rc<ContextFrame>>) {
+        if self.running.is_empty() {
+            return;
+        }
+        let read = ContextFrame::find(context, key);
+        let frame = read.map(|(frame, _)| frame);
+        let ambient = Ambient::Context(key, read.map(|(_, value)| value.clone()));
+        let found: Vec<RunningAt> = self
+            .running
+            .iter()
+            .filter(|running| {
+                ContextFrame::find(running.context.as_ref(), key).map(|(at, _)| at) == frame
+            })
+            .map(Running::at)
+            .collect();
+        for at in found {
+            self.record(at, &ambient);
+        }
+    }
+
+    /// Records, for every running memoised call, every context its own
+    /// context binds as a dependency, once each: what a future made in it
+    /// may read after it has returned (see [Context](#context)).
+    fn depend_contexts(&mut self) {
+        let found: Vec<(RunningAt, Ambient)> = self
+            .running
+            .iter()
+            .map(|running| {
+                let all = ContextFrame::flattened(running.context.as_ref());
+                (running.at(), Ambient::Contexts(all.into()))
+            })
+            .collect();
+        for (at, ambient) in found {
+            self.record(at, &ambient);
+        }
+    }
+
+    /// Adds `ambient` to the dependencies of the running entry `at`, unless
+    /// it has it.
+    fn record(&mut self, (closure, hash, id): RunningAt, ambient: &Ambient) {
+        let entry = self
+            .tables
+            .get_mut(&closure)
+            .and_then(|table| table.buckets.get_mut(&hash))
+            .and_then(|bucket| bucket.entries_mut().iter_mut().find(|entry| entry.id == id));
+        if let Some(entry) = entry
+            && !entry.deps.contains(ambient)
+        {
+            entry.deps = entry
+                .deps
+                .iter()
+                .cloned()
+                .chain([ambient.clone()])
+                .collect();
+        }
+    }
+
+    /// A new identity, for a frame of the context a `with` makes (see
+    /// [Context](#context)).
+    fn new_context_frame(&mut self) -> u64 {
+        self.context_frames = self.context_frames.wrapping_add(1);
+        self.context_frames
     }
 
     /// Marks this point, before an evaluation whose values may not outlive
@@ -4623,7 +4879,7 @@ impl MemoTables {
             .and_then(|table| table.buckets.get(&key_hash(key)))
             .and_then(|bucket| {
                 bucket.entries().iter().find(|entry| {
-                    key_eq(&entry.key, key) && entry.deps.iter().all(|dep| dep.holds(caller))
+                    key_eq(&entry.key, key) && entry.deps.iter().all(|dep| dep.holds(caller, None))
                 })
             });
         entry.is_some_and(|entry| matches!(entry.state, EntryState::Done(_)))
@@ -4656,6 +4912,7 @@ impl MemoTables {
         closure: &Rc<Closure>,
         key: &[Value],
         (caller, inherited): (Caller, bool),
+        context: Option<&Rc<ContextFrame>>,
     ) -> Lookup {
         let hash = key_hash(key);
         let Some(bucket) = self
@@ -4666,18 +4923,21 @@ impl MemoTables {
             return Lookup::Missing(hash);
         };
         let Some(entry) = bucket.entries_mut().iter_mut().find(|entry| {
-            key_eq(&entry.key, key) && entry.deps.iter().all(|dep| dep.holds(caller))
+            key_eq(&entry.key, key) && entry.deps.iter().all(|dep| dep.holds(caller, context))
         }) else {
             return Lookup::Missing(hash);
         };
         let (value, passed) = match &mut entry.state {
             EntryState::Done(value) => {
-                // Copied only when they are passed on, which allocates.
-                let passed = if inherited {
-                    entry.deps.to_vec()
-                } else {
-                    Vec::new()
-                };
+                // Copied only when they are passed on, which allocates: the
+                // caller only by a helper, and a context always, as a read
+                // of it here would be (see [Context](#context)).
+                let passed: Vec<Ambient> = entry
+                    .deps
+                    .iter()
+                    .filter(|dep| inherited || !matches!(dep, Ambient::Caller(_)))
+                    .cloned()
+                    .collect();
                 (value.clone(), passed)
             }
             EntryState::Running { reentered } => {
@@ -4686,7 +4946,11 @@ impl MemoTables {
             }
         };
         for dep in passed {
-            self.depend(caller.origin, dep);
+            match dep {
+                Ambient::Caller(_) => self.depend(caller.origin, &dep),
+                Ambient::Context(key, _) => self.depend_context(key, context),
+                Ambient::Contexts(_) => self.depend_contexts(),
+            }
         }
         Lookup::Done(value)
     }

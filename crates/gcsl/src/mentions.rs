@@ -1765,6 +1765,7 @@ impl Walker<'_> {
             | ItemKind::Type { .. }
             | ItemKind::Enum { .. }
             | ItemKind::Variant { .. }
+            | ItemKind::Context { .. }
             | ItemKind::Error => {}
             ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } => {
                 self.def_type_def(def, value);
@@ -1851,6 +1852,30 @@ impl Walker<'_> {
             // [Types](#types)).
             | ExprKind::Variant { .. }
             | ExprKind::Error => {}
+            // A read of a context the file declares with a default may call
+            // the default's function, a binding of the file: it mentions it
+            // as its name would (see the checker's "Context").
+            ExprKind::ContextRead(name) => {
+                let binding = ast
+                    .contexts()
+                    .iter()
+                    .find(|context| context.name == name)
+                    .and_then(|context| context.binding);
+                if let Some(binding) = binding {
+                    self.name(binding, ast.get(id).span);
+                }
+            }
+            // The bindings' values are read where the `with` is; their
+            // names are contexts', of no scope.
+            ExprKind::With { bindings, body } => {
+                for binding in ast.with_bindings(bindings) {
+                    if let Some(current) = binding.current {
+                        self.expr(current);
+                    }
+                    self.expr(binding.value);
+                }
+                self.expr(body);
+            }
             ExprKind::Interp(parts) => {
                 for &part in ast.parts(parts) {
                     if let StrPart::Expr(expr) = part {

@@ -57,8 +57,13 @@ fn jump_item(ast: &Ast, id: ItemId, jump: Jump, out: &mut String) {
 }
 
 fn body_item(ast: &Ast, id: ItemId, out: &mut String) {
+    if let Some(context) = ast.contexts().iter().find(|context| context.item == id) {
+        return context_item(ast, context, out);
+    }
     match ast.item(id).kind {
         ItemKind::Error => out.push_str("<error>"),
+        // Shown from its declaration, above.
+        ItemKind::Context { .. } => {}
         ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => {
             jump_item(ast, id, jump, out);
         }
@@ -274,9 +279,46 @@ fn type_args(ast: &Ast, args: TypeArgRange, out: &mut String) {
     out.push('>');
 }
 
+/// Writes a context's declaration, `context NAME: TYPE = DEFAULT`.
+fn context_item(ast: &Ast, context: &crate::ast::ContextDecl, out: &mut String) {
+    out.push_str("context ");
+    out.push_str(ast.names().get(context.name));
+    out.push_str(": ");
+    type_name(ast, context.ty, out);
+    if let ItemKind::Let { value, .. } = ast.item(context.item).kind
+        && let ExprKind::Fn(function) = ast.get(value).kind
+    {
+        out.push_str(" = ");
+        expr(ast, ast.fn_decl(function).body, out);
+    }
+}
+
+/// Writes a `with`, `(BODY with {NAME = VALUE; NAME.PATH = VALUE})`.
+fn with_shape(ast: &Ast, (bindings, body): (crate::ast::WithRange, ExprId), out: &mut String) {
+    out.push('(');
+    expr(ast, body, out);
+    out.push_str(" with {");
+    for (index, binding) in ast.with_bindings(bindings).iter().enumerate() {
+        if index > 0 {
+            out.push_str("; ");
+        }
+        out.push_str(ast.names().get(binding.name));
+        for segment in ast.path(binding.path) {
+            if let Some(name) = segment.name() {
+                out.push('.');
+                out.push_str(ast.names().get(name));
+            }
+        }
+        out.push_str(" = ");
+        expr(ast, binding.value, out);
+    }
+    out.push_str("})");
+}
+
 fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
     match ast.type_expr(id).kind {
         TypeExprKind::Named(name) => out.push_str(ast.names().get(name)),
+        TypeExprKind::Context(name) => write!(out, "^{}", ast.names().get(name)).unwrap(),
         TypeExprKind::Path(path) => out.push_str(&ast.show_path(ast.path(path)).to_string()),
         TypeExprKind::Record(fields) => {
             out.push('{');
@@ -459,6 +501,8 @@ fn expr(ast: &Ast, id: ExprId, out: &mut String) {
         ExprKind::Index { expr: inner, index } => index_shape(ast, (inner, index), out),
         ExprKind::For(id) => for_shape(ast, id, out),
         ExprKind::Variant { of, name } => variant_expr(ast, (of, name), out),
+        ExprKind::ContextRead(name) => write!(out, "^{}", ast.names().get(name)).unwrap(),
+        ExprKind::With { bindings, body } => with_shape(ast, (bindings, body), out),
         ExprKind::DefTypeRef(def) => {
             let (def_type, path) = ast.show_def_type(def);
             write!(out, "({def_type} {path})").unwrap();
@@ -7203,6 +7247,67 @@ fn definitions_and_references_made_with_a_variant_parse() {
         (
             "def Toolchain::C gcc(x: Int) { 1 }",
             "the parameter types of a `Toolchain::C` definition come from `Toolchain::C`",
+        ),
+    ] {
+        assert_eq!(error(text).0, message, "{text}");
+    }
+}
+
+#[test]
+fn contexts_reads_withs_and_context_parameters_parse() {
+    assert_eq!(
+        shape("context arch: String = \"x86_64\"\ncontext toolchains: List<Int>"),
+        "context arch: String = {= \"x86_64\"}; context toolchains: List<Int>"
+    );
+    assert_eq!(shape("r = ^arch"), "r = ^arch");
+    assert_eq!(shape("r = ^platform.arch"), "r = (^platform . arch)");
+    assert_eq!(
+        shape("r = f() with { arch = \"x\"; platform.os = \"y\" }"),
+        "r = (f() with {arch = \"x\"; platform.os = \"y\"})"
+    );
+    assert_eq!(
+        shape("r = a + f() with { arch }"),
+        "r = (a + (f() with {arch = arch}))"
+    );
+    assert_eq!(
+        shape("r = with { arch = \"x\" } { f() }"),
+        "r = ({f()} with {arch = \"x\"})"
+    );
+    assert_eq!(
+        shape("fn f(^arch, ^os: String): String { arch }"),
+        "fn f(arch: ^arch = ^arch, os: String = ^os): String {arch}"
+    );
+    // `context` and `with` are names everywhere else.
+    assert_eq!(
+        shape("context = 1\nwith = 2\nr = with"),
+        "context = 1; with = 2; r = with"
+    );
+    // A `with` on the next line is a new item.
+    assert_eq!(
+        error("r = f()\nwith { arch = \"x\" }").0,
+        "expected `{` to start the body of `with`, found end of input"
+    );
+    for (text, message) in [
+        (
+            "x = { context y: Int = 1 }",
+            "`context` is declared only at the top level of a file",
+        ),
+        ("r = ^1", "expected a context's name after `^`, found `1`"),
+        (
+            "r = f() with { 1 }",
+            "expected a context's name in `with`, found `1`",
+        ),
+        (
+            "r = f() with { platform.arch }",
+            "expected `=` after `platform.arch`, found `}`",
+        ),
+        (
+            "r = f() with { a = 1 b = 2 }",
+            "expected `;` or a line break after a binding, found `b`",
+        ),
+        (
+            "fn f(^arch = \"x\"): String { arch }",
+            "a context parameter's default is its context",
         ),
     ] {
         assert_eq!(error(text).0, message, "{text}");
