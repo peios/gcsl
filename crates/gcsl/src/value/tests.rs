@@ -362,7 +362,7 @@ fn exec_and_panic_show_as_their_types() {
     assert_eq!(exec.kind(), ValueKind::Fn);
     assert_eq!(
         exec.to_string(),
-        "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}"
+        "fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}"
     );
     assert_eq!(exec.repr().to_string(), exec.to_string());
     assert_eq!(

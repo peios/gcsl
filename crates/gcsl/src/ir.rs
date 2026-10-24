@@ -1165,10 +1165,11 @@ pub enum IrKind {
     },
     /// An operation on secrets (see [`crate::eval`], "Secrets"): the value
     /// of the node, of any kind, which computes on the values of secrets,
-    /// as a secret, its identity derived from theirs; a failure of it names
-    /// none of them, and nothing recovers or retries it. Of kind
+    /// as a secret, its identity derived from theirs, revealed if the flag
+    /// says, as the checker found every secret computed on to be; a failure
+    /// of it names none of them, and nothing recovers or retries it. Of kind
     /// [`ValueKind::Mixed`].
-    SecretWrap(IrId),
+    SecretWrap(IrId, bool),
     /// The failure the innermost `recover` running its fallback caught, a
     /// record `{message: String}` of the layout it names. Of kind
     /// [`ValueKind::Record`].
@@ -1341,7 +1342,7 @@ impl IrKind {
             | IrKind::Catch { body: child, .. }
             | IrKind::ContextBind { value: child, .. }
             | IrKind::SecretValue { value: child, .. }
-            | IrKind::SecretWrap(child)
+            | IrKind::SecretWrap(child, _)
             | IrKind::ContextRead { default: child, .. }
             | IrKind::Meta(child) => (None, [Some(child), None, None]),
             IrKind::Break { value, .. }
@@ -1511,7 +1512,7 @@ impl IrKind {
             | IrKind::LoadCallee
             | IrKind::Meta(_)
             | IrKind::Tag { .. } => KindStep::Own(ValueKind::Fn),
-            IrKind::SecretWrap(_) => KindStep::Own(ValueKind::Mixed),
+            IrKind::SecretWrap(..) => KindStep::Own(ValueKind::Mixed),
             IrKind::MakeFuture { .. } => KindStep::Own(ValueKind::Deferred),
         }
     }
@@ -1569,7 +1570,7 @@ impl IrKind {
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
-            | IrKind::SecretWrap(_)
+            | IrKind::SecretWrap(..)
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::ContextBind { .. }
@@ -1686,7 +1687,7 @@ impl IrKind {
             IrKind::Recover { .. } => "recover",
             IrKind::Failure(_) => "failure",
             IrKind::SecretValue { .. } => "secret-value",
-            IrKind::SecretWrap(_) => "secret-wrap",
+            IrKind::SecretWrap(..) => "secret-wrap",
             IrKind::With { .. } => "with",
             IrKind::ContextBind { .. } => "context-bind",
             IrKind::Caller => "caller",
@@ -1786,7 +1787,7 @@ impl IrNode {
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
-            | IrKind::SecretWrap(_)
+            | IrKind::SecretWrap(..)
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::ContextBind { .. }

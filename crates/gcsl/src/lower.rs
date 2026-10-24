@@ -874,14 +874,15 @@ impl Lowerer<'_> {
     /// does, but an operation on secrets: the operation on their values, of
     /// its value's kind, made a secret (see the checker's "Secrets").
     fn lower_computed(&mut self, id: ExprId, kind: ValueKind) -> Result<IrId, InternalError> {
-        let Some(value) = self.resolution.secret_op(id) else {
+        let Some((value, revealed)) = self.resolution.secret_op(id) else {
             return self.lower_plain(id, kind);
         };
         let kind = self.kind_of_type(id, value)?;
         let computed = self.lower_plain(id, kind)?;
-        Ok(self
-            .builder
-            .alloc(IrKind::SecretWrap(computed), self.ast.get(id).span))
+        Ok(self.builder.alloc(
+            IrKind::SecretWrap(computed, revealed),
+            self.ast.get(id).span,
+        ))
     }
 
     /// Lowers expression `id`, which the checker marked to be awaited as

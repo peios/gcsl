@@ -20,7 +20,7 @@ pub enum Builtin {
     Int,
     /// `float(x: Int): Float`: the `Float` nearest `x`.
     Float,
-    /// `exec(argv: List<String>) -> {status: Int, stderr: String, stdout:
+    /// `exec(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout:
     /// String}`: runs the program `argv[0]` with the arguments `argv[1..]`
     /// and reports what it did (see [`crate::eval`]). Impure.
     Exec,
@@ -84,7 +84,7 @@ pub enum Builtin {
     /// `show(value)`: the GCSL source of a value, as text, which reads back
     /// as an equal value. Its typing is special.
     Show,
-    /// `exec_live(argv: List<String>) -> {status: Int, stderr: String,
+    /// `exec_live(argv: List<Revealed<String>>) -> {status: Int, stderr: String,
     /// stdout: String}`: `exec`, but the program's standard output and
     /// standard error are also copied, line by line as they arrive, to this
     /// process's standard error (see [`crate::eval`]). Impure.
@@ -108,6 +108,10 @@ pub enum Builtin {
     /// prelude's `s.unsafe_value()`, the deliberate escape (see
     /// [Secrets](crate::check::secrets#secrets)).
     SecretValue,
+    /// `secret_reveal<T>(s: Secret<T>): Revealed<T>`: the secret `s`
+    /// revealed, which a program may be given, the prelude's `s.reveal()`
+    /// (see [Secrets](crate::check::secrets#secrets)).
+    SecretReveal,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -131,7 +135,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 29] = [
+    pub const ALL: [Builtin; 30] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -161,6 +165,7 @@ impl Builtin {
         Builtin::PartialMatches,
         Builtin::Secret,
         Builtin::SecretValue,
+        Builtin::SecretReveal,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -205,6 +210,7 @@ impl Builtin {
             Builtin::PartialMatches => "partial_matches",
             Builtin::Secret => "secret",
             Builtin::SecretValue => "secret_value",
+            Builtin::SecretReveal => "secret_reveal",
         }
     }
 
@@ -243,7 +249,8 @@ impl Builtin {
             | Builtin::VariantPayload
             | Builtin::PartialMatches
             | Builtin::Secret
-            | Builtin::SecretValue => None,
+            | Builtin::SecretValue
+            | Builtin::SecretReveal => None,
         }
     }
 
@@ -260,7 +267,11 @@ impl Builtin {
             Builtin::Join => &["parts", "sep"],
             Builtin::StartsWith | Builtin::StripPrefix => &["s", "prefix"],
             Builtin::EndsWith | Builtin::StripSuffix => &["s", "suffix"],
-            Builtin::Trim | Builtin::Lines | Builtin::Fields | Builtin::SecretValue => &["s"],
+            Builtin::Trim
+            | Builtin::Lines
+            | Builtin::Fields
+            | Builtin::SecretValue
+            | Builtin::SecretReveal => &["s"],
             Builtin::CompareVersions => &["a", "b"],
             Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
             Builtin::FsCopy => &["from", "to"],
@@ -313,7 +324,8 @@ impl Builtin {
             | Builtin::VariantPayload
             | Builtin::PartialMatches
             | Builtin::Secret
-            | Builtin::SecretValue => Effect::Pure,
+            | Builtin::SecretValue
+            | Builtin::SecretReveal => Effect::Pure,
         }
     }
 
@@ -348,7 +360,8 @@ impl Builtin {
             | Builtin::VariantPayload
             | Builtin::PartialMatches
             | Builtin::Secret
-            | Builtin::SecretValue => Typing::Ordinary,
+            | Builtin::SecretValue
+            | Builtin::SecretReveal => Typing::Ordinary,
         }
     }
 
@@ -365,7 +378,7 @@ impl Builtin {
             Builtin::Int => "fn(x: Float): Int",
             Builtin::Float => "fn(x: Int): Float",
             Builtin::Exec | Builtin::ExecLive => {
-                "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}"
+                "fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}"
             }
             Builtin::Panic => "fn(message: String): Never",
             Builtin::Split => "fn(s: String, sep: String): List<String>",
@@ -389,6 +402,7 @@ impl Builtin {
             Builtin::PartialMatches => "fn<T>(partial: Partial<T>, full: T): Bool",
             Builtin::Secret => "fn<T>(value: T, identity: String): Secret<T>",
             Builtin::SecretValue => "fn<T>(s: Secret<T>): T",
+            Builtin::SecretReveal => "fn<T>(s: Secret<T>): Revealed<T>",
         }
     }
 
@@ -406,7 +420,10 @@ impl Builtin {
             Builtin::Int => ([TyId::FLOAT, UNUSED], TyId::INT),
             Builtin::Float => ([TyId::INT, UNUSED], TyId::FLOAT),
             Builtin::Exec | Builtin::ExecLive => {
-                let argv = types.list(TyId::STRING);
+                // A word is a string or a secret revealed to the program.
+                let revealed = types.revealed(TyId::STRING);
+                let word = types.union([TyId::STRING, revealed]);
+                let argv = types.list(word);
                 let [status, stdout, stderr] = Builtin::EXEC_FIELDS.map(|text| names.intern(text));
                 let result = types.record([
                     (status, TyId::INT),
@@ -440,7 +457,8 @@ impl Builtin {
             | Builtin::VariantPayload
             | Builtin::PartialMatches
             | Builtin::Secret
-            | Builtin::SecretValue => {
+            | Builtin::SecretValue
+            | Builtin::SecretReveal => {
                 return self.generic_ty(types, names);
             }
         };
@@ -457,10 +475,14 @@ impl Builtin {
     /// The type of a generic built-in's value, interned into `types`, its
     /// type parameters' and parameters' names into `names` (see
     /// [Generics](crate::check::methods#generics)): `variant_matches` and `variant_payload` of
-    /// `E` and `T`, `partial_matches`, `secret` and `secret_value` of `T`;
+    /// `E` and `T`, `partial_matches`, `secret`, `secret_value` and
+    /// `secret_reveal` of `T`;
     /// `Error` for any other.
     pub(super) fn generic_ty(self, types: &mut TypeTable, names: &mut Names) -> TyId {
-        if matches!(self, Builtin::Secret | Builtin::SecretValue) {
+        if matches!(
+            self,
+            Builtin::Secret | Builtin::SecretValue | Builtin::SecretReveal
+        ) {
             return self.secret_ty(types, names);
         }
         let partial = self == Builtin::PartialMatches;
@@ -497,7 +519,8 @@ impl Builtin {
 }
 
 impl Builtin {
-    /// The type of `secret` or `secret_value`, as [`Builtin::generic_ty`]
+    /// The type of `secret`, `secret_value` or `secret_reveal`, as
+    /// [`Builtin::generic_ty`]
     /// makes it (see [Secrets](crate::check::secrets#secrets)).
     pub(super) fn secret_ty(self, types: &mut TypeTable, names: &mut Names) -> TyId {
         let generic = types.new_generic(Box::new([names.intern("T")]));
@@ -514,6 +537,10 @@ impl Builtin {
                 secret,
                 Effect::Pure,
             ),
+            (Builtin::SecretReveal, &[only]) => {
+                let revealed = types.revealed(value);
+                types.fn_type([(Some(only), secret)], revealed, Effect::Pure)
+            }
             (_, &[only]) => types.fn_type([(Some(only), secret)], value, Effect::Pure),
             _ => return TyId::ERROR,
         };

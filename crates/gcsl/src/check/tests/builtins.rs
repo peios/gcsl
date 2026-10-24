@@ -527,7 +527,7 @@ fn show_rejects_a_function_anywhere_in_its_argument() {
         (
             "show({e = exec})",
             "{e = exec}",
-            "`{e: fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}}`",
+            "`{e: fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}}`",
         ),
         (
             "show(lazy fn(): Int { 1 })",
@@ -577,7 +577,7 @@ pub(super) const EXEC_RESULT: &str = "{status: Int, stderr: String, stdout: Stri
 fn exec_and_panic_have_function_types() {
     assert_eq!(
         shown_result("exec"),
-        "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}"
+        "fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}"
     );
     assert_eq!(shown_result("panic"), "fn(message: String): Never");
     assert_eq!(
@@ -647,7 +647,7 @@ fn exec_is_impure_and_called_as_any_impure_function() {
         labels(&found[0])[0],
         (
             at(text, "exec"),
-            "this is fn(argv: List<String>) -> {status: Int, stderr: String, stdout: \
+            "this is fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: \
                  String}"
         )
     );
@@ -683,7 +683,9 @@ fn exec_is_impure_and_called_as_any_impure_function() {
         "Int | Future<Int>"
     );
     assert_eq!(
-        messages("fn pick(f: fn(argv: List<String>) -> {status: Int}): Int { 1 }\npick(exec)"),
+        messages(
+            "fn pick(f: fn(argv: List<Revealed<String>>) -> {status: Int}): Int { 1 }\npick(exec)"
+        ),
         ["mismatched types"]
     );
     assert_eq!(

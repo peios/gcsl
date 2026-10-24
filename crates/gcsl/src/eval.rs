@@ -467,7 +467,7 @@ impl Evaluator<'_> {
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
-            | IrKind::SecretWrap(_) => self.whole_node(node),
+            | IrKind::SecretWrap(..) => self.whole_node(node),
             IrKind::ContextBind { .. } => mistyped(node, CONTEXT_BIND),
             IrKind::Meta(function) => self.meta_value(function, node),
             IrKind::Call {
@@ -697,7 +697,7 @@ impl Evaluator<'_> {
             IrKind::Recover { body, fallback, .. } => self.recover(body, fallback),
             IrKind::Failure(layout) => self.failure(layout, node),
             IrKind::SecretValue { value, deep, .. } => self.secret_value(value, deep),
-            IrKind::SecretWrap(computed) => self.secret_wrap(computed, node),
+            IrKind::SecretWrap(computed, revealed) => self.secret_wrap(computed, revealed, node),
             _ => mistyped(node, "a node evaluated whole that is none"),
         }
     }
@@ -755,7 +755,7 @@ impl Evaluator<'_> {
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
-            | IrKind::SecretWrap(_) => match (taken.owned)(self.whole_node(node)?) {
+            | IrKind::SecretWrap(..) => match (taken.owned)(self.whole_node(node)?) {
                 Some(value) => Ok(value),
                 None => mistyped(node, "a value of another kind than its node"),
             },

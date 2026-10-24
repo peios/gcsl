@@ -256,16 +256,8 @@ impl Checker<'_> {
         if let Some(note) = self.default_note(found, expected) {
             error = error.with_note(note);
         }
-        if self.types.secret_value(self.types.strip(found)).is_some()
-            && self
-                .types
-                .secret_value(self.types.strip(expected))
-                .is_none()
-        {
-            error = error.with_note(
-                "a secret is not its value, which it keeps from leaking; `.unsafe_value()` takes \
-                 the value, deliberately",
-            );
+        if let Some(note) = self.secret_note(found, expected) {
+            error = error.with_note(note);
         }
         if self.types.laziness(expected) == Laziness::Future {
             let shown = self.in_message(expected);

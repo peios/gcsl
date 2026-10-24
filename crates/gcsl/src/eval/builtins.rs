@@ -9,25 +9,39 @@ use crate::value::{Quantity, Secret, Value};
 
 use super::{Flow, mistyped};
 
-/// The call `node` of `builtin`, `secret` or `secret_value`, with the
-/// argument `value` and, for `secret`, the identity `identity` (see
-/// [Secrets](crate::eval::secrets#secrets)): `secret` of a secret is its value as a secret of
-/// the new identity, and `secret_value` of a plain value, a plain `T`
-/// where a `Secret<T>` is expected, is the value.
+/// The call `node` of `builtin`, `secret`, `secret_value` or
+/// `secret_reveal`, with the argument `value` and, for `secret`, the
+/// identity `identity` (see [Secrets](crate::eval::secrets#secrets)):
+/// `secret` of a secret is its value as a secret of the new identity, not
+/// revealed; `secret_reveal` is the secret revealed, of its identity; and
+/// each of the other two of a plain value, a plain `T` where a `Secret<T>`
+/// is expected, is the value.
 pub(super) fn secret_builtin(
     builtin: Builtin,
     value: Value,
     identity: Option<Value>,
     node: &IrNode,
 ) -> Flow<Value> {
+    if builtin == Builtin::SecretReveal {
+        return match value {
+            Value::Secret(secret) => Ok(Value::Secret(Rc::new(Secret {
+                value: secret.value.clone(),
+                identity: Rc::clone(&secret.identity),
+                revealed: true,
+            }))),
+            value => Ok(value),
+        };
+    }
     let value = match value {
         Value::Secret(secret) => secret.value.clone(),
         value => value,
     };
     match (builtin, identity) {
-        (Builtin::Secret, Some(Value::Str(identity))) => {
-            Ok(Value::Secret(Rc::new(Secret { value, identity })))
-        }
+        (Builtin::Secret, Some(Value::Str(identity))) => Ok(Value::Secret(Rc::new(Secret {
+            value,
+            identity,
+            revealed: false,
+        }))),
         (Builtin::SecretValue, None) => Ok(value),
         _ => mistyped(node, "a secret's built-in with an argument of another kind"),
     }

@@ -80,8 +80,12 @@ No epoch, revision, or filename-suffix processing is applied.
 Return a stable ascending sort in compare_versions order, retaining duplicates.
 .SH PROCESS FUNCTIONS
 .TP
-.B exec(argv: List<String>) -> {status: Int, stdout: String, stderr: String}
+.B exec(argv: List<Revealed<String>>) -> {status: Int, stdout: String, stderr: String}
 Run argv[0] with argv[1..] as literal arguments, without a shell.
+Each word is a string or a secret revealed with
+.BR reveal() ,
+which the program receives as its value and GCSL shows as
+.BR *** .
 Search PATH if the program name contains no slash.
 Inherit the host working directory and environment and supply null standard input.
 Capture standard output and standard error in memory.
@@ -89,7 +93,7 @@ Decode captured bytes as UTF-8, replacing invalid sequences.
 Return a nonzero exit status as data; a signal termination uses 128 plus the signal number.
 An empty argument list or failure to start the program is a runtime error.
 .TP
-.B exec_live(argv: List<String>) -> {status: Int, stdout: String, stderr: String}
+.B exec_live(argv: List<Revealed<String>>) -> {status: Int, stdout: String, stderr: String}
 Run as exec does and also copy both output streams to GCSL standard error as complete lines arrive.
 A final unterminated line is copied at end of stream.
 Captured output is still retained in memory.

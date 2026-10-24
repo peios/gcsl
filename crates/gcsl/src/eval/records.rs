@@ -100,7 +100,7 @@ impl Evaluator<'_> {
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
-            | IrKind::SecretWrap(_)
+            | IrKind::SecretWrap(..)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &RECORD),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a record was expected"),
             IrKind::Store(slot, value) => self.store(slot, value, node),

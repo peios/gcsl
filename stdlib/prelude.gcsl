@@ -104,9 +104,14 @@ def (partial: Partial<T>) matches<T>(full: T): Bool {
 
 # Secrets: `s.unsafe_value()` is the secret's value, the deliberate escape
 # from what keeps it from leaking, for a linter or a strict mode to flag.
-# `secret(value, identity)` makes one; a secret shows as `***`.
+# `s.reveal()` is the secret revealed, which only a program may be given, as
+# a word of `exec`'s `argv`. `secret(value, identity)` makes one; a secret
+# shows as `***`.
 def (s: Secret<T>) unsafe_value<T>(): T {
     builtins.secret_value(s)
+}
+def (s: Secret<T>) reveal<T>(): Revealed<T> {
+    builtins.secret_reveal(s)
 }
 def secret<T>(value: T, identity: String): Secret<T> {
     builtins.secret(value, identity)

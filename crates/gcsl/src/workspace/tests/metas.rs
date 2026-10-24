@@ -495,7 +495,7 @@ fn meta_errors() {
                  defmeta tagged x { tag = exec([\"true\"]).stdout; n = 1 }"
         ),
         "cannot call an impure function from a pure function at app.gcsl; app.gcsl: this \
-             is fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}; \
+             is fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}; \
              app.gcsl: this function is pure, declared with `:`; note: a pure function, \
              declared with `:`, may call only pure functions; declare it with `->` to make it \
              impure"

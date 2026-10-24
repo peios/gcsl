@@ -14,7 +14,11 @@
 //! (`Evaluator::secret_wrap`) makes what the operation computes a secret,
 //! its identity the identities pushed while it ran, joined by plus signs,
 //! as in `user + password`; a secret it computes, a secret's field that is
-//! one, is its value, the identities joined with its own.
+//! one, is its value, the identities joined with its own. The wrap makes
+//! it revealed if the checker found every secret computed on revealed, and
+//! only if a secret it computes is revealed too; `secret_reveal` makes a
+//! secret revealed, of its identity, and `exec` gives a revealed word's
+//! value to the program, shown as `***`.
 //!
 //! A failure of the operation itself, a division by zero, an overflow or an
 //! index past the end of a secret list, can tell of the secret: it is "an
@@ -73,9 +77,9 @@ impl Evaluator<'_> {
     }
 
     /// Evaluates `computed`, an operation on the values of secrets, for the
-    /// `SecretWrap` `node` (see [Secrets](#secrets)): its value as a secret
-    /// whose identity is the identities of the secrets it computed on,
-    /// joined by ` + ` in order; a failure of it is "an operation on a
+    /// `SecretWrap` `node` (see [Secrets](#secrets)): its value as a secret,
+    /// revealed if `revealed`, whose identity is the identities of the
+    /// secrets it computed on, joined by ` + ` in order; a failure of it is "an operation on a
     /// secret failed", where it failed, naming nothing else, which nothing
     /// recovers or retries, since whether it fails can depend on a secret.
     /// A failure of one of its operands is that operand's, and passes
@@ -86,7 +90,12 @@ impl Evaluator<'_> {
     /// its own error as ever, and the failure of an operation on a secret
     /// inside this one, already redacted where it failed.
     #[inline(never)]
-    pub(super) fn secret_wrap(&mut self, computed: IrId, node: &IrNode) -> Flow<Value> {
+    pub(super) fn secret_wrap(
+        &mut self,
+        computed: IrId,
+        revealed: bool,
+        node: &IrNode,
+    ) -> Flow<Value> {
         let depth = self.shared.identities.borrow().len();
         let result = self.value(computed);
         let identities: Vec<Rc<str>> = self.shared.identities.borrow_mut().split_off(depth);
@@ -95,17 +104,21 @@ impl Evaluator<'_> {
             Ok(value) => {
                 // A value that is a secret already, a secret's field that
                 // is one, is its value: a secret's value is never a secret.
-                let (value, inner) = match value {
-                    Value::Secret(secret) => {
-                        (secret.value.clone(), Some(Rc::clone(&secret.identity)))
-                    }
-                    value => (value, None),
+                // It is revealed only if that secret is too.
+                let (value, inner, revealed) = match value {
+                    Value::Secret(secret) => (
+                        secret.value.clone(),
+                        Some(Rc::clone(&secret.identity)),
+                        revealed && secret.revealed,
+                    ),
+                    value => (value, None, revealed),
                 };
                 let identity: Vec<&str> =
                     identities.iter().chain(&inner).map(AsRef::as_ref).collect();
                 Ok(Value::Secret(Rc::new(Secret {
                     value,
                     identity: Rc::from(identity.join(" + ")),
+                    revealed,
                 })))
             }
             Err(Unwind::Error(error)) if error.mark == ErrorMark::NONE && !of_operand => {

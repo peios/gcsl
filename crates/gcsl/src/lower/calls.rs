@@ -69,7 +69,8 @@ impl Lowerer<'_> {
             | Builtin::VariantPayload
             | Builtin::PartialMatches
             | Builtin::Secret
-            | Builtin::SecretValue => Err(InternalError {
+            | Builtin::SecretValue
+            | Builtin::SecretReveal => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),

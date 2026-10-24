@@ -26,7 +26,7 @@
 //! no code or captures, since it is implemented in Rust. It is a function
 //! ([`ValueKind::Fn`]): a call of it through a value, a parameter say, is
 //! applied by the evaluator (see [`crate::eval`]). It shows as its type, as
-//! the type table shows it (`fn(argv: List<String>) -> {status: Int,
+//! the type table shows it (`fn(argv: List<Revealed<String>>) -> {status: Int,
 //! stderr: String, stdout: String}` for `exec`, its record's fields by
 //! name, and `fn(message: String): Never` for `panic`), or as `builtin len`
 //! for one whose typing is special, and two compare equal when they are the
@@ -848,16 +848,20 @@ pub struct Secret {
     pub value: Value,
     /// Its public identity, what a host's receipts record of it.
     pub identity: Rc<str>,
+    /// Whether it is revealed, `Revealed<T>`, which a program may be given.
+    pub revealed: bool,
 }
 
-/// Two secrets are equal if their identities are, whatever their values:
-/// a comparison that is not itself a secret, total equality's of fields a
-/// type does not name or a memoised call's of its arguments, must not tell
-/// of a secret's value (see [`crate::eval`], "Secrets"). A comparison of
-/// secrets' values is the checker's, of their values, into a secret.
+/// Two secrets are equal if their identities are, whatever their values,
+/// and they are both revealed or both not: a comparison that is not itself
+/// a secret, total equality's of fields a type does not name or a memoised
+/// call's of its arguments, must not tell of a secret's value (see
+/// [`crate::eval`], "Secrets"), and whether one is revealed is public, its
+/// type's. A comparison of secrets' values is the checker's, of their
+/// values, into a secret.
 impl PartialEq for Secret {
     fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity
+        self.identity == other.identity && self.revealed == other.revealed
     }
 }
 

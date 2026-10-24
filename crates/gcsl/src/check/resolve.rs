@@ -638,6 +638,7 @@ impl Checker<'_> {
             || Some(name) == self.constructors.variant
             || Some(name) == self.constructors.partial
             || Some(name) == self.constructors.secret
+            || Some(name) == self.constructors.revealed
     }
 
     /// Whether a type written as `ty` is *bare*, so that the bare type rule
@@ -659,6 +660,7 @@ impl Checker<'_> {
                 self.constructors.list,
                 self.constructors.partial,
                 self.constructors.secret,
+                self.constructors.revealed,
             ]
             .contains(&Some(name)),
             TypeExprKind::Union { .. } => !self.has_future_member(ty),
@@ -699,6 +701,7 @@ impl Checker<'_> {
             self.constructors.present,
             self.constructors.partial,
             self.constructors.secret,
+            self.constructors.revealed,
         ]
         .contains(&Some(name));
         let &[arg] = self.ast.type_args(args) else {
@@ -732,7 +735,10 @@ impl Checker<'_> {
             return arg;
         }
         if Some(name) == self.constructors.secret {
-            return self.secret_type(arg, span);
+            return self.secret_type(arg, span, false);
+        }
+        if Some(name) == self.constructors.revealed {
+            return self.secret_type(arg, span, true);
         }
         self.unknown_applied(name, span);
         TyId::ERROR

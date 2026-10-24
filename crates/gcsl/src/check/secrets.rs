@@ -41,6 +41,17 @@
 //! and a `for` iterates over a list, which a secret is not either. A
 //! secret where its value's type is expected is "mismatched types", noted
 //! that a secret is not its value and that `.unsafe_value()` takes it.
+//!
+//! `s.reveal()`, the prelude's over the built-in `secret_reveal`, is
+//! `Revealed<T>`: the secret, revealed, which only a program may be given,
+//! as a word of `exec`'s `argv`, `List<Revealed<String>>`, a plain string
+//! fitting it. A revealed secret is still a secret, contagious and
+//! deciding nothing; it fits `Secret<T>`, and no secret that is not
+//! revealed fits `Revealed<T>`. What is computed on secrets is revealed
+//! only if every secret computed on is (`Checker::secret_operation`), so
+//! that mixing in one that is not, or wrapping one in `secret()` again,
+//! keeps it from a program. A secret not revealed where a revealed one is
+//! expected is noted that `.reveal()` reveals it (`Checker::secret_note`).
 
 use crate::ast::{BinaryOp, ExprId};
 use crate::diagnostic::Diagnostic;
@@ -50,11 +61,11 @@ use crate::types::{Laziness, TyId, TypeTable};
 use super::Checker;
 
 impl Checker<'_> {
-    /// `Secret<T>` of `value`, `T` resolved present, written at `span` (see
-    /// [Secrets](#secrets)): `Error` for an erroneous one, and (reported)
-    /// for one that may be a future, "a secret's value is present, not
-    /// `Future<String>`".
-    pub(super) fn secret_type(&mut self, value: TyId, span: Span) -> TyId {
+    /// `Secret<T>` of `value`, `T` resolved present, written at `span`, or
+    /// `Revealed<T>` if `revealed` (see [Secrets](#secrets)): `Error` for an
+    /// erroneous one, and (reported) for one that may be a future, "a
+    /// secret's value is present, not `Future<String>`".
+    pub(super) fn secret_type(&mut self, value: TyId, span: Span, revealed: bool) -> TyId {
         if value == TyId::ERROR {
             return TyId::ERROR;
         }
@@ -66,7 +77,7 @@ impl Checker<'_> {
             ));
             return TyId::ERROR;
         }
-        self.types.secret(value)
+        self.types.secret_of(value, revealed)
     }
 
     /// Types the binary operator `op` of `id`, `lhs` of type `lhs_ty` and
@@ -190,7 +201,17 @@ impl Checker<'_> {
         if found == TyId::ERROR || found == self.never {
             return found;
         }
-        self.lowering.secret_ops.insert(id, found);
+        // Revealed if every secret computed on is, so that nothing is
+        // revealed that was not.
+        let revealed = operands.iter().all(|&(operand, unwrapped)| {
+            let ty = self.types.strip(self.expr_types[operand.index()]);
+            match unwrapped {
+                None => true,
+                Some((_, false)) => self.types.is_revealed(ty),
+                Some((_, true)) => !self.types.holds_kept_secret(ty),
+            }
+        });
+        self.lowering.secret_ops.insert(id, (found, revealed));
         for &(operand, unwrapped) in operands {
             if let Some(unwrapped) = unwrapped {
                 self.lowering.secret_operands.insert(operand, unwrapped);
@@ -198,7 +219,24 @@ impl Checker<'_> {
                 self.lowering.plain_operands.insert(operand);
             }
         }
-        self.types.secret(found)
+        self.types.secret_of(found, revealed)
+    }
+
+    /// The note of a mismatch of `found` where `expected` is, if a secret
+    /// is why (see [Secrets](#secrets)): where a revealed secret is
+    /// expected, a program's word, and `found` holds one not revealed, that
+    /// `.reveal()` gives one to a program; where `found` is a secret and
+    /// `expected` none, that a secret is not its value.
+    pub(super) fn secret_note(&self, found: TyId, expected: TyId) -> Option<&'static str> {
+        let (found, expected) = (self.types.strip(found), self.types.strip(expected));
+        if self.types.holds_kept_secret(found) && self.types.holds_revealed(expected) {
+            return Some("a program is given a secret only revealed: `.reveal()` reveals it");
+        }
+        (self.types.secret_value(found).is_some() && self.types.secret_value(expected).is_none())
+            .then_some(
+                "a secret is not its value, which it keeps from leaking; `.unsafe_value()` takes \
+                 the value, deliberately",
+            )
     }
 
     /// Reports `operand`, a secret, where it would decide what runs, by

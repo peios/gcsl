@@ -529,9 +529,11 @@ impl Evaluator<'_> {
                 Some((first, _)),
                 Some(second),
             ) => enum_builtin(builtin, (&first, &second), node),
-            (Builtin::Secret | Builtin::SecretValue, Some((value, _)), identity) => {
-                secret_builtin(builtin, value, identity, node)
-            }
+            (
+                Builtin::Secret | Builtin::SecretValue | Builtin::SecretReveal,
+                Some((value, _)),
+                identity,
+            ) => secret_builtin(builtin, value, identity, node),
             _ => mistyped(
                 node,
                 "a built-in function called through a value with an argument of another kind",

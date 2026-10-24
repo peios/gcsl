@@ -156,7 +156,7 @@ pub(super) struct ForLowering {
     pub(super) recover_slots: HashMap<RecoverId, Slot>,
     /// Each operation on a secret, by its id, with the type of the value it
     /// computes, which lowering makes a secret (see [Secrets](crate::check::secrets#secrets)).
-    pub(super) secret_ops: HashMap<ExprId, TyId>,
+    pub(super) secret_ops: HashMap<ExprId, (TyId, bool)>,
     /// Each operand of an operation on secrets that is or holds a secret,
     /// by its id, with the type of what it is unwrapped to and whether that
     /// is deeply, every secret it holds its value (see [Secrets](crate::check::secrets#secrets)).
@@ -548,10 +548,11 @@ impl Resolution {
     }
 
     /// The type of the value the expression `id` computes, if it is an
-    /// operation on a secret, whose result lowering makes a secret (see
+    /// operation on a secret, whose result lowering makes a secret, and
+    /// whether that secret is revealed (see
     /// [Secrets](crate::check::secrets#secrets)).
     #[must_use]
-    pub fn secret_op(&self, id: ExprId) -> Option<TyId> {
+    pub fn secret_op(&self, id: ExprId) -> Option<(TyId, bool)> {
         self.lowered.secret_ops.get(&id).copied()
     }
 

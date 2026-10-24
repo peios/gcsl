@@ -52,9 +52,33 @@ the secret, so `recover` doesn't catch it and `#[retry]` doesn't retry
 it. A failure of anything else in the expression is unchanged: in
 `password + panic("boom")`, the `panic` fails as it always does.
 
+## Giving a secret to a program
+
+A program that needs a secret gets it revealed: `.reveal()` turns a
+`Secret<T>` into a `Revealed<T>`, which `exec` accepts as an argument.
+
+```gcsl
+let token = secret("abc123", "api token")
+
+# `test -n` exits 0 if the token it is given isn't empty.
+status = exec(["test", "-n", token.reveal()]).status
+```
+
+The program receives the value, but GCSL still shows a revealed secret as
+`***`, so it doesn't appear in error messages or anywhere GCSL shows the
+command line. A revealed secret is contagious too:
+`"--token={token.reveal()}"` is a `Revealed<String>`, while mixing in a
+secret that isn't revealed gives a plain `Secret`, which `exec` refuses.
+
+Only `exec` takes a revealed secret, so searching for `.reveal()` finds
+every program that ever receives one. What the program does with it is up
+to the program: if it prints the secret, the output it returns has it in
+plain text.
+
 ## Taking the value
 
-When you really do need the value, take it with `.unsafe_value()`:
+When you really do need the value inside GCSL, take it with
+`.unsafe_value()`:
 
 ```gcsl
 let token = secret("abc123", "api token")
@@ -62,5 +86,6 @@ let token = secret("abc123", "api token")
 header = "Authorization: Bearer {token.unsafe_value()}"
 ```
 
-`header` is a plain `String`, and is shown in full. Use it only where the
-value has to leave GCSL, and nowhere it might be shown.
+`header` is a plain `String`, and is shown in full. Use it only when
+nothing else will do, and nowhere it might be shown. To give a secret to a
+program, reveal it instead.

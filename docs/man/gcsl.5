@@ -233,7 +233,15 @@ that never leaks; it is shown as
 .BI secret( VALUE ", " IDENTITY )
 makes one, with a public identity;
 .B .unsafe_value()
-takes its value.
+takes its value, and
+.B .reveal()
+makes it a
+.BI Revealed< T > ,
+which only
+.BR exec 's
+arguments accept: the program receives the value, and GCSL shows it as
+.BR *** .
+Computing on revealed secrets alone gives a revealed one.
 An operator with a secret operand, a secret interpolated, a field of a secret record and an element of a secret list are secrets, identified by the secrets computed on, as is any comparison of values that hold a secret.
 Elsewhere, in
 .B ===

@@ -108,7 +108,7 @@ fn exec_reports_what_its_program_did() {
         // The value shows as its type.
         (
             "= exec",
-            "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}",
+            "fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}",
         ),
         ("= panic", "fn(message: String): Never"),
     ] {
@@ -274,8 +274,8 @@ fn every_record_exec_builds_shares_the_runs_one_layout() {
         .map(|&(path, text)| SourceFile::new(path, text).unwrap())
         .collect();
     let mut workspace = check(&sources).unwrap();
-    // The driver wrote the twenty-nine built-in functions' cells.
-    assert_eq!(assert_builtins_written(&workspace).len(), 29);
+    // The driver wrote the thirty built-in functions' cells.
+    assert_eq!(assert_builtins_written(&workspace).len(), 30);
     let a = workspace.file("a.gcsl").unwrap();
     let b = workspace.file("b.gcsl").unwrap();
     let first = workspace.run(a).unwrap().value;
@@ -366,7 +366,7 @@ fn exec_live_gives_the_record_exec_gives() {
         // The value shows as its type, `exec`'s.
         (
             "= exec_live",
-            "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}",
+            "fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}",
         ),
     ] {
         assert_eq!(lone(text).unwrap(), expected, "{text}");

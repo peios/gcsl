@@ -840,6 +840,7 @@ pub(super) fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize)
         Value::Secret(secret) => {
             state.write_u8(13);
             secret.identity.hash(state);
+            secret.revealed.hash(state);
         }
         Value::Record(record) => {
             state.write_u8(5);

@@ -32,7 +32,7 @@
 //! [`Builtin::ty`] interns with the table in hand (its parameters' and its
 //! result's names into the run's names): `int` (`fn(x: Float): Int`,
 //! truncation toward zero), `float` (`fn(x: Int): Float`), `exec`
-//! (`fn(argv: List<String>) -> {status: Int, stderr: String, stdout:
+//! (`fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout:
 //! String}`, which runs a program), `exec_live` (of `exec`'s type, which
 //! runs a program as `exec` does, copying its output to standard error as
 //! it runs), `panic` (`fn(message: String):

@@ -37,7 +37,7 @@ impl Evaluator<'_> {
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
-            | IrKind::SecretWrap(_)
+            | IrKind::SecretWrap(..)
             | IrKind::MakeFuture { .. } => self.shared_amount(id, node),
             IrKind::ListLen(list) => self.list_len(list),
             IrKind::Block { items, result } => {
@@ -225,7 +225,7 @@ impl Evaluator<'_> {
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
-            | IrKind::SecretWrap(_)
+            | IrKind::SecretWrap(..)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &FLOAT),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a Float was expected"),
             IrKind::Block { items, result } => {
@@ -333,7 +333,7 @@ impl Evaluator<'_> {
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
-            | IrKind::SecretWrap(_)
+            | IrKind::SecretWrap(..)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &BOOL),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a Bool was expected"),
             IrKind::Is { .. } => self.is_test(node),
@@ -468,7 +468,7 @@ impl Evaluator<'_> {
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
-            | IrKind::SecretWrap(_)
+            | IrKind::SecretWrap(..)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &STRING),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a String was expected"),
             IrKind::Block { items, result } => {

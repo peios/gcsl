@@ -36,10 +36,13 @@ use super::{Flow, mistyped};
 /// program to run" for an empty `argv` (`exec_live` naming itself), and
 /// with "cannot run `name`", noting the OS's own reason, for a program that
 /// cannot be started, or whose output cannot be read or whose end cannot be
-/// waited for, as [`Command::output`] reports each. A run without the
-/// standard library has no `exec` layout, nor any `exec` to call, so
-/// `exec_result` being `None` is an internal error, as is an element of
-/// `argv` that is not a string, which the checker rules out.
+/// waited for, as [`Command::output`] reports each. A word of `argv` that
+/// is a revealed secret is given to the program as its value, and shown as
+/// `***` (see [Secrets](crate::eval::secrets#secrets)): "cannot run `***`".
+/// A run without the standard library has no `exec` layout, nor any `exec`
+/// to call, so `exec_result` being `None` is an internal error, as is an
+/// element of `argv` that is neither a string nor a revealed one, which the
+/// checker rules out.
 #[inline(never)]
 pub(super) fn exec(
     builtin: Builtin,
@@ -57,12 +60,12 @@ pub(super) fn exec(
         )
         .into());
     };
-    let Value::Str(program) = program else {
+    let Some((program, shown)) = word(program) else {
         return mistyped(node, "a program of `exec` that is not a string");
     };
     let mut command = Command::new(&**program);
     for argument in arguments {
-        let Value::Str(argument) = argument else {
+        let Some((argument, _)) = word(argument) else {
             return mistyped(node, "an argument of `exec` that is not a string");
         };
         command.arg(&**argument);
@@ -82,7 +85,7 @@ pub(super) fn exec(
         Ok(output) => output,
         Err(error) => {
             return Err(
-                Diagnostic::error(format!("cannot run `{program}`"), node.span)
+                Diagnostic::error(format!("cannot run `{shown}`"), node.span)
                     .with_note(error.to_string())
                     .into(),
             );
@@ -105,6 +108,20 @@ pub(super) fn exec(
             text(&output.stderr),
         ]),
     }))))
+}
+
+/// The text of `value`, a word of `exec`'s `argv`, and how it is shown: a
+/// string as itself, a revealed secret's string as `***`; `None` for
+/// anything else.
+fn word(value: &Value) -> Option<(&Rc<str>, &str)> {
+    match value {
+        Value::Str(text) => Some((text, text)),
+        Value::Secret(secret) if secret.revealed => match &secret.value {
+            Value::Str(text) => Some((text, "***")),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Runs `command` as [`exec`] does, but only until `deadline`, copying its
