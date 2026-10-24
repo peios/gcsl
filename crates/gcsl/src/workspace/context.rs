@@ -65,8 +65,9 @@ pub(crate) enum AttributeLookup<'a> {
     Nothing,
     /// A type of the file's view that is not marked `#[attribute]`.
     NotAttribute,
-    /// A type marked `#[attribute]`, known to a host as this.
-    Attribute(&'a AttributeId),
+    /// A type marked `#[attribute]`, known to a host as this, and whether
+    /// it is marked `#[defers]` too.
+    Attribute(&'a AttributeId, bool),
 }
 
 impl<'a> Context<'a> {
@@ -77,7 +78,7 @@ impl<'a> Context<'a> {
         match self.file.type_view.get(&name) {
             None => AttributeLookup::Nothing,
             Some(&decl) => match self.scan.type_store.attribute(decl) {
-                Some(id) => AttributeLookup::Attribute(id),
+                Some(id) => AttributeLookup::Attribute(id, self.scan.type_store.defers(decl)),
                 None => AttributeLookup::NotAttribute,
             },
         }

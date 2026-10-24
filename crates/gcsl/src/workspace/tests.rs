@@ -291,6 +291,7 @@ fn messages(files: &[(&str, &str)], path: &str) -> Vec<String> {
 // ----- Scan errors -----
 
 mod arguments;
+mod defers;
 mod deftypes;
 mod errors;
 mod fileroot;

@@ -536,13 +536,35 @@ pub(super) fn declare_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
                 .set_arity(scan.type_base.saturating_add(at), arity);
         }
     }
-    // Those marked `#[attribute]`, by their numbers, but one named like a
-    // built-in attribute.
-    for (at, decl) in (0u32..).zip(&types) {
+    mark_attributes(scan, &types, errors);
+    scan.types = types;
+    scan.dir_types = dir_types;
+}
+
+/// Marks each of `types` that its file marks `#[attribute]` as an
+/// attribute's declaration, by its number, and as deferring if it is marked
+/// `#[defers]` too; but one named like a built-in attribute, or one with
+/// type parameters, which is reported, and `#[defers]` on a type that is no
+/// attribute's, which is reported too.
+fn mark_attributes(scan: &mut Scan, types: &[DeclaredType], errors: &mut Vec<Diagnostic>) {
+    for (at, decl) in (0u32..).zip(types) {
         let Some(file) = scan.files.get(decl.file as usize) else {
             continue;
         };
         if !file.ast.is_attribute(decl.item) {
+            if file.ast.is_defers(decl.item) {
+                errors.push(
+                    Diagnostic::error(
+                        format!(
+                            "`#[defers]` marks an attribute's declaration, and `{}` is none",
+                            scan.names.get(decl.name)
+                        ),
+                        decl.span,
+                    )
+                    .with_note("mark the type `#[attribute]` too")
+                    .in_input(decl.file),
+                );
+            }
             continue;
         }
         let name = scan.names.get(decl.name);
@@ -570,9 +592,11 @@ pub(super) fn declare_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
         };
         scan.type_store
             .mark_attribute(scan.type_base.saturating_add(at), id);
+        if file.ast.is_defers(decl.item) {
+            scan.type_store
+                .mark_deferring(scan.type_base.saturating_add(at));
+        }
     }
-    scan.types = types;
-    scan.dir_types = dir_types;
 }
 
 /// Where one name of a file's view of types comes from, as [`type_views`]

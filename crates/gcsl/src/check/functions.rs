@@ -417,6 +417,7 @@ impl Checker<'_> {
             self.fn_params.push((Some(param.name), ty));
         }
         let ret = self.declared_result(id, decl.ret, ret_mode);
+        self.check_deferred_result(function, ret, decl.ret);
         let mut ty = self.function_type(function, base, (ret, decl.effect));
         self.expr_types[id.index()] = ty;
         self.check_def_type_signature(function, ty);
@@ -458,7 +459,12 @@ impl Checker<'_> {
         let mut unnarrowed = Vec::new();
         if !pure && ty != TyId::ERROR && self.errors.len() == errors {
             let mut result = ret;
-            if let Some(ret_expr) = decl.ret {
+            // A deferring function's result stays able to be a future: a
+            // host may give its calls' results later (see [Deferring
+            // attributes](crate::check::attributes#deferring-attributes)).
+            if let Some(ret_expr) = decl.ret
+                && !self.calls.deferred.contains(&function)
+            {
                 result = self.inferred_result((ret_expr, ret), decl.body, &returns);
             }
             let narrowed = self.narrow_callbacks(base, callbacks.0, &mut unnarrowed);

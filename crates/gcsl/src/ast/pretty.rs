@@ -222,6 +222,7 @@ impl<A: Annotate> Pretty<'_, A> {
             (ast.is_shadowable(id), "#[shadowable] "),
             (ast.is_def_type(id), "#[def_type] "),
             (ast.is_attribute(id), "#[attribute] "),
+            (ast.is_defers(id), "#[defers] "),
         ];
         for (marked, text) in marks {
             if marked {

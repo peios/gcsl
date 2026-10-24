@@ -109,7 +109,8 @@
 //! otherwise, rather than a comment that would hide the code after them on
 //! their line. Every other `#` starts a comment to the end of its line, as
 //! it always has: so a shebang, `#!/usr/bin/env gcsl`, is a comment, and so
-//! are `# [x]`, with a space, `#[` alone, `#[]` and `#[1]`. The scan of a string literal's interpolations (see [String
+//! are `# [x]`, with a space, `#[` alone, `#[]` and `#[1]`. The scan of a
+//! string literal's interpolations (see [String
 //! literals](#string-literals)) tells the two apart by the same rule
 //! (`attribute_at`), so the lexer and the scan always agree on where a
 //! comment ends.

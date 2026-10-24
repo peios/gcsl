@@ -1658,13 +1658,15 @@ fn item_function(ast: &Ast, item: ItemId) -> Option<FnId> {
 }
 
 /// The names of the built-in attributes: the parser's, `shadowable`,
-/// `def_type`, `attribute` and `no_prelude`, and the checker's, `retry`
-/// and `timeout` (see [Attributes](crate::check::attributes#attributes)). No `#[attribute]` type
+/// `def_type`, `attribute`, `defers` and `no_prelude`, and the checker's,
+/// `retry`, `timeout` and `track_caller` (see
+/// [Attributes](crate::check::attributes#attributes)). No `#[attribute]` type
 /// may be named like one: "`retry` is a built-in attribute".
-pub(crate) const BUILTIN_ATTRIBUTES: [&str; 7] = [
+pub(crate) const BUILTIN_ATTRIBUTES: [&str; 8] = [
     "shadowable",
     "def_type",
     "attribute",
+    "defers",
     "no_prelude",
     "retry",
     "timeout",

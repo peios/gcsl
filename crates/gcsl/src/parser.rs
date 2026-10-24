@@ -120,6 +120,13 @@ const ATTRIBUTE: &str = "attribute";
 /// The error for `#[attribute]` before anything but a top-level `type`.
 const MISPLACED_ATTRIBUTE: &str = "`#[attribute]` applies only to a file's top-level `type`s";
 
+/// The name of the outer attribute that makes an attribute defer the calls
+/// of the functions it is on.
+const DEFERS: &str = "defers";
+
+/// The error for `#[defers]` before anything but a top-level `type`.
+const MISPLACED_DEFERS: &str = "`#[defers]` applies only to a file's top-level `type`s";
+
 /// The error for a use of an attribute before anything but a function item.
 const MISPLACED_USE: &str = "attributes apply to functions: a `fn`, a `def` or a definition";
 
@@ -417,6 +424,8 @@ struct Pending {
     def_type: Option<Span>,
     /// `#[attribute]`.
     attribute: Option<Span>,
+    /// `#[defers]`.
+    defers: Option<Span>,
     /// The uses of attributes that are none of the parser's, in source
     /// order, each with the item it applies to left for the item to give.
     uses: Vec<AttributeUse>,
@@ -428,6 +437,7 @@ impl Pending {
         self.shadowable.is_none()
             && self.def_type.is_none()
             && self.attribute.is_none()
+            && self.defers.is_none()
             && self.uses.is_empty()
     }
 
@@ -438,6 +448,7 @@ impl Pending {
             (SHADOWABLE, self.shadowable),
             (DEF_TYPE, self.def_type),
             (ATTRIBUTE, self.attribute),
+            (DEFERS, self.defers),
         ];
         let builtin = builtin
             .into_iter()

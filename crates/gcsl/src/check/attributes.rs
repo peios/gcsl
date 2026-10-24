@@ -60,6 +60,29 @@
 //! warning "retrying a pure function cannot change its result", noted "a
 //! pure function's result depends only on its arguments".
 //!
+//! # Deferring attributes
+//!
+//! An attribute's declaration marked `#[defers]` too (see the parser's
+//! [Attributes](crate::parser::attributes#attributes)), `#[attribute]
+//! #[defers] type hermetic = {on: Bool = true}`, declares a *deferring*
+//! attribute: one a host may take as running a function's calls as steps,
+//! whose results it gives later. The workspace records which attributes'
+//! declarations are marked so ([`crate::ast::TypeStore::defers`]), and
+//! `#[defers]` on a type that is no attribute's is "`#[defers]` marks an
+//! attribute's declaration, and `T` is none". A function a deferring
+//! attribute is on, whatever its arguments, is noted as one
+//! (`Checker::note_deferring`): its result type stays the either shape of
+//! an impure function's bare result, `File | Future<File>`, never narrowed
+//! to present by its body (`Checker::check_fn`), so that every use of a
+//! call's result is awaited, as a future's is, and a host may give a future
+//! where plain GCSL gives the value at once. A pure function's calls are no
+//! steps: one is "a pure function cannot defer: its calls are never steps";
+//! and a result type that cannot be a future, `Present<File>`, is "the
+//! result of a deferring function must be able to be a future"
+//! (`Checker::check_deferred_result`). A definition made with a def-type
+//! takes a deferring attribute as it takes any, but its type stays its
+//! def-type's exactly: the def-type's invocation is the step.
+//!
 //! # Metas
 //!
 //! A function type may have a *meta*, written after its return type with a
@@ -168,7 +191,9 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{ArgKind, AttributeId, AttributeUse, Effect, ExprId, ExprKind, FnId, ItemKind};
+use crate::ast::{
+    ArgKind, AttributeId, AttributeUse, Effect, ExprId, ExprKind, FnId, ItemKind, TypeExprId,
+};
 use crate::diagnostic::Diagnostic;
 use crate::names::Name;
 use crate::source::Span;
@@ -233,9 +258,14 @@ impl Checker<'_> {
         let outer = (self.next_slot, self.frame_size, self.slot_names.len());
         let mut found: HashMap<FnId, Vec<Attribute>> = HashMap::new();
         for used in uses {
-            let attribute = self.check_attribute_use(used);
-            let attribute = attribute.filter(|attribute| self.fits_builtin(attribute, used));
-            if let (Some(attribute), Some(function)) = (attribute, item_function(ast, used.item)) {
+            let checked = self.check_attribute_use(used);
+            let checked = checked.filter(|(attribute, _)| self.fits_builtin(attribute, used));
+            if let (Some((attribute, defers)), Some(function)) =
+                (checked, item_function(ast, used.item))
+            {
+                if defers {
+                    self.note_deferring(used, function);
+                }
                 if attribute.id == AttributeId::Builtin(RETRY)
                     && !matches!(ast.item(used.item).kind, ItemKind::DefTypeDef { .. })
                     && ast.fn_decl(function).effect == Effect::Pure
@@ -265,19 +295,21 @@ impl Checker<'_> {
     /// any other name a type of the file's view marked `#[attribute]`,
     /// whose record type its arguments are checked against. `None`, the
     /// error reported, if it names none, or its arguments do not fit.
-    pub(super) fn check_attribute_use(&mut self, used: &AttributeUse) -> Option<Attribute> {
+    pub(super) fn check_attribute_use(&mut self, used: &AttributeUse) -> Option<(Attribute, bool)> {
         let names = self.ast.names();
         let text = names.get(used.name);
-        let (id, fields) = match text {
+        let (id, fields, defers) = match text {
             RETRY => (
                 AttributeId::Builtin(RETRY),
                 vec![(Box::from("times"), TyId::INT, None)],
+                false,
             ),
             TIMEOUT => (
                 AttributeId::Builtin(TIMEOUT),
                 vec![(Box::from("limit"), TyId::DURATION, None)],
+                false,
             ),
-            TRACK_CALLER => (AttributeId::Builtin(TRACK_CALLER), Vec::new()),
+            TRACK_CALLER => (AttributeId::Builtin(TRACK_CALLER), Vec::new(), false),
             _ => self.declared_attribute(used)?,
         };
         let given = self.attribute_args(used, &fields)?;
@@ -298,10 +330,71 @@ impl Checker<'_> {
                 None => failed = true,
             }
         }
-        (!failed).then(|| Attribute {
-            id,
-            args: args.into_boxed_slice(),
+        (!failed).then(|| {
+            let attribute = Attribute {
+                id,
+                args: args.into_boxed_slice(),
+            };
+            (attribute, defers)
         })
+    }
+
+    /// Records `function`, which the deferring attribute `used` is on, as a
+    /// function whose calls a host may run as steps (see [Deferring
+    /// attributes](#deferring-attributes)): but a definition's, whose
+    /// def-type's invocation is the step, and a pure function's, "a pure
+    /// function cannot defer: its calls are never steps".
+    pub(super) fn note_deferring(&mut self, used: &AttributeUse, function: FnId) {
+        let ast = self.ast;
+        if matches!(ast.item(used.item).kind, ItemKind::DefTypeDef { .. }) {
+            return;
+        }
+        if ast.fn_decl(function).effect == Effect::Pure {
+            let text = ast.names().get(used.name);
+            self.errors.push(
+                Diagnostic::error(
+                    "a pure function cannot defer: its calls are never steps",
+                    used.span,
+                )
+                .with_note(format!(
+                    "`#[{text}]` lets a host run the function's calls as steps, which only an \
+                         impure function's can be: declare it with `->`"
+                )),
+            );
+            return;
+        }
+        self.calls.deferred.insert(function);
+    }
+
+    /// Reports the result type `ret`, written at `written`, of `function`, if
+    /// a deferring attribute is on it and `ret` cannot be a future: "the
+    /// result of a deferring function must be able to be a future" (see
+    /// [Deferring attributes](#deferring-attributes)).
+    pub(super) fn check_deferred_result(
+        &mut self,
+        function: FnId,
+        ret: TyId,
+        written: Option<TypeExprId>,
+    ) {
+        if !self.calls.deferred.contains(&function)
+            || ret == TyId::ERROR
+            || self.types.laziness(ret) != Laziness::Present
+        {
+            return;
+        }
+        let Some(written) = written else {
+            return;
+        };
+        self.errors.push(
+            Diagnostic::error(
+                "the result of a deferring function must be able to be a future",
+                self.ast.type_expr(written).span,
+            )
+            .with_note(
+                "a host may give its calls' results later: write its result type bare, as in \
+                 `-> File`, not `Present<File>`",
+            ),
+        );
     }
 
     /// Whether `attribute`, written as `used`, has arguments its meaning
@@ -334,7 +427,7 @@ impl Checker<'_> {
     pub(super) fn declared_attribute(
         &mut self,
         used: &AttributeUse,
-    ) -> Option<(AttributeId, AttributeFields)> {
+    ) -> Option<(AttributeId, AttributeFields, bool)> {
         let names = self.ast.names();
         let text = names.get(used.name);
         let lookup = self
@@ -342,8 +435,8 @@ impl Checker<'_> {
             .map_or(AttributeLookup::Nothing, |workspace| {
                 workspace.attribute(used.name)
             });
-        let id = match lookup {
-            AttributeLookup::Attribute(id) => id.clone(),
+        let (id, defers) = match lookup {
+            AttributeLookup::Attribute(id, defers) => (id.clone(), defers),
             AttributeLookup::NotAttribute => {
                 self.errors.push(
                     Diagnostic::error(format!("`{text}` is not an attribute"), used.name_span)
@@ -385,7 +478,7 @@ impl Checker<'_> {
                 (Box::from(names.get(name)), field, default)
             })
             .collect();
-        Some((id, fields))
+        Some((id, fields, defers))
     }
 
     /// The argument `used` gives each of `fields`, the fields of its

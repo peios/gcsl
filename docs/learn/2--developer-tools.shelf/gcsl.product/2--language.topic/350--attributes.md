@@ -120,3 +120,31 @@ results = [(check fast)()(), (check online)()()]
 ```
 
 Here `fast` is hermetic and `online` is not.
+
+## Attributes that defer calls
+
+A host such as pekit can run some calls as separate steps, possibly in
+parallel or from a cache, and give their results later. An attribute that
+asks for that is declared with `#[defers]` as well as `#[attribute]`:
+
+```gcsl
+#[attribute] #[defers] type hermetic = {on: Bool = true}
+
+#[hermetic]
+fn compile(source: String) -> String { "{source}.o" }
+
+fn link(objects: List<String>): String { "app from {len(objects)} objects" }
+
+app = link([compile("main.c"), compile("util.c")])
+```
+
+A call of a function with a deferring attribute can give a future instead
+of its value. GCSL waits for it wherever the value is used, so nothing
+about the code changes: plain GCSL runs each call at once, and under a host
+that defers it, only code that uses the result waits. The function's type
+shows it: `compile` is a `fn(source: String) -> String | Future<String>`.
+
+Only an impure function can defer, and its result type must be able to be
+a future, so `Present<String>` isn't allowed. For a definition type that
+defers, its invocations are the deferred calls: a definition keeps the
+definition type's function type.

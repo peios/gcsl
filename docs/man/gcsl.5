@@ -376,6 +376,11 @@ Mark a top-level type as an attribute whose arguments are that record type.
 Its fields must hold only constants: Int, Float, Bool, String, Duration, Size, or lists and records of them.
 It is declared, imported and named like any type.
 .TP
+.B #[defers]
+Mark an attribute's declaration as deferring: a call of an impure function it is on, whatever its arguments, may give a future that a host resolves later, so the function's result type stays T | Future<T> and every use of a result is awaited.
+Plain GCSL runs such calls at once.
+A pure function, or a result type that cannot be a future, is an error; a definition keeps its definition type's function type, and the definition type's invocation is deferred.
+.TP
 .B #[NAME] #[NAME(ARGUMENTS)]
 Apply an attribute to the following fn, def or definition.
 Arguments are constants, by name, or by position for an attribute of one field; fields left out take their defaults.

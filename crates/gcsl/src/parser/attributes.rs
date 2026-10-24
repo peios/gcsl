@@ -53,7 +53,11 @@
 //! `#[attribute]` marks a top-level `type` as an attribute's declaration
 //! ([`Ast::is_attribute`](super::Ast::is_attribute)), applying to the next item as `#[shadowable]`
 //! does; before anything else it is "`#[attribute]` applies only to a
-//! file's top-level `type`s".
+//! file's top-level `type`s". `#[defers]` marks one too
+//! ([`Ast::is_defers`](super::Ast::is_defers)), as the declaration of an attribute that defers the
+//! calls of the functions it is on, a step's (see the checker's
+//! [Attributes](crate::check::attributes#attributes)); before anything else
+//! it is "`#[defers]` applies only to a file's top-level `type`s".
 //!
 //! Any other outer name, `#[NAME]` or `#[NAME(ARGS)]`, is a *use* of an
 //! attribute, which the checker resolves (see the checker's
@@ -71,7 +75,7 @@
 //! through its `]` whatever goes wrong in it; an inner one with arguments is
 //! "an inner attribute takes no arguments".
 
-use super::{ATTRIBUTE, DEF_TYPE, SHADOWABLE};
+use super::{ATTRIBUTE, DEF_TYPE, DEFERS, SHADOWABLE};
 use crate::ast::{ArgRange, AttributeUse, ItemId, ItemKind, TypeExpr, TypeExprKind};
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -79,8 +83,9 @@ use crate::names::Name;
 use crate::source::Span;
 
 use super::{
-    Braces, LET_SHADOWS_NOTE, MISPLACED_ATTRIBUTE, MISPLACED_DEF_TYPE, MISPLACED_NO_PRELUDE,
-    MISPLACED_SHADOWABLE, MISPLACED_USE, NO_PRELUDE, ParseResult, Parser, Pending, Reported,
+    Braces, LET_SHADOWS_NOTE, MISPLACED_ATTRIBUTE, MISPLACED_DEF_TYPE, MISPLACED_DEFERS,
+    MISPLACED_NO_PRELUDE, MISPLACED_SHADOWABLE, MISPLACED_USE, NO_PRELUDE, ParseResult, Parser,
+    Pending, Reported,
 };
 
 impl Parser<'_> {
@@ -142,6 +147,7 @@ impl Parser<'_> {
             SHADOWABLE => &mut pending.shadowable,
             DEF_TYPE => &mut pending.def_type,
             ATTRIBUTE => &mut pending.attribute,
+            DEFERS => &mut pending.defers,
             NO_PRELUDE => return Err(self.misplaced_attribute(token)),
             _ => {
                 let used = self.attribute_use(token, (name, &text), token.span, None);
@@ -218,7 +224,7 @@ impl Parser<'_> {
         let text = self.names.get(name).to_owned();
         if matches!(
             text.as_str(),
-            SHADOWABLE | DEF_TYPE | ATTRIBUTE | NO_PRELUDE
+            SHADOWABLE | DEF_TYPE | ATTRIBUTE | DEFERS | NO_PRELUDE
         ) {
             let reported = self.error(format!("`#[{text}]` takes no arguments"), token.span);
             self.skip_attribute();
@@ -307,6 +313,24 @@ impl Parser<'_> {
         Err(self.error(MISPLACED_ATTRIBUTE, attribute))
     }
 
+    /// Marks `item`, an item of a body that is the file's if `top`, with the
+    /// `#[defers]` written at `defers` before it, if it is a top-level
+    /// `type`; else the error that it is not one (see
+    /// [Attributes](#attributes)). Whether the type is an attribute's
+    /// declaration too is the workspace's to say.
+    pub(super) fn attach_defers(
+        &mut self,
+        defers: Span,
+        item: ItemId,
+        top: bool,
+    ) -> ParseResult<()> {
+        if top && matches!(self.builder.item(item).kind, ItemKind::Type { .. }) {
+            self.builder.mark_defers(item);
+            return Ok(());
+        }
+        Err(self.error(MISPLACED_DEFERS, defers))
+    }
+
     /// Gives `item` the uses `uses` of attributes that are none of the
     /// parser's, if it is a function item: a named `fn`, a `def` or a
     /// definition made with a def-type, at any level; else the error, at the
@@ -363,7 +387,7 @@ impl Parser<'_> {
         };
         let text = self.names.get(name).to_owned();
         let message = match (text.as_str(), inner) {
-            (SHADOWABLE | DEF_TYPE | ATTRIBUTE, true) => {
+            (SHADOWABLE | DEF_TYPE | ATTRIBUTE | DEFERS, true) => {
                 format!("`{text}` applies to a declaration: write `#[{text}]`")
             }
             (NO_PRELUDE, false) => {
@@ -372,6 +396,7 @@ impl Parser<'_> {
             (SHADOWABLE, false) => MISPLACED_SHADOWABLE.to_owned(),
             (DEF_TYPE, false) => MISPLACED_DEF_TYPE.to_owned(),
             (ATTRIBUTE, false) => MISPLACED_ATTRIBUTE.to_owned(),
+            (DEFERS, false) => MISPLACED_DEFERS.to_owned(),
             (NO_PRELUDE, true) => MISPLACED_NO_PRELUDE.to_owned(),
             // Any other outer one is a use, which applies to functions.
             (_, false) => MISPLACED_USE.to_owned(),

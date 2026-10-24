@@ -39,6 +39,8 @@ pub struct AstBuilder {
     pub(super) shadowable: Vec<ItemId>,
     pub(super) def_type_marks: Vec<ItemId>,
     pub(super) attribute_marks: Vec<ItemId>,
+    /// The `type` items marked `#[defers]`, sorted.
+    pub(super) defers_marks: Vec<ItemId>,
     pub(super) attribute_uses: Vec<AttributeUse>,
     pub(super) generics: Vec<Generics>,
     pub(super) methods: Vec<MethodDecl>,
@@ -403,6 +405,16 @@ impl AstBuilder {
         }
     }
 
+    /// Marks the `type` item `id` `#[defers]`: its attribute defers the
+    /// calls of the functions it is on (see the parser's
+    /// [Attributes](crate::parser::attributes#attributes)).
+    pub fn mark_defers(&mut self, id: ItemId) {
+        let at = self.defers_marks.partition_point(|&marked| marked.0 < id.0);
+        if self.defers_marks.get(at) != Some(&id) {
+            self.defers_marks.insert(at, id);
+        }
+    }
+
     /// Records the type parameters of a generic function item.
     pub fn push_generics(&mut self, generics: Generics) {
         self.generics.push(generics);
@@ -545,6 +557,7 @@ impl AstBuilder {
         self.shadowable.retain(|item| item.0 < items);
         self.def_type_marks.retain(|item| item.0 < items);
         self.attribute_marks.retain(|item| item.0 < items);
+        self.defers_marks.retain(|item| item.0 < items);
         self.attribute_uses.retain(|used| used.item.0 < items);
         let fns = next_id(mark.fns);
         self.generics.retain(|generics| match generics.owner {
@@ -625,6 +638,7 @@ impl AstBuilder {
             shadowable: self.shadowable,
             def_type_marks: self.def_type_marks,
             attribute_marks: self.attribute_marks,
+            defers_marks: self.defers_marks,
             attribute_uses: self.attribute_uses,
             generics: self.generics,
             methods: self.methods,

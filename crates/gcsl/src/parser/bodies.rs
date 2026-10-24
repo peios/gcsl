@@ -241,6 +241,9 @@ impl Parser<'_> {
         if let Some(attribute) = pending.attribute.take() {
             self.attach_attribute(attribute, item, !inner)?;
         }
+        if let Some(defers) = pending.defers.take() {
+            self.attach_defers(defers, item, !inner)?;
+        }
         if !pending.uses.is_empty() {
             self.attach_uses(std::mem::take(&mut pending.uses), item)?;
         }

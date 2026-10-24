@@ -162,7 +162,7 @@ found = [1, 2, 3].contains(2)
 ```
 
 Strings have `split`, `starts_with`, `ends_with`, `trim`, `strip_prefix`,
-`strip_suffix`, `lines`, `fields`, `contains` and `compare_version`.
+`strip_suffix`, `lines`, `fields`, `contains`, and `compare_version`.
 Lists of strings have `join` and `sort_versions`, and every list has
 `len`, `unique` and `contains`. `unique` keeps the first of each group of
 equal elements, in order, and `contains` tells whether any element equals

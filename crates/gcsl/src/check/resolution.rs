@@ -119,6 +119,10 @@ pub(super) struct CallsChecked {
     /// What the type parameters of each generic function and `type` item
     /// belong to, made once for it.
     pub(super) ids: HashMap<GenericOwner, GenericId>,
+    /// The functions of the input that a deferring attribute is on, whose
+    /// calls a host may run as steps (see [Deferring
+    /// attributes](crate::check::attributes#deferring-attributes)).
+    pub(super) deferred: HashSet<FnId>,
     /// The arguments of the call being bound that were checked to infer its
     /// type parameters, each with its type: checked once, then only
     /// expected to fit its substituted parameter.

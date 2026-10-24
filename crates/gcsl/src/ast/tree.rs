@@ -48,6 +48,8 @@ pub struct Ast {
     pub(super) def_type_marks: Vec<ItemId>,
     /// The `type` items marked `#[attribute]`, in id order.
     pub(super) attribute_marks: Vec<ItemId>,
+    /// The `type` items marked `#[defers]`, sorted.
+    pub(super) defers_marks: Vec<ItemId>,
     /// The uses of attributes that are none of the parser's, by the items
     /// they apply to, in id order, and on each item in source order.
     pub(super) attribute_uses: Vec<AttributeUse>,
@@ -587,6 +589,16 @@ impl Ast {
     #[must_use]
     pub fn is_attribute(&self, id: ItemId) -> bool {
         self.attribute_marks
+            .binary_search_by_key(&id.0, |marked| marked.0)
+            .is_ok()
+    }
+
+    /// Whether the `type` item `id` is marked `#[defers]`: its attribute, if
+    /// it declares one, defers the calls of the functions it is on (see the
+    /// parser's [Attributes](crate::parser::attributes#attributes)).
+    #[must_use]
+    pub fn is_defers(&self, id: ItemId) -> bool {
+        self.defers_marks
             .binary_search_by_key(&id.0, |marked| marked.0)
             .is_ok()
     }

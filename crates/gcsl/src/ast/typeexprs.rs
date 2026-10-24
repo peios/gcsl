@@ -758,6 +758,9 @@ pub struct TypeStore {
     /// The declarations marked `#[attribute]`, by their numbers, each with
     /// what a host knows it by.
     pub(super) attributes: HashMap<u32, AttributeId>,
+    /// The declarations of attributes marked `#[defers]` too, by their
+    /// numbers.
+    pub(super) deferring: HashSet<u32>,
     /// How many type parameters each declaration has, by number: none but
     /// for a generic one.
     pub(super) arities: Vec<u32>,
@@ -813,6 +816,19 @@ impl TypeStore {
     /// `#[attribute]`, known to a host as `id`.
     pub fn mark_attribute(&mut self, decl: u32, id: AttributeId) {
         self.attributes.insert(decl, id);
+    }
+
+    /// Records that the declaration numbered `decl`, an attribute's, is
+    /// marked `#[defers]`.
+    pub fn mark_deferring(&mut self, decl: u32) {
+        self.deferring.insert(decl);
+    }
+
+    /// Whether the declaration numbered `decl` is an attribute's marked
+    /// `#[defers]`.
+    #[must_use]
+    pub fn defers(&self, decl: u32) -> bool {
+        self.deferring.contains(&decl)
     }
 
     /// What a host knows the declaration numbered `decl` by, if it is
