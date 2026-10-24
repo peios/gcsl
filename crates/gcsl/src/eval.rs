@@ -2962,34 +2962,16 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::IntConst(value) => Ok(value),
-            IrKind::Load(_, ValueKind::Deferred)
-            | IrKind::LoadCapture(_, ValueKind::Deferred)
-            | IrKind::Field {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::Call {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::Index {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_INT),
-            IrKind::Await { .. } => self.await_as(node, into_int),
-            IrKind::As { .. } => self.narrow_as(node, into_int),
-            IrKind::Index { list, index, .. } => self.index_as((list, index), node, into_int),
+            IrKind::Load(..)
+            | IrKind::LoadCapture(..)
+            | IrKind::Top(..)
+            | IrKind::Call { .. }
+            | IrKind::Field { .. }
+            | IrKind::Index { .. }
+            | IrKind::Await { .. }
+            | IrKind::As { .. }
+            | IrKind::MakeFuture { .. } => self.shared_as(node, &INT),
             IrKind::ListLen(list) => self.list_len(list),
-            IrKind::Load(slot, _) => self.slot_as(slot, node, as_int),
-            IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_int),
-            IrKind::Top(slot, _) => self.top_as(slot, node, as_int),
-            IrKind::Call {
-                callee,
-                args,
-                depth,
-                ..
-            } => self.call_as((callee, args, depth), node, into_int),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.int(result)
@@ -3006,7 +2988,6 @@ impl Evaluator<'_> {
             IrKind::IntRem(operands) => {
                 self.int_division(node, operands, |lhs, rhs| Some(floor_mod(lhs, rhs)))
             }
-            IrKind::Field { record, name, .. } => self.field_as((record, name), node, into_int),
             IrKind::FloatConst(_)
             | IrKind::FloatNeg(_)
             | IrKind::FloatAdd(_)
@@ -3058,6 +3039,50 @@ impl Evaluator<'_> {
             | IrKind::LoadCallee
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where an Int was expected"),
+        }
+    }
+
+    /// Evaluates `node` for a typed walker that takes the values of its kind
+    /// as `taken` says. The node is a load, a capture or top-level read, a
+    /// call, a field access, an index, an await, an `as` or a `lazy`, any of
+    /// whose values may be of any kind. This is the one place where the
+    /// typed walkers evaluate such nodes. One of them that may be a future
+    /// is an internal error, since only the general walker evaluates those;
+    /// a `lazy` always is.
+    fn shared_as<T>(&mut self, node: &IrNode, taken: &Taken<T>) -> Flow<T> {
+        match node.kind {
+            IrKind::Load(_, ValueKind::Deferred)
+            | IrKind::LoadCapture(_, ValueKind::Deferred)
+            | IrKind::Field {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::Call {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::Index {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::MakeFuture { .. } => mistyped(node, taken.deferred),
+            IrKind::Load(slot, _) => self.slot_as(slot, node, taken.borrowed),
+            IrKind::LoadCapture(index, _) => self.capture_as(index, node, taken.borrowed),
+            IrKind::Top(slot, _) => self.top_as(slot, node, taken.borrowed),
+            IrKind::Call {
+                callee,
+                args,
+                depth,
+                ..
+            } => self.call_as((callee, args, depth), node, taken.owned),
+            IrKind::Field { record, name, .. } => self.field_as((record, name), node, taken.owned),
+            IrKind::Index { list, index, .. } => self.index_as((list, index), node, taken.owned),
+            IrKind::Await { .. } => self.await_as(node, taken.owned),
+            IrKind::As { .. } => self.narrow_as(node, taken.owned),
+            _ => mistyped(
+                node,
+                "a node a typed walker evaluates itself, given to it shared",
+            ),
         }
     }
 
@@ -3116,35 +3141,15 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::FloatConst(value) => Ok(value),
-            IrKind::Load(_, ValueKind::Deferred)
-            | IrKind::LoadCapture(_, ValueKind::Deferred)
-            | IrKind::Field {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::Call {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::Index {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_FLOAT),
-            IrKind::Await { .. } => self.await_as(node, Value::into_float),
-            IrKind::As { .. } => self.narrow_as(node, Value::into_float),
-            IrKind::Index { list, index, .. } => {
-                self.index_as((list, index), node, Value::into_float)
-            }
-            IrKind::Load(slot, _) => self.slot_as(slot, node, as_float),
-            IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_float),
-            IrKind::Top(slot, _) => self.top_as(slot, node, as_float),
-            IrKind::Call {
-                callee,
-                args,
-                depth,
-                ..
-            } => self.call_as((callee, args, depth), node, Value::into_float),
+            IrKind::Load(..)
+            | IrKind::LoadCapture(..)
+            | IrKind::Top(..)
+            | IrKind::Call { .. }
+            | IrKind::Field { .. }
+            | IrKind::Index { .. }
+            | IrKind::Await { .. }
+            | IrKind::As { .. }
+            | IrKind::MakeFuture { .. } => self.shared_as(node, &FLOAT),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.float(result)
@@ -3159,9 +3164,6 @@ impl Evaluator<'_> {
             IrKind::FloatMul(o) => self.float_arithmetic(o, |lhs, rhs| lhs * rhs),
             IrKind::FloatDiv(o) => self.float_arithmetic(o, |lhs, rhs| lhs / rhs),
             IrKind::IntToFloat(operand) => self.int(operand).map(int_to_float),
-            IrKind::Field { record, name, .. } => {
-                self.field_as((record, name), node, Value::into_float)
-            }
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -3233,38 +3235,18 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::BoolConst(value) => Ok(value),
-            IrKind::Load(_, ValueKind::Deferred)
-            | IrKind::LoadCapture(_, ValueKind::Deferred)
-            | IrKind::Field {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::Call {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::Index {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_BOOL),
-            IrKind::Await { .. } => self.await_as(node, Value::into_bool),
-            IrKind::As { .. } => self.narrow_as(node, Value::into_bool),
+            IrKind::Load(..)
+            | IrKind::LoadCapture(..)
+            | IrKind::Top(..)
+            | IrKind::Call { .. }
+            | IrKind::Field { .. }
+            | IrKind::Index { .. }
+            | IrKind::Await { .. }
+            | IrKind::As { .. }
+            | IrKind::MakeFuture { .. } => self.shared_as(node, &BOOL),
             IrKind::Is { .. } => self.is_test(node),
             IrKind::ValueSame(o) => self.value_same(o, true),
             IrKind::ValueNotSame(o) => self.value_same(o, false),
-            IrKind::Index { list, index, .. } => {
-                self.index_as((list, index), node, Value::into_bool)
-            }
-            IrKind::Load(slot, _) => self.slot_as(slot, node, as_bool),
-            IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_bool),
-            IrKind::Top(slot, _) => self.top_as(slot, node, as_bool),
-            IrKind::Call {
-                callee,
-                args,
-                depth,
-                ..
-            } => self.call_as((callee, args, depth), node, Value::into_bool),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.bool(result)
@@ -3288,9 +3270,6 @@ impl Evaluator<'_> {
             IrKind::And(o) => self.logic(o, false),
             IrKind::Or(o) => self.logic(o, true),
             IrKind::Not(operand) => self.not(operand),
-            IrKind::Field { record, name, .. } => {
-                self.field_as((record, name), node, Value::into_bool)
-            }
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -3402,35 +3381,15 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::StrConst(constant) => Ok(Rc::clone(self.ir.string(constant))),
-            IrKind::Load(_, ValueKind::Deferred)
-            | IrKind::LoadCapture(_, ValueKind::Deferred)
-            | IrKind::Field {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::Call {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::Index {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_STRING),
-            IrKind::Await { .. } => self.await_as(node, Value::into_string),
-            IrKind::As { .. } => self.narrow_as(node, Value::into_string),
-            IrKind::Index { list, index, .. } => {
-                self.index_as((list, index), node, Value::into_string)
-            }
-            IrKind::Load(slot, _) => self.slot_as(slot, node, as_string),
-            IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_string),
-            IrKind::Top(slot, _) => self.top_as(slot, node, as_string),
-            IrKind::Call {
-                callee,
-                args,
-                depth,
-                ..
-            } => self.call_as((callee, args, depth), node, Value::into_string),
+            IrKind::Load(..)
+            | IrKind::LoadCapture(..)
+            | IrKind::Top(..)
+            | IrKind::Call { .. }
+            | IrKind::Field { .. }
+            | IrKind::Index { .. }
+            | IrKind::Await { .. }
+            | IrKind::As { .. }
+            | IrKind::MakeFuture { .. } => self.shared_as(node, &STRING),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.string(result)
@@ -3442,9 +3401,6 @@ impl Evaluator<'_> {
             IrKind::StrConcat(operands) => self.concat(operands),
             IrKind::Interp(items) => self.interpolate(items, node.span),
             IrKind::Show(_) | IrKind::Caller => self.computed_string(node),
-            IrKind::Field { record, name, .. } => {
-                self.field_as((record, name), node, Value::into_string)
-            }
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -3506,33 +3462,15 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::Empty | IrKind::Helper => Ok(self.empty(node)),
-            IrKind::Load(_, ValueKind::Deferred)
-            | IrKind::LoadCapture(_, ValueKind::Deferred)
-            | IrKind::Field {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::Call {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::Index {
-                kind: ValueKind::Deferred,
-                ..
-            }
-            | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_RECORD),
-            IrKind::Await { .. } => self.await_as(node, into_record),
-            IrKind::As { .. } => self.narrow_as(node, into_record),
-            IrKind::Index { list, index, .. } => self.index_as((list, index), node, into_record),
-            IrKind::Load(slot, _) => self.slot_as(slot, node, as_record),
-            IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_record),
-            IrKind::Top(slot, _) => self.top_as(slot, node, as_record),
-            IrKind::Call {
-                callee,
-                args,
-                depth,
-                ..
-            } => self.call_as((callee, args, depth), node, into_record),
+            IrKind::Load(..)
+            | IrKind::LoadCapture(..)
+            | IrKind::Top(..)
+            | IrKind::Call { .. }
+            | IrKind::Field { .. }
+            | IrKind::Index { .. }
+            | IrKind::Await { .. }
+            | IrKind::As { .. }
+            | IrKind::MakeFuture { .. } => self.shared_as(node, &RECORD),
             IrKind::Store(slot, value) => self.store(slot, value, node),
             IrKind::Block { items, result } => {
                 self.items(items)?;
@@ -3543,7 +3481,6 @@ impl Evaluator<'_> {
                 self.record(branch)
             }
             IrKind::MakeRecord { layout, values } => self.make_record(layout, values),
-            IrKind::Field { record, name, .. } => self.field_as((record, name), node, into_record),
             IrKind::UpdateField { .. } => self.update_field(node),
             IrKind::Update {
                 kind: ValueKind::Record,
@@ -4911,6 +4848,55 @@ fn depends_on_own_result(node: &IrNode) -> Diagnostic {
 /// Extracts a value of one kind from a slot or capture, for the node
 /// reading it: [`as_int`], [`as_float`], and so on.
 type Extract<T> = fn(&Value, &IrNode) -> Flow<T>;
+
+/// How a typed walker takes values of its kind, `T`, from the nodes whose
+/// values may be of any kind, which it evaluates through
+/// [`Evaluator::shared_as`].
+struct Taken<T> {
+    /// From a slot or a capture.
+    borrowed: Extract<T>,
+    /// From an element read by an index, an awaited or narrowed value, a
+    /// field or a call's result.
+    owned: fn(Value) -> Option<T>,
+    /// The internal error of meeting such a node whose value may be a
+    /// future, which only the general walker evaluates.
+    deferred: &'static str,
+}
+
+/// How the `Int` walker takes its values.
+const INT: Taken<i64> = Taken {
+    borrowed: as_int,
+    owned: into_int,
+    deferred: DEFERRED_INT,
+};
+
+/// How the `Float` walker takes its values.
+const FLOAT: Taken<f64> = Taken {
+    borrowed: as_float,
+    owned: Value::into_float,
+    deferred: DEFERRED_FLOAT,
+};
+
+/// How the `Bool` walker takes its values.
+const BOOL: Taken<bool> = Taken {
+    borrowed: as_bool,
+    owned: Value::into_bool,
+    deferred: DEFERRED_BOOL,
+};
+
+/// How the `String` walker takes its values.
+const STRING: Taken<Rc<str>> = Taken {
+    borrowed: as_string,
+    owned: Value::into_string,
+    deferred: DEFERRED_STRING,
+};
+
+/// How the record walker takes its values.
+const RECORD: Taken<Value> = Taken {
+    borrowed: as_record,
+    owned: into_record,
+    deferred: DEFERRED_RECORD,
+};
 
 /// Whether `node`, a load, a capture, a field access, a call, an index, an
 /// await or an `as`, which a typed walker reads through a helper, is of
