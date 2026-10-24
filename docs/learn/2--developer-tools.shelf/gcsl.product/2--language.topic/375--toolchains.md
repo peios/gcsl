@@ -66,8 +66,9 @@ def Toolchain::C gcc_x86_64() {
 
 The context `toolchains` lists the registered toolchains in order, and
 the first that fits wins. In plain GCSL it holds only `system_c`, the
-host's own C compiler found with `which`. Set it with `with` to choose
-others:
+host's own C compiler found with `which`. It runs on the host and builds
+for the host alone, so a build for another platform needs a toolchain
+registered for that platform. Set it with `with` to choose others:
 
 ```text
 let app = build_app() with { toolchains = [Toolchain::C gcc_x86_64] }

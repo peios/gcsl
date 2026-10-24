@@ -48,10 +48,11 @@ def Toolchain<T>(name: String, kind: Variant<Toolchain, T>, f: fn() -> Toolchain
 
 context toolchains: List<fn() ->> Registered> = [Toolchain::C system_c]
 
-# The host's own C toolchain, found on `PATH`, for wherever GCSL runs.
+# The host's own C toolchain, found on `PATH`, for wherever GCSL runs: it
+# runs on the host and builds for it, never for another platform.
 def Toolchain::C system_c() {
-    host_platform = {}
-    platform = {}
+    host_platform = ^host_platform
+    platform = ^host_platform
     provides = {
         root = dir("/usr")
         runtime = dir("/")
