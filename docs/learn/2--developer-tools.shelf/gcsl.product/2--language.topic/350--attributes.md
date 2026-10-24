@@ -5,7 +5,7 @@ description: Tell the program that runs a function how to run it.
 ---
 
 An attribute goes before a function and says how to run it, for example
-whether a build step may be cached or how long it may take. GCSL checks
+whether a build step can be cached or how long it can take. GCSL checks
 every attribute. Most are read by the tool that runs the program, such as
 a build system, and GCSL itself acts on its own two, `retry` and
 `timeout`.
@@ -38,7 +38,7 @@ booted = boot()
 ```
 
 Arguments must be constants: literals, or lists and records of them. A
-field may be an `Int`, `Float`, `Bool`, `String`, `Duration` or `Size`, or
+field can be an `Int`, `Float`, `Bool`, `String`, `Duration` or `Size`, or
 a list or record of those. An attribute is declared, imported and named in
 the same way as any other type, so a tool usually provides its attributes
 in a module that you import.

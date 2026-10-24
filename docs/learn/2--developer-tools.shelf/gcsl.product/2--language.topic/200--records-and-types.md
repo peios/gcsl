@@ -94,7 +94,7 @@ let wanted: Partial<Platform> = {arch = "x86_64"}
 fits = wanted.matches({arch = "x86_64"; os = "linux"})
 ```
 
-A field of a partial record can't be read by name, because it may be
+A field of a partial record can't be read by name, because it might be
 absent.
 
 ## Records of any fields

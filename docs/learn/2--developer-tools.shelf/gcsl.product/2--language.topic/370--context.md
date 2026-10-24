@@ -49,7 +49,7 @@ that needs one, compute it first and bind it with `with`.
 ## Setting a context with `with`
 
 `EXPR with { NAME = VALUE }` evaluates `EXPR` with the context `NAME`
-set to `VALUE`. It applies to the call or field access just before it,
+set to `VALUE`. It applies to the call or field access immediately before it,
 so `a + f() with {...}` sets the context for `f()` alone. It must be on
 the line where the expression ends. To set a context for several
 statements, use the block form, `with { NAME = VALUE } { ... }`.

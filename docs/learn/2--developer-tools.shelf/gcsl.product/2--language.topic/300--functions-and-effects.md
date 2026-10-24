@@ -109,7 +109,7 @@ The value before the dot is the receiver. GCSL chooses the method by
 the receiver's type, so methods with the same name can serve different
 types. When more than one fits, the one for the more specific type is
 used: a method for `List<Int>` is chosen over one for `List<T>` when
-the receiver is a `List<Int>`. A method's other parameters, defaults and
+the receiver is a `List<Int>`. A method's other parameters, defaults, and
 effects work as a function's do.
 
 A method has no name of its own: `twice` alone is not a variable, and
