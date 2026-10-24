@@ -84,6 +84,7 @@ impl Lowerer<'_> {
             | Builtin::DirFile
             | Builtin::DirDir
             | Builtin::FsComposeDir
+            | Builtin::FsCompose
             | Builtin::DirSandbox
             | Builtin::SandboxExec
             | Builtin::SandboxFile

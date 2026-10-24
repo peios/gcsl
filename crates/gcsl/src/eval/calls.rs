@@ -416,6 +416,7 @@ impl Evaluator<'_> {
                 inside(builtin, &dir, &path, node)
             }
             (Builtin::FsComposeDir, entries, None) => self.compose_dir(&entries, node),
+            (Builtin::FsCompose, entries, None) => self.compose_list(&entries, node),
             (Builtin::DirSandbox, Value::Dir(dir), Some(options)) => {
                 self.make_sandbox(&dir, &options, node)
             }

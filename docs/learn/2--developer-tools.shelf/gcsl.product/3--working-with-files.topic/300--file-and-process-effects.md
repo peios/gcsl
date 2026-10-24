@@ -239,6 +239,26 @@ a command that writes in the new directory changes none of the originals.
 Copying a large tree, such as a toolchain, takes time and space; a build
 tool such as pekit mounts the trees instead.
 
+A record's keys are written out, so they can't be computed. When a path
+depends on a value, such as a package's name, use `fs.compose`, which
+takes a list of entries, each with the path it goes at and what to place
+there:
+
+```gcsl
+import fs
+import path
+let root = fs.temp_dir()
+fs.write(path.join(root, "zlib.h"), "int deflate(void);")
+let name = "zlib"
+let stage = fs.compose([
+    {at = "include/{name}.h"; place = dir(root).file("zlib.h")},
+])
+header = stage.file("include/zlib.h").read()
+```
+
+Its entries are placed as `fs.compose_dir` places a record's, with the
+same errors.
+
 ## Sandboxes
 
 An upstream build, such as `./configure && make`, expects its tools at the

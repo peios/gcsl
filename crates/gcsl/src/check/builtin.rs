@@ -169,6 +169,11 @@ pub enum Builtin {
     /// directory of `entries`, each placed at its key, `fs.compose_dir`.
     /// Impure.
     FsComposeDir,
+    /// `fs_compose(entries: List<{at: String, place: List<File> | Dir |
+    /// File}>) -> Dir`: `fs_compose_dir`, but its entries a list, each placed
+    /// at a path computed as any string is, the `fs` module's `compose`.
+    /// Impure.
+    FsCompose,
     /// `dir_sandbox(d: Dir, options: {cwd: String, env: {*: String}}) ->
     /// Sandbox`: a sandbox of a copy of `d`, its commands run in `cwd` with
     /// the environment `env` by default, the prelude's `d.sandbox(...)`.
@@ -221,7 +226,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 50] = [
+    pub const ALL: [Builtin; 51] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -265,6 +270,7 @@ impl Builtin {
         Builtin::DirFile,
         Builtin::DirDir,
         Builtin::FsComposeDir,
+        Builtin::FsCompose,
         Builtin::DirSandbox,
         Builtin::SandboxExec,
         Builtin::SandboxFile,
@@ -343,6 +349,7 @@ impl Builtin {
             Builtin::DirFile => "dir_file",
             Builtin::DirDir => "dir_dir",
             Builtin::FsComposeDir => "fs_compose_dir",
+            Builtin::FsCompose => "fs_compose",
             Builtin::DirSandbox => "dir_sandbox",
             Builtin::SandboxExec => "sandbox_exec",
             Builtin::SandboxFile => "sandbox_file",
@@ -367,6 +374,7 @@ impl Builtin {
             Builtin::FsTempDir => Some("fs.temp_dir"),
             Builtin::FsWrite => Some("fs.write"),
             Builtin::FsComposeDir => Some("fs.compose_dir"),
+            Builtin::FsCompose => Some("fs.compose"),
             Builtin::Len
             | Builtin::Int
             | Builtin::Float
@@ -430,6 +438,7 @@ impl Builtin {
                 | Builtin::DirFile
                 | Builtin::DirDir
                 | Builtin::FsComposeDir
+                | Builtin::FsCompose
                 | Builtin::DirSandbox
                 | Builtin::SandboxExec
                 | Builtin::SandboxFile
@@ -457,7 +466,7 @@ impl Builtin {
             Builtin::Exec | Builtin::ExecLive | Builtin::ExecSecret => &["argv", "options"],
             Builtin::DirFiles => &["d"],
             Builtin::DirFile | Builtin::DirDir => &["d", "path"],
-            Builtin::FsComposeDir => &["entries"],
+            Builtin::FsComposeDir | Builtin::FsCompose => &["entries"],
             Builtin::DirSandbox => &["d", "options"],
             Builtin::SandboxExec => &["s", "request"],
             Builtin::SandboxFile | Builtin::SandboxDir => &["s", "path"],
@@ -520,6 +529,7 @@ impl Builtin {
             | Builtin::Dir
             | Builtin::DirFiles
             | Builtin::FsComposeDir
+            | Builtin::FsCompose
             | Builtin::DirSandbox
             | Builtin::SandboxExec => Effect::Impure,
             Builtin::Len
@@ -602,6 +612,7 @@ impl Builtin {
             | Builtin::DirFile
             | Builtin::DirDir
             | Builtin::FsComposeDir
+            | Builtin::FsCompose
             | Builtin::DirSandbox
             | Builtin::SandboxExec
             | Builtin::SandboxFile
@@ -667,6 +678,9 @@ impl Builtin {
             Builtin::DirFile => "fn(d: Dir, path: String): File",
             Builtin::DirDir => "fn(d: Dir, path: String): Dir",
             Builtin::FsComposeDir => "fn(entries: {*: List<File> | Dir | File}) -> Dir",
+            Builtin::FsCompose => {
+                "fn(entries: List<{at: String, place: List<File> | Dir | File}>) -> Dir"
+            }
             Builtin::DirSandbox => {
                 "fn(d: Dir, options: {cwd: String, env: {*: String}}) -> Sandbox"
             }
@@ -724,6 +738,7 @@ impl Builtin {
             Builtin::SandboxFile => ([TyId::SANDBOX, TyId::STRING], TyId::FILE),
             Builtin::SandboxDir => ([TyId::SANDBOX, TyId::STRING], TyId::DIR),
             Builtin::FsComposeDir => ([compose_entries(types), UNUSED], TyId::DIR),
+            Builtin::FsCompose => ([compose_list(types, names), UNUSED], TyId::DIR),
             Builtin::StripPrefix | Builtin::StripSuffix => {
                 ([TyId::STRING, TyId::STRING], TyId::STRING)
             }
@@ -934,6 +949,19 @@ impl Builtin {
         };
         types.generic_fn(ty, generic)
     }
+}
+
+/// The type of `fs_compose`'s parameter, interned into `types`, its fields'
+/// names into `names`: a list of records of a path, `at`, and what to
+/// place there, a directory, a file or a list of files.
+fn compose_list(types: &mut TypeTable, names: &mut Names) -> TyId {
+    let files = types.list(TyId::FILE);
+    let place = types.union([TyId::DIR, TyId::FILE, files]);
+    let entry = types.record([
+        (names.intern("at"), TyId::STRING),
+        (names.intern("place"), place),
+    ]);
+    types.list(entry)
 }
 
 /// The type of `fs_compose_dir`'s parameter, interned into `types`: a record

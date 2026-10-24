@@ -301,6 +301,40 @@ fn compose_dir_copies_each_entry_to_its_place() {
 }
 
 #[test]
+fn compose_places_each_entry_at_a_computed_path() {
+    let root = temp_tree("compose-list");
+    let text = format!(
+        "import fs\n\
+         let src = dir(\"{root}\")\n\
+         let name = \"one\"\n\
+         let made = fs.compose([\n\
+             {{at = \"opt/{{name}}.txt\"; place = src.file(\"a.txt\")}},\n\
+             {{at = \"tree\"; place = src.dir(\"sub\")}},\n\
+             {{at = \"flat\"; place = [src.file(\"sub/b.txt\")]}}\n\
+         ])\n\
+         = for f in made.files() {{ strip_prefix(f.path, made.path) }}"
+    );
+    assert_eq!(
+        lone(&text).unwrap(),
+        "[\"/flat/b.txt\", \"/opt/one.txt\", \"/tree/b.txt\", \"/tree/link\"]"
+    );
+    // None at all is an empty directory; its errors are `compose_dir`'s,
+    // naming it.
+    assert_eq!(
+        lone("import fs\n= fs.compose([]).files().len()").unwrap(),
+        "0"
+    );
+    let error = lone_error(&format!(
+        "import fs\nx = fs.compose([{{at = \"../up\"; place = file(\"{root}/a.txt\")}}])"
+    ));
+    assert_eq!(
+        error.message,
+        "`fs.compose`: `../up` is outside the directory"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
 fn a_value_s_dirs_are_found_apart_from_its_files() {
     let source = SourceFile::new(
         "lone.gcsl",

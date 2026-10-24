@@ -246,17 +246,68 @@ impl Evaluator<'_> {
     /// run, each entry placed at its key in it, in order, the directory
     /// returned.
     pub(super) fn compose_dir(&self, entries: &Value, node: &IrNode) -> Flow<Value> {
+        let pairs: Vec<(Rc<str>, Value)> = match entries {
+            Value::Empty => Vec::new(),
+            Value::Record(record) => record
+                .layout
+                .texts
+                .iter()
+                .map(|text| Rc::from(&**text))
+                .zip(record.values.iter().cloned())
+                .collect(),
+            _ => return mistyped(node, "entries of `fs.compose_dir` that are no record"),
+        };
+        self.compose_pairs(&pairs, ("fs.compose_dir", node))
+    }
+
+    /// Applies `fs_compose`, for the call `node`, to `entries`, a list of
+    /// records of a path, `at`, and what to place there (see
+    /// [Directories](#directories)): `fs.compose_dir`'s directory, each entry
+    /// placed at its path.
+    pub(super) fn compose_list(&self, entries: &Value, node: &IrNode) -> Flow<Value> {
+        let Value::List(list) = entries else {
+            return mistyped(node, "entries of `fs.compose` that are no list");
+        };
+        let mut pairs: Vec<(Rc<str>, Value)> = Vec::new();
+        for entry in list.values() {
+            let Value::Record(record) = entry else {
+                return mistyped(node, "an entry of `fs.compose` that is no record");
+            };
+            let field = |name: &str| {
+                let at = record
+                    .layout
+                    .texts
+                    .iter()
+                    .position(|text| &**text == name)?;
+                record.values.get(at).cloned()
+            };
+            let (Some(Value::Str(at)), Some(place)) = (field("at"), field("place")) else {
+                return mistyped(node, "an entry of `fs.compose` of another shape");
+            };
+            pairs.push((at, place));
+        }
+        self.compose_pairs(&pairs, ("fs.compose", node))
+    }
+
+    /// Makes a new directory of the run of `pairs`, each a path in it and
+    /// what to place there (see [Directories](#directories)), for the call
+    /// `node` of the member `shown`.
+    fn compose_pairs(
+        &self,
+        pairs: &[(Rc<str>, Value)],
+        (shown, node): (&str, &IrNode),
+    ) -> Flow<Value> {
         let fail = |message: String| Err(Diagnostic::error(message, node.span).into());
         let effects = self.shared.effects;
         let Some(made) = effects.temp_dir() else {
-            return mistyped(node, "`fs.compose_dir` called in a run without an owner");
+            return mistyped(node, "a composition made in a run without an owner");
         };
         let made = made.and_then(|root| Ok((effects.host_path(&root)?, root)));
         let (host_root, root) = match made {
             Ok(made) => made,
             Err(reason) => {
                 return fail(format!(
-                    "`fs.compose_dir` could not create a temporary directory: {reason}"
+                    "`{shown}` could not create a temporary directory: {reason}"
                 ));
             }
         };
@@ -265,25 +316,12 @@ impl Evaluator<'_> {
             placed: HashSet::new(),
             effects,
         };
-        let pairs: Vec<(&str, &Value)> = match entries {
-            Value::Empty => Vec::new(),
-            Value::Record(record) => record
-                .layout
-                .texts
-                .iter()
-                .map(|text| &**text)
-                .zip(record.values.iter())
-                .collect(),
-            _ => return mistyped(node, "entries of `fs.compose_dir` that are no record"),
-        };
         for (key, value) in pairs {
             let Some(at) = relative(key) else {
-                return fail(format!(
-                    "`fs.compose_dir`: `{key}` is outside the directory"
-                ));
+                return fail(format!("`{shown}`: `{key}` is outside the directory"));
             };
             if let Err(message) = composer.place(&at, value) {
-                return fail(format!("`fs.compose_dir`: {message}"));
+                return fail(format!("`{shown}`: {message}"));
             }
         }
         effects.composed(&root);

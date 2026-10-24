@@ -36,7 +36,10 @@
 #   error, as a key leaving the directory is. Everything is COPIED, its
 #   permissions kept and its symbolic links as links, so that a program
 #   writing in the directory changes nothing it was made of; a host that
-#   isolates steps, as pekit does, mounts instead.
+#   isolates steps, as pekit does, mounts instead;
+# - `compose(entries)`: `compose_dir`'s directory, but of the list
+#   `entries`, each `{at = PATH; place = WHAT}`, so that a path can be
+#   computed, `"include/{name}.h"`, as no record's key can.
 #
 # Like every standard file it is a scope of its own: it sees its own
 # declarations, the prelude's names, and `builtins`.
@@ -49,3 +52,4 @@ copy = builtins.fs_copy
 temp_dir = builtins.fs_temp_dir
 write = builtins.fs_write
 compose_dir = builtins.fs_compose_dir
+compose = builtins.fs_compose
