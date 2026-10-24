@@ -1802,6 +1802,8 @@ impl Walker<'_> {
         match ast.get(id).kind {
             ExprKind::Int(_)
             | ExprKind::Float(_)
+            | ExprKind::Duration(_)
+            | ExprKind::Size(_)
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
             | ExprKind::Error => {}

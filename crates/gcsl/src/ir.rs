@@ -56,6 +56,20 @@
 //! a [`ListShape`] ([`Ir::list_shape`]) in the same table, gives. Total
 //! equality, `===` and `!==`, compares whole values and needs none.
 //!
+//! # Quantities
+//!
+//! A duration or a size is an `i64` amount of its smallest unit, and is
+//! tagged with its quantity at run time, [`crate::value::Value::Quantity`],
+//! so that a host, `gcsl run` and an `is` test see what it measures. Its
+//! nodes are of kind [`ValueKind::Quantity`]. Arithmetic and comparison
+//! reuse the checked `Int` nodes: an `IntAdd`, `IntCmp` and the like may
+//! have quantity operands, whose amounts the `Int` walker takes, and a
+//! quantity's result is the `Int` node wrapped in a [`IrKind::Quantity`],
+//! which gives it its unit and its kind. So `1s + 1m` is `(quantity
+//! duration (int-add (quantity duration (int ...)) (quantity duration (int
+//! ...))))`, `1h // 1m` an `IntFloorDiv` of two quantities, of kind `Int`,
+//! and a literal or a constant a `Quantity` of an `IntConst`.
+//!
 //! # Lists
 //!
 //! A list literal lowers to an [`IrKind::MakeList`] of its elements in
@@ -290,7 +304,7 @@ use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::{FieldName, Quoted};
 use crate::types::ValueTest;
-use crate::value::{Layout, ValueKind};
+use crate::value::{Layout, Quantity, ValueKind};
 
 /// Index of an [`IrNode`] in its [`Ir`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -677,7 +691,8 @@ pub enum ArgValue {
 }
 
 /// What an [`IrNode`] computes. Operand ids of `Int*` nodes always refer to
-/// Int-typed nodes, of `Float*` nodes (except [`IrKind::IntToFloat`]) to
+/// Int-typed nodes or quantity nodes, a duration's or a size's, whose
+/// amounts they compute on, of `Float*` nodes (except [`IrKind::IntToFloat`]) to
 /// Float-typed nodes, of `Str*` nodes to String-typed nodes, of `Bool*`,
 /// `And`, `Or` and `Not` nodes, an `If`'s condition, a `For`'s guard and a
 /// `Loop`'s condition to Bool-typed nodes, and of `Record*`, `Field` and
@@ -820,6 +835,11 @@ pub enum IrKind {
     /// Converts an `Int` operand to the nearest `Float`. Inserted by lowering
     /// for concrete `Int` operands of `/`.
     IntToFloat(IrId),
+    /// The value of the `Int` node given as a value of the quantity given,
+    /// a duration's or a size's amount of its smallest unit: what gives a
+    /// quantity's literal, arithmetic and negation their unit, and so their
+    /// kind (see [Quantities](crate::ir#quantities)).
+    Quantity(Quantity, IrId),
     /// The empty record `{}`.
     Empty,
     /// Reads a variable's slot. Carries the kind of the variable's value so
@@ -1171,6 +1191,7 @@ impl IrKind {
             IrKind::IntNeg(operand)
             | IrKind::FloatNeg(operand)
             | IrKind::IntToFloat(operand)
+            | IrKind::Quantity(_, operand)
             | IrKind::Not(operand)
             | IrKind::Field {
                 record: operand, ..
@@ -1285,6 +1306,7 @@ impl IrKind {
             | IrKind::If { .. }
             | IrKind::Interp(_)
             | IrKind::IntToFloat(_)
+            | IrKind::Quantity(..)
             | IrKind::Empty
             | IrKind::Load(..)
             | IrKind::Store(..)
@@ -1389,6 +1411,7 @@ impl IrKind {
             IrKind::FloatMul(_) => "float-mul",
             IrKind::FloatDiv(_) => "float-div",
             IrKind::IntToFloat(_) => "int-to-float",
+            IrKind::Quantity(..) => "quantity",
             IrKind::Empty => "empty",
             IrKind::Load(..) => "load",
             IrKind::Store(..) => "store",
@@ -1482,6 +1505,7 @@ impl IrNode {
             | IrKind::If { .. }
             | IrKind::Interp(_)
             | IrKind::IntToFloat(_)
+            | IrKind::Quantity(..)
             | IrKind::Empty
             | IrKind::Load(..)
             | IrKind::Store(..)
@@ -2043,6 +2067,7 @@ impl Ir {
                 | IrKind::FloatMul(_)
                 | IrKind::FloatDiv(_)
                 | IrKind::IntToFloat(_) => ValueKind::Float,
+                IrKind::Quantity(quantity, _) => ValueKind::Quantity(quantity),
                 IrKind::Empty
                 | IrKind::Store(..)
                 | IrKind::MakeRecord { .. }
@@ -2703,6 +2728,7 @@ impl Pretty<'_> {
                 ValueKind::Deferred => "deferred",
                 ValueKind::Mixed => "mixed",
                 ValueKind::Never => "never",
+                ValueKind::Quantity(quantity) => quantity.name(),
             }),
             ValueTest::Record(fields) => {
                 f.write_str("{")?;
@@ -2822,6 +2848,7 @@ impl Pretty<'_> {
             IrKind::MakeClosure { function, .. } | IrKind::MakeFuture { function, .. } => {
                 write!(f, " {function}")?;
             }
+            IrKind::Quantity(quantity, _) => write!(f, " {}", quantity.name())?,
             IrKind::Await { shape, .. } if shape != LazyShapeId::NONE => {
                 f.write_str(" ")?;
                 self.lazy_shape(f, shape)?;

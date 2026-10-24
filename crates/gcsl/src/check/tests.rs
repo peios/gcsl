@@ -905,6 +905,8 @@ fn lets(ast: &Ast, body: ItemRange, out: &mut Vec<ItemId>) {
             }
             ExprKind::Int(_)
             | ExprKind::Float(_)
+            | ExprKind::Duration(_)
+            | ExprKind::Size(_)
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
             | ExprKind::Name(_)
@@ -14005,5 +14007,86 @@ fn a_rest_field_s_fields_are_tested_by_is_and_as() {
     assert_eq!(
         messages("let f: {to: String, *: Int} = {to = \"a\"}\nf is {*: Int}"),
         vec!["`f` is never a `{*: Int}`"]
+    );
+}
+
+// ----- Quantities -----
+
+#[test]
+fn quantities_have_their_own_arithmetic() {
+    let cases = [
+        ("30s", "Duration"),
+        ("2GiB", "Size"),
+        ("1s + 1m", "Duration"),
+        ("1B - 1KiB", "Size"),
+        ("2 * 1s", "Duration"),
+        ("1s * 2", "Duration"),
+        ("1s // 2", "Duration"),
+        ("1h // 1m", "Int"),
+        ("1h % 7m", "Duration"),
+        ("-1s", "Duration"),
+        ("1s < 2s", "Bool"),
+        ("1s == 1000ms", "Bool"),
+        ("\"{1s}\"", "String"),
+    ];
+    for (text, ty) in cases {
+        assert_eq!(file_type(text), ty, "{text}");
+    }
+    // An untyped integer beside one is an `Int`.
+    let types = all_types("1s * 2");
+    assert!(types.contains(&TyId::INT), "{types:?}");
+}
+
+#[test]
+fn quantities_mix_with_nothing_else() {
+    let cases = [
+        ("1s + 1", "cannot add Duration and Int"),
+        ("1s + 1B", "cannot add Duration and Size"),
+        ("1s * 1.5", "cannot multiply Duration and Float"),
+        ("1s * 1s", "cannot multiply Duration and Duration"),
+        ("1s / 2", "cannot divide Duration and Int"),
+        ("1s % 2", "cannot take modulo of Duration and Int"),
+        ("2 // 1s", "cannot floor-divide Int and Duration"),
+        ("1s // 1B", "cannot floor-divide Duration and Size"),
+        ("0 == 0s", "cannot compare Int and Duration"),
+        ("1s < 1B", "cannot compare Duration and Size"),
+        ("let x: Duration = 5\nx", "mismatched types"),
+    ];
+    for (text, message) in cases {
+        assert_eq!(messages(text), [message], "{text}");
+    }
+    // `/` says to use `//`, and `//` and `%` what they take.
+    let found = diagnostics("1B / 2");
+    assert_eq!(
+        found[0].notes,
+        ["use `//`; a Size is a whole number of bytes"]
+    );
+    let found = diagnostics("1s % 2");
+    assert_eq!(
+        found[0].notes,
+        [
+            "a Duration divides with `//` by an Int, giving a Duration, or by a Duration, giving \
+          an Int, and `%` gives the remainder of one Duration by another"
+        ]
+    );
+    // `Duration` and `Size` are built-in type names.
+    assert_eq!(messages("type Size = Int"), ["`Size` is a built-in type"]);
+}
+
+#[test]
+fn a_quantity_literal_is_a_constant_default() {
+    let text = "fn f(t: Duration = 30s, s: Size = -1KiB): Int { 0 }";
+    assert_eq!(
+        defaults_of(text, 0),
+        [
+            Some(Constant::Quantity(Quantity::Duration, 30_000_000_000)),
+            Some(Constant::Quantity(Quantity::Size, -1024)),
+        ]
+    );
+    // A field's default too, shown in its type.
+    let text = "type T = {t: Duration = 1m30s}\nfn f(r: T): T { r }\nf";
+    assert_eq!(
+        file_type(text),
+        "fn(r: {t: Duration = 1m30s}): {t: Duration = 1m30s}"
     );
 }

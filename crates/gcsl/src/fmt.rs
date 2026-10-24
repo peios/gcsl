@@ -1171,6 +1171,19 @@ mod tests {
     }
 
     #[test]
+    fn a_duration_or_a_size_is_kept_as_it_is_written() {
+        check(&[
+            ("a  =  1h30m\n", "a = 1h30m\n"),
+            ("b = -1_000ms\n", "b = -1_000ms\n"),
+            ("c = 2GiB+1.5KB\n", "c = 2GiB + 1.5KB\n"),
+            (
+                "fn f(t: Duration = 30s, s: Size = 0B): Duration { t }\n",
+                "fn f(t: Duration = 30s, s: Size = 0B): Duration { t }\n",
+            ),
+        ]);
+    }
+
+    #[test]
     fn a_rest_field_s_star_is_no_operator() {
         check(&[
             // A line it starts is no continuation of the line before.

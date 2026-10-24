@@ -366,6 +366,8 @@ impl<'s> Tokens<'s> {
             | TokenKind::InnerAttribute(_)
             | TokenKind::Int(_)
             | TokenKind::Float(_)
+            | TokenKind::Duration(_)
+            | TokenKind::Size(_)
             | TokenKind::Str(_)
             | TokenKind::StrEnd(_)
             | TokenKind::True
@@ -1643,6 +1645,7 @@ mod tests {
         assert_eq!(v.detail.as_deref(), Some("{version: String}"));
         assert_eq!(v.documentation.as_deref(), Some("A version."));
         assert!(labels(&found).contains(&"Int") && labels(&found).contains(&"List"));
+        assert!(labels(&found).contains(&"Duration") && labels(&found).contains(&"Size"));
         // After `is`, in a parameter, and in a `type` item.
         for text in [
             "type V = Int\nfn f(v: |): Int { 1 }\n",

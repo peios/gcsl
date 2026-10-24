@@ -64,3 +64,35 @@ Integer literals adapt to an expected numeric type. A bound `Int` does
 not silently become a `Float`; use `float(value)` when that conversion is
 intended. Conditions require `Bool`, not a nonzero integer or a nonempty
 string. See `gcsl(5)` for syntax and operator rules.
+
+## Durations and sizes
+
+`Duration` and `Size` hold amounts with units. Write a duration as a
+number followed by units from largest to smallest: `30s`, `500ms`,
+`1h30m`, `2d`. The units are `d`, `h`, `m`, `s`, `ms`, `us` and `ns`, and a
+day is exactly 24 hours. Write a size with one unit: `512B`, the decimal
+`KB` to `PB`, or the binary `KiB` to `PiB`, as in `2GiB`. The last part of
+a literal can have a fraction if the result is a whole number of
+nanoseconds or bytes, so `1.5s` and `0.5KiB` are allowed but `1.5ns` is
+not. Units are case-sensitive.
+
+```gcsl
+let timeout = 1m30s
+retry_after = timeout // 3
+budget = 2 * timeout
+memory = 2GiB + 512MiB
+long = timeout > 1m
+message = "giving up after {timeout}"
+```
+
+Add or subtract two values of the same kind, multiply one by an `Int`,
+and use `//` to divide by an `Int` or by another value of the same kind.
+Dividing by the same kind gives an `Int`. `%` gives the remainder of one
+value by another of the same kind. Values of the same kind can be
+compared. Durations and sizes never mix with each other, with `Int` or
+with `Float`, and an integer is never a duration, so write `0s` rather
+than `0`. `/` is not available, because the result would not be a whole
+number of the smallest unit.
+
+A value is shown as its simplest literal: `retry_after` above is `30s`,
+`budget` is `3m`, and `memory` is `2560MiB`.

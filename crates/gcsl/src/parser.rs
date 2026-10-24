@@ -683,6 +683,13 @@
 //! folds the result into a new left-hand side. Otherwise the operator
 //! belongs to an enclosing call, and the loop stops.
 //!
+//! A literal is a number, a duration or a size, a string, `true` or `false`,
+//! each one token. A number with a name glued to it, `30sec`, which the
+//! lexer leaves a number before any name that is no unit's (see the lexer),
+//! is "unknown unit `sec`" where an expression is expected, noted with the
+//! units there are (`Parser::unitless`); a module path or a definition's
+//! path takes such a run of glued tokens as its segment.
+//!
 //! Precedence and associativity both fall out of the binding-power pairs:
 //!
 //! | operator                    | left bp | right bp / operand min bp  |
@@ -2254,7 +2261,12 @@ impl Parser<'_> {
                 }
                 // A segment after the first may start with a digit: an
                 // integer, or a float split at its `.`.
-                TokenKind::Int(_) | TokenKind::Float(_) if !segments.is_empty() => {
+                TokenKind::Int(_)
+                | TokenKind::Float(_)
+                | TokenKind::Duration(_)
+                | TokenKind::Size(_)
+                    if !segments.is_empty() =>
+                {
                     self.advance();
                     self.number_segments(token, &mut segments);
                 }
@@ -2267,7 +2279,14 @@ impl Parser<'_> {
                 }
             }
             match (self.peek().kind, self.peek_at(1).kind) {
-                (TokenKind::Dot, TokenKind::Ident(_) | TokenKind::Int(_) | TokenKind::Float(_)) => {
+                (
+                    TokenKind::Dot,
+                    TokenKind::Ident(_)
+                    | TokenKind::Int(_)
+                    | TokenKind::Float(_)
+                    | TokenKind::Duration(_)
+                    | TokenKind::Size(_),
+                ) => {
                     self.advance();
                 }
                 (TokenKind::Dot, TokenKind::Str(_) | TokenKind::StrStart(_)) => {
@@ -2997,7 +3016,10 @@ impl Parser<'_> {
                 return Err(self.error(QUOTED_MODULE_PATH, first.span));
             }
             TokenKind::Ident(_) if !self.is_from(first) => {}
-            TokenKind::Int(_) | TokenKind::Float(_) => {}
+            TokenKind::Int(_)
+            | TokenKind::Float(_)
+            | TokenKind::Duration(_)
+            | TokenKind::Size(_) => {}
             _ => {
                 let found = self.describe(first);
                 return Err(self.error(
@@ -4219,8 +4241,10 @@ impl Parser<'_> {
     fn parse_prefix(&mut self) -> ParseResult<ExprId> {
         let token = self.peek();
         let kind = match token.kind {
-            TokenKind::Int(value) => ExprKind::Int(value),
-            TokenKind::Float(value) => ExprKind::Float(value),
+            TokenKind::Int(value) => self.unitless(token, ExprKind::Int(value))?,
+            TokenKind::Float(value) => self.unitless(token, ExprKind::Float(value))?,
+            TokenKind::Duration(value) => ExprKind::Duration(value),
+            TokenKind::Size(value) => ExprKind::Size(value),
             TokenKind::True => ExprKind::Bool(true),
             TokenKind::False => ExprKind::Bool(false),
             TokenKind::Str(id) => ExprKind::Str(id),
@@ -5648,6 +5672,23 @@ impl Parser<'_> {
         }
     }
 
+    /// `kind`, the literal of the number token `number`, unless a name is
+    /// glued to it, as in `30sec`: the lexer makes a number glued to a unit
+    /// a duration or a size, and leaves it a number before any other name,
+    /// so that a module path's `pkgs/7zip` is still a path. Where an
+    /// expression is expected, that name is "unknown unit `sec`", noted with
+    /// the units there are (see [Expressions](#expressions)).
+    fn unitless(&mut self, number: Token, kind: ExprKind) -> ParseResult<ExprKind> {
+        let next = self.peek_at(1);
+        if next.span.start != number.span.end || !matches!(next.kind, TokenKind::Ident(_)) {
+            return Ok(kind);
+        }
+        let name = self.source.slice(next.span);
+        let error = Diagnostic::error(format!("unknown unit `{name}`"), next.span)
+            .with_note(lexer::UNITS_NOTE);
+        Err(self.report(error))
+    }
+
     /// Records an error in the sink and returns the proof that it was
     /// recorded.
     fn error(&mut self, message: impl Into<String>, span: Span) -> Reported {
@@ -5766,6 +5807,8 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         TokenKind::DotDotEq => Some(BinaryOp::RangeInclusive),
         TokenKind::Int(_)
         | TokenKind::Float(_)
+        | TokenKind::Duration(_)
+        | TokenKind::Size(_)
         | TokenKind::Str(_)
         | TokenKind::StrStart(_)
         | TokenKind::StrMid(_)

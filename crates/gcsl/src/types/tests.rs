@@ -10,7 +10,7 @@ fn setup() -> (TypeTable, Names, [Name; 3]) {
 #[test]
 fn the_constants_are_pre_interned_in_order() {
     let mut table = TypeTable::new();
-    assert_eq!(table.len(), 7);
+    assert_eq!(table.len(), 9);
     assert!(!table.is_empty());
     assert_eq!(table.intern(TyKind::Int), TyId::INT);
     assert_eq!(table.intern(TyKind::Float), TyId::FLOAT);
@@ -19,8 +19,18 @@ fn the_constants_are_pre_interned_in_order() {
     assert_eq!(table.record([]), TyId::EMPTY);
     assert_eq!(table.intern(TyKind::UntypedInt), TyId::UNTYPED_INT);
     assert_eq!(table.intern(TyKind::Error), TyId::ERROR);
-    assert_eq!(table.len(), 7);
-    assert_eq!(TypeTable::default().len(), 7);
+    assert_eq!(
+        table.intern(TyKind::Quantity(Quantity::Duration)),
+        TyId::DURATION
+    );
+    assert_eq!(table.intern(TyKind::Quantity(Quantity::Size)), TyId::SIZE);
+    assert_eq!(table.len(), 9);
+    assert_eq!(TypeTable::default().len(), 9);
+    // Each quantity's type, and back.
+    for quantity in [Quantity::Duration, Quantity::Size] {
+        assert_eq!(TyId::of_quantity(quantity).quantity(), Some(quantity));
+    }
+    assert_eq!(TyId::INT.quantity(), None);
 }
 
 #[test]

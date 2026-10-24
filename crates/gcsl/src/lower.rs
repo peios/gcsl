@@ -1904,6 +1904,10 @@ impl Lowerer<'_> {
             (ExprKind::Int(value), ValueKind::Int) => IrKind::IntConst(value),
             (ExprKind::Int(value), ValueKind::Float) => IrKind::FloatConst(int_to_float(value)),
             (ExprKind::Float(value), ValueKind::Float) => IrKind::FloatConst(value),
+            (
+                ExprKind::Duration(amount) | ExprKind::Size(amount),
+                ValueKind::Quantity(quantity),
+            ) => IrKind::Quantity(quantity, self.builder.alloc(IrKind::IntConst(amount), span)),
             (ExprKind::Bool(value), ValueKind::Bool) => IrKind::BoolConst(value),
             (ExprKind::Str(text), ValueKind::String) => {
                 IrKind::StrConst(self.builder.push_string(self.ast.strings().get(text)))
@@ -1960,6 +1964,8 @@ impl Lowerer<'_> {
             (
                 ExprKind::Int(_)
                 | ExprKind::Float(_)
+                | ExprKind::Duration(_)
+                | ExprKind::Size(_)
                 | ExprKind::Bool(_)
                 | ExprKind::Str(_)
                 | ExprKind::Interp(_),
@@ -3011,7 +3017,7 @@ impl Lowerer<'_> {
     /// Lowers `constant`, a parameter's default or a field's (see the
     /// checker's "Field defaults"), to nodes spanning `span`
     /// that build it: an `IntConst`, `FloatConst`, `BoolConst` or
-    /// `StrConst`, a `MakeList` of its elements' nodes, a `MakeRecord` of its
+    /// `StrConst`, a `Quantity` of an `IntConst`, a `MakeList` of its elements' nodes, a `MakeRecord` of its
     /// fields', in the order they are written, with the layout of their
     /// names, shared as a record block's is, or `Empty` for `{}`.
     ///
@@ -3020,6 +3026,9 @@ impl Lowerer<'_> {
         let kind = match constant {
             Constant::Int(value) => IrKind::IntConst(*value),
             Constant::Float(bits) => IrKind::FloatConst(f64::from_bits(*bits)),
+            &Constant::Quantity(quantity, amount) => {
+                IrKind::Quantity(quantity, self.builder.alloc(IrKind::IntConst(amount), span))
+            }
             Constant::Bool(value) => IrKind::BoolConst(*value),
             Constant::Str(text) => IrKind::StrConst(self.builder.push_string(text)),
             Constant::Empty => IrKind::Empty,
@@ -3063,6 +3072,10 @@ impl Lowerer<'_> {
             }
             (UnaryOp::Neg, ValueKind::Float) => {
                 IrKind::FloatNeg(self.lower_operand(operand, ValueKind::Float)?)
+            }
+            (UnaryOp::Neg, ValueKind::Quantity(quantity)) => {
+                let negated = IrKind::IntNeg(self.lower_operand(operand, kind)?);
+                IrKind::Quantity(quantity, self.builder.alloc(negated, span))
             }
             (UnaryOp::Not, ValueKind::Bool) => {
                 IrKind::Not(self.lower_operand(operand, ValueKind::Bool)?)
@@ -3113,6 +3126,13 @@ impl Lowerer<'_> {
         if let Some(cmp) = comparison(op) {
             return self.lower_comparison((op, cmp), op_start, (lhs, rhs), kind, id);
         }
+        if let Some(make) = integer_operator(op) {
+            let lhs_kind = self.kind(lhs)?;
+            if matches!(kind, ValueKind::Quantity(_)) || matches!(lhs_kind, ValueKind::Quantity(_))
+            {
+                return self.lower_quantity_operator(make, op_start, (lhs, rhs), kind, id);
+            }
+        }
         let (make, operand_kind): (fn(Operands) -> IrKind, ValueKind) = match (op, kind) {
             (BinaryOp::Add, ValueKind::String) => (IrKind::StrConcat, ValueKind::String),
             (BinaryOp::And, ValueKind::Bool) => (IrKind::And, ValueKind::Bool),
@@ -3148,6 +3168,33 @@ impl Lowerer<'_> {
         Ok(make(Operands { lhs, rhs, op_start }))
     }
 
+    /// Lowers the integer operator that `make` makes, whose symbol starts at
+    /// `op_start`, of kind `kind`, the expression `id`, with an operand that
+    /// is a quantity or a quantity's result (see the checker's
+    /// "Quantities"): the `Int` node of each operand lowered as its own kind,
+    /// which the `Int` walker takes the amount of, and, for a quantity's
+    /// result, that node given its unit, a `Quantity` node.
+    fn lower_quantity_operator(
+        &mut self,
+        make: fn(Operands) -> IrKind,
+        op_start: u32,
+        (lhs, rhs): (ExprId, ExprId),
+        kind: ValueKind,
+        id: ExprId,
+    ) -> Result<IrKind, InternalError> {
+        let (lhs_kind, rhs_kind) = (self.kind(lhs)?, self.kind(rhs)?);
+        let lhs = self.lower_operand(lhs, lhs_kind)?;
+        let rhs = self.lower_operand(rhs, rhs_kind)?;
+        let operated = make(Operands { lhs, rhs, op_start });
+        Ok(match kind {
+            ValueKind::Quantity(quantity) => {
+                let span = self.ast.get(id).span;
+                IrKind::Quantity(quantity, self.builder.alloc(operated, span))
+            }
+            _ => operated,
+        })
+    }
+
     /// Lowers the comparison `op`, which tests `cmp` on every kind but
     /// records, of kind `kind`, to the node for its operands' kind, which
     /// the checker has made the same on both sides.
@@ -3179,7 +3226,7 @@ impl Lowerer<'_> {
         let rhs = self.lower_operand(rhs, operand_kind)?;
         let operands = Operands { lhs, rhs, op_start };
         Ok(match (operand_kind, op, shape) {
-            (ValueKind::Int, ..) => IrKind::IntCmp(cmp, operands),
+            (ValueKind::Int | ValueKind::Quantity(_), ..) => IrKind::IntCmp(cmp, operands),
             (ValueKind::Float, ..) => IrKind::FloatCmp(cmp, operands),
             (ValueKind::String, ..) => IrKind::StrCmp(cmp, operands),
             (ValueKind::Bool, BinaryOp::Eq | BinaryOp::Same, _) => IrKind::BoolEq(true, operands),
@@ -3585,3 +3632,16 @@ const fn unparsed(span: Span) -> InternalError {
 
 #[cfg(test)]
 mod tests;
+
+/// The `Int` node an integer operator makes, `+`, `-`, `*`, `//` or `%`, which a
+/// quantity's arithmetic uses too; `None` for any other operator.
+fn integer_operator(op: BinaryOp) -> Option<fn(Operands) -> IrKind> {
+    Some(match op {
+        BinaryOp::Add => IrKind::IntAdd,
+        BinaryOp::Sub => IrKind::IntSub,
+        BinaryOp::Mul => IrKind::IntMul,
+        BinaryOp::FloorDiv => IrKind::IntFloorDiv,
+        BinaryOp::Rem => IrKind::IntRem,
+        _ => return None,
+    })
+}

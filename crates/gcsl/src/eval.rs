@@ -14,7 +14,15 @@
 //! [Stops](#stops)): an `if` evaluates its condition through `bool` and
 //! then exactly one branch through the walker it was called with, and a
 //! field access, an index, a call, an await or an `as` produces a [`Value`]
-//! from which the walker extracts its kind's. A general walker,
+//! from which the walker extracts its kind's, the walkers sharing that
+//! handling (`Evaluator::shared_as`). A duration and a size, whose values
+//! are tagged with their quantity, have no walker of their own: the `Int`
+//! walker takes their amounts, by a node's kind, for the `Int` operators
+//! that compute on them, and the general walker tags the amount of a
+//! [`IrKind::Quantity`] node (see [`crate::ir`], "Quantities"). An overflow
+//! in a quantity's own operator is "duration overflow" or "size overflow",
+//! and an operator's error labels a quantity operand with its literal,
+//! `30s`. A general walker,
 //! `Evaluator::value`, handles every node, and hands the typed nodes to the
 //! typed walkers, building a [`Value`] only where a value of statically
 //! unknown kind is needed: at the root, in a slot, in a record, in a list,
@@ -898,7 +906,7 @@ use crate::source::Span;
 use crate::strings::FieldName;
 use crate::types::ValueTest;
 use crate::value::{
-    Begin, Caller, Closure, Future, FutureState, Layout, List, Record, Value, ValueKind,
+    Begin, Caller, Closure, Future, FutureState, Layout, List, Quantity, Record, Value, ValueKind,
     int_to_float,
 };
 use crate::{CALL_LEVELS, MAX_DEPTH};
@@ -1244,6 +1252,7 @@ impl Evaluator<'_> {
             IrKind::Catch { .. } => self.catch(node),
             IrKind::Index { list, index, .. } => self.index((list, index), node),
             IrKind::Spread(_) => mistyped(node, "a spread outside a list"),
+            IrKind::Quantity(quantity, amount) => self.quantity_value(quantity, amount),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -2962,6 +2971,7 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::IntConst(value) => Ok(value),
+            IrKind::Quantity(quantity, amount) => self.quantity_amount(quantity, amount),
             IrKind::Load(..)
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
@@ -2970,7 +2980,7 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
-            | IrKind::MakeFuture { .. } => self.shared_as(node, &INT),
+            | IrKind::MakeFuture { .. } => self.shared_amount(id, node),
             IrKind::ListLen(list) => self.list_len(list),
             IrKind::Block { items, result } => {
                 self.items(items)?;
@@ -3086,6 +3096,50 @@ impl Evaluator<'_> {
         }
     }
 
+    /// The value of the quantity node of `quantity` whose `Int` node is
+    /// `amount` ([`Evaluator::quantity_amount`]). Out of line, as the walkers'
+    /// helpers are, so that the general walker's frame holds none of its
+    /// temporaries.
+    #[inline(never)]
+    fn quantity_value(&mut self, quantity: Quantity, amount: IrId) -> Flow<Value> {
+        let amount = self.quantity_amount(quantity, amount)?;
+        Ok(Value::Quantity(quantity, amount))
+    }
+
+    /// Evaluates `node`, the node `id` of a kind any walker shares, for the
+    /// `Int` walker: an `Int`, or the amount of a duration or a size, by the
+    /// node's kind. Out of line, so that the walker's frame holds none of its
+    /// temporaries.
+    #[inline(never)]
+    fn shared_amount(&mut self, id: IrId, node: &IrNode) -> Flow<i64> {
+        self.shared_as(node, amount_taken(self.ir.kind_of(id)))
+    }
+
+    /// The amount of the quantity node of `quantity` whose `Int` node is
+    /// `amount`, of its smallest unit: an overflow in `amount`'s own
+    /// operator is "duration overflow" or "size overflow", saying what
+    /// overflowed, rather than the `Int` operator's "integer overflow".
+    fn quantity_amount(&mut self, quantity: Quantity, amount: IrId) -> Flow<i64> {
+        let inner = self.ir.get(amount);
+        let at = inner.operator_span().unwrap_or(inner.span);
+        self.int(amount).map_err(|unwind| match unwind {
+            Unwind::Error(mut error) if error.message == OVERFLOW && error.span == at => {
+                error.message = format!("{} overflow", quantity.name());
+                Unwind::Error(error)
+            }
+            unwind => unwind,
+        })
+    }
+
+    /// The text an operator's error labels its operand `operand` with, whose
+    /// value is `value`: as the quantity it is, `30s`, or as the `Int`.
+    fn operand_text(&self, operand: IrId, value: i64) -> String {
+        match self.ir.kind_of(operand) {
+            ValueKind::Quantity(quantity) => Value::Quantity(quantity, value).to_string(),
+            _ => value.to_string(),
+        }
+    }
+
     /// Evaluates both `Int` operands, left to right.
     fn ints(&mut self, operands: Operands) -> Flow<(i64, i64)> {
         let lhs = self.int(operands.lhs)?;
@@ -3150,6 +3204,7 @@ impl Evaluator<'_> {
             | IrKind::Await { .. }
             | IrKind::As { .. }
             | IrKind::MakeFuture { .. } => self.shared_as(node, &FLOAT),
+            IrKind::Quantity(..) => mistyped(node, "quantity node where a Float was expected"),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.float(result)
@@ -3244,6 +3299,7 @@ impl Evaluator<'_> {
             | IrKind::Await { .. }
             | IrKind::As { .. }
             | IrKind::MakeFuture { .. } => self.shared_as(node, &BOOL),
+            IrKind::Quantity(..) => mistyped(node, "quantity node where a Bool was expected"),
             IrKind::Is { .. } => self.is_test(node),
             IrKind::ValueSame(o) => self.value_same(o, true),
             IrKind::ValueNotSame(o) => self.value_same(o, false),
@@ -3390,6 +3446,7 @@ impl Evaluator<'_> {
             | IrKind::Await { .. }
             | IrKind::As { .. }
             | IrKind::MakeFuture { .. } => self.shared_as(node, &STRING),
+            IrKind::Quantity(..) => mistyped(node, "quantity node where a String was expected"),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.string(result)
@@ -3471,6 +3528,7 @@ impl Evaluator<'_> {
             | IrKind::Await { .. }
             | IrKind::As { .. }
             | IrKind::MakeFuture { .. } => self.shared_as(node, &RECORD),
+            IrKind::Quantity(..) => mistyped(node, "quantity node where a record was expected"),
             IrKind::Store(slot, value) => self.store(slot, value, node),
             IrKind::Block { items, result } => {
                 self.items(items)?;
@@ -3695,6 +3753,7 @@ impl Evaluator<'_> {
             }
             Value::Int(_)
             | Value::Float(_)
+            | Value::Quantity(..)
             | Value::Bool(_)
             | Value::Str(_)
             | Value::List(_)
@@ -3804,8 +3863,14 @@ impl Evaluator<'_> {
         rhs: i64,
     ) -> Diagnostic {
         Diagnostic::error(message, node.operator_span().unwrap_or(node.span))
-            .with_context(self.ir.get(operands.lhs).span, lhs.to_string())
-            .with_context(self.ir.get(operands.rhs).span, rhs.to_string())
+            .with_context(
+                self.ir.get(operands.lhs).span,
+                self.operand_text(operands.lhs, lhs),
+            )
+            .with_context(
+                self.ir.get(operands.rhs).span,
+                self.operand_text(operands.rhs, rhs),
+            )
     }
 
     /// A runtime error in a unary operator, labelling the operand with its
@@ -3818,7 +3883,7 @@ impl Evaluator<'_> {
         value: i64,
     ) -> Diagnostic {
         Diagnostic::error(message, node.operator_span().unwrap_or(node.span))
-            .with_context(self.ir.get(operand).span, value.to_string())
+            .with_context(self.ir.get(operand).span, self.operand_text(operand, value))
     }
 }
 
@@ -4588,6 +4653,11 @@ fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize) {
             state.write_u8(2);
             state.write_u8(u8::from(*value));
         }
+        Value::Quantity(quantity, amount) => {
+            state.write_u8(10);
+            quantity.hash(state);
+            state.write_i64(*amount);
+        }
         Value::Str(text) => {
             state.write_u8(3);
             text.hash(state);
@@ -4870,6 +4940,32 @@ const INT: Taken<i64> = Taken {
     deferred: DEFERRED_INT,
 };
 
+/// How the `Int` walker takes a duration's amount, for an integer operator
+/// computing on durations.
+const DURATION_AMOUNT: Taken<i64> = Taken {
+    borrowed: as_duration,
+    owned: Value::into_duration,
+    deferred: DEFERRED_INT,
+};
+
+/// How the `Int` walker takes a size's amount, as [`DURATION_AMOUNT`] a
+/// duration's.
+const SIZE_AMOUNT: Taken<i64> = Taken {
+    borrowed: as_size,
+    owned: Value::into_size,
+    deferred: DEFERRED_INT,
+};
+
+/// How the `Int` walker takes the value of a node of any kind, of kind
+/// `kind`: an `Int`, or a duration's or a size's amount.
+const fn amount_taken(kind: ValueKind) -> &'static Taken<i64> {
+    match kind {
+        ValueKind::Quantity(Quantity::Duration) => &DURATION_AMOUNT,
+        ValueKind::Quantity(Quantity::Size) => &SIZE_AMOUNT,
+        _ => &INT,
+    }
+}
+
 /// How the `Float` walker takes its values.
 const FLOAT: Taken<f64> = Taken {
     borrowed: as_float,
@@ -5100,12 +5196,14 @@ fn with_fields(value: &Value) -> Option<&Record> {
 }
 
 /// What `value` is, after its indefinite article, as a failed test's label
-/// says it: "an Int", "a Float", "a Bool", "a String", "a record", "a
-/// list", "a function" or "a future".
+/// says it: "an Int", "a Float", "a Duration", "a Size", "a Bool", "a
+/// String", "a record", "a list", "a function" or "a future".
 const fn described(value: &Value) -> &'static str {
     match value {
         Value::Int(_) => "an Int",
         Value::Float(_) => "a Float",
+        Value::Quantity(Quantity::Duration, _) => "a Duration",
+        Value::Quantity(Quantity::Size, _) => "a Size",
         Value::Bool(_) => "a Bool",
         Value::Str(_) => "a String",
         Value::Empty | Value::Record(_) => "a record",
@@ -5154,6 +5252,24 @@ fn as_record(value: &Value, node: &IrNode) -> Flow<Value> {
     match value {
         Value::Empty | Value::Record(_) => Ok(value.clone()),
         _ => mistyped(node, "record load from a slot holding another type"),
+    }
+}
+
+/// The amount of the duration in `value`, read by the load or capture read
+/// `node`.
+fn as_duration(value: &Value, node: &IrNode) -> Flow<i64> {
+    match value {
+        &Value::Quantity(Quantity::Duration, amount) => Ok(amount),
+        _ => mistyped(node, "Duration load from a slot holding another type"),
+    }
+}
+
+/// The amount of the size in `value`, read by the load or capture read
+/// `node`.
+fn as_size(value: &Value, node: &IrNode) -> Flow<i64> {
+    match value {
+        &Value::Quantity(Quantity::Size, amount) => Ok(amount),
+        _ => mistyped(node, "Size load from a slot holding another type"),
     }
 }
 
@@ -5875,7 +5991,12 @@ fn source_of(value: &Value, node: &IrNode) -> Flow<Rc<str>> {
             Value::Fn(_) | Value::Builtin(_) => {
                 return mistyped(node, "a function given to `show`");
             }
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Empty => {}
+            Value::Int(_)
+            | Value::Float(_)
+            | Value::Quantity(..)
+            | Value::Bool(_)
+            | Value::Str(_)
+            | Value::Empty => {}
         }
     }
     Ok(Rc::from(value.repr().to_string()))

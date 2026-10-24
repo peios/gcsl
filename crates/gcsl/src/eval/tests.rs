@@ -5453,3 +5453,89 @@ fn a_shorthand_argument_passes_its_variable_to_its_parameter() {
     .unwrap();
     assert_eq!(value.to_string(), "123");
 }
+
+#[test]
+fn quantities_compute_exactly() {
+    let cases = [
+        ("30s + 1m", "1m30s"),
+        ("1h - 1ns", "59m59s999ms999us999ns"),
+        ("3 * 20s", "1m"),
+        ("1m * 3", "3m"),
+        ("1h // 7", "8m34s285ms714us285ns"),
+        ("-1h // 7", "-8m34s285ms714us286ns"),
+        ("1h // 7m", "8"),
+        ("1h % 7m", "4m"),
+        ("-(1h30m)", "-1h30m"),
+        ("2GiB + 512MiB", "2560MiB"),
+        ("1GiB // 3", "357913941B"),
+        ("30s < 1m", "true"),
+        ("1000ms == 1s", "true"),
+        ("2KiB > 2KB", "true"),
+        ("\"in {1m30s}, {2GiB}\"", "in 1m30s, 2GiB"),
+        ("[1s, 1KB]", "[1s, 1KB]"),
+        ("{ t = 1h }", "{t = 1h}"),
+    ];
+    for (text, shown) in cases {
+        assert_eq!(run(text).unwrap().to_string(), shown, "{text}");
+    }
+}
+
+#[test]
+fn a_quantity_that_overflows_says_so_with_its_operands_as_literals() {
+    let labels = |text: &str| -> (String, Vec<String>) {
+        let error = run(text).unwrap_err();
+        let labels = error
+            .labels
+            .iter()
+            .map(|label| label.text.clone())
+            .collect();
+        (error.message, labels)
+    };
+    assert_eq!(
+        labels("106751d * 2"),
+        (
+            "duration overflow".to_owned(),
+            vec!["106751d".to_owned(), "2".to_owned()]
+        )
+    );
+    assert_eq!(
+        labels("8191PiB + 8191PiB"),
+        (
+            "size overflow".to_owned(),
+            vec!["8191PiB".to_owned(), "8191PiB".to_owned()]
+        )
+    );
+    assert_eq!(
+        labels("let least = -106751d23h47m16s854ms775us807ns - 1ns\n-least"),
+        (
+            "duration overflow".to_owned(),
+            vec!["-106751d23h47m16s854ms775us808ns".to_owned()]
+        )
+    );
+    assert_eq!(
+        labels("30s // 0"),
+        (
+            "division by zero".to_owned(),
+            vec!["30s".to_owned(), "0".to_owned()]
+        )
+    );
+    // An `Int`'s is as ever.
+    assert_eq!(labels(&format!("{MAX} * 2")).0, "integer overflow");
+}
+
+#[test]
+fn quantities_are_memo_keys_and_tell_apart_with_is() {
+    let text = "fn f(t: Duration) ->> {v: Duration} { v = t }\n\
+                    a = f(1s)\nb = f(1000ms)\nc = f(2s)";
+    let values = fields(text);
+    assert!(same(&values[0], &values[1]));
+    assert!(!same(&values[0], &values[2]));
+    let text = "fn pick(x: Duration | Size | Int): String {\n\
+                    \x20   if x is Duration { \"time {x}\" } else if x is Size { \"data {x}\" } else { \"{x}\" }\n\
+                    }\n\
+                    r = [pick(1s), pick(1B), pick(1)]";
+    assert_eq!(
+        fields(text)[0].to_string(),
+        r#"["time 1s", "data 1B", "1"]"#
+    );
+}

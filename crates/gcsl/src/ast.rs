@@ -1317,6 +1317,10 @@ pub enum ExprKind {
     Int(i64),
     /// A float literal.
     Float(f64),
+    /// A duration literal, `30s` or `1h30m`: a number of nanoseconds.
+    Duration(i64),
+    /// A size literal, `2GiB`: a number of bytes.
+    Size(i64),
     /// `true` or `false`.
     Bool(bool),
     /// A string literal without interpolations.
@@ -1515,6 +1519,8 @@ impl Expr {
             ExprKind::Binary { op, op_start, .. } => Some(op.span_at(op_start)),
             ExprKind::Int(_)
             | ExprKind::Float(_)
+            | ExprKind::Duration(_)
+            | ExprKind::Size(_)
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
             | ExprKind::Interp(_)
@@ -2531,7 +2537,7 @@ impl ConstantTree for AstBuilder {
 /// default, is a constant (see the checker's
 /// [Calls](crate::check#functions)): a literal, a string without
 /// interpolation (raw or not), an integer, a float, `true` or `false`; `-`
-/// applied directly to an integer or float literal; a list literal without
+/// applied directly to an integer, float, duration or size literal; a list literal without
 /// a spread whose elements are constants; or a record block whose items are
 /// all fields `NAME = CONSTANT`, of one name each and not annotated, `{}`
 /// among them. Nothing else, not even in parentheses. A parameter's default
@@ -2542,13 +2548,18 @@ impl ConstantTree for AstBuilder {
 #[must_use]
 pub fn is_constant(tree: &impl ConstantTree, id: ExprId) -> bool {
     match tree.constant_expr(id).kind {
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) => true,
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Duration(_)
+        | ExprKind::Size(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Str(_) => true,
         ExprKind::Unary {
             op: UnaryOp::Neg,
             operand,
         } => matches!(
             tree.constant_expr(operand).kind,
-            ExprKind::Int(_) | ExprKind::Float(_)
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Duration(_) | ExprKind::Size(_)
         ),
         ExprKind::List(elements) => tree
             .constant_elements(elements)
@@ -3858,6 +3869,8 @@ impl Ast {
             node = match self.get(node).kind {
                 ExprKind::Int(_)
                 | ExprKind::Float(_)
+                | ExprKind::Duration(_)
+                | ExprKind::Size(_)
                 | ExprKind::Bool(_)
                 | ExprKind::Str(_)
                 | ExprKind::Name(_)
@@ -4711,6 +4724,8 @@ impl<A: Annotate> Pretty<'_, A> {
         match expr.kind {
             ExprKind::Int(value) => write!(f, "int {value}"),
             ExprKind::Float(value) => write!(f, "float {value:?}"),
+            ExprKind::Duration(value) => write!(f, "duration {value}"),
+            ExprKind::Size(value) => write!(f, "size {value}"),
             ExprKind::Bool(value) => write!(f, "bool {value}"),
             ExprKind::Str(id) => write!(f, "str {}", Quoted(self.ast.strings().get(id))),
             ExprKind::Interp(_) => f.write_str("interp"),
@@ -4847,6 +4862,8 @@ impl<A: Annotate> Pretty<'_, A> {
             }
             ExprKind::Int(_)
             | ExprKind::Float(_)
+            | ExprKind::Duration(_)
+            | ExprKind::Size(_)
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
             | ExprKind::Name(_)

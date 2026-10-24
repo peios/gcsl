@@ -25,8 +25,8 @@
 //! A record type `S` is a subtype of `T` when `S` has every field of `T`,
 //! each with a type that is a subtype of the field's type in `T`: width and
 //! depth subtyping, covariant. Every record type is therefore a subtype of
-//! `{}`. `Int`, `Float`, `Bool` and `String` are subtypes only of
-//! themselves (and of the unions they are members of: see
+//! `{}`. `Int`, `Float`, `Bool`, `String`, `Duration` and `Size` are
+//! subtypes only of themselves (and of the unions they are members of: see
 //! [Unions](#unions)). The *join* of two record types is the record of the
 //! fields they share, each with the join of its two types; see
 //! [`TypeTable::join`].
@@ -323,7 +323,7 @@ use crate::ast::{Effect, FnId};
 use crate::check::{Builtin, Constant};
 use crate::names::{Name, Names};
 use crate::strings::{FieldName, Quoted};
-use crate::value::ValueKind;
+use crate::value::{Quantity, ValueKind, write_quantity};
 
 /// An interned type: an index into the [`TypeTable`] that produced it.
 ///
@@ -354,6 +354,29 @@ impl TyId {
     /// reporting anything, so one mistake is reported once rather than at
     /// every enclosing operator. It never survives a successful check.
     pub const ERROR: TyId = TyId(6);
+    /// A duration, of whole nanoseconds.
+    pub const DURATION: TyId = TyId(7);
+    /// A size, of whole bytes.
+    pub const SIZE: TyId = TyId(8);
+
+    /// The type of `quantity`: [`TyId::DURATION`] or [`TyId::SIZE`].
+    #[must_use]
+    pub const fn of_quantity(quantity: Quantity) -> TyId {
+        match quantity {
+            Quantity::Duration => TyId::DURATION,
+            Quantity::Size => TyId::SIZE,
+        }
+    }
+
+    /// The quantity this type is, if it is `Duration` or `Size`.
+    #[must_use]
+    pub const fn quantity(self) -> Option<Quantity> {
+        match self {
+            TyId::DURATION => Some(Quantity::Duration),
+            TyId::SIZE => Some(Quantity::Size),
+            _ => None,
+        }
+    }
 
     /// The id as an index into its table.
     const fn index(self) -> usize {
@@ -372,6 +395,8 @@ pub enum TyKind {
     Bool,
     /// An immutable UTF-8 string.
     String,
+    /// A duration or a size: an `i64` of nanoseconds or of bytes.
+    Quantity(Quantity),
     /// A record type: its fields, sorted by [`Name`], with no duplicates.
     Record(RecordTy),
     /// A list type, `List<T>`: the type of its elements. See the module
@@ -555,8 +580,8 @@ pub enum AwaitKind {
 pub enum ValueTest {
     /// Passes for every value: what the static type already guarantees.
     Pass,
-    /// Passes for a value of this kind: `Int`, `Float`, `Bool` or `String`,
-    /// any record or any list; never [`ValueKind::Fn`],
+    /// Passes for a value of this kind: `Int`, `Float`, `Bool`, `String`,
+    /// `Duration` or `Size`, any record or any list; never [`ValueKind::Fn`],
     /// [`ValueKind::Deferred`] or [`ValueKind::Mixed`].
     Kind(ValueKind),
     /// Passes for a record that has each of these fields, whatever else it
@@ -643,6 +668,8 @@ impl TypeTable {
             }),
             TyKind::UntypedInt,
             TyKind::Error,
+            TyKind::Quantity(Quantity::Duration),
+            TyKind::Quantity(Quantity::Size),
         ] {
             table.intern(kind);
         }
@@ -704,6 +731,7 @@ impl TypeTable {
             | TyKind::Float
             | TyKind::Bool
             | TyKind::String
+            | TyKind::Quantity(_)
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -780,6 +808,7 @@ impl TypeTable {
             | TyKind::Float
             | TyKind::Bool
             | TyKind::String
+            | TyKind::Quantity(_)
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never => None,
@@ -1183,6 +1212,7 @@ impl TypeTable {
             | TyKind::Float
             | TyKind::Bool
             | TyKind::String
+            | TyKind::Quantity(_)
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -2006,6 +2036,7 @@ impl TypeTable {
             TyKind::Never => Some(ValueKind::Never),
             TyKind::Int => Some(ValueKind::Int),
             TyKind::Float => Some(ValueKind::Float),
+            &TyKind::Quantity(quantity) => Some(ValueKind::Quantity(quantity)),
             TyKind::Bool => Some(ValueKind::Bool),
             TyKind::String => Some(ValueKind::String),
             TyKind::Record(_) => Some(ValueKind::Record),
@@ -2250,7 +2281,7 @@ impl TypeTable {
     /// [`TypeTable::display`] shows it (a function type without the
     /// parentheses a union puts around it), in the order a union shows its
     /// members: by kind, in the order of [`TyKind`] (`Int`, `Float`,
-    /// `Bool`, `String`, records, lists, functions), and among members of
+    /// `Bool`, `String`, `Duration`, `Size`, records, lists, functions), and among members of
     /// one kind by text.
     #[must_use]
     pub fn shown_members(&self, members: &[TyId], names: &Names) -> Vec<(TyId, String)> {
@@ -2259,10 +2290,12 @@ impl TypeTable {
             Some(TyKind::Float) => 1,
             Some(TyKind::Bool) => 2,
             Some(TyKind::String) => 3,
-            Some(TyKind::Record(_)) => 4,
-            Some(TyKind::List(_)) => 5,
-            Some(TyKind::Fn(_)) => 6,
-            _ => 7,
+            Some(TyKind::Quantity(Quantity::Duration)) => 4,
+            Some(TyKind::Quantity(Quantity::Size)) => 5,
+            Some(TyKind::Record(_)) => 6,
+            Some(TyKind::List(_)) => 7,
+            Some(TyKind::Fn(_)) => 8,
+            _ => 9,
         };
         let mut shown: Vec<(u8, String, TyId)> = members
             .iter()
@@ -2329,6 +2362,7 @@ impl fmt::Display for Display<'_> {
         match self.table.kind(self.id) {
             TyKind::Int | TyKind::UntypedInt => f.write_str("Int"),
             TyKind::Float => f.write_str("Float"),
+            TyKind::Quantity(quantity) => f.write_str(quantity.type_name()),
             TyKind::Bool => f.write_str("Bool"),
             TyKind::String => f.write_str("String"),
             TyKind::Error => f.write_str("<error>"),
@@ -2433,6 +2467,7 @@ pub(crate) fn write_constant(
 ) -> fmt::Result {
     match constant {
         Constant::Int(value) => write!(f, "{value}"),
+        &Constant::Quantity(quantity, amount) => write_quantity(f, quantity, amount),
         Constant::Float(bits) => {
             let value = f64::from_bits(*bits);
             // `{:?}` would show NaN as `NaN`.

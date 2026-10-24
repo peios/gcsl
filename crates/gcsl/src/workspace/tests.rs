@@ -8623,7 +8623,7 @@ fn the_arguments_must_name_each_required_parameter_once() {
 }
 
 #[test]
-fn only_four_types_of_parameter_can_be_given() {
+fn only_six_types_of_parameter_can_be_given() {
     let files = [
         (
             "workspace.gcsl",
@@ -8665,26 +8665,26 @@ fn only_four_types_of_parameter_can_be_given() {
     // One that has no default is reported whatever is given, before
     // anything given, the first, its type as it is written.
     let mixed = "`mixed`'s parameter `b` is `List<String>`, but only `String`, `Int`, \
-                     `Float` and `Bool` parameters can be given here yet";
+                     `Float`, `Bool`, `Duration` and `Size` parameters can be given here yet";
     assert_eq!(error("mixed", &[("a", "a"), ("b", "b"), ("c", "1")]), mixed);
     assert_eq!(error("mixed", &[("a", "a"), ("c", "1")]), mixed);
     assert_eq!(error("mixed", &[("nope", "a")]), mixed);
     assert_eq!(
         error("versioned", &[("v", "1")]),
-        "`versioned`'s parameter `v` is `Version`, but only `String`, `Int`, `Float` and \
-             `Bool` parameters can be given here yet"
+        "`versioned`'s parameter `v` is `Version`, but only `String`, `Int`, `Float`, \
+             `Bool`, `Duration` and `Size` parameters can be given here yet"
     );
     // A present value fits no future.
     assert_eq!(
         error("later", &[("s", "1")]),
-        "`later`'s parameter `s` is `Future<String>`, but only `String`, `Int`, `Float` \
-             and `Bool` parameters can be given here yet"
+        "`later`'s parameter `s` is `Future<String>`, but only `String`, `Int`, `Float`, \
+             `Bool`, `Duration` and `Size` parameters can be given here yet"
     );
     // An alias of `String` can be given; a union with it cannot.
     assert_eq!(
         error("fits", &[("n", "n"), ("s", "s")]),
-        "`fits`'s parameter `s` is `String | Int`, but only `String`, `Int`, `Float` and \
-             `Bool` parameters can be given here yet"
+        "`fits`'s parameter `s` is `String | Int`, but only `String`, `Int`, `Float`, \
+             `Bool`, `Duration` and `Size` parameters can be given here yet"
     );
 }
 
@@ -9003,13 +9003,64 @@ fn a_text_that_is_not_a_value_of_its_type_is_an_error() {
     // given, it cannot be.
     assert_eq!(
         error("tags", "a"),
-        "`typed`'s parameter `tags` is `List<String>`, but only `String`, `Int`, `Float` \
-             and `Bool` parameters can be given here yet"
+        "`typed`'s parameter `tags` is `List<String>`, but only `String`, `Int`, `Float`, \
+             `Bool`, `Duration` and `Size` parameters can be given here yet"
     );
     // An alias, by the type it names.
     assert_eq!(
         request_error_with(&files, ("aliased", "x"), &[("n", "three")]),
         format!("`three` is not an `Int`, the type of `n` of `aliased x`; {int}")
+    );
+}
+
+#[test]
+fn a_duration_or_a_size_can_be_given_and_read_from_text() {
+    let files = [
+        (
+            "workspace.gcsl",
+            "#[def_type]\n\
+                 def job(name: String, f: fn(): String, timeout: Duration = 30s, memory: Size) -> \
+                 String {\n\
+                 \x20   \"{f()} {timeout} {memory}\"\n\
+                 }",
+        ),
+        ("defs.gcsl", "def job x() { \"x\" }"),
+    ];
+    let mut workspace = rooted(&files).unwrap();
+    let given = [
+        (
+            "timeout".to_owned(),
+            Given::Quantity(Quantity::Duration, 90_000_000_000),
+        ),
+        (
+            "memory".to_owned(),
+            Given::Quantity(Quantity::Size, 2 << 30),
+        ),
+    ];
+    let outcome = workspace.invoke("job", "x", &given).unwrap();
+    assert_eq!(outcome.value.to_string(), "x 1m30s 2GiB");
+    assert_eq!(given[0].1.to_string(), "1m30s");
+    // From text, as a command line gives it: a literal, negated or not.
+    let value = |args: &[(&str, &str)]| match invoke_with(&files, ("job", "x"), args) {
+        Ok(value) => value.to_string(),
+        Err(error) => panic!("{args:?}: {error:?}"),
+    };
+    assert_eq!(value(&[("memory", "512MiB")]), "x 30s 512MiB");
+    assert_eq!(value(&[("timeout", "-1h"), ("memory", "1B")]), "x -1h 1B");
+    // Not a literal of its type, or not a literal alone.
+    let duration = "note: a `Duration` is written as a duration literal, `30s` or `1h30m`, with \
+                    `-` before it if it is negative";
+    for text in ["30", "2GiB", "30 s", "30sec", "1m1h", " 1s", ""] {
+        assert_eq!(
+            request_error_with(&files, ("job", "x"), &[("timeout", text), ("memory", "1B")]),
+            format!("`{text}` is not a `Duration`, the type of `timeout` of `job x`; {duration}")
+        );
+    }
+    let size = "note: a `Size` is written as a size literal, `512B` or `2GiB`, with `-` before \
+                it if it is negative";
+    assert_eq!(
+        request_error_with(&files, ("job", "x"), &[("memory", "2gib")]),
+        format!("`2gib` is not a `Size`, the type of `memory` of `job x`; {size}")
     );
 }
 
@@ -9113,8 +9164,8 @@ fn arguments_are_checked_without_running_anything() {
     );
     assert_eq!(
         request(workspace.arguments("typed", "x", &[("tags", None)])),
-        "`typed`'s parameter `tags` is `List<String>`, but only `String`, `Int`, `Float` \
-             and `Bool` parameters can be given here yet"
+        "`typed`'s parameter `tags` is `List<String>`, but only `String`, `Int`, `Float`, \
+             `Bool`, `Duration` and `Size` parameters can be given here yet"
     );
     // What is asked for, before its arguments.
     assert_eq!(

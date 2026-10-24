@@ -1987,6 +1987,45 @@
 //! static type. They have no order, and no arithmetic: `+` does not
 //! concatenate them, a spread does.
 //!
+//! # Quantities
+//!
+//! `Duration` and `Size` are *quantities*: a duration of whole
+//! nanoseconds and a size of whole bytes, each an `i64` of its smallest
+//! unit ([`TyId::DURATION`], [`TyId::SIZE`]). A duration literal, `30s` or
+//! `1h30m`, is a `Duration`, and a size literal, `2GiB`, a `Size` (see the
+//! lexer's literal grammar, `Lexer::quantity`); each is a constant, negated
+//! or not, so it may be a parameter's or a field's default. Each is a type
+//! of its own: it is a subtype only of itself, mixes with no other type
+//! (`Int`, `Float` and the other quantity included), and nothing converts
+//! to it, so `0` is no duration and an integer literal never adapts to
+//! one. Their names are built-in type names, so a `type` may not be named
+//! `Duration` or `Size`.
+//!
+//! Its operators (`Checker::arithmetic`, `Checker::integer_only`), `Q`
+//! being either quantity:
+//!
+//! | expression                | type   |
+//! |---------------------------|--------|
+//! | `Q + Q`, `Q - Q`, `-Q`    | `Q`    |
+//! | `Q * Int`, `Int * Q`      | `Q`    |
+//! | `Q // Int`                | `Q`    |
+//! | `Q // Q`                  | `Int`  |
+//! | `Q % Q`                   | `Q`    |
+//! | `Q < Q` and the others    | `Bool` |
+//! | `Q == Q`, `Q != Q`        | `Bool` |
+//!
+//! An untyped integer beside a quantity is an `Int`. Any other mix is the
+//! operator's usual error, naming both operands, as in "cannot add
+//! Duration and Int"; `/` is "cannot divide Duration and Int", noted "use
+//! `//`; a Duration is a whole number of nanoseconds", and a `//` or `%`
+//! that does not fit is noted with what a quantity divides by. Comparing
+//! two of one type is as for `Int`, and comparing a quantity with anything
+//! else is the mismatch. A quantity is shown as its canonical literal
+//! wherever a value is (see [`crate::value::write_quantity`]): in an
+//! interpolation, by `show` and in a type's default. Lowering computes on
+//! the amounts with the `Int` nodes, giving a quantity's result its unit
+//! (see [`crate::ir`], "Quantities").
+//!
 //! # Ranges
 //!
 //! `a..b` is the list of the integers from `a` up to but not including
@@ -2922,7 +2961,7 @@ use crate::source::Span;
 use crate::strings::FieldName;
 use crate::suggest;
 use crate::types::{AwaitKind, FnTy, Laziness, Meta, TyId, TyKind, TypeTable, ValueTest};
-use crate::value::{ValueKind, int_to_float};
+use crate::value::{Quantity, ValueKind, int_to_float};
 use crate::workspace::{Context, Target};
 
 /// The type of every expression in an [`Ast`], indexed by [`ExprId`].
@@ -3702,6 +3741,8 @@ impl NarrowingBlock {
 pub enum Constant {
     /// An `Int`.
     Int(i64),
+    /// A `Duration` or a `Size`, of its smallest unit.
+    Quantity(Quantity, i64),
     /// A `Float`, by its bits ([`f64::to_bits`]), so that a constant has
     /// equality: an integer literal typed `Float` included.
     Float(u64),
@@ -5596,13 +5637,13 @@ pub(crate) fn check_types(ast: &Ast, types: &mut TypeTable, sees_broken: bool) -
 /// The names of the built-in types: those of [`BuiltinTypes`], and the
 /// type constructors, `List`, `Future` and `Present`. A `type` may not be
 /// named like one: "`Int` is a built-in type".
-pub(crate) const BUILTIN_TYPE_NAMES: [&str; 7] = [
-    "Int", "Float", "Bool", "String", "List", "Future", "Present",
+pub(crate) const BUILTIN_TYPE_NAMES: [&str; 9] = [
+    "Int", "Float", "Bool", "String", "Duration", "Size", "List", "Future", "Present",
 ];
 
 /// The type names every program can use, as `(name, type)` pairs. A name
 /// the program never mentions has no [`Name`].
-type BuiltinTypes = [(Option<Name>, TyId); 4];
+type BuiltinTypes = [(Option<Name>, TyId); 6];
 
 /// The [`BuiltinTypes`] of a program whose names are `names`.
 fn builtin_types(names: &Names) -> BuiltinTypes {
@@ -5611,6 +5652,8 @@ fn builtin_types(names: &Names) -> BuiltinTypes {
         (names.lookup("Float"), TyId::FLOAT),
         (names.lookup("Bool"), TyId::BOOL),
         (names.lookup("String"), TyId::STRING),
+        (names.lookup("Duration"), TyId::DURATION),
+        (names.lookup("Size"), TyId::SIZE),
     ]
 }
 
@@ -12429,7 +12472,9 @@ impl<'a> Checker<'a> {
         if applied {
             candidates.extend(["List", "Future", "Present"].map(|text| (text, 1)));
         } else {
-            candidates.extend(["Int", "Float", "Bool", "String"].map(|text| (text, 1)));
+            candidates.extend(
+                ["Int", "Float", "Bool", "String", "Duration", "Size"].map(|text| (text, 1)),
+            );
             if let Some(workspace) = self.workspace {
                 candidates.extend(
                     workspace
@@ -13895,6 +13940,8 @@ impl<'a> Checker<'a> {
         let ty = match expr.kind {
             ExprKind::Int(_) => TyId::UNTYPED_INT,
             ExprKind::Float(_) => TyId::FLOAT,
+            ExprKind::Duration(_) => TyId::DURATION,
+            ExprKind::Size(_) => TyId::SIZE,
             ExprKind::Bool(_) => TyId::BOOL,
             ExprKind::Str(_) => TyId::STRING,
             ExprKind::Interp(parts) => self.check_interpolation(parts),
@@ -14657,6 +14704,10 @@ impl<'a> Checker<'a> {
             Constant::Bool(_) => self
                 .types
                 .is_subtype(TyId::BOOL, expected)
+                .then(|| constant.clone()),
+            &Constant::Quantity(quantity, _) => self
+                .types
+                .is_subtype(TyId::of_quantity(quantity), expected)
                 .then(|| constant.clone()),
             Constant::Str(_) => self
                 .types
@@ -17108,7 +17159,7 @@ impl<'a> Checker<'a> {
         }
         let operand_ty = self.measure(operand, operand_ty);
         match op {
-            UnaryOp::Neg if is_numeric(operand_ty) => operand_ty,
+            UnaryOp::Neg if is_numeric(operand_ty) || is_quantity(operand_ty) => operand_ty,
             UnaryOp::Neg => {
                 let message = format!("cannot {} {}", op.verb(), self.in_message(operand_ty));
                 let label = self.in_label(operand_ty);
@@ -17462,7 +17513,9 @@ impl<'a> Checker<'a> {
 
     /// Types `+`, `-` and `*`: both operands must end up the same numeric
     /// type, with untyped operands adapting to a concrete one, except that
-    /// `+` also concatenates two strings.
+    /// `+` also concatenates two strings, and that a quantity is added to and
+    /// subtracted from one of its type and multiplied by an `Int` on either
+    /// side, giving its type (see [Quantities](#quantities)).
     fn arithmetic(
         &mut self,
         id: ExprId,
@@ -17472,6 +17525,22 @@ impl<'a> Checker<'a> {
     ) -> TyId {
         if op == BinaryOp::Add && lhs_ty == TyId::STRING && rhs_ty == TyId::STRING {
             return TyId::STRING;
+        }
+        match (op, lhs_ty, rhs_ty) {
+            (BinaryOp::Add | BinaryOp::Sub, quantity, other)
+                if is_quantity(quantity) && quantity == other =>
+            {
+                return quantity;
+            }
+            (BinaryOp::Mul, quantity, count) if is_quantity(quantity) && is_int(count) => {
+                self.coerce(rhs, TyId::INT);
+                return quantity;
+            }
+            (BinaryOp::Mul, count, quantity) if is_int(count) && is_quantity(quantity) => {
+                self.coerce(lhs, TyId::INT);
+                return quantity;
+            }
+            _ => {}
         }
         if let Some(ty) = self.numeric((lhs, lhs_ty), (rhs, rhs_ty)) {
             return ty;
@@ -17626,8 +17695,8 @@ impl<'a> Checker<'a> {
     }
 
     /// Decides the common type of two expressions that must have the same
-    /// type: `Bool`, `String`, record, list and function types and unions
-    /// must match exactly, and numeric types agree as for
+    /// type: `Bool`, `String`, `Duration`, `Size`, record, list and function
+    /// types and unions must match exactly, and numeric types agree as for
     /// [`Checker::numeric`], whose results this returns.
     fn agree(
         &mut self,
@@ -17639,6 +17708,7 @@ impl<'a> Checker<'a> {
         if self.types.same(lhs_ty, rhs_ty)
             && (lhs_ty == TyId::BOOL
                 || lhs_ty == TyId::STRING
+                || is_quantity(lhs_ty)
                 || self.types.is_record(lhs_ty)
                 || self.types.list_element(lhs_ty).is_some()
                 || self.types.fn_sig(lhs_ty).is_some()
@@ -19180,6 +19250,17 @@ impl<'a> Checker<'a> {
                 self.in_message(rhs_ty)
             );
             self.operand_error(id, message, (lhs, lhs_ty), (rhs, rhs_ty));
+            // A quantity is whole: it divides only with `//`.
+            if let Some(quantity) = [lhs_ty, rhs_ty].into_iter().find(|&ty| is_quantity(ty))
+                && let Some(error) = self.errors.last_mut()
+            {
+                let quantity = quantity.quantity().unwrap_or(Quantity::Duration);
+                error.notes.push(format!(
+                    "use `//`; a {} is a whole number of {}",
+                    quantity.type_name(),
+                    quantity.smallest()
+                ));
+            }
             return TyId::ERROR;
         }
         TyId::FLOAT
@@ -19289,7 +19370,10 @@ impl<'a> Checker<'a> {
 
     /// Types `//` and `%`: both operands must be integers, and the result is
     /// a concrete `Int`. Untyped operands are coerced to `Int`; they never
-    /// adapt to `Float`, since these operators do not accept it.
+    /// adapt to `Float`, since these operators do not accept it. A quantity
+    /// divided by an `Int` with `//` is of its type, one divided by one of
+    /// its type with `//` an `Int`, and the remainder of two of a type with
+    /// `%` of their type (see [Quantities](#quantities)).
     fn integer_only(
         &mut self,
         id: ExprId,
@@ -19297,6 +19381,41 @@ impl<'a> Checker<'a> {
         (lhs, lhs_ty): (ExprId, TyId),
         (rhs, rhs_ty): (ExprId, TyId),
     ) -> TyId {
+        if is_quantity(lhs_ty) {
+            match op {
+                BinaryOp::FloorDiv if is_int(rhs_ty) => {
+                    self.coerce(rhs, TyId::INT);
+                    return lhs_ty;
+                }
+                BinaryOp::FloorDiv if rhs_ty == lhs_ty => return TyId::INT,
+                BinaryOp::Rem if rhs_ty == lhs_ty => return lhs_ty,
+                _ => {}
+            }
+        }
+        // A quantity on either side is no `Int` to reject alone: what it
+        // takes is said.
+        if let Some(quantity) = [lhs_ty, rhs_ty].into_iter().find_map(TyId::quantity) {
+            self.coerce(lhs, TyId::INT);
+            self.coerce(rhs, TyId::INT);
+            if lhs_ty == TyId::ERROR || rhs_ty == TyId::ERROR {
+                return TyId::ERROR;
+            }
+            let message = format!(
+                "cannot {} {} and {}",
+                op.verb(),
+                self.in_message(lhs_ty),
+                self.in_message(rhs_ty)
+            );
+            self.operand_error(id, message, (lhs, lhs_ty), (rhs, rhs_ty));
+            let name = quantity.type_name();
+            if let Some(error) = self.errors.last_mut() {
+                error.notes.push(format!(
+                    "a {name} divides with `//` by an Int, giving a {name}, or by a {name}, \
+                     giving an Int, and `%` gives the remainder of one {name} by another"
+                ));
+            }
+            return TyId::ERROR;
+        }
         // Whatever the outcome, untyped operands settle to Int: these
         // operators never accept Float, so nothing else could decide them.
         self.coerce(lhs, TyId::INT);
@@ -19346,6 +19465,8 @@ impl<'a> Checker<'a> {
         match self.ast.get(id).kind {
             ExprKind::Int(_)
             | ExprKind::Float(_)
+            | ExprKind::Duration(_)
+            | ExprKind::Size(_)
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
             | ExprKind::Interp(_)
@@ -19439,6 +19560,7 @@ impl<'a> Checker<'a> {
             | TyKind::Float
             | TyKind::Bool
             | TyKind::String
+            | TyKind::Quantity(_)
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never => shown.to_string(),
@@ -19514,6 +19636,8 @@ fn constant_of(ast: &Ast, id: ExprId, (types, fills): (&[TyId], &RecordFills)) -
         ExprKind::Int(value) if float(id) => Constant::Float(int_to_float(value).to_bits()),
         ExprKind::Int(value) => Constant::Int(value),
         ExprKind::Float(value) => Constant::Float(value.to_bits()),
+        ExprKind::Duration(amount) => Constant::Quantity(Quantity::Duration, amount),
+        ExprKind::Size(amount) => Constant::Quantity(Quantity::Size, amount),
         ExprKind::Bool(value) => Constant::Bool(value),
         ExprKind::Str(text) => Constant::Str(ast.strings().get(text).into()),
         // Negated as lowering negates it: as the whole is typed.
@@ -19524,6 +19648,10 @@ fn constant_of(ast: &Ast, id: ExprId, (types, fills): (&[TyId], &RecordFills)) -
             ExprKind::Int(value) if float(id) => Constant::Float((-int_to_float(value)).to_bits()),
             ExprKind::Int(value) => Constant::Int(value.checked_neg()?),
             ExprKind::Float(value) => Constant::Float((-value).to_bits()),
+            ExprKind::Duration(amount) => {
+                Constant::Quantity(Quantity::Duration, amount.checked_neg()?)
+            }
+            ExprKind::Size(amount) => Constant::Quantity(Quantity::Size, amount.checked_neg()?),
             _ => return None,
         },
         ExprKind::List(elements) => Constant::List(
@@ -19584,6 +19712,16 @@ fn jump_span(keyword: &str, item: Span, label: Option<Label>) -> Span {
 /// Whether `ty` is a numeric type, untyped integers included.
 fn is_numeric(ty: TyId) -> bool {
     matches!(ty, TyId::INT | TyId::FLOAT | TyId::UNTYPED_INT)
+}
+
+/// Whether `ty` is a quantity, `Duration` or `Size`.
+fn is_quantity(ty: TyId) -> bool {
+    matches!(ty, TyId::DURATION | TyId::SIZE)
+}
+
+/// Whether `ty` is an `Int`, an untyped integer being one.
+fn is_int(ty: TyId) -> bool {
+    matches!(ty, TyId::INT | TyId::UNTYPED_INT)
 }
 
 /// A field's position in its block or type, as stored in

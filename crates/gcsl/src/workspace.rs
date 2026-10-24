@@ -602,7 +602,8 @@
 //! fn(version: String) -> List<Version>, version: String = "")` invoked with
 //! none gives `version` `""`, and `def build(name: String, f: fn(): String,
 //! version: String = "", target: String)` may be given `target` alone. A
-//! value is of one of four types, `String`, `Int`, `Float` and `Bool`, and
+//! value is of one of six types, `String`, `Int`, `Float`, `Bool`,
+//! `Duration` and `Size`, and
 //! is given only for a parameter of that type as it is declared, an alias of
 //! it, or the either shape of an impure def-type's bare one (`version:
 //! String` of an impure def-type is `String | Future<String>`, of a memoised
@@ -614,13 +615,14 @@
 //! `String` the text as it is, read as nothing else (no `{` in it
 //! interpolates), an `Int` a decimal integer, with `-` before it if
 //! negative, in range, a `Float` a decimal number Rust's `f64` reads, finite,
-//! a `Bool` `true` or `false`; it runs nothing, so a host can check every
+//! a `Bool` `true` or `false`, a `Duration` or a `Size` one of its literals,
+//! `30s` or `2GiB`, with `-` before it if negative; it runs nothing, so a host can check every
 //! request before it runs any. What is asked for may name nothing: no
 //! def-type of the name, no definition of the path, or a path above
 //! definitions; or the arguments may not fit the def-type: an invocation
 //! parameter that has no default and cannot be given a value, "`build`'s
-//! parameter `n` is `List<Int>`, but only `String`, `Int`, `Float` and
-//! `Bool` parameters can be given here yet", the first such, its type as it
+//! parameter `n` is `List<Int>`, but only `String`, `Int`, `Float`, `Bool`,
+//! `Duration` and `Size` parameters can be given here yet", the first such, its type as it
 //! is written, whatever is given; then, argument by argument, a name that
 //! is no invocation parameter's, "`package` has no invocation parameter
 //! `jbos`", noting those it has, one named twice, "`package`'s parameter
@@ -906,7 +908,7 @@ use crate::session;
 use crate::source::{SourceFile, Span};
 use crate::strings::Strings;
 use crate::types::{Laziness, TyId, TypeTable};
-use crate::value::{Layout, Value};
+use crate::value::{Layout, Quantity, Value};
 
 /// The key of a root in [`Scan`]'s index of nodes by parent and name.
 const ROOT: u32 = u32::MAX;
@@ -7709,7 +7711,7 @@ pub enum RequestError {
     /// that must be, having no default, is of a type no argument can be
     /// given for: only a `String`, `Int`, `Float` or `Bool` one can be (see
     /// [`Given`]): "`build`'s parameter `n` is `List<Int>`, but only
-    /// `String`, `Int`, `Float` and `Bool` parameters can be given here
+    /// `String`, `Int`, `Float`, `Bool`, `Duration` and `Size` parameters can be given here
     /// yet". One that must be given is reported whatever is given, the
     /// first as it declares them, before anything given is looked at.
     CannotBeGiven {
@@ -7804,7 +7806,7 @@ impl RequestError {
                 ty,
             } => format!(
                 "`{def_type}`'s parameter `{parameter}` is `{ty}`, but only `String`, `Int`, \
-                 `Float` and `Bool` parameters can be given here yet"
+                 `Float`, `Bool`, `Duration` and `Size` parameters can be given here yet"
             ),
             RequestError::UnknownParameter {
                 def_type,
@@ -7895,6 +7897,16 @@ impl RequestError {
                         .to_owned(),
                 ],
                 "Bool" => vec!["a `Bool` is written `true` or `false`".to_owned()],
+                "Duration" => vec![
+                    "a `Duration` is written as a duration literal, `30s` or `1h30m`, with `-` \
+                     before it if it is negative"
+                        .to_owned(),
+                ],
+                "Size" => vec![
+                    "a `Size` is written as a size literal, `512B` or `2GiB`, with `-` before it \
+                     if it is negative"
+                        .to_owned(),
+                ],
                 _ => Vec::new(),
             },
             RequestError::CannotBeGiven { .. }
@@ -7934,8 +7946,9 @@ fn and_list(items: &[String]) -> String {
 }
 
 /// A value given for an invocation parameter of a def-type, to invoke one of
-/// its definitions with ([`Workspace::invoke`]): of one of the four types a
-/// parameter given an argument can be, `String`, `Int`, `Float` or `Bool`,
+/// its definitions with ([`Workspace::invoke`]): of one of the six types a
+/// parameter given an argument can be, `String`, `Int`, `Float`, `Bool`,
+/// `Duration` or `Size`,
 /// which the call that invokes the definition writes as a literal of its
 /// kind (see the module documentation, "Def-types by name").
 /// [`Workspace::arguments`] reads one from text, by the parameter's type.
@@ -7949,22 +7962,26 @@ pub enum Given {
     Float(f64),
     /// A `Bool`.
     Bool(bool),
+    /// A `Duration` or a `Size`, of its smallest unit.
+    Quantity(Quantity, i64),
 }
 
 impl std::fmt::Display for Given {
     /// The value as text: a string as it is, unquoted; a number in decimal;
-    /// a `Bool` as `true` or `false`.
+    /// a `Bool` as `true` or `false`; a duration or a size as its canonical
+    /// literal, `1m30s`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Given::Str(text) => f.write_str(text),
             Given::Int(value) => write!(f, "{value}"),
             Given::Float(value) => write!(f, "{value}"),
             Given::Bool(value) => write!(f, "{value}"),
+            &Given::Quantity(quantity, amount) => Value::Quantity(quantity, amount).fmt(f),
         }
     }
 }
 
-/// One of the four types an invocation parameter given an argument can be
+/// One of the six types an invocation parameter given an argument can be
 /// (see [`Given`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scalar {
@@ -7976,11 +7993,20 @@ enum Scalar {
     Float,
     /// `Bool`.
     Bool,
+    /// `Duration` or `Size`.
+    Quantity(Quantity),
 }
 
 impl Scalar {
-    /// The four.
-    const ALL: [Scalar; 4] = [Scalar::String, Scalar::Int, Scalar::Float, Scalar::Bool];
+    /// The six.
+    const ALL: [Scalar; 6] = [
+        Scalar::String,
+        Scalar::Int,
+        Scalar::Float,
+        Scalar::Bool,
+        Scalar::Quantity(Quantity::Duration),
+        Scalar::Quantity(Quantity::Size),
+    ];
 
     /// Its type.
     fn ty(self) -> TyId {
@@ -7989,6 +8015,7 @@ impl Scalar {
             Scalar::Int => TyId::INT,
             Scalar::Float => TyId::FLOAT,
             Scalar::Bool => TyId::BOOL,
+            Scalar::Quantity(quantity) => TyId::of_quantity(quantity),
         }
     }
 
@@ -7999,13 +8026,16 @@ impl Scalar {
             Scalar::Int => "Int",
             Scalar::Float => "Float",
             Scalar::Bool => "Bool",
+            Scalar::Quantity(quantity) => quantity.type_name(),
         }
     }
 
     /// The value of this type `text` is, if it is one: for a `String`, the
     /// text as it is; for an `Int`, a decimal integer, with `-` before it if
     /// negative (no `+`), in range; for a `Float`, a number Rust's `f64`
-    /// reads (`1.5`, `2`, `1e3`), finite; for a `Bool`, `true` or `false`.
+    /// reads (`1.5`, `2`, `1e3`), finite; for a `Bool`, `true` or `false`;
+    /// for a `Duration` or a `Size`, one of its literals, with `-` before it
+    /// if negative, as the lexer reads it ([`quantity_literal`]).
     fn read(self, text: &str) -> Option<Given> {
         match self {
             Scalar::String => Some(Given::Str(text.to_owned())),
@@ -8027,6 +8057,9 @@ impl Scalar {
                 "false" => Some(Given::Bool(false)),
                 _ => None,
             },
+            Scalar::Quantity(quantity) => quantity_literal(text)
+                .filter(|&(read, _)| read == quantity)
+                .map(|(read, amount)| Given::Quantity(read, amount)),
         }
     }
 
@@ -8037,6 +8070,7 @@ impl Scalar {
             (Scalar::String, Given::Str(_))
             | (Scalar::Int, Given::Int(_))
             | (Scalar::Bool, Given::Bool(_)) => true,
+            (Scalar::Quantity(quantity), &Given::Quantity(given, _)) => quantity == given,
             (Scalar::Float, Given::Float(value)) => value.is_finite(),
             _ => false,
         }
@@ -9434,6 +9468,8 @@ fn invocation(
             Given::Int(value) => ExprKind::Int(*value),
             Given::Float(value) => ExprKind::Float(*value),
             Given::Bool(value) => ExprKind::Bool(*value),
+            Given::Quantity(Quantity::Duration, amount) => ExprKind::Duration(*amount),
+            Given::Quantity(Quantity::Size, amount) => ExprKind::Size(*amount),
         };
         let value = builder.alloc(Expr { kind, span });
         arguments.push(Arg {
@@ -9886,3 +9922,29 @@ pub(crate) fn check_beside_prelude(
 
 #[cfg(test)]
 mod tests;
+
+/// The duration or the size `text` is, if it is one: one of its literals,
+/// read by the lexer as a program's is, with `-` before it if negative, and
+/// nothing else, not even a space.
+fn quantity_literal(text: &str) -> Option<(Quantity, i64)> {
+    let (negative, literal) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let source = SourceFile::new("<argument>", literal).ok()?;
+    let (tokens, _, _) = crate::lexer::tokenize(&source).ok()?;
+    let (quantity, amount) = match tokens.as_slice() {
+        [first, end] if end.kind == TokenKind::Eof && first.span.start == 0 => match first.kind {
+            TokenKind::Duration(amount) => (Quantity::Duration, amount),
+            TokenKind::Size(amount) => (Quantity::Size, amount),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let amount = if negative {
+        amount.checked_neg()?
+    } else {
+        amount
+    };
+    Some((quantity, amount))
+}

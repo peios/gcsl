@@ -1,4 +1,6 @@
 use super::*;
+use crate::value::Quantity;
+use std::fmt::Write as _;
 use crate::ast::{ImportId, ItemKind};
 use crate::lexer::tokenize;
 use crate::strings::FieldName;
@@ -290,11 +292,21 @@ fn type_operator(kind: ExprKind) -> &'static str {
     }
 }
 
+/// The duration or size literal `kind`, as GCSL shows its value.
+fn quantity(kind: ExprKind) -> String {
+    let value = match kind {
+        ExprKind::Duration(amount) => crate::value::Value::Quantity(Quantity::Duration, amount),
+        ExprKind::Size(amount) => crate::value::Value::Quantity(Quantity::Size, amount),
+        _ => panic!("{kind:?} is no quantity"),
+    };
+    value.to_string()
+}
+
 fn expr(ast: &Ast, id: ExprId, out: &mut String) {
-    use std::fmt::Write as _;
     match ast.get(id).kind {
         ExprKind::Int(value) => write!(out, "{value}").unwrap(),
         ExprKind::Float(value) => write!(out, "{value:?}").unwrap(),
+        kind @ (ExprKind::Duration(_) | ExprKind::Size(_)) => out.push_str(&quantity(kind)),
         ExprKind::Bool(value) => write!(out, "{value}").unwrap(),
         ExprKind::Str(text) => write!(out, "\"{}\"", ast.strings().get(text)).unwrap(),
         ExprKind::Interp(parts) => {
@@ -6805,4 +6817,16 @@ fn nothing_hangs_on_any_prefix_of_a_program() {
         let source = SourceFile::new("t.gcsl", &text[..end]).unwrap();
         let _ = parse_source(&source);
     }
+}
+
+#[test]
+fn a_number_glued_to_a_name_that_is_no_unit_is_an_unknown_unit() {
+    let error = parse_text("x = 30sec").unwrap_err();
+    assert_eq!(error.message, "unknown unit `sec`");
+    assert_eq!(error.span, Span::new(6, 9));
+    assert_eq!(error.notes, [crate::lexer::UNITS_NOTE]);
+    // A module path is no expression: `7zip` is its segment.
+    assert!(parse_text("import pkgs/7zip as zip\nx = zip.v").is_ok());
+    // A quantity is a literal, negated as a number is.
+    assert_eq!(shape("x = -1h30m"), "x = (-1h30m)");
 }

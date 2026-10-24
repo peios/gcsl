@@ -59,6 +59,8 @@ pub enum ValueKind {
     Bool,
     /// A `String`, [`Value::Str`].
     String,
+    /// A `Duration` or a `Size`, [`Value::Quantity`].
+    Quantity(Quantity),
     /// A record: [`Value::Empty`] or [`Value::Record`].
     Record,
     /// A list, [`Value::List`].
@@ -80,6 +82,94 @@ pub enum ValueKind {
     /// ends in one. Every walker evaluates such a node, which always
     /// unwinds (see [`crate::eval`]); no [`Value`] is of it.
     Never,
+}
+
+/// A quantity with a unit: a duration, of time in whole nanoseconds, or a
+/// size, of data in whole bytes. Each is an `i64` of its smallest unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Quantity {
+    /// A `Duration`, of nanoseconds.
+    Duration,
+    /// A `Size`, of bytes.
+    Size,
+}
+
+impl Quantity {
+    /// What it is, in prose: `duration` or `size`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Quantity::Duration => "duration",
+            Quantity::Size => "size",
+        }
+    }
+
+    /// The name of its type: `Duration` or `Size`.
+    #[must_use]
+    pub const fn type_name(self) -> &'static str {
+        match self {
+            Quantity::Duration => "Duration",
+            Quantity::Size => "Size",
+        }
+    }
+
+    /// Its smallest unit, in the plural: `nanoseconds` or `bytes`.
+    #[must_use]
+    pub const fn smallest(self) -> &'static str {
+        match self {
+            Quantity::Duration => "nanoseconds",
+            Quantity::Size => "bytes",
+        }
+    }
+}
+
+/// A unit of a duration or a size literal: its name, its quantity, and
+/// how many of the smallest unit, a nanosecond or a byte, it is.
+pub(crate) struct Unit {
+    /// Its name, as written after the number.
+    pub(crate) name: &'static str,
+    /// What it is a unit of.
+    pub(crate) quantity: Quantity,
+    /// How many of the smallest unit it is.
+    pub(crate) factor: u128,
+}
+
+/// A duration's units, from the largest to the smallest, the order its
+/// components are written in. A day is exactly 24 hours.
+pub(crate) const DURATION_UNITS: [Unit; 7] = [
+    unit("d", Quantity::Duration, 86_400_000_000_000),
+    unit("h", Quantity::Duration, 3_600_000_000_000),
+    unit("m", Quantity::Duration, 60_000_000_000),
+    unit("s", Quantity::Duration, 1_000_000_000),
+    unit("ms", Quantity::Duration, 1_000_000),
+    unit("us", Quantity::Duration, 1_000),
+    unit("ns", Quantity::Duration, 1),
+];
+
+/// A size's units: the byte, the decimal ones, powers of 1000, and the
+/// binary ones, powers of 1024. There are none of exabytes: `1E5` is a
+/// float.
+pub(crate) const SIZE_UNITS: [Unit; 11] = [
+    unit("B", Quantity::Size, 1),
+    unit("KB", Quantity::Size, 1_000),
+    unit("MB", Quantity::Size, 1_000_000),
+    unit("GB", Quantity::Size, 1_000_000_000),
+    unit("TB", Quantity::Size, 1_000_000_000_000),
+    unit("PB", Quantity::Size, 1_000_000_000_000_000),
+    unit("KiB", Quantity::Size, 1 << 10),
+    unit("MiB", Quantity::Size, 1 << 20),
+    unit("GiB", Quantity::Size, 1 << 30),
+    unit("TiB", Quantity::Size, 1 << 40),
+    unit("PiB", Quantity::Size, 1 << 50),
+];
+
+/// The unit `name` of `quantity`, `factor` of its smallest unit.
+const fn unit(name: &'static str, quantity: Quantity, factor: u128) -> Unit {
+    Unit {
+        name,
+        quantity,
+        factor,
+    }
 }
 
 /// The field names of a record, in definition order. Built once per record
@@ -657,6 +747,8 @@ pub enum Value {
     Bool(bool),
     /// A `String`.
     Str(Rc<str>),
+    /// A `Duration`, of nanoseconds, or a `Size`, of bytes.
+    Quantity(Quantity, i64),
     /// `{}`, the empty record. Unboxed, so that the many statements whose
     /// value it is produce it without allocating.
     Empty,
@@ -683,6 +775,7 @@ impl Value {
     pub const fn kind(&self) -> ValueKind {
         match self {
             Value::Int(_) => ValueKind::Int,
+            &Value::Quantity(quantity, _) => ValueKind::Quantity(quantity),
             Value::Float(_) => ValueKind::Float,
             Value::Bool(_) => ValueKind::Bool,
             Value::Str(_) => ValueKind::String,
@@ -709,6 +802,26 @@ impl Value {
     pub(crate) fn into_int(self) -> Option<i64> {
         match self {
             Value::Int(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The amount of the duration the value is, if it is one, as
+    /// [`Value::into_int`] takes an `Int`.
+    #[must_use]
+    pub(crate) fn into_duration(self) -> Option<i64> {
+        match self {
+            Value::Quantity(Quantity::Duration, amount) => Some(amount),
+            _ => None,
+        }
+    }
+
+    /// The amount of the size the value is, if it is one, as
+    /// [`Value::into_int`] takes an `Int`.
+    #[must_use]
+    pub(crate) fn into_size(self) -> Option<i64> {
+        match self {
+            Value::Quantity(Quantity::Size, amount) => Some(amount),
             _ => None,
         }
     }
@@ -752,6 +865,9 @@ impl Value {
 /// show as `inf`, `-inf` and `nan`. A `Bool` shows as `true` or `false`, and
 /// a `String` as its text with no quotes or escaping.
 ///
+/// A duration or a size shows as its canonical literal ([`write_quantity`]):
+/// `1m30s`, `2GiB`.
+///
 /// A record shows as GCSL syntax, the same as its [`Value::repr`]: its
 /// fields in definition order, separated by `;` as items are, each value in
 /// `repr` form, so strings are quoted, as in
@@ -770,6 +886,7 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(value) => write!(f, "{value}"),
+            &Value::Quantity(quantity, amount) => write_quantity(f, quantity, amount),
             Value::Bool(value) => write!(f, "{value}"),
             Value::Str(text) => f.write_str(text),
             Value::Empty => f.write_str("{}"),
@@ -837,3 +954,44 @@ pub(crate) const fn int_to_float(value: i64) -> f64 {
     reason = "these tests check exact IEEE 754 results, not approximations"
 )]
 mod tests;
+
+/// Writes the canonical literal of the `quantity` of `amount` of its
+/// smallest unit, a literal of the same value: a duration's components that
+/// are not zero, from days down to nanoseconds, as in `1m30s` and
+/// `1s500ms`, or `0s`; a size in the largest unit, decimal or binary, that
+/// divides it exactly, as in `2GiB`, `1500B` and `1MB`, or `0B`. A negative
+/// one is `-` and the literal of its magnitude.
+pub(crate) fn write_quantity(
+    f: &mut fmt::Formatter<'_>,
+    quantity: Quantity,
+    amount: i64,
+) -> fmt::Result {
+    if amount < 0 {
+        f.write_str("-")?;
+    }
+    let magnitude = u128::from(amount.unsigned_abs());
+    match quantity {
+        Quantity::Duration if magnitude == 0 => f.write_str("0s"),
+        Quantity::Duration => {
+            let mut rest = magnitude;
+            for unit in &DURATION_UNITS {
+                let count = rest / unit.factor;
+                rest %= unit.factor;
+                if count > 0 {
+                    write!(f, "{count}{}", unit.name)?;
+                }
+            }
+            Ok(())
+        }
+        // Every unit divides zero: it is in bytes.
+        Quantity::Size if magnitude == 0 => f.write_str("0B"),
+        Quantity::Size => {
+            let unit = SIZE_UNITS
+                .iter()
+                .filter(|unit| magnitude.is_multiple_of(unit.factor))
+                .max_by_key(|unit| unit.factor)
+                .unwrap_or(&SIZE_UNITS[0]);
+            write!(f, "{}{}", magnitude / unit.factor, unit.name)
+        }
+    }
+}

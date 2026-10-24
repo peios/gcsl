@@ -17,6 +17,12 @@ Float values use IEEE 754 binary64.
 Integer literals adapt to an expected numeric type; a bound Int does not implicitly convert to Float.
 Conditions require Bool.
 .PP
+A duration literal is a number glued to units from largest to smallest, each at most once: d (24 hours), h, m, s, ms, us and ns, as in 1h30m.
+A size literal is a number glued to one unit: B, the decimal KB, MB, GB, TB and PB, or the binary KiB, MiB, GiB, TiB and PiB, as in 2GiB.
+Only the last part may have a fraction, and the value must be a whole number of nanoseconds or bytes.
+Durations and sizes are signed 64-bit amounts of nanoseconds and bytes; overflow is an error.
+A number glued to letters that are no unit, as in 30sec, is an unknown unit where an expression is expected.
+.PP
 Strings use one double quote or a matching run of at least three double quotes at each end.
 A leading r makes a string raw, without escapes or interpolation.
 Ordinary strings interpolate expressions in braces; doubled braces represent literal braces.
@@ -60,7 +66,7 @@ Private let, let mut, and fn names do not become directory declarations.
 Top-level named functions and public fields support forward references subject to dependency checks.
 Inner record blocks retain ordered construction.
 .SH TYPES
-The built-in value types include Int, Float, Bool, String, records, lists, functions, futures, and unions.
+The built-in value types include Int, Float, Bool, String, Duration, Size, records, lists, functions, futures, and unions.
 The empty record type is {}.
 List<T> and T[] are equivalent.
 Type aliases are structural and do not create nominal runtime identities.
@@ -106,6 +112,7 @@ Arithmetic uses +, -, *, /, //, and %.
 The / operator returns Float, including for integer operands.
 The // and % operators use integer floor division and modulo.
 String + concatenates strings.
+A Duration or Size adds to and subtracts from one of its type, multiplies by an Int, floor-divides by an Int or by one of its type (giving an Int), and takes the remainder by one of its type; / is an error for them, and they mix with no other type.
 Boolean operations are and, or, and not, with short-circuit evaluation for and and or.
 Comparisons are not associative.
 .PP

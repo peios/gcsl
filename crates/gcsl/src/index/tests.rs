@@ -441,6 +441,18 @@ fn a_long_record_type_is_cut_short() {
 }
 
 #[test]
+fn a_quantity_is_shown_by_its_type() {
+    let text = "t = 30s\nm = 2GiB\nr = t\ns = m\n";
+    let Indexed { index, .. } = indexed(&[("app.gcsl", text)]);
+    let mut index = index.unwrap();
+    let file = index.file("app.gcsl").unwrap();
+    for (at, ty) in [("r = |t", "Duration"), ("s = |m", "Size")] {
+        let hover = index.hover(file, offset(text, at)).unwrap();
+        assert!(hover.text.contains(ty), "{at}: {}", hover.text);
+    }
+}
+
+#[test]
 fn a_wide_record_type_shows_its_rest_field_after_its_named_fields() {
     // Too wide for one line, a field per line, the rest-field last; the
     // named fields are never lost to it.
