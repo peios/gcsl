@@ -109,6 +109,13 @@ can't read a context with no default that its function doesn't need. A
 context that only your host binds for some runs, such as pekit's script
 session, then doesn't change the key of a step that never reads it.
 
+`Workspace::step_definition` tells you which definition's call made a
+step: the innermost `DT PATH()` around where it was made. Name a step's
+outputs by it rather than by the target you were asked to build, so that
+`build lib()` gives the same steps whether you build `lib` itself or a
+target that calls it. A step made by a prepared call's own code has
+none: the call names its definition directly, so you already know it.
+
 `Plain::files` lists the files and directories in a value, which is what
 a sandbox needs to contain. Results go back with `Workspace::from_plain`,
 and `Workspace::to_plain` refuses a result that holds a function or a

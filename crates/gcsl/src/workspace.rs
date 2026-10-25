@@ -447,7 +447,9 @@ pub struct StepInputs {
     /// Each context bound where it was made that it can read, by its
     /// declaration's key's text, sorted, with its value: of a call, each
     /// with a default, and each with none that its callee's type needs
-    /// ([`FnCode::needs`](crate::ir::FnCode::needs)); of an effect, each.
+    /// ([`FnCode::needs`](crate::ir::FnCode::needs)); of an effect, each;
+    /// and never the definition it is of
+    /// ([`Workspace::step_definition`]).
     pub context: Vec<(String, Plain)>,
     /// Its callee's attributes, in source order; none for an effect.
     pub attributes: Vec<Attribute>,
@@ -761,7 +763,14 @@ impl Workspace {
         // one that nothing it calls reads, since needs are inferred through
         // every call: a context only `pekit run` binds, say, keys none of
         // the steps a script builds.
+        // The definition the step is of, which a host names it by, keys it
+        // no further: keyed by its closure, every step a definition reached
+        // would change with its file.
+        let definition = self.scan.names.lookup(crate::lower::DEFINITION_CONTEXT);
         let readable = |key: Name| {
+            if Some(key) == definition {
+                return false;
+            }
             let Some(code) = node
                 .closure()
                 .and_then(|closure| closure.code.find_function(closure.function))
@@ -806,6 +815,27 @@ impl Workspace {
             attributes,
             code_files,
         })
+    }
+
+    /// The definition whose call made the node `id` of `graph`, a step or an
+    /// effect: the innermost call of a def-type reference, `DT PATH()`,
+    /// around where it was made, whose definition every node it makes knows
+    /// through a context of its own
+    /// ([`DEFINITION_CONTEXT`](crate::lower::DEFINITION_CONTEXT)), named as
+    /// [`Workspace::definition_of`] names a reference's. `None` for a node
+    /// made outside any such call, by a prepared call's own code, which
+    /// calls its definition directly, say: a host names it by what it
+    /// prepared. So a host can place a step by the definition it is of, the
+    /// same whichever target's build reaches it.
+    #[must_use]
+    pub fn step_definition(&self, graph: &Graph, id: NodeId) -> Option<Referenced> {
+        let key = self.scan.names.lookup(crate::lower::DEFINITION_CONTEXT)?;
+        let node = graph.node(id)?;
+        let (_, Value::Fn(definition)) = node.context().into_iter().find(|(at, _)| *at == key)?
+        else {
+            return None;
+        };
+        self.definition_holding(&definition)
     }
 
     /// Runs file `index` and every file it needs, as [`Workspace::run`]

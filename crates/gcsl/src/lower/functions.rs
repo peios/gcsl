@@ -10,7 +10,7 @@ use crate::source::Span;
 use crate::types::FnTy;
 use crate::value::ValueKind;
 
-use super::{Lowerer, REFERENCE_DEFINITION, read};
+use super::{DEFINITION_CONTEXT, Lowerer, REFERENCE_DEFINITION, read};
 use crate::check::{retry_of, timeout_of};
 
 impl Lowerer<'_> {
@@ -232,6 +232,35 @@ impl Lowerer<'_> {
         Ok(args)
     }
 
+    /// `call`, a def-type reference's call of its def-type, of kind `kind`,
+    /// at `span`, in a `with` that binds the reference's definition, its
+    /// capture, to the context of [`DEFINITION_CONTEXT`], so that every
+    /// node the call makes knows the definition it is of.
+    fn with_definition(
+        &mut self,
+        call: IrId,
+        kind: ValueKind,
+        span: Span,
+    ) -> Result<IrId, InternalError> {
+        let key = self
+            .ast
+            .names()
+            .lookup(DEFINITION_CONTEXT)
+            .ok_or(InternalError {
+                message: "a def-type reference whose context the parser did not name",
+                span,
+            })?;
+        let held = self.builder.alloc(
+            IrKind::LoadCapture(REFERENCE_DEFINITION, ValueKind::Fn),
+            span,
+        );
+        let bind = self
+            .builder
+            .alloc(IrKind::ContextBind { key, value: held }, span);
+        let parts = self.builder.push_item_list(&[bind, call]);
+        Ok(self.builder.alloc(IrKind::With { parts, kind }, span))
+    }
+
     pub(super) fn lower_def_type_ref(
         &mut self,
         id: ExprId,
@@ -286,6 +315,7 @@ impl Lowerer<'_> {
             },
             span,
         );
+        let call = self.with_definition(call, kind, span)?;
         let helper = self.builder.alloc(IrKind::Helper, span);
         let items = self.builder.push_item_list(&[helper]);
         let body = self.builder.alloc(

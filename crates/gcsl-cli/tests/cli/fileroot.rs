@@ -356,7 +356,7 @@ fn dumps_show_references_past_definitions() {
     let output = gcsl(&["run", file, "--dump-ir"]);
     assert!(
         stdout(&output)
-            .contains("fn #0 meta capture 1 (frame 1, params 1, captures 2, height 4)\n"),
+            .contains("fn #0 meta capture 1 (frame 1, params 1, captures 2, height 5)\n"),
         "{}",
         stdout(&output)
     );

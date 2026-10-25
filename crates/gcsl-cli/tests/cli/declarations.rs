@@ -394,7 +394,7 @@ fn dumps_show_def_types() {
         heads,
         [
             "fn #0 testpkg package dev.peios.testpkg (frame 3, params 0, captures 0, height 3)",
-            "fn #1 (frame 0, params 0, captures 2, height 4)",
+            "fn #1 (frame 0, params 0, captures 2, height 5)",
         ]
     );
     assert!(

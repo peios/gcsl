@@ -850,6 +850,9 @@ impl Parser<'_> {
         let read = self.path_expr(&read_path)?;
         let span = Span::join(self.span_of(dt), path_span(&segments));
         let height = self.height_of(dt).max(self.height_of(read)) + 1;
+        // The key of the context its call binds to the definition, which
+        // lowering finds by its text.
+        self.names.intern(crate::lower::DEFINITION_CONTEXT);
         let def = self.builder.push_def_type(DefTypeUse {
             role: DefTypeRole::Reference,
             dt,

@@ -448,6 +448,14 @@ use crate::source::Span;
 /// The capture of the closure of a def-type reference that holds the
 /// definition, after the def-type's (`Lowerer::lower_def_type_ref`).
 pub(crate) const REFERENCE_DEFINITION: u32 = 1;
+
+/// The text of the key of the context a def-type reference's call binds,
+/// around its def-type's call, to the definition it calls: so that every
+/// step and effect made in that call, whenever it is made, knows the
+/// definition it is of ([`crate::workspace::Workspace::step_definition`]).
+/// No context can be declared of it, since it is no name, and the parser
+/// interns it with each reference it makes, so that lowering finds it.
+pub const DEFINITION_CONTEXT: &str = "<definition>";
 use crate::types::{TyId, TypeTable};
 use crate::value::{Layout, ValueKind, int_to_float};
 

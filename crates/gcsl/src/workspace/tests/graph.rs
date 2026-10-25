@@ -977,3 +977,50 @@ fn a_step_s_context_of_functions_is_keyed_by_their_code() {
     // Its argument is still data alone.
     assert_eq!(inputs.args, [Plain::Str("a".to_owned())]);
 }
+
+#[test]
+fn a_step_knows_the_definition_whose_call_made_it() {
+    let files = [
+        (
+            "workspace.gcsl",
+            "#[attribute] #[defers] type step = {}\n\
+             #[step] def compile(src: String) -> String { \"{src}.o\" }",
+        ),
+        (
+            "app/build.gcsl",
+            "def build lib() { = compile(\"lib\") }\n\
+             def build app() {\n\
+             \x20   let l = build lib()\n\
+             \x20   = [l, compile(\"main\")]\n\
+             }",
+        ),
+    ];
+    let mut workspace = crate::workspace::tests::fileroot::rooted(&files).unwrap();
+    let call = workspace.prepare_call(("build", "app"), &[], &[]).unwrap();
+    let mut graph = Graph::new();
+    workspace.run_prepared(&call, &mut graph, every()).unwrap();
+    let of = |src: &str| {
+        let (id, _) = graph
+            .nodes()
+            .find(|(_, node)| node.args() == [text(src)])
+            .unwrap();
+        workspace
+            .step_definition(&graph, id)
+            .map(|definition| definition.qualified())
+    };
+    // `lib`'s, made in the call of `build lib`, wherever it is called from;
+    // `app`'s own, by the call prepared, which calls its definition directly.
+    assert_eq!(of("lib"), Some("app/lib".to_owned()));
+    assert_eq!(of("main"), None);
+    // Nor does the definition key the step.
+    let (id, _) = graph
+        .nodes()
+        .find(|(_, node)| node.args() == [text("lib")])
+        .unwrap();
+    let inputs = workspace.step_inputs(&graph, id).unwrap();
+    assert!(
+        inputs.context.iter().all(|(key, _)| key != "<definition>"),
+        "{:?}",
+        inputs.context
+    );
+}

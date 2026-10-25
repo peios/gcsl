@@ -16,7 +16,7 @@ use crate::names::{self, Name, Names};
 use crate::source::Span;
 use crate::strings::Strings;
 use crate::types::{Laziness, TyId};
-use crate::value::{ContextFrame, Quantity, Value};
+use crate::value::{Closure, ContextFrame, Quantity, Value};
 
 use super::{
     Argument, ContextDefault, DefType, Definition, FoundDefType, Given, INVOKED_DEFINITION,
@@ -360,6 +360,13 @@ impl Workspace {
         else {
             return None;
         };
+        self.definition_holding(definition)
+    }
+
+    /// Which definition of the workspace's def-types `definition` is the
+    /// function of: the one whose cell holds it (see
+    /// [`Workspace::definition_of`]).
+    pub(super) fn definition_holding(&self, definition: &Rc<Closure>) -> Option<Referenced> {
         let holds = |file: u32, item: ItemId| {
             let cell = self.leaf_cell(file, item);
             let held = cell.and_then(|(slot, _)| self.frame.get(slot.index()));
