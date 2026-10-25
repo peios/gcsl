@@ -841,11 +841,13 @@ impl Workspace {
     /// around where it was made, whose definition every node it makes knows
     /// through a context of its own
     /// ([`DEFINITION_CONTEXT`](crate::lower::DEFINITION_CONTEXT)), named as
-    /// [`Workspace::definition_of`] names a reference's. `None` for a node
-    /// made outside any such call, by a prepared call's own code, which
-    /// calls its definition directly, say: a host names it by what it
-    /// prepared. So a host can place a step by the definition it is of, the
-    /// same whichever target's build reaches it.
+    /// [`Workspace::definition_of`] names a reference's. A prepared call
+    /// binds its own definition so too ([`Workspace::run_prepared`]), so a
+    /// node its own code makes is its definition's, and two prepared calls
+    /// that make the same call make a node each. `None` for a node made
+    /// outside every prepared call and reference, by a file's own run, say.
+    /// So a host can place a step by the definition it is of, the same
+    /// whichever target's build reaches it and whatever else it builds.
     #[must_use]
     pub fn step_definition(&self, graph: &Graph, id: NodeId) -> Option<Referenced> {
         let key = self.scan.names.lookup(crate::lower::DEFINITION_CONTEXT)?;

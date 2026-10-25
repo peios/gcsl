@@ -450,9 +450,10 @@ use crate::source::Span;
 pub(crate) const REFERENCE_DEFINITION: u32 = 1;
 
 /// The text of the key of the context a def-type reference's call binds,
-/// around its def-type's call, to the definition it calls: so that every
-/// step and effect made in that call, whenever it is made, knows the
-/// definition it is of ([`crate::workspace::Workspace::step_definition`]).
+/// around its def-type's call, to the definition it calls, as a prepared
+/// call binds its own around all of it: so that every step and effect made
+/// in that call, whenever it is made, knows the definition it is of
+/// ([`crate::workspace::Workspace::step_definition`]).
 /// No context can be declared of it, since it is no name, and the parser
 /// interns it with each reference it makes, so that lowering finds it.
 pub const DEFINITION_CONTEXT: &str = "<definition>";

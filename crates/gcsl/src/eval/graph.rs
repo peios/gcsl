@@ -181,10 +181,17 @@ impl Node {
         self.unit
     }
 
-    /// Where the call that made it is, in its unit's input.
+    /// Where the call that made it is, in the input [`Node::input`] says.
     #[must_use]
     pub const fn span(&self) -> Span {
         self.site.span
+    }
+
+    /// The input number of the file whose code made it, which its span is
+    /// in: a library's, say, for a call a library's function makes.
+    #[must_use]
+    pub fn input(&self) -> u32 {
+        self.code.input()
     }
 
     /// Where it is in its life.

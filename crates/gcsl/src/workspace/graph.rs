@@ -75,6 +75,14 @@ pub struct PreparedCall {
     files: Vec<u32>,
     /// Its number as a unit, after every file's.
     unit: u32,
+    /// The slot of its definition's cell, whose closure it binds to the
+    /// context of [`DEFINITION_CONTEXT`](crate::lower::DEFINITION_CONTEXT)
+    /// around its call, as a reference's call does.
+    definition: crate::check::Slot,
+    /// The root context it runs in, `root` with its definition bound, made
+    /// once its definition's file has run, the first time it runs, and kept,
+    /// so that a frame is one frame however often it runs.
+    running: std::cell::OnceCell<Option<Rc<ContextFrame>>>,
 }
 
 impl PreparedCall {
@@ -300,6 +308,8 @@ impl Workspace {
             root,
             files,
             unit,
+            definition: resolved.definition_cell.0,
+            running: std::cell::OnceCell::new(),
         })
     }
 
@@ -329,6 +339,25 @@ impl Workspace {
                 return Ok(Progress::Paused(node));
             }
         }
+        // Its root context, its definition bound as a reference's call binds
+        // it, so that every node it makes knows the definition it is of,
+        // whichever other targets make the same calls.
+        let root = call
+            .running
+            .get_or_init(|| {
+                let key = self.scan.names.lookup(crate::lower::DEFINITION_CONTEXT);
+                match (key, self.frame.get(call.definition.index())) {
+                    (Some(key), Some(definition @ crate::Value::Fn(_))) => {
+                        Some(Rc::new(ContextFrame {
+                            id: self.memo.new_context_frame(),
+                            binds: Box::new([(key, definition.clone())]),
+                            outer: call.root.clone(),
+                        }))
+                    }
+                    _ => call.root.clone(),
+                }
+            })
+            .clone();
         let context = (
             &mut self.memo,
             Some(&self.exec_result),
@@ -336,12 +365,7 @@ impl Workspace {
             host.effects,
         );
         let run = GraphRun::new(mem::take(graph), call.unit, host.defers);
-        let outcome = session::run_input_in(
-            &call.ir,
-            &mut self.frame,
-            context,
-            (call.root.clone(), Some(&run)),
-        );
+        let outcome = session::run_input_in(&call.ir, &mut self.frame, context, (root, Some(&run)));
         let (left, paused) = run.finish();
         *graph = left;
         match outcome {

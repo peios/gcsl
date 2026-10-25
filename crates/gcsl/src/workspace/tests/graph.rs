@@ -992,26 +992,33 @@ fn a_step_knows_the_definition_whose_call_made_it() {
              def build app() {\n\
              \x20   let l = build lib()\n\
              \x20   = [l, compile(\"main\")]\n\
-             }",
+             }\n\
+             def build other() { = compile(\"main\") }",
         ),
     ];
     let mut workspace = crate::workspace::tests::fileroot::rooted(&files).unwrap();
     let call = workspace.prepare_call(("build", "app"), &[], &[]).unwrap();
+    let other = workspace
+        .prepare_call(("build", "other"), &[], &[])
+        .unwrap();
     let mut graph = Graph::new();
     workspace.run_prepared(&call, &mut graph, every()).unwrap();
+    workspace.run_prepared(&other, &mut graph, every()).unwrap();
     let of = |src: &str| {
-        let (id, _) = graph
+        let mut found: Vec<String> = graph
             .nodes()
-            .find(|(_, node)| node.args() == [text(src)])
-            .unwrap();
-        workspace
-            .step_definition(&graph, id)
+            .filter(|(_, node)| node.args() == [text(src)])
+            .filter_map(|(id, _)| workspace.step_definition(&graph, id))
             .map(|definition| definition.qualified())
+            .collect();
+        found.sort();
+        found
     };
     // `lib`'s, made in the call of `build lib`, wherever it is called from;
-    // `app`'s own, by the call prepared, which calls its definition directly.
-    assert_eq!(of("lib"), Some("app/lib".to_owned()));
-    assert_eq!(of("main"), None);
+    // and the prepared calls' own, each its own, though they make the same
+    // call: a step is its definition's, whatever else is built with it.
+    assert_eq!(of("lib"), ["app/lib"]);
+    assert_eq!(of("main"), ["app/app", "app/other"]);
     // Nor does the definition key the step.
     let (id, _) = graph
         .nodes()

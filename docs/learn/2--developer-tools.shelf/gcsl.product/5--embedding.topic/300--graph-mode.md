@@ -113,8 +113,9 @@ session, then doesn't change the key of a step that never reads it.
 step: the innermost `DT PATH()` around where it was made. Name a step's
 outputs by it rather than by the target you were asked to build, so that
 `build lib()` gives the same steps whether you build `lib` itself or a
-target that calls it. A step made by a prepared call's own code has
-none: the call names its definition directly, so you already know it.
+target that calls it. A step made by a prepared call's own code is its
+definition's too, so two targets that make the same call make a step
+each, and a step's name never depends on what else you build with it.
 
 `Plain::files` lists the files and directories in a value, which is what
 a sandbox needs to contain. Results go back with `Workspace::from_plain`,
