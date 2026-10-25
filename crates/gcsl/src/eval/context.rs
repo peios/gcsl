@@ -57,6 +57,7 @@ impl Evaluator<'_> {
     ) -> Flow<Value> {
         let context = self.shared.context.borrow().clone();
         self.memo.depend_context(key, context.as_ref());
+        self.note_step_read(key, context.as_ref());
         if let Some((_, value)) = ContextFrame::find(context.as_ref(), key) {
             return Ok(value.clone());
         }
@@ -103,6 +104,28 @@ impl Evaluator<'_> {
         match result.or_else(|unwind| unwind.returned(node.span)) {
             Err(error) => Err(self.call_error(error, &closure, node).into()),
             Ok(value) => Ok(value),
+        }
+    }
+
+    /// Notes a read of the context of the key `key` in the context `context`
+    /// for the step whose unit the run is of, if it is one's, telling the
+    /// host of the first of the run (see [Graph mode](crate::eval::graph#graph-mode),
+    /// "Reads").
+    pub(super) fn note_step_read(&self, key: Name, context: Option<&Rc<ContextFrame>>) {
+        if let Some(run) = self.shared.graph
+            && let Some(text) = run.note_read(key, context)
+        {
+            self.shared.effects.context_read(text);
+        }
+    }
+
+    /// Notes that the step whose unit the run is of read every context its
+    /// context binds, telling the host of each it had not read.
+    pub(super) fn note_step_reads_all(&self) {
+        if let Some(run) = self.shared.graph {
+            for text in run.note_all() {
+                self.shared.effects.context_read(text);
+            }
         }
     }
 

@@ -237,6 +237,17 @@ impl Running {
     }
 }
 
+/// A read a memoised call found in its table replays where it is called, as
+/// a read there would be ([`MemoTables::lookup`]), for the step whose unit
+/// is running to note (see [Graph mode](crate::eval::graph#graph-mode), "Reads").
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Replayed {
+    /// A read of the context of this declaration key.
+    Context(Name),
+    /// A read of every context bound.
+    All,
+}
+
 /// An ambient input of a memoised call (see [Memoised
 /// functions](#memoised-functions), "Ambient inputs"): a kind of input the
 /// call does not take as an argument but may read, with the value it read.
@@ -513,14 +524,21 @@ impl MemoTables {
                 return Lookup::Running;
             }
         };
+        let mut replayed = Vec::new();
         for dep in passed {
             match dep {
                 Ambient::Caller(_) => self.depend(caller.origin, &dep),
-                Ambient::Context(key, _) => self.depend_context(key, context),
-                Ambient::Contexts(_) => self.depend_contexts(),
+                Ambient::Context(key, _) => {
+                    self.depend_context(key, context);
+                    replayed.push(Replayed::Context(key));
+                }
+                Ambient::Contexts(_) => {
+                    self.depend_contexts();
+                    replayed.push(Replayed::All);
+                }
             }
         }
-        Lookup::Done(value)
+        Lookup::Done(value, replayed)
     }
 
     /// Records `key`, whose hash is `hash`, as running in `closure`'s
@@ -718,8 +736,9 @@ pub(super) enum EntryState {
 
 /// What looking a call's arguments up in a memo table finds.
 pub(super) enum Lookup {
-    /// The closure returned this value for equal arguments.
-    Done(Value),
+    /// The closure returned this value for equal arguments, the reads it
+    /// replays here with it.
+    Done(Value, Vec<Replayed>),
     /// The closure is running with equal arguments.
     Running,
     /// No entry: the arguments' hash, for recording them.

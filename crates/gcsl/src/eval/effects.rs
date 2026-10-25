@@ -77,6 +77,15 @@ pub trait Effects: std::fmt::Debug {
         None
     }
 
+    /// That a step's run read the context whose declaration's key's text is
+    /// `key`, from the step's own context, the first time it did in the run
+    /// (see [Graph mode](crate::eval::graph#graph-mode), "Reads"): what a
+    /// host that gives a step a context's files only once it reads them
+    /// stages them by, before the step goes on. By default, nothing.
+    fn context_read(&self, key: &str) {
+        let _ = key;
+    }
+
     /// The path of the host's file system that `path`, an absolute path as
     /// GCSL code names it, is: what GCSL reads, writes, copies or lists
     /// there.

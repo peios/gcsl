@@ -19,7 +19,8 @@ use std::rc::Rc;
 
 use crate::diagnostic::{Diagnostic, Mark};
 use crate::eval::graph::{
-    EffectJob, Graph, GraphHost, GraphRun, NodeId, NodeKind, STEP_UNITS, StepCall, run_step_call,
+    EffectJob, Graph, GraphHost, GraphRun, NodeId, NodeKind, STEP_UNITS, StepCall, StepReads,
+    run_step_call,
 };
 use crate::ir::Ir;
 use crate::source::Span;
@@ -111,7 +112,11 @@ impl Workspace {
     /// runs ([`Workspace::effect_job`]), deferred calls in it as `host`
     /// says, and its own `#[retry]` and `#[timeout]` not applied, which are
     /// the host's. [`Progress::Paused`] if it needs a result the host has yet
-    /// to give, to run again from its start once it is given.
+    /// to give, to run again from its start once it is given. With it, what
+    /// the run read of the context the step was made in ([`StepReads`]): a
+    /// run that ends has made every read the step makes, since it ran from
+    /// the start, so a host keys the step by those; each first read is told
+    /// to `host`'s effects as it is made ([`Effects::context_read`](crate::eval::Effects::context_read)).
     ///
     /// # Errors
     ///
@@ -123,7 +128,7 @@ impl Workspace {
         graph: &mut Graph,
         id: NodeId,
         host: GraphHost<'_>,
-    ) -> Result<Progress, Diagnostic> {
+    ) -> Result<(Progress, StepReads), Diagnostic> {
         let call = graph.node(id).and_then(StepCall::of);
         let Some(call) = call else {
             return Err(internal("a step that is no deferred call's"));
@@ -132,19 +137,21 @@ impl Workspace {
             mem::take(graph),
             STEP_UNITS.saturating_add(id.number()),
             host.defers,
-        );
+        )
+        .watching(call.context(), &self.scan.names);
         let extras = (
             Some(&self.exec_result),
             &self.scan.dir_texts[..],
             host.effects,
         );
         let outcome = run_step_call(&call, (&mut self.frame, &mut self.memo), extras, &run);
+        let reads = run.reads();
         let (left, paused) = run.finish();
         *graph = left;
         match outcome {
-            Ok(value) => Ok(Progress::Done(value)),
+            Ok(value) => Ok((Progress::Done(value), reads)),
             Err(error) if error.mark == Mark::PENDING => match paused {
-                Some(node) => Ok(Progress::Paused(node)),
+                Some(node) => Ok((Progress::Paused(node), reads)),
                 None => Err(internal("a step stopped for no step")),
             },
             Err(error) => Err(error),

@@ -10,7 +10,7 @@ use crate::value::{Caller, Closure, Value};
 
 use super::calls::raised_in_tracked;
 use super::{Evaluator, Flow, depends_on_own_result, mistyped, nested_too_deeply};
-use super::memo::{Lookup, Mark, MemoBegin, NO_ORIGIN, Running, key_eq};
+use super::memo::{Lookup, Mark, MemoBegin, NO_ORIGIN, Replayed, Running, key_eq};
 
 impl Evaluator<'_> {
     /// Evaluates the `Call` `node` of `closure`, whose code `code` is
@@ -124,8 +124,16 @@ impl Evaluator<'_> {
             .lookup(closure, key, (caller, inherited), context.as_ref())
         {
             Lookup::Missing(hash) => hash,
-            Lookup::Done(value) => {
+            Lookup::Done(value, replayed) => {
                 self.stack.truncate(base);
+                // As reads here, of the step whose unit is running.
+                let context = self.shared.context.borrow().clone();
+                for read in replayed {
+                    match read {
+                        Replayed::Context(key) => self.note_step_read(key, context.as_ref()),
+                        Replayed::All => self.note_step_reads_all(),
+                    }
+                }
                 return Ok(MemoBegin::Found(value));
             }
             Lookup::Running => {

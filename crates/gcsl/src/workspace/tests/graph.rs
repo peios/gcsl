@@ -600,7 +600,7 @@ fn a_step_runs_as_a_unit_whose_effects_are_jobs_on_any_thread() {
     };
     let mut jobs = 0;
     let result = loop {
-        match workspace.run_step(&mut graph, step, inline).unwrap() {
+        match workspace.run_step(&mut graph, step, inline).unwrap().0 {
             Progress::Paused(effect) => {
                 let node = graph.node(effect).unwrap();
                 assert_eq!(node.unit(), crate::eval::graph::STEP_UNITS + step.number());
@@ -693,7 +693,7 @@ fn a_step_s_unit_forgotten_runs_afresh_with_new_effects() {
         defers: &|_: &[crate::check::Attribute]| false,
         effects: &crate::eval::Direct { temp_dirs: None },
     };
-    let Progress::Paused(first) = workspace.run_step(&mut graph, step, inline).unwrap() else {
+    let Progress::Paused(first) = workspace.run_step(&mut graph, step, inline).unwrap().0 else {
         panic!("not paused");
     };
     let failure = Diagnostic::error("echo crashed", Span::new(0, 0));
@@ -701,7 +701,7 @@ fn a_step_s_unit_forgotten_runs_afresh_with_new_effects() {
     assert!(workspace.run_step(&mut graph, step, inline).is_err());
     // Retried afresh: a new effect, not the failed one.
     graph.forget_unit(crate::eval::graph::STEP_UNITS + step.number());
-    let Progress::Paused(second) = workspace.run_step(&mut graph, step, inline).unwrap() else {
+    let Progress::Paused(second) = workspace.run_step(&mut graph, step, inline).unwrap().0 else {
         panic!("not paused");
     };
     assert_ne!(first, second);
@@ -1073,4 +1073,79 @@ fn a_step_knows_a_definition_made_with_a_variant() {
     assert_eq!(definition.def_type, "Tool::C");
     assert_eq!(definition.path, "gcc");
     assert_eq!(definition.dir, "");
+}
+
+/// Effects as plain GCSL's, recording each context a step's run tells it
+/// it read.
+#[derive(Debug, Default)]
+struct Told {
+    read: std::cell::RefCell<Vec<String>>,
+}
+
+impl crate::eval::Effects for Told {
+    fn context_read(&self, key: &str) {
+        self.read.borrow_mut().push(key.to_owned());
+    }
+
+    fn temp_dir(&self) -> Option<Result<String, String>> {
+        None
+    }
+}
+
+/// The context's name in its key's text, `<context NAME@...>`.
+fn context_name(key: &str) -> String {
+    let name = key.trim_start_matches("<context ");
+    name.split('@').next().unwrap_or(name).to_owned()
+}
+
+#[test]
+fn a_step_s_run_tells_what_it_read_of_its_context() {
+    let (mut workspace, file) = lone_workspace(
+        "context level: Int = 1\n\
+         context arch: String = \"x86\"\n\
+         context quiet: Int = 0\n\
+         fn label(n: Int) ->> String { \"{n}-{^arch}\" }\n\
+         #[step] fn reads(n: Int) -> String {\n\
+         \x20   let shadowed = ^quiet with { quiet = 2 }\n\
+         \x20   = \"{n} {^level} {label(1)} {shadowed}\"\n\
+         }\n\
+         #[step] fn none(n: Int) -> Int { n }\n\
+         = [label(1), reads(1), none(2), reads(2)] with { level = 3 }",
+    );
+    let mut graph = Graph::new();
+    workspace.run_graph(file, &mut graph, every()).unwrap();
+    let told = Told::default();
+    let host = GraphHost {
+        defers: &|_: &[crate::check::Attribute]| false,
+        effects: &told,
+    };
+    let reads_of = |workspace: &mut Workspace, graph: &mut Graph, node: u32| {
+        told.read.borrow_mut().clear();
+        let (progress, reads) = workspace.run_step(graph, NodeId::of(node), host).unwrap();
+        assert!(matches!(progress, Progress::Done(_)), "{progress:?}");
+        let shown: Vec<(String, bool)> = reads
+            .keys
+            .iter()
+            .map(|(key, bound)| (context_name(key), *bound))
+            .collect();
+        let named: Vec<String> = told
+            .read
+            .borrow()
+            .iter()
+            .map(|key| context_name(key))
+            .collect();
+        (shown, named)
+    };
+    // `level`, bound; `arch`, its default, read by `label(1)`, which the
+    // file's own run computed, so found in its memo table, the hit
+    // replaying its read; not `quiet`, which the step binds itself. Each
+    // told the host as it was first read.
+    let (reads, told_of) = reads_of(&mut workspace, &mut graph, 0);
+    assert_eq!(
+        reads,
+        [("level".to_owned(), true), ("arch".to_owned(), false)]
+    );
+    assert_eq!(told_of, ["level", "arch"]);
+    // A step that reads nothing.
+    assert_eq!(reads_of(&mut workspace, &mut graph, 1).0, []);
 }

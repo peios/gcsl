@@ -55,6 +55,20 @@
 //! node met just before it in its unit, in program order. A host that
 //! isolates a node may drop its order edge; one that does not runs it in
 //! program order.
+//!
+//! **Reads.** A run of a step's unit records what it reads of the context
+//! the step was made in ([`StepReads`], `GraphRun::watching`): each context
+//! read whose nearest binding is a frame of the step's own context, or, for
+//! a read of a default, none in either, with whether that context binds it,
+//! once each, in the order first read. A read a `with` inside the step binds
+//! is no input of the step. A memoised call found in its table replays the
+//! reads it recorded where it is called (`Replayed`), so a cache hit hides
+//! no read; one that recorded every context, having made a future, reads
+//! every context the step's binds. The first such read of a run is told to
+//! the host's effects at once ([`crate::eval::Effects::context_read`]),
+//! before the step does anything with it, so that a host can give the step
+//! the context's files then. A run that ends ran from the start, so its
+//! reads are the step's.
 
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
@@ -432,6 +446,38 @@ pub(crate) struct GraphRun<'g> {
     last: Cell<Option<NodeId>>,
     /// The scopes being run, innermost last.
     scopes: RefCell<Vec<Scope>>,
+    /// Of a step's unit's run, what it reads of the step's own context
+    /// ([`StepReads`]); `None` for any other unit's.
+    watch: RefCell<Option<Watch>>,
+    /// The names of the run's workspace, by which a read is told to the
+    /// host.
+    names: Option<&'g crate::names::Names>,
+}
+
+/// What a run of a step's unit read of the context the step was made in
+/// (see [Graph mode](#graph-mode), "Reads"): each context read whose
+/// binding is the step's own, a frame of the step's context, or none, for a
+/// default read where it binds none, by its declaration's key's text, with
+/// whether the step's context binds it, in the order first read; and
+/// whether it read every context its context binds, as a memoised call
+/// found in its table that made a future may have.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StepReads {
+    /// Each context read, by its key's text, and whether it was bound.
+    pub keys: Vec<(String, bool)>,
+    /// Whether every context the step's context binds was read too.
+    pub all: bool,
+}
+
+/// The context of a step whose run's reads are watched, and what it read.
+#[derive(Debug)]
+struct Watch {
+    /// The step's context.
+    context: Option<Rc<ContextFrame>>,
+    /// Each context read, by its declaration's key, and whether it was bound.
+    keys: Vec<(crate::names::Name, bool)>,
+    /// Whether every context bound was read.
+    all: bool,
 }
 
 impl std::fmt::Debug for GraphRun<'_> {
@@ -459,6 +505,81 @@ impl<'g> GraphRun<'g> {
             paused: Cell::new(None),
             last: Cell::new(None),
             scopes: RefCell::new(vec![root]),
+            watch: RefCell::new(None),
+            names: None,
+        }
+    }
+
+    /// The run, watching what it reads of the context `context`, a step's,
+    /// each read told by its key's text in `names` ([`GraphRun::note_read`]).
+    pub(crate) fn watching(
+        mut self,
+        context: Option<Rc<ContextFrame>>,
+        names: &'g crate::names::Names,
+    ) -> Self {
+        self.watch = RefCell::new(Some(Watch {
+            context,
+            keys: Vec::new(),
+            all: false,
+        }));
+        self.names = Some(names);
+        self
+    }
+
+    /// Notes a read of the context of the declaration key `key` in the
+    /// context `context`, if the run watches a step's: one whose nearest
+    /// binding there is the step's context's, or none in both. The key's
+    /// text if it is the first such read of the run, which the host is told
+    /// of; `None` otherwise.
+    pub(crate) fn note_read(
+        &self,
+        key: crate::names::Name,
+        context: Option<&Rc<ContextFrame>>,
+    ) -> Option<&'g str> {
+        let mut watch = self.watch.borrow_mut();
+        let watch = watch.as_mut()?;
+        let read = ContextFrame::find(context, key).map(|(frame, _)| frame);
+        let own = ContextFrame::find(watch.context.as_ref(), key).map(|(frame, _)| frame);
+        if read != own || watch.keys.iter().any(|&(seen, _)| seen == key) {
+            return None;
+        }
+        watch.keys.push((key, own.is_some()));
+        Some(self.names?.get(key))
+    }
+
+    /// Notes that the run read every context its step's context binds, if it
+    /// watches one: each's key's text that it had not read before.
+    pub(crate) fn note_all(&self) -> Vec<&'g str> {
+        let mut watch = self.watch.borrow_mut();
+        let Some(watch) = watch.as_mut() else {
+            return Vec::new();
+        };
+        watch.all = true;
+        let mut new = Vec::new();
+        for (key, _) in ContextFrame::flattened(watch.context.as_ref()) {
+            if !watch.keys.iter().any(|&(seen, _)| seen == key) {
+                watch.keys.push((key, true));
+                new.extend(self.names.map(|names| names.get(key)));
+            }
+        }
+        new
+    }
+
+    /// What the run read of its step's context ([`StepReads`]): nothing for
+    /// a run that watches none.
+    pub(crate) fn reads(&self) -> StepReads {
+        let watch = self.watch.borrow();
+        let Some(watch) = watch.as_ref() else {
+            return StepReads::default();
+        };
+        let names = self.names;
+        StepReads {
+            keys: watch
+                .keys
+                .iter()
+                .filter_map(|&(key, bound)| Some((names?.get(key).to_owned(), bound)))
+                .collect(),
+            all: watch.all,
         }
     }
 
@@ -816,6 +937,11 @@ impl StepCall {
             site: node.site,
             made_in: node.code.input(),
         })
+    }
+
+    /// The context it was made in, which its run reads.
+    pub(crate) fn context(&self) -> Option<Rc<ContextFrame>> {
+        self.context.clone()
     }
 }
 

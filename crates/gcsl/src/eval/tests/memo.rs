@@ -487,7 +487,7 @@ pub(super) fn found(
         origin: NO_ORIGIN,
     };
     match memo.lookup(closure, &[], (caller, false), None) {
-        Lookup::Done(value) => Ok(Some(value)),
+        Lookup::Done(value, _) => Ok(Some(value)),
         Lookup::Running => Ok(None),
         Lookup::Missing(_) => Err("missing"),
     }
