@@ -380,6 +380,11 @@ def (xs: List<T>) contains<T>(x: T): Bool { builtins.list_contains(xs, x) }
 # builds when it is named.
 #[attribute] #[defers] type hermetic = {on: Bool = true}
 #[attribute] type scratch = {}
+# `#[device("kvm")]` gives a step a device of the machine it runs on, where
+# the machine has it: `kvm`, for a virtual machine to run at speed. It
+# changes how fast a step runs, never what it gives, so it keys nothing, and
+# a step runs on a machine without it all the same.
+#[attribute] type device = {name: String}
 #[def_type] def build<T>(name: String, f: fn() -> T) -> T { f() }
 
 # Packages. A `package` definition, `def package dev.example.greet() {
