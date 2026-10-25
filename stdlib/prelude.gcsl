@@ -420,6 +420,17 @@ def test(name: String, f: fn() -> {}) -> TestResult {
     message = outcome.message
 }
 
+# Scripts. A `script` definition, `def script deploy() { ... }`, is a task a
+# person runs, as `pekit run deploy` does, whose effects may change the world
+# outside the build. Only a run of a script binds `^script_session`, which
+# has no default, and a script's body may need it: so a script may call
+# another, and nothing that a build, a test or a package calls can call one.
+# A script builds what it calls as any build does. `^script_session.args`
+# are the words it was given after its name.
+type ScriptSession = {args: List<String>}
+context script_session: ScriptSession
+#[def_type] def script<T>(name: String, f: fn(^script_session) -> T) -> T { f() }
+
 # Platforms: an architecture and an operating system, as Rust names them.
 # `^host_platform` is where steps run: in plain GCSL this machine; a build
 # tool sets it to where it runs them. `^platform` is what is being built

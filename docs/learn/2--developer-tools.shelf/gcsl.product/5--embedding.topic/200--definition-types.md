@@ -173,6 +173,23 @@ tool such as pekit runs each test's body as a step, given what its
 parameters' defaults build, and doesn't run a test that passed again for
 the same inputs.
 
+The prelude's `script` is for tasks a person runs, such as deploying or
+booting what was built, whose effects change the world outside the build:
+
+```text
+def script deploy() {
+    let ran = exec(["rsync", "-a", (build site()).path, "host:/srv"])
+}
+```
+
+Its function parameter is `fn(^script_session) -> T`, and
+`script_session` has no default, so a script can read `^script_session`
+and call other scripts. Only the tool that runs a script binds the
+context, for example `pekit run deploy`, so nothing a build, a test or a
+package calls can call a script: that fails its check. A script builds
+what it calls as any build does. `^script_session.args` holds the words
+given after the script's name.
+
 ## Metadata
 
 Function types can carry metadata with `META:`, `META->`, or `META->>`.

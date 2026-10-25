@@ -713,7 +713,8 @@ fn an_invocation_runs_in_the_context_its_host_sets() {
     };
     assert_eq!(
         error(vec![("lable".to_owned(), Value::Int(1))]),
-        "no context `lable` is declared; the contexts are `host_platform`, `label`, `platform`"
+        "no context `lable` is declared; the contexts are `host_platform`, `label`, `platform`, \
+         `script_session`"
     );
     assert_eq!(
         error(vec![("label".to_owned(), Value::Int(1))]),

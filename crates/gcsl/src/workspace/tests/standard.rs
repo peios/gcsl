@@ -282,7 +282,8 @@ fn a_file_s_own_names_shadow_the_prelude_s_silently() {
             "dir",
             "build",
             "package",
-            "test"
+            "test",
+            "script"
         ]
     );
     assert!(scan.files[2].aliases.iter().all(|alias| alias.implicit));
