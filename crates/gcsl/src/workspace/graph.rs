@@ -83,6 +83,15 @@ impl PreparedCall {
     pub const fn unit(&self) -> u32 {
         self.unit
     }
+
+    /// The files it needs, by number, which run before it: its
+    /// definition's, its def-type's, and each whose field it sets a root
+    /// context from. What each of them needs in turn is
+    /// [`Workspace::files_needed`]'s.
+    #[must_use]
+    pub fn files(&self) -> &[u32] {
+        &self.files
+    }
 }
 
 impl Workspace {

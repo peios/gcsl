@@ -817,6 +817,25 @@ impl Workspace {
         })
     }
 
+    /// The files file `file` needs to run, by number, transitively, with
+    /// itself and the standard files every run runs, in the order they run:
+    /// every file whose change can change what it does.
+    #[must_use]
+    pub fn files_needed(&self, file: u32) -> Vec<u32> {
+        self.scan.needed(file)
+    }
+
+    /// The files whose sources make the code of the node `id` of `graph`, a
+    /// deferred call's, by number, as [`StepInputs::code_files`] gives them,
+    /// but known before its data edges are given; none for an effect's.
+    #[must_use]
+    pub fn node_code_files(&self, graph: &Graph, id: NodeId) -> Vec<u32> {
+        graph
+            .node(id)
+            .and_then(crate::eval::graph::Node::closure)
+            .map_or_else(Vec::new, |closure| self.scan.needed(closure.code.input()))
+    }
+
     /// The definition whose call made the node `id` of `graph`, a step or an
     /// effect: the innermost call of a def-type reference, `DT PATH()`,
     /// around where it was made, whose definition every node it makes knows

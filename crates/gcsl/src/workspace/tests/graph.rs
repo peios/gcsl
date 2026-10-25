@@ -1023,4 +1023,16 @@ fn a_step_knows_the_definition_whose_call_made_it() {
         "{:?}",
         inputs.context
     );
+    // Its code's files, known before it runs: `compile`'s, and what that
+    // file needs; and the call's own, which run before it.
+    let root = workspace.file("workspace.gcsl").unwrap();
+    let app = workspace.file("app/build.gcsl").unwrap();
+    let code = workspace.node_code_files(&graph, id);
+    assert!(code.contains(&root) && !code.contains(&app), "{code:?}");
+    assert!(call.files().contains(&app), "{:?}", call.files());
+    let needed = workspace.files_needed(app);
+    assert!(
+        needed.contains(&app) && needed.contains(&root),
+        "{needed:?}"
+    );
 }
