@@ -41,6 +41,13 @@
 //! expression's parameters", at the `=` (see [Functions and
 //! calls](crate::parser::functions#functions-and-calls)).
 //!
+//! After its parameters, a function type may name the contexts it needs,
+//! each `^NAME`, the name directly after the `^`, as in `fn(String,
+//! ^session) -> {}` ([`NeedTy`]), the form a function type is shown in (see
+//! the checker's [Needs](crate::check::needs#needs)). A parameter after a
+//! need is "a function type's needs come after its parameters". No program
+//! that parsed had a `^` there, so every one parses as it did.
+//!
 //! A function type may have a *meta* (see the checker's "Metas"): after its
 //! whole return type, a union included, the identifier `META` directly
 //! followed by `:`, `->>` or `->`, its marker, then the meta's type, newlines
@@ -109,7 +116,7 @@
 use crate::MAX_DEPTH;
 use crate::ast::{
     Effect, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind, GenericOwner, Generics, Item,
-    ItemId, ItemKind, MetaTy, ParamTy, PathSegment, SegmentKind, TypeArgRange, TypeExpr,
+    ItemId, ItemKind, MetaTy, NeedTy, ParamTy, PathSegment, SegmentKind, TypeArgRange, TypeExpr,
     TypeExprId, TypeExprKind, path_span,
 };
 use crate::diagnostic::Diagnostic;
@@ -121,6 +128,9 @@ use super::{
     Braces, LEAF_HEIGHT, META, MISPLACED_DEFAULT, MISSING_RETURN_TYPE, Nesting, Open, ParseResult,
     Parser, RETURN_TYPE_NOTE, Reported, TYPE, error_span, nest,
 };
+
+/// A parameter after a need of a function type.
+const NEEDS_AFTER_PARAMS: &str = "a function type's needs come after its parameters";
 
 impl Parser<'_> {
     /// Whether the current token begins a `type` item: the identifier
@@ -424,12 +434,15 @@ impl Parser<'_> {
 
     /// Parses a function type, starting at its `fn`: `(`, parameter types
     /// separated by `,` with an optional trailing `,`, each `NAME: TYPE` or
-    /// `TYPE`, `)`, the marker `:` or `->`, and the return type.
+    /// `TYPE`, then the contexts it needs, each `^NAME`, `)`, the marker `:`
+    /// or `->`, and the return type. A parameter after a need is "a function
+    /// type's needs come after its parameters".
     pub(super) fn parse_fn_type(&mut self) -> ParseResult<(TypeExprId, u32)> {
         let keyword = self.peek();
         self.advance();
         let open = self.expect_fn_paren()?;
         let base = self.param_ty_stack.len();
+        let mut needs: Vec<NeedTy> = Vec::new();
         let mut tallest = 0;
         // A parameter that fails is skipped to its `,`, and the list goes
         // on, to fail at its end (see [Errors and
@@ -441,7 +454,18 @@ impl Parser<'_> {
                 self.advance();
                 break;
             }
-            match self.parse_param_ty(open, &mut tallest) {
+            let entry = if self.peek().kind == TokenKind::Caret {
+                self.parse_need_ty(open, &mut needs)
+            } else if let Some(need) = needs.first() {
+                let span = self.peek().span;
+                Err(self.report(
+                    Diagnostic::error(NEEDS_AFTER_PARAMS, span)
+                        .with_context(need.span, "the first need"),
+                ))
+            } else {
+                self.parse_param_ty(open, &mut tallest)
+            };
+            match entry {
                 Ok(true) => break,
                 Ok(false) => {}
                 Err(reported) => {
@@ -457,6 +481,7 @@ impl Parser<'_> {
         }
         let params = self.builder.push_param_tys(&self.param_ty_stack[base..]);
         self.param_ty_stack.truncate(base);
+        let needs = self.builder.push_need_tys(&needs);
         let (effect, _) = self.return_marker()?;
         let (ret, ret_height) = self.parse_type()?;
         // The return type, a union included, and then its meta, if `META`
@@ -478,6 +503,7 @@ impl Parser<'_> {
         let id = self.builder.alloc_type(TypeExpr {
             kind: TypeExprKind::Fn {
                 params,
+                needs,
                 ret,
                 effect,
                 meta,
@@ -514,6 +540,33 @@ impl Parser<'_> {
             return Err(self.error(MISPLACED_DEFAULT, eq.span));
         }
         self.param_ty_stack.push(ParamTy { name, ty, rest });
+        self.list_separator(open)
+    }
+
+    /// Parses a need of a function type whose parameter list `open` opens,
+    /// at its `^`: the `^`, the context's name directly after it, and the
+    /// `,` or the `)` after them, adding it to `needs`. Returns whether the
+    /// `)` ends the list.
+    pub(super) fn parse_need_ty(
+        &mut self,
+        open: Token,
+        needs: &mut Vec<NeedTy>,
+    ) -> ParseResult<bool> {
+        let caret = self.peek();
+        self.advance();
+        let token = self.peek();
+        let TokenKind::Ident(name) = token.kind else {
+            let found = self.describe(token);
+            return Err(self.error(
+                format!("expected a context's name after `^`, found {found}"),
+                error_span(token),
+            ));
+        };
+        self.advance();
+        needs.push(NeedTy {
+            name,
+            span: Span::join(caret.span, token.span),
+        });
         self.list_separator(open)
     }
 

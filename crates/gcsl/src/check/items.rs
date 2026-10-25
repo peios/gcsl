@@ -243,7 +243,9 @@ impl Checker<'_> {
                 }
             }
             let errors = self.errors.len();
+            self.in_type_item = true;
             let resolved = self.resolve_type(ty, Bareness::Present);
+            self.in_type_item = false;
             // A generic attribute is the workspace's error.
             if ast.is_attribute(id)
                 && ast.type_arity(id) == 0

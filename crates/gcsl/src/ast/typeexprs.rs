@@ -81,8 +81,9 @@ use crate::names::Name;
 use crate::source::Span;
 
 use super::{
-    Ast, ExprId, FieldDefault, FieldTy, FieldTyKind, FieldTyRange, GenericOwner, MetaTy, ParamTy,
-    ParamTyRange, Replace, ToConstant, TypeArgRange, TypeExpr, TypeExprId, TypeExprKind,
+    Ast, Effect, ExprId, FieldDefault, FieldTy, FieldTyKind, FieldTyRange, GenericOwner, MetaTy,
+    NeedTy, NeedTyRange, ParamTy, ParamTyRange, Replace, ToConstant, TypeArgRange, TypeExpr,
+    TypeExprId, TypeExprKind,
 };
 
 /// The type expressions of a tree, or of a [`TypeStore`]: the nodes, in an
@@ -96,6 +97,7 @@ pub struct TypeArena {
     pub(super) exprs: Vec<TypeExpr>,
     pub(super) fields: Vec<FieldTy>,
     pub(super) params: Vec<ParamTy>,
+    pub(super) needs: Vec<NeedTy>,
     pub(super) args: Vec<TypeExprId>,
     pub(super) constants: Vec<Option<Constant>>,
 }
@@ -127,6 +129,17 @@ impl TypeArena {
         ParamTyRange {
             start,
             len: next_id(params.len()),
+        }
+    }
+
+    /// Appends `needs` to the need pool as one function type's and returns
+    /// their range.
+    pub(super) fn push_needs(&mut self, needs: &[NeedTy]) -> NeedTyRange {
+        let start = next_id(self.needs.len());
+        self.needs.extend_from_slice(needs);
+        NeedTyRange {
+            start,
+            len: next_id(needs.len()),
         }
     }
 
@@ -193,6 +206,16 @@ impl TypeArena {
     pub(super) fn params(&self, range: ParamTyRange) -> &[ParamTy] {
         let start = range.start as usize;
         &self.params[start..start + range.len as usize]
+    }
+
+    /// The needs of the function type whose needs are `range`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is not of the arena.
+    pub(super) fn needs(&self, range: NeedTyRange) -> &[NeedTy] {
+        let start = range.start as usize;
+        &self.needs[start..start + range.len as usize]
     }
 
     /// The number of nodes.
@@ -271,10 +294,12 @@ impl TypeArena {
                 }
                 TypeExprKind::Fn {
                     params,
+                    needs,
                     ret,
                     effect,
                     meta,
                 } => {
+                    let needs = self.push_needs(from.needs(needs));
                     let params: Vec<ParamTy> = from
                         .params(params)
                         .iter()
@@ -290,6 +315,7 @@ impl TypeArena {
                     });
                     TypeExprKind::Fn {
                         params: self.push_params(&params),
+                        needs,
                         ret,
                         effect,
                         meta,
@@ -324,6 +350,44 @@ impl TypeArena {
         let id = self.alloc(TypeExpr { kind, span });
         memo.insert(root, id);
         id
+    }
+
+    /// The function type of the parameters, needs, return type, effect and
+    /// meta written, each of `args` substituted for the type parameter
+    /// of its number, as [`TypeArena::substitute`] substitutes: `None` if
+    /// none of it changed.
+    fn substitute_fn(
+        &mut self,
+        (params, needs, ret, effect, meta): (
+            ParamTyRange,
+            NeedTyRange,
+            TypeExprId,
+            Effect,
+            Option<MetaTy>,
+        ),
+        args: &[TypeExprId],
+        memo: &mut HashMap<TypeExprId, TypeExprId>,
+    ) -> Option<TypeExprKind> {
+        let written = self.params(params).to_vec();
+        let substituted: Vec<ParamTy> = written
+            .iter()
+            .map(|param| ParamTy {
+                ty: self.substitute(param.ty, args, memo),
+                ..*param
+            })
+            .collect();
+        let new_ret = self.substitute(ret, args, memo);
+        let new_meta = meta.map(|meta| MetaTy {
+            ty: self.substitute(meta.ty, args, memo),
+            ..meta
+        });
+        (substituted != written || new_ret != ret || new_meta != meta).then(|| TypeExprKind::Fn {
+            params: self.push_params(&substituted),
+            needs,
+            ret: new_ret,
+            effect,
+            meta: new_meta,
+        })
     }
 
     /// The node `root` with the type argument `args[i]` in place of each
@@ -374,32 +438,11 @@ impl TypeArena {
             }
             TypeExprKind::Fn {
                 params,
+                needs,
                 ret,
                 effect,
                 meta,
-            } => {
-                let written = self.params(params).to_vec();
-                let substituted: Vec<ParamTy> = written
-                    .iter()
-                    .map(|param| ParamTy {
-                        ty: self.substitute(param.ty, args, memo),
-                        ..*param
-                    })
-                    .collect();
-                let new_ret = self.substitute(ret, args, memo);
-                let new_meta = meta.map(|meta| MetaTy {
-                    ty: self.substitute(meta.ty, args, memo),
-                    ..meta
-                });
-                (substituted != written || new_ret != ret || new_meta != meta).then(|| {
-                    TypeExprKind::Fn {
-                        params: self.push_params(&substituted),
-                        ret: new_ret,
-                        effect,
-                        meta: new_meta,
-                    }
-                })
-            }
+            } => self.substitute_fn((params, needs, ret, effect, meta), args, memo),
             TypeExprKind::Applied {
                 args: given,
                 name,

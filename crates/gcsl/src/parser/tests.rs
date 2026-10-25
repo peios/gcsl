@@ -372,6 +372,7 @@ fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
         | TypeExprKind::Invalid => out.push('?'),
         TypeExprKind::Fn {
             params,
+            needs,
             ret,
             effect,
             meta,
@@ -386,6 +387,14 @@ fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
                     out.push_str(": ");
                 }
                 type_name(ast, param.ty, out);
+            }
+            for need in ast.need_tys(needs) {
+                if out.ends_with('(') {
+                    out.push('^');
+                } else {
+                    out.push_str(", ^");
+                }
+                out.push_str(ast.names().get(need.name));
             }
             out.push_str(effect.params_end());
             type_name(ast, ret, out);

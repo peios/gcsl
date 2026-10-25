@@ -178,8 +178,8 @@ fn a_function_type_shows_and_fits_by_what_it_needs() {
     assert_eq!(
         notes,
         [
-            "a function that needs `^arch` fits only a function type that needs it too; bind it \
-          with a `with` inside the function to need nothing"
+            "a function that needs `^arch` fits only a function type that needs it too, written \
+             `fn(^arch) -> ...`; or bind it with a `with` inside the function to need nothing"
         ]
     );
     // Bound inside, it needs nothing.
@@ -302,4 +302,61 @@ fn a_definition_cannot_need_a_context() {
          r = (package p)().v"
     ));
     assert!(bound.ends_with("r = \"bound\"}"), "{bound}");
+}
+
+#[test]
+fn a_written_need_lets_a_function_that_needs_a_context_be_passed() {
+    let twice = "fn twice(f: fn(String, ^arch): String): String { \"{f(\"a\")} {f(\"b\")}\" }\n\
+                 fn tag(name: String): String { \"{name}-{^arch}\" }\n";
+    assert_eq!(
+        value_of(&format!("{twice}= twice(tag) with {{ arch = \"x\" }}")),
+        "a-x b-x"
+    );
+    // Calling the function needs the context, so a call of `twice` does.
+    let (message, notes) = error_of(&format!("{twice}x = twice(tag)"));
+    assert_eq!(message, "context `arch` has no value here");
+    assert_eq!(
+        notes,
+        ["`twice` needs it, and no `with` around this call sets it"]
+    );
+    // A function that needs nothing fits it too.
+    assert_eq!(
+        value_of(&format!(
+            "{twice}= twice(fn(name: String): String {{ name }}) with {{ arch = \"x\" }}"
+        )),
+        "a b"
+    );
+    // A context with a default, or a need in a declared type, is an error.
+    assert_eq!(
+        error_of("fn f(g: fn(^os): String): String { g() }").0,
+        "context `os` has a default, so nothing needs it"
+    );
+    assert_eq!(
+        error_of("type T = fn(^arch): String").0,
+        "a declared type cannot need a context yet"
+    );
+    assert_eq!(
+        error_of("fn f(g: fn(^arch, Int): String): String { g(1) }").0,
+        "a function type's needs come after its parameters"
+    );
+}
+
+#[test]
+fn a_definition_needs_what_its_def_type_s_parameter_names() {
+    let def_type = "#[def_type]\n\
+                    def script(name: String, f: fn(^arch): {v: String}): {v: String} { f() }\n\
+                    def script inner() { v = ^arch }\n\
+                    def script outer() { v = \"outer {(script inner)().v}\" }\n";
+    let ran = value_of(&format!(
+        "{def_type}r = with {{ arch = \"x\" }} {{ (script outer)().v }}"
+    ));
+    assert!(ran.ends_with("r = \"outer x\"}"), "{ran}");
+    // Calling one needs the context, so a definition of a def-type whose
+    // parameter names none cannot.
+    let (message, _) = error_of(&format!(
+        "{def_type}#[def_type]\n\
+         def build(name: String, f: fn(): {{v: String}}): {{v: String}} {{ f() }}\n\
+         def build b() {{ v = (script inner)().v }}"
+    ));
+    assert_eq!(message, "context `arch` has no value in this definition");
 }

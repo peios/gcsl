@@ -687,6 +687,27 @@ fn calls() {
 }
 
 #[test]
+fn a_function_type_s_need_errors() {
+    let diagnostic = parse_text("let f: fn(^arch, Int) -> {} = g").unwrap_err();
+    assert_eq!(
+        diagnostic.message,
+        "a function type's needs come after its parameters"
+    );
+    assert_eq!(diagnostic.span, Span::new(17, 20));
+    assert_eq!(
+        labels(&diagnostic),
+        vec![(Span::new(10, 15), "the first need")]
+    );
+    assert_eq!(
+        error("let f: fn(^) -> {} = g"),
+        (
+            "expected a context's name after `^`, found `)`".to_owned(),
+            Span::new(11, 12)
+        )
+    );
+}
+
+#[test]
 fn call_errors() {
     let diagnostic = parse_text("f(1 2)").unwrap_err();
     assert_eq!(diagnostic.message, "expected `,` or `)`, found `2`");
@@ -780,6 +801,15 @@ fn function_types() {
     assert_eq!(
         shape("let f: fn(\n  Int,\n  x: Int\n) ->\n  Int = g"),
         "let f: fn(Int, x: Int) -> Int = g"
+    );
+    // The contexts it needs, after its parameters.
+    assert_eq!(
+        shape("let f: fn(String, ^arch, ^os,) -> {} = g"),
+        "let f: fn(String, ^arch, ^os) -> {} = g"
+    );
+    assert_eq!(
+        shape("let f: fn(^arch): Int = g"),
+        "let f: fn(^arch): Int = g"
     );
     // A name followed by `:` names the parameter; a name alone is a type.
     let ast = parse_text("g : fn(x: Int, Int): Int").unwrap();

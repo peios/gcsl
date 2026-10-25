@@ -9,10 +9,10 @@ use crate::strings::{FieldName, Quoted};
 use crate::types::write_constant;
 
 use super::{
-    ArgKind, ArgRange, Ast, DefTypeId, ElementRange, Expr, ExprId, ExprKind, FieldDefault,
+    ArgKind, ArgRange, Ast, DefTypeId, Effect, ElementRange, Expr, ExprId, ExprKind, FieldDefault,
     FieldTyKind, FnId, ForHead, ForId, ImportDecl, ImportForm, ImportMember, ImportName, ItemId,
-    ItemKind, ItemRange, Jump, Label, PathDisplay, PathRange, PathSegment, StrPart, TypeArgRange,
-    TypeExprId, TypeExprKind, UnaryOp, WithRange,
+    ItemKind, ItemRange, Jump, Label, MetaTy, NeedTyRange, ParamTyRange, PathDisplay, PathRange,
+    PathSegment, StrPart, TypeArgRange, TypeExprId, TypeExprKind, UnaryOp, WithRange,
 };
 
 /// Per-node information written by [`Ast::pretty_with`].
@@ -497,6 +497,46 @@ impl WrittenType<'_> {
         f.write_str(">")
     }
 
+    /// Writes the function type of the parameters `params`, the needs
+    /// `needs`, the return type `ret` after the marker of `effect`, and the
+    /// meta `meta`, as [`WrittenType::type_expr`] writes a type.
+    fn fn_type(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        (params, needs): (ParamTyRange, NeedTyRange),
+        (ret, effect, meta): (TypeExprId, Effect, Option<MetaTy>),
+    ) -> fmt::Result {
+        let names = self.names;
+        f.write_str("fn(")?;
+        let params = self.ast.param_tys(params);
+        for (index, param) in params.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            if param.rest {
+                f.write_str("...")?;
+            }
+            if let Some(name) = param.name {
+                write!(f, "{}: ", FieldName(names.get(name)))?;
+            }
+            self.type_expr(f, param.ty)?;
+        }
+        for (index, need) in self.ast.need_tys(needs).iter().enumerate() {
+            if index > 0 || !params.is_empty() {
+                f.write_str(", ")?;
+            }
+            write!(f, "^{}", names.get(need.name))?;
+        }
+        f.write_str(effect.params_end())?;
+        let Some(meta) = meta else {
+            return self.type_expr(f, ret);
+        };
+        // A return type that is a function type would take the meta.
+        self.union_member(f, ret)?;
+        write!(f, " {} ", meta.effect.meta_marker())?;
+        self.type_expr(f, meta.ty)
+    }
+
     /// Writes a type expression as it is written in source: as the parser
     /// made it, whatever the expansion of the tree's types made of it
     /// ([`Ast::written_type`]).
@@ -540,32 +580,11 @@ impl WrittenType<'_> {
             }
             TypeExprKind::Fn {
                 params,
+                needs,
                 ret,
                 effect,
                 meta,
-            } => {
-                f.write_str("fn(")?;
-                for (index, param) in self.ast.param_tys(params).iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(", ")?;
-                    }
-                    if param.rest {
-                        f.write_str("...")?;
-                    }
-                    if let Some(name) = param.name {
-                        write!(f, "{}: ", FieldName(names.get(name)))?;
-                    }
-                    self.type_expr(f, param.ty)?;
-                }
-                f.write_str(effect.params_end())?;
-                let Some(meta) = meta else {
-                    return self.type_expr(f, ret);
-                };
-                // A return type that is a function type would take the meta.
-                self.union_member(f, ret)?;
-                write!(f, " {} ", meta.effect.meta_marker())?;
-                self.type_expr(f, meta.ty)
-            }
+            } => self.fn_type(f, (params, needs), (ret, effect, meta)),
             TypeExprKind::Applied { name, args, .. } => {
                 f.write_str(names.get(name))?;
                 self.type_args(f, args)

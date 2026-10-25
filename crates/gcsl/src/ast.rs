@@ -787,6 +787,26 @@ pub struct ParamTyRange {
     len: u32,
 }
 
+/// The needs written in a function type expression, `^arch`: a contiguous
+/// range of the need pool of the arena that allocated it. Resolve it with
+/// [`Ast::need_tys`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct NeedTyRange {
+    start: u32,
+    len: u32,
+}
+
+/// A context a function type is written to need, `^arch` in `fn(^arch) ->
+/// {}`: its name, as the file where it is written reads it, and where it is
+/// written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NeedTy {
+    /// The context's name.
+    pub name: Name,
+    /// Where `^NAME` is written.
+    pub span: Span,
+}
+
 /// The type arguments of an applied type, `<Int, String>`: a contiguous
 /// range of the type-argument pool of the arena that allocated it. Resolve
 /// it with [`Ast::type_args`].
@@ -2033,10 +2053,13 @@ pub enum TypeExprKind {
     Record(FieldTyRange),
     /// A function type, `fn(Int, name: String): Bool`, `fn(Int) ->> Int` or
     /// `fn() -> Int`, with a meta or not, as in `fn(v: Version): PackageDef
-    /// META-> PackageMeta` (see [Types](crate::ast::typeexprs#types)).
+    /// META-> PackageMeta`, and needing contexts or not, `fn(^arch) -> {}`
+    /// (see [Types](crate::ast::typeexprs#types)).
     Fn {
         /// The parameters, each with its name if it has one.
         params: ParamTyRange,
+        /// The contexts it is written to need, after its parameters.
+        needs: NeedTyRange,
         /// The return type.
         ret: TypeExprId,
         /// What it may do, as its marker says: `:`, `->>` or `->`.

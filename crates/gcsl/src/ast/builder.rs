@@ -11,9 +11,9 @@ use super::{
     Arg, ArgRange, Ast, AttributeUse, ContextDecl, DefTypeId, DefTypeUse, Element, ElementRange,
     Expansion, Expr, ExprId, ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForDecl, ForId,
     GenericOwner, Generics, ImportDecl, ImportId, ImportMember, ImportMemberRange, Item, ItemId,
-    ItemKind, ItemRange, Label, LabelId, MethodDecl, Param, ParamRange, ParamTy, ParamTyRange,
-    PartRange, PathRange, PathSegment, RecoverDecl, RecoverId, StrPart, TypeArena, TypeArgRange,
-    TypeExpr, TypeExprId, UnaryOp, WithBinding, WithRange, next_id,
+    ItemKind, ItemRange, Label, LabelId, MethodDecl, NeedTy, NeedTyRange, Param, ParamRange,
+    ParamTy, ParamTyRange, PartRange, PathRange, PathSegment, RecoverDecl, RecoverId, StrPart,
+    TypeArena, TypeArgRange, TypeExpr, TypeExprId, UnaryOp, WithBinding, WithRange, next_id,
 };
 
 /// Arenas under construction. Allocate children before their parents, then
@@ -155,29 +155,31 @@ pub fn is_constant(tree: &impl ConstantTree, id: ExprId) -> bool {
 }
 
 /// Where every arena and pool of an [`AstBuilder`] was, to put it back
-/// there ([`AstBuilder::mark`], [`AstBuilder::truncate`]).
+/// there ([`AstBuilder::mark`], [`AstBuilder::truncate`]): each a length,
+/// which an id of its arena or pool, a `u32`, bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuilderMark {
-    pub(super) exprs: usize,
-    pub(super) items: usize,
-    pub(super) item_lists: usize,
-    pub(super) parts: usize,
-    pub(super) types: usize,
-    pub(super) fields: usize,
-    pub(super) param_tys: usize,
-    pub(super) type_args: usize,
-    pub(super) paths: usize,
-    pub(super) fns: usize,
-    pub(super) params: usize,
-    pub(super) args: usize,
-    pub(super) with_bindings: usize,
-    pub(super) elements: usize,
-    pub(super) fors: usize,
-    pub(super) recovers: usize,
-    pub(super) labels: usize,
-    pub(super) imports: usize,
-    pub(super) import_members: usize,
-    pub(super) def_types: usize,
+    pub(super) exprs: u32,
+    pub(super) items: u32,
+    pub(super) item_lists: u32,
+    pub(super) parts: u32,
+    pub(super) types: u32,
+    pub(super) fields: u32,
+    pub(super) param_tys: u32,
+    pub(super) need_tys: u32,
+    pub(super) type_args: u32,
+    pub(super) paths: u32,
+    pub(super) fns: u32,
+    pub(super) params: u32,
+    pub(super) args: u32,
+    pub(super) with_bindings: u32,
+    pub(super) elements: u32,
+    pub(super) fors: u32,
+    pub(super) recovers: u32,
+    pub(super) labels: u32,
+    pub(super) imports: u32,
+    pub(super) import_members: u32,
+    pub(super) def_types: u32,
 }
 
 /// Whether a tree was parsed from source with syntax errors, and so how far
@@ -369,6 +371,12 @@ impl AstBuilder {
         self.types.push_params(params)
     }
 
+    /// Appends `needs` to the need pool as one function type's needs and
+    /// returns their range.
+    pub fn push_need_tys(&mut self, needs: &[NeedTy]) -> NeedTyRange {
+        self.types.push_needs(needs)
+    }
+
     /// Appends `args` to the type-argument pool as one applied type's
     /// arguments and returns their range.
     pub fn push_type_args(&mut self, args: &[TypeExprId]) -> TypeArgRange {
@@ -505,26 +513,27 @@ impl AstBuilder {
     #[must_use]
     pub fn mark(&self) -> BuilderMark {
         BuilderMark {
-            exprs: self.exprs.len(),
-            items: self.items.len(),
-            item_lists: self.item_lists.len(),
-            parts: self.parts.len(),
-            types: self.types.exprs.len(),
-            fields: self.types.fields.len(),
-            param_tys: self.types.params.len(),
-            type_args: self.types.args.len(),
-            paths: self.paths.len(),
-            fns: self.fns.len(),
-            params: self.params.len(),
-            args: self.args.len(),
-            with_bindings: self.with_bindings.len(),
-            elements: self.elements.len(),
-            fors: self.fors.len(),
-            recovers: self.recovers.len(),
-            labels: self.labels.len(),
-            imports: self.imports.len(),
-            import_members: self.import_members.len(),
-            def_types: self.def_types.len(),
+            exprs: next_id(self.exprs.len()),
+            items: next_id(self.items.len()),
+            item_lists: next_id(self.item_lists.len()),
+            parts: next_id(self.parts.len()),
+            types: next_id(self.types.exprs.len()),
+            fields: next_id(self.types.fields.len()),
+            param_tys: next_id(self.types.params.len()),
+            need_tys: next_id(self.types.needs.len()),
+            type_args: next_id(self.types.args.len()),
+            paths: next_id(self.paths.len()),
+            fns: next_id(self.fns.len()),
+            params: next_id(self.params.len()),
+            args: next_id(self.args.len()),
+            with_bindings: next_id(self.with_bindings.len()),
+            elements: next_id(self.elements.len()),
+            fors: next_id(self.fors.len()),
+            recovers: next_id(self.recovers.len()),
+            labels: next_id(self.labels.len()),
+            imports: next_id(self.imports.len()),
+            import_members: next_id(self.import_members.len()),
+            def_types: next_id(self.def_types.len()),
         }
     }
 
@@ -533,33 +542,34 @@ impl AstBuilder {
     /// could not parse, so that no node of the tree is unreachable and a
     /// subtree's nodes stay contiguous ([`Ast::subtree`]).
     pub fn truncate(&mut self, mark: BuilderMark) {
-        self.exprs.truncate(mark.exprs);
-        self.items.truncate(mark.items);
-        self.item_lists.truncate(mark.item_lists);
-        self.parts.truncate(mark.parts);
-        self.types.exprs.truncate(mark.types);
-        self.types.fields.truncate(mark.fields);
-        self.types.params.truncate(mark.param_tys);
-        self.types.args.truncate(mark.type_args);
-        self.paths.truncate(mark.paths);
-        self.fns.truncate(mark.fns);
-        self.params.truncate(mark.params);
-        self.args.truncate(mark.args);
-        self.with_bindings.truncate(mark.with_bindings);
-        self.elements.truncate(mark.elements);
-        self.fors.truncate(mark.fors);
-        self.recovers.truncate(mark.recovers);
-        self.labels.truncate(mark.labels);
-        self.imports.truncate(mark.imports);
-        self.import_members.truncate(mark.import_members);
-        self.def_types.truncate(mark.def_types);
-        let items = next_id(mark.items);
+        self.exprs.truncate(mark.exprs as usize);
+        self.items.truncate(mark.items as usize);
+        self.item_lists.truncate(mark.item_lists as usize);
+        self.parts.truncate(mark.parts as usize);
+        self.types.exprs.truncate(mark.types as usize);
+        self.types.fields.truncate(mark.fields as usize);
+        self.types.params.truncate(mark.param_tys as usize);
+        self.types.needs.truncate(mark.need_tys as usize);
+        self.types.args.truncate(mark.type_args as usize);
+        self.paths.truncate(mark.paths as usize);
+        self.fns.truncate(mark.fns as usize);
+        self.params.truncate(mark.params as usize);
+        self.args.truncate(mark.args as usize);
+        self.with_bindings.truncate(mark.with_bindings as usize);
+        self.elements.truncate(mark.elements as usize);
+        self.fors.truncate(mark.fors as usize);
+        self.recovers.truncate(mark.recovers as usize);
+        self.labels.truncate(mark.labels as usize);
+        self.imports.truncate(mark.imports as usize);
+        self.import_members.truncate(mark.import_members as usize);
+        self.def_types.truncate(mark.def_types as usize);
+        let items = mark.items;
         self.shadowable.retain(|item| item.0 < items);
         self.def_type_marks.retain(|item| item.0 < items);
         self.attribute_marks.retain(|item| item.0 < items);
         self.defers_marks.retain(|item| item.0 < items);
         self.attribute_uses.retain(|used| used.item.0 < items);
-        let fns = next_id(mark.fns);
+        let fns = mark.fns;
         self.generics.retain(|generics| match generics.owner {
             GenericOwner::Fn(function) => function.0 < fns,
             GenericOwner::Type(item) => item.0 < items,

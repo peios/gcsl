@@ -293,7 +293,8 @@ impl Checker<'_> {
     /// The note on a mismatch of a function of type `found` with the function
     /// type `expected` when `found` needs a context `expected` does not list:
     /// "a function that needs `^arch` fits only a function type that needs it
-    /// too", saying to bind it inside the function. `None` otherwise.
+    /// too", saying how one is written, and to bind it inside the function
+    /// instead. `None` otherwise.
     pub(super) fn needs_note(&self, found: TyId, expected: TyId) -> Option<String> {
         let (found, expected) = (self.types.fn_sig(found)?, self.types.fn_sig(expected)?);
         let allowed = self.types.need_set(expected.needs);
@@ -303,9 +304,12 @@ impl Checker<'_> {
             .iter()
             .find(|need| !allowed.iter().any(|allowed| implies(allowed, need)))?;
         let text = self.context_text(need);
+        // A need is written by its context with no default, its first.
+        let written = self.context_text(need.get(..1)?);
         Some(format!(
-            "a function that needs `^{text}` fits only a function type that needs it too; bind \
-             it with a `with` inside the function to need nothing"
+            "a function that needs `^{text}` fits only a function type that needs it too, \
+             written `fn(^{written}) -> ...`; or bind it with a `with` inside the function to \
+             need nothing"
         ))
     }
 

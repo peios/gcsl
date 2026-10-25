@@ -1836,6 +1836,10 @@ pub struct Checker<'a> {
     /// Nested uses push above the entries of the use enclosing them and
     /// truncate back, as `sorted_fields` does.
     fn_params: Vec<(Option<Name>, TyId)>,
+    /// Whether the type being resolved is a `type` item's own, in which a
+    /// function type cannot be written to need a context yet (see
+    /// [`Checker::resolve_fn_type`]).
+    in_type_item: bool,
     /// Reused for binding a call's arguments: for each parameter, the index
     /// in the call's arguments of the argument filling it, or `u32::MAX`.
     filled: Vec<u32>,
@@ -2084,6 +2088,7 @@ impl<'a> Checker<'a> {
             claimed: Vec::new(),
             callee_name: None,
             fn_params: Vec::new(),
+            in_type_item: false,
             filled: Vec::new(),
             rest_args: Vec::new(),
             block_start: 0,

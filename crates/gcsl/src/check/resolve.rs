@@ -66,19 +66,29 @@
 
 use crate::ast::{
     Effect, ExprId, FieldDefault, FieldTyKind, FieldTyRange, FnId, GenericOwner, MetaTy,
-    ParamTyRange, PathSegment, Syntax, TypeArgRange, TypeExprId, TypeExprKind, TypeProblem,
+    NeedTyRange, ParamTyRange, PathSegment, Syntax, TypeArgRange, TypeExprId, TypeExprKind,
+    TypeProblem,
 };
 use crate::diagnostic::{Diagnostic, InternalError};
 use crate::names::Name;
 use crate::source::Span;
 use crate::strings::FieldName;
 use crate::suggest;
-use crate::types::{GenericId, Laziness, Meta, TyId, TyKind};
+use crate::types::{GenericId, Laziness, Meta, Need, TyId, TyKind};
+use crate::workspace::ContextDefault;
 
 use super::{
     Bareness, Binding, CONSTANT_NOTE, Checker, Constant, FIELD_NOT_CONSTANT, appears_twice,
     bareness_of, position, spread_first_note,
 };
+
+/// A need written in a `type` item's type.
+const NEED_IN_TYPE: &str = "a declared type cannot need a context yet";
+
+/// Why a need cannot be written in a `type` item's type.
+const NEED_IN_TYPE_NOTE: &str = "a declared type is copied where it is used, and resolved there, \
+                                 so its contexts would be those of the file using it: write \
+                                 the function type where it is used";
 
 impl Checker<'_> {
     /// The type a type expression denotes, with a bare type meaning what
@@ -299,10 +309,11 @@ impl Checker<'_> {
             TypeExprKind::Record(range) => self.resolve_record(id, range, mode),
             TypeExprKind::Fn {
                 params,
+                needs,
                 ret,
                 effect,
                 meta,
-            } => self.resolve_fn_type(id, (params, ret), effect, meta),
+            } => self.resolve_fn_type(id, (params, needs, ret), effect, meta),
             // A qualified name is made what it names by the expansion of
             // the file's types; checked alone, a file names no module.
             TypeExprKind::Path(path) | TypeExprKind::PathApplied { path, .. } => {
@@ -899,10 +910,11 @@ impl Checker<'_> {
     pub(super) fn resolve_fn_type(
         &mut self,
         id: TypeExprId,
-        (params, ret): (ParamTyRange, TypeExprId),
+        (params, needs, ret): (ParamTyRange, NeedTyRange, TypeExprId),
         effect: Effect,
         meta: Option<MetaTy>,
     ) -> TyId {
+        let needs = self.written_needs(id, needs);
         let (params_mode, ret_mode) = bareness_of(effect);
         let base = self.fn_params.len();
         let rest_param = self.rest_position(
@@ -925,7 +937,69 @@ impl Checker<'_> {
         let resolved =
             self.intern_fn_type_with_meta(base, (ret, effect), meta.flatten(), rest_param);
         self.fn_params.truncate(base);
-        resolved
+        match needs {
+            None => TyId::ERROR,
+            Some(needs) if needs.is_empty() || resolved == TyId::ERROR => resolved,
+            Some(needs) => self.types.with_needs(resolved, &needs),
+        }
+    }
+
+    /// The needs of the function type `id`, written as `written` (see
+    /// [Needs](crate::check::needs#needs)): each a context with no default,
+    /// by its declaration's key. `None` if one is erroneous, reported: a
+    /// context with a default, "context `level` has a default, so nothing
+    /// needs it"; or a need in a `type` item's type, "a declared type cannot
+    /// need a context yet", since a copy of it is resolved where it is
+    /// used, whose contexts are not its declaration's. A copy of such a type
+    /// is erroneous where it is used too, its declaration's error reported.
+    pub(super) fn written_needs(
+        &mut self,
+        id: TypeExprId,
+        written: NeedTyRange,
+    ) -> Option<Vec<Need>> {
+        let written = self.ast.need_tys(written);
+        let Some(first) = written.first() else {
+            return Some(Vec::new());
+        };
+        if self.ast.is_definition_copy(id) {
+            self.quiet.failed = true;
+            return None;
+        }
+        if self.in_type_item {
+            self.errors
+                .push(Diagnostic::error(NEED_IN_TYPE, first.span).with_note(NEED_IN_TYPE_NOTE));
+            return None;
+        }
+        let mut needs = Vec::with_capacity(written.len());
+        let mut erroneous = false;
+        for need in written {
+            let Some(context) = self.context_named(need.name, need.span) else {
+                erroneous = true;
+                continue;
+            };
+            match context.default {
+                ContextDefault::None => needs.push(Need::from([context.key])),
+                ContextDefault::Foreign(None) => {
+                    self.quiet.failed = true;
+                    erroneous = true;
+                }
+                ContextDefault::Binding(_) | ContextDefault::Foreign(Some(_)) => {
+                    let text = self.ast.names().get(need.name);
+                    self.errors.push(
+                        Diagnostic::error(
+                            format!("context `{text}` has a default, so nothing needs it"),
+                            need.span,
+                        )
+                        .with_note(
+                            "a function may read a context with a default wherever it is \
+                             called: name only contexts with none",
+                        ),
+                    );
+                    erroneous = true;
+                }
+            }
+        }
+        (!erroneous).then_some(needs)
     }
 
     /// The position of the rest parameter among parameters that are rest

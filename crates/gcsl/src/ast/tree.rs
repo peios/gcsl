@@ -16,10 +16,11 @@ use super::{
     Element, ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind,
     FieldTyRange, FnDecl, FnId, ForDecl, ForHead, ForId, GenericOwner, Generics, ImportDecl,
     ImportForm, ImportGlob, ImportId, ImportMember, ImportMemberRange, Item, ItemId, ItemKind,
-    ItemRange, Label, LabelId, MethodDecl, NoAnnotation, Param, ParamRange, ParamTy, ParamTyRange,
-    PartRange, PathDisplay, PathRange, PathSegment, Pretty, RecoverDecl, RecoverId, SegmentKind,
-    StrPart, Syntax, TypeArena, TypeArgRange, TypeExpr, TypeExprId, TypeExprKind, TypeLink,
-    TypeProblem, TypeStore, WithBinding, WithRange, WrittenType, next_id, symbol_span,
+    ItemRange, Label, LabelId, MethodDecl, NeedTy, NeedTyRange, NoAnnotation, Param, ParamRange,
+    ParamTy, ParamTyRange, PartRange, PathDisplay, PathRange, PathSegment, Pretty, RecoverDecl,
+    RecoverId, SegmentKind, StrPart, Syntax, TypeArena, TypeArgRange, TypeExpr, TypeExprId,
+    TypeExprKind, TypeLink, TypeProblem, TypeStore, WithBinding, WithRange, WrittenType, next_id,
+    symbol_span,
 };
 
 /// A complete syntax tree: the arenas, the file's body, the names and the
@@ -486,6 +487,17 @@ impl Ast {
     #[must_use]
     pub fn param_tys(&self, range: ParamTyRange) -> &[ParamTy] {
         self.types.params(range)
+    }
+
+    /// Returns the needs of the function type expression whose needs are
+    /// `range`, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not belong to this tree.
+    #[must_use]
+    pub fn need_tys(&self, range: NeedTyRange) -> &[NeedTy] {
+        self.types.needs(range)
     }
 
     /// Returns the type arguments of the applied type whose arguments are
