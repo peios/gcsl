@@ -245,6 +245,7 @@ fn one_function(display: &str) -> Rc<Ir> {
         retry: 0,
         timeout: None,
         name_text: None,
+        needs: Box::default(),
     };
     Rc::new(builder.finish_program(root, (0, Vec::new()), vec![code], (0, 0)))
 }

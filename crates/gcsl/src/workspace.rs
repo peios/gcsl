@@ -444,8 +444,10 @@ pub struct StepInputs {
     pub args: Vec<Plain>,
     /// Its callee's captures, which its code reads; none for an effect.
     pub captures: Vec<Plain>,
-    /// Each context bound where it was made, by its declaration's key's
-    /// text, sorted, with its value.
+    /// Each context bound where it was made that it can read, by its
+    /// declaration's key's text, sorted, with its value: of a call, each
+    /// with a default, and each with none that its callee's type needs
+    /// ([`FnCode::needs`](crate::ir::FnCode::needs)); of an effect, each.
     pub context: Vec<(String, Plain)>,
     /// Its callee's attributes, in source order; none for an effect.
     pub attributes: Vec<Attribute>,
@@ -737,7 +739,8 @@ impl Workspace {
     /// What a host needs of the node `id` of `graph` to key, stage and run
     /// it as a step, once its data edges are given (see [Graph
     /// mode](crate::eval::graph#graph-mode)): its arguments as plain data,
-    /// its callee's captures and its context as keys, functions by their code
+    /// its callee's captures and the context it can read as keys, functions
+    /// by their code
     /// ([Keys of functions](crate::eval::plain#keys-of-functions)), its
     /// callee's attributes, and
     /// the files whose sources make its code, by number, every file its
@@ -753,10 +756,30 @@ impl Workspace {
         let plain_all = |values: &[Value]| -> Result<Vec<Plain>, String> {
             values.iter().map(|value| to_plain(value, names)).collect()
         };
-        // What it reads, functions among them, which are keyed by their code.
+        // What it can read, functions among them, which are keyed by their
+        // code. A context with no default that its callee does not need is
+        // one that nothing it calls reads, since needs are inferred through
+        // every call: a context only `pekit run` binds, say, keys none of
+        // the steps a script builds.
+        let readable = |key: Name| {
+            let Some(code) = node
+                .closure()
+                .and_then(|closure| closure.code.find_function(closure.function))
+            else {
+                return true;
+            };
+            let defaulted = self
+                .scan
+                .contexts
+                .iter()
+                .find(|context| context.key == key)
+                .is_none_or(|context| context.binding.is_some());
+            defaulted || code.needs.binary_search(&key).is_ok()
+        };
         let context = node
             .context()
             .iter()
+            .filter(|(key, _)| readable(*key))
             .map(|(key, value)| Ok((names.get(*key).to_owned(), to_key_plain(value, names)?)))
             .collect::<Result<Vec<_>, String>>()?;
         let (captures, attributes, code_files) = match node.closure() {

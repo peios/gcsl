@@ -130,8 +130,13 @@ impl Lowerer<'_> {
         let body = self.lower_expr(body_expr);
         (self.loops, self.catches) = outer;
         let captures = body.and_then(|body| {
+            // A default is called by its caller, whose needs it charges.
             let display = Box::from("default");
-            self.enter_code(function, (FnKind::Function, body), (span, display))
+            self.enter_code(
+                function,
+                (FnKind::Function, body),
+                (span, display, Box::default()),
+            )
         });
         self.reads_caller.pop();
         let captures = captures?;
@@ -324,6 +329,8 @@ impl Lowerer<'_> {
             retry: 0,
             timeout: None,
             name_text: None,
+            // It defers nothing, so is never a step.
+            needs: Box::default(),
         }));
         Ok(IrKind::MakeClosure { function, captures })
     }
@@ -411,23 +418,33 @@ impl Lowerer<'_> {
         (kind, body): (FnKind, IrId),
     ) -> Result<IrRange, InternalError> {
         let span = self.ast.get(id).span;
+        let ty = self.expr_types.get(id);
         let display = self
             .table
-            .display(self.expr_types.get(id), self.ast.names())
+            .display(ty, self.ast.names())
             .to_string()
             .into_boxed_str();
-        self.enter_code(function, (kind, body), (span, display))
+        let mut needs: Vec<Name> = self
+            .table
+            .needs(ty)
+            .iter()
+            .filter_map(|need| need.first().copied())
+            .collect();
+        needs.sort_unstable();
+        needs.dedup();
+        self.enter_code(function, (kind, body), (span, display, needs.into()))
     }
 
     /// Enters function `function`, of kind `kind`, whose body lowered to
-    /// `body`, into the function table, shown as `display`, an error located
-    /// at `span`, and returns the list of the loads, in the current frame,
-    /// of what it captures.
+    /// `body`, into the function table, shown as `display`, needing the
+    /// contexts with no default `needs` ([`FnCode::needs`]), an error
+    /// located at `span`, and returns the list of the loads, in the current
+    /// frame, of what it captures.
     pub(super) fn enter_code(
         &mut self,
         function: FnId,
         (kind, body): (FnKind, IrId),
-        (span, display): (Span, Box<str>),
+        (span, display, needs): (Span, Box<str>, Box<[Name]>),
     ) -> Result<IrRange, InternalError> {
         let resolution = self.resolution.function(function);
         let code = FnCode {
@@ -449,6 +466,7 @@ impl Lowerer<'_> {
                 .callee
                 .filter(|_| !self.resolution.attributes(function).is_empty())
                 .map(|name| Box::from(self.ast.names().get(name))),
+            needs,
         };
         let Some(entry) = self.functions.get_mut(function.index()) else {
             return Err(InternalError {

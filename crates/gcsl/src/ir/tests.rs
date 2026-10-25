@@ -893,6 +893,7 @@ fn a_dotted_update_is_two_levels_taller_for_each_step() {
         retry: 0,
         timeout: None,
         name_text: None,
+        needs: Box::default(),
     };
     let mut functions = vec![code];
     builder.measure(update, &mut functions);

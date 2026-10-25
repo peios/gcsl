@@ -898,6 +898,54 @@ fn a_prepared_call_can_be_given_to_a_top_level_function() {
     }
 }
 
+/// The contexts `inputs` holds, by name, each declaration's key's text
+/// `<context NAME@...>`.
+fn context_names(inputs: &crate::workspace::StepInputs) -> Vec<String> {
+    inputs
+        .context
+        .iter()
+        .map(|(key, _)| {
+            let name = key.trim_start_matches("<context ");
+            name.split('@').next().unwrap_or(name).to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn a_step_is_keyed_by_no_context_with_no_default_that_it_does_not_need() {
+    let (mut workspace, file) = lone_workspace(
+        "context arch: String\n\
+         context session: String\n\
+         context level: Int = 1\n\
+         fn flags(): String { \"-m{^arch}\" }\n\
+         #[step] fn cc(src: String) -> String { \"{src} {flags()}\" }\n\
+         #[step] fn plain(src: String) -> String { src }\n\
+         #[step] fn quiet(src: String) -> String { cc(src) with { arch = \"x86\" } }\n\
+         #[step] fn rec(n: Int) -> String { if n == 0 { ^arch } else { rec(n - 1) } }\n\
+         fn odd(n: Int) -> String { if n == 0 { ^arch } else { even(n - 1) } }\n\
+         #[step] fn even(n: Int) -> String { if n == 0 { \"e\" } else { odd(n - 1) } }\n\
+         = [cc(\"a\"), plain(\"b\"), quiet(\"c\"), rec(1), even(1)] \
+         with { arch = \"arm\"; session = \"s\"; level = 2 }",
+    );
+    let mut graph = Graph::new();
+    workspace.run_graph(file, &mut graph, every()).unwrap();
+    // `cc` needs `arch`, through `flags`; `level` has a default, so any
+    // step can read it; nothing reads `session`.
+    let cc = workspace.step_inputs(&graph, NodeId::of(0)).unwrap();
+    assert_eq!(context_names(&cc), ["arch", "level"]);
+    let plain = workspace.step_inputs(&graph, NodeId::of(1)).unwrap();
+    assert_eq!(context_names(&plain), ["level"]);
+    // `quiet` binds `arch` around what it calls, so needs nothing.
+    let quiet = workspace.step_inputs(&graph, NodeId::of(2)).unwrap();
+    assert_eq!(context_names(&quiet), ["level"]);
+    // A step's needs are its own once its group of recursion is checked,
+    // whether it calls itself or a function that calls it.
+    for node in [3, 4] {
+        let inputs = workspace.step_inputs(&graph, NodeId::of(node)).unwrap();
+        assert_eq!(context_names(&inputs), ["arch", "level"], "{node}");
+    }
+}
+
 #[test]
 fn a_step_s_context_of_functions_is_keyed_by_their_code() {
     let (mut workspace, file) = lone_workspace(

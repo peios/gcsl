@@ -95,11 +95,19 @@ first, so that its effects are made again rather than found failed.
 
 `Workspace::step_inputs` gives what you need to key and stage a step:
 
-- its arguments, its function's captured values and the context it runs
-  in, as plain data (`Plain`);
+- its arguments, its function's captured values and the context it can
+  read, as plain data (`Plain`);
 - its function's attributes;
 - the files whose sources make up its code, which you hash to identify
   the code.
+
+The context a step can read is every context bound where it was made
+that has a default, and each without one that its function needs (see
+[What a function needs](~gcsl/context#what-a-function-needs)). GCSL
+works out what a function needs through every call it makes, so a step
+can't read a context with no default that its function doesn't need. A
+context that only your host binds for some runs, such as pekit's script
+session, then doesn't change the key of a step that never reads it.
 
 `Plain::files` lists the files and directories in a value, which is what
 a sandbox needs to contain. Results go back with `Workspace::from_plain`,

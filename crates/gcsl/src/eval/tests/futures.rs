@@ -323,6 +323,7 @@ fn a_future_that_depends_on_itself_is_an_error() {
         retry: 0,
         timeout: None,
         name_text: None,
+        needs: Box::default(),
     }];
     builder.measure(root, &mut functions);
     let ir = Rc::new(builder.finish_program(root, (1, Vec::new()), functions, (0, 0)));

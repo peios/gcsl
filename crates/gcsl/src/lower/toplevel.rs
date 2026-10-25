@@ -191,6 +191,7 @@ impl Lowerer<'_> {
                 retry: 0,
                 timeout: None,
                 name_text: None,
+                needs: Box::default(),
             });
         }
     }

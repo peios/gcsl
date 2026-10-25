@@ -1866,6 +1866,12 @@ pub struct FnCode {
     /// The text of [`FnCode::name`], for the errors of `#[retry]` and
     /// `#[timeout]`; `None` for a function without either, or without a name.
     pub name_text: Option<Box<str>>,
+    /// The contexts with no default its type needs, by their declarations'
+    /// keys, sorted: the first context of each of its needs (see
+    /// [Needs](crate::types::needs#needs)). A call of it can read no other
+    /// context with no default, so a host keys a step of it by no other
+    /// ([`crate::workspace::Workspace::step_inputs`]).
+    pub needs: Box<[Name]>,
 }
 
 /// A lowered program: an arena of [`IrNode`]s, the item pool, the string
