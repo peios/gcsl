@@ -10,12 +10,11 @@
 #   store, changing the world outside the build.
 # - `context packagers`: the packagers a workspace uses, which a host such
 #   as pekit sets from the workspace's configuration.
-# - `context publish_to`: the store `publish` publishes into, a path or a
-#   URL, as the packager reads it.
 # - `pack(pkg)`: the package `pkg` packed by each packager, in order, each
 #   with its packager's name.
-# - `publish(pkg)`: the same, each then published into `^publish_to`; with
-#   no store to publish to, an error.
+# - `publish(pkg, store)`: the same, each then published into `store`, a
+#   path or a URL, as each packager reads it. The store is an argument, not
+#   a context, so that packing for one store is packing for any.
 import builtins
 
 type Packed = {packager: String, packed: Dir}
@@ -28,22 +27,16 @@ type Packager = {
 
 context packagers: List<Packager> = []
 
-context publish_to: String = ""
-
 def pack(pkg: Package, ^packagers) -> List<Packed> {
     = for each in packagers {
         = {packager = each.name; packed = each.pack(pkg)}
     }
 }
 
-#[track_caller]
-def publish(pkg: Package, ^packagers, ^publish_to) -> List<Packed> {
-    if publish_to == "" {
-        panic("`{pkg.name}` has no store to publish to: name one")
-    }
+def publish(pkg: Package, store: String, ^packagers) -> List<Packed> {
     = for each in packagers {
         let packed = each.pack(pkg)
-        let published = each.publish(pkg, packed, publish_to)
+        let published = each.publish(pkg, packed, store)
         = {packager = each.name; packed = packed}
     }
 }

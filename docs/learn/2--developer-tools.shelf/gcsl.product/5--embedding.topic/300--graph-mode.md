@@ -53,12 +53,12 @@ The host keeps a `Graph` for the whole evaluation and drives it:
 A target's call can set root contexts as it starts, from values you give
 or from a top-level field of a file, `Workspace::prepare_call_with`. With
 `Workspace::prepare_call_wrapped` it can also give the target's value to
-a top-level function of a file, as if the call were written
-`FUNCTION(DT PATH())`. That's how a host runs code of its own over a
-target without calling a function value itself: pekit packs a package as
-`packaging.pack(package NAME())`. Several prepared calls are units of
-their own, and can be driven together against one graph, sharing the
-steps they both reach.
+a top-level function of a file, followed by literal arguments of your
+own, as if the call were written `FUNCTION(DT PATH(), ARGS...)`. That's
+how a host runs code of its own over a target without calling a function
+value itself: pekit packs a package as `packaging.pack(package NAME())`.
+Several prepared calls are units of their own, and can be driven together
+against one graph, sharing the steps they both reach.
 
 A step's failure is raised where its result is used, so a `recover`
 around that use catches it, as with any failure. A finished value can

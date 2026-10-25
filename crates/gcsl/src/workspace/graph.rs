@@ -47,13 +47,15 @@ pub struct RootField<'a> {
 
 /// A top-level function a prepared call gives its invocation to
 /// ([`Workspace::prepare_call_wrapped`]): the function `function` of file
-/// `file`.
+/// `file`, given the invocation's value and then `args`.
 #[derive(Clone, Copy, Debug)]
 pub struct RootWrap<'a> {
     /// The file, by its number.
     pub file: u32,
     /// Its top-level function's name.
     pub function: &'a str,
+    /// The arguments it is given after the invocation's value, in order.
+    pub args: &'a [Given],
 }
 
 /// An invocation of a definition, prepared to run in graph mode, as many
@@ -196,9 +198,10 @@ impl Workspace {
     }
 
     /// [`Workspace::prepare_call_with`], the invocation given, if `wrap`
-    /// says so, to a top-level function of a file as its one argument, as if
-    /// the call were written `FUNCTION(DT PATH(...))`, in the root contexts
-    /// too: as pekit packs a package, `packaging.pack(package NAME())`.
+    /// says so, to a top-level function of a file as its first argument, the
+    /// wrapper's others after it, as if the call were written
+    /// `FUNCTION(DT PATH(...), ARGS...)`, in the root contexts too: as pekit
+    /// packs a package, `packaging.pack(package NAME())`.
     ///
     /// # Errors
     ///
@@ -230,7 +233,10 @@ impl Workspace {
                 let Some((_, (cell, known))) = self.top_level_cell(wrap.file, wrap.function) else {
                     return Err(no_field(self, wrap.file, wrap.function));
                 };
-                Some((self.scan.names.intern("<root wrapper>"), cell, known))
+                Some((
+                    (self.scan.names.intern("<root wrapper>"), cell, known),
+                    wrap.args,
+                ))
             }
         };
         let mut cells = Vec::with_capacity(fields.len());

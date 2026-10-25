@@ -841,7 +841,8 @@ fn a_prepared_call_can_be_given_to_a_top_level_function() {
         (
             "workspace.gcsl",
             "context factor: Int = 1\nconf = {factor = 3}\n\
-             def scaled(n: Int, ^factor) -> Int { n * factor }",
+             def scaled(n: Int, ^factor) -> Int { n * factor }\n\
+             def offset(n: Int, by: Int) -> Int { n + by }",
         ),
         ("app/build.gcsl", "def build x() { = 7 }"),
     ];
@@ -856,6 +857,7 @@ fn a_prepared_call_can_be_given_to_a_top_level_function() {
     let wrap = crate::workspace::graph::RootWrap {
         file: root,
         function: "scaled",
+        args: &[],
     };
     // `scaled(build x())`, in the root contexts too.
     let call = workspace
@@ -866,6 +868,20 @@ fn a_prepared_call_can_be_given_to_a_top_level_function() {
         panic!("not done");
     };
     assert_eq!(value, Value::Int(21));
+    // Given arguments after the invocation's value.
+    let given = [crate::workspace::Given::Int(5)];
+    let offset = crate::workspace::graph::RootWrap {
+        function: "offset",
+        args: &given,
+        ..wrap
+    };
+    let call = workspace
+        .prepare_call_wrapped(("build", "x"), &[], &[], (&[], Some(offset)))
+        .unwrap();
+    let Progress::Done(value) = workspace.run_prepared(&call, &mut graph, every()).unwrap() else {
+        panic!("not done");
+    };
+    assert_eq!(value, Value::Int(12));
     // A function there is not.
     let missing = crate::workspace::graph::RootWrap {
         function: "nope",

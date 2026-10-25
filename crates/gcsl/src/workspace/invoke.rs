@@ -1044,7 +1044,7 @@ impl Workspace {
         (definition, invoked): (&Definition, Invocation),
         (def_type, definition_cell): ((Slot, TyId), (Slot, TyId)),
         (known, root): (Option<Rc<KnownParams>>, Option<&Rc<ContextFrame>>),
-        (fields, wrap): (&[FieldCell], Option<BoundCell>),
+        (fields, wrap): (&[FieldCell], Option<(BoundCell, &[Given])>),
     ) -> Result<(Ir, Vec<Diagnostic>), InvokeError> {
         let at = (definition.file, definition.span);
         let bound = (
@@ -1053,8 +1053,8 @@ impl Workspace {
         );
         let mut cells = vec![(bound.0, def_type, known), (bound.1, definition_cell, None)];
         cells.extend(fields.iter().map(|field| (field.bound, field.cell, None)));
-        let wrapper = wrap.as_ref().map(|(name, ..)| *name);
-        cells.extend(wrap);
+        let wrapper = wrap.as_ref().map(|((name, ..), args)| (*name, *args));
+        cells.extend(wrap.map(|(cell, _)| cell));
         let path = &definition.path;
         let contexts: Vec<Name> = fields.iter().map(|field| field.context).collect();
         self.lower_built(
@@ -1187,6 +1187,11 @@ impl Workspace {
 /// by, its slot and type, and what a call of it needs to know of its
 /// parameters, if it is a `def`'s.
 pub(super) type BoundCell = (Name, (Slot, TyId), Option<Rc<KnownParams>>);
+
+/// The top-level function a prepared call's invocation is given to, by the
+/// name its cell is bound by, and the arguments it is given after it (see
+/// [`invocation`]).
+pub(super) type Wrapper<'a> = (Name, &'a [Given]);
 
 /// A top-level function's cell, its slot and type, with what a call of it
 /// needs to know of its parameters, if it is a `def`'s (see
@@ -1558,14 +1563,14 @@ pub(super) fn invocation_params(ast: &Ast, item: ItemId) -> &[Param] {
 /// `<def-type>("PATH", <definition>, NAME = VALUE, ...)`, its result, PATH
 /// `path`, each named argument one of `args`, in order, its value a literal
 /// of its kind, the two names those of `bound`, each node at `span`; with
-/// `wrap`, the name a top-level function's cell is bound by, given that as
-/// its one argument, `<wrap>(<def-type>(...))`; and with `fields`, wrapped
-/// in `with { CONTEXT = BOUND.PATH, ... } { ... }`, each field's cell read
-/// by its name.
+/// `wrap`, the name a top-level function's cell is bound by and its other
+/// arguments, given that first, `<wrap>(<def-type>(...), ARGS...)`; and
+/// with `fields`, wrapped in `with { CONTEXT = BOUND.PATH, ... } { ... }`,
+/// each field's cell read by its name.
 pub(super) fn invocation(
     mut names: Names,
     (path, invoked): (&str, Invocation),
-    (bound, fields, wrap): ((Name, Name), &[FieldCell], Option<Name>),
+    (bound, fields, wrap): ((Name, Name), &[FieldCell], Option<Wrapper<'_>>),
     span: Span,
 ) -> Ast {
     let args = match invoked {
@@ -1600,15 +1605,10 @@ pub(super) fn invocation(
         },
     ];
     for (name, given) in args {
-        let kind = match given {
-            Given::Str(text) => ExprKind::Str(strings.push(text)),
-            Given::Int(value) => ExprKind::Int(*value),
-            Given::Float(value) => ExprKind::Float(*value),
-            Given::Bool(value) => ExprKind::Bool(*value),
-            Given::Quantity(Quantity::Duration, amount) => ExprKind::Duration(*amount),
-            Given::Quantity(Quantity::Size, amount) => ExprKind::Size(*amount),
-        };
-        let value = builder.alloc(Expr { kind, span });
+        let value = builder.alloc(Expr {
+            kind: literal(given, &mut strings),
+            span,
+        });
         arguments.push(Arg {
             kind: ArgKind::Named {
                 name: names.intern(name),
@@ -1623,15 +1623,26 @@ pub(super) fn invocation(
         kind: ExprKind::Call { callee, args },
         span,
     });
-    if let Some(wrap) = wrap {
+    if let Some((wrap, given)) = wrap {
         let callee = builder.alloc(Expr {
             kind: ExprKind::Name(wrap),
             span,
         });
-        let args = builder.push_args(&[Arg {
+        let mut arguments = vec![Arg {
             kind: ArgKind::Positional,
             value: call,
-        }]);
+        }];
+        for given in given {
+            let value = builder.alloc(Expr {
+                kind: literal(given, &mut strings),
+                span,
+            });
+            arguments.push(Arg {
+                kind: ArgKind::Positional,
+                value,
+            });
+        }
+        let args = builder.push_args(&arguments);
         call = builder.alloc(Expr {
             kind: ExprKind::Call { callee, args },
             span,
@@ -1646,6 +1657,18 @@ pub(super) fn invocation(
     });
     let root = builder.push_item_list(&[item]);
     builder.finish(root, names, strings)
+}
+
+/// The literal expression of the value `given`, its text kept in `strings`.
+fn literal(given: &Given, strings: &mut Strings) -> ExprKind {
+    match given {
+        Given::Str(text) => ExprKind::Str(strings.push(text)),
+        Given::Int(value) => ExprKind::Int(*value),
+        Given::Float(value) => ExprKind::Float(*value),
+        Given::Bool(value) => ExprKind::Bool(*value),
+        Given::Quantity(Quantity::Duration, amount) => ExprKind::Duration(*amount),
+        Given::Quantity(Quantity::Size, amount) => ExprKind::Size(*amount),
+    }
 }
 
 /// `call` wrapped in `with { CONTEXT = BOUND.PATH, ... } { ... }`, built in
