@@ -363,16 +363,19 @@ impl Workspace {
         self.definition_holding(definition)
     }
 
-    /// Which definition of the workspace's def-types `definition` is the
-    /// function of: the one whose cell holds it (see
-    /// [`Workspace::definition_of`]).
+    /// Which definition `definition` is the function of: the one whose cell
+    /// holds it (see [`Workspace::definition_of`]). Of a def-type the
+    /// workspace lists, its def-type's path as declared; of any other, a
+    /// library's or one made with a variant, which nothing invokes by name,
+    /// its def-type as the definition writes it, with its variant,
+    /// `Toolchain::C`.
     pub(super) fn definition_holding(&self, definition: &Rc<Closure>) -> Option<Referenced> {
         let holds = |file: u32, item: ItemId| {
             let cell = self.leaf_cell(file, item);
             let held = cell.and_then(|(slot, _)| self.frame.get(slot.index()));
             matches!(held, Some(Value::Fn(held)) if Rc::ptr_eq(held, definition))
         };
-        self.found_def_types().into_iter().find_map(|found| {
+        let listed = self.found_def_types().into_iter().find_map(|found| {
             let (_, listed) = found
                 .items
                 .iter()
@@ -383,7 +386,49 @@ impl Workspace {
                 path: listed.path.clone(),
                 dir: listed.dir.clone(),
             })
-        })
+        });
+        listed.or_else(|| self.unlisted_holding(&holds))
+    }
+
+    /// The definition of any file, listed or not, whose cell `holds` says
+    /// holds the function sought, as [`Workspace::definition_holding`] names
+    /// one the workspace doesn't list.
+    fn unlisted_holding(&self, holds: &dyn Fn(u32, ItemId) -> bool) -> Option<Referenced> {
+        let names = &self.scan.names;
+        for (index, file) in (0u32..).zip(&self.scan.files) {
+            let ast = &file.ast;
+            for &item in ast.items(ast.root()) {
+                let ItemKind::DefTypeDef { def, .. } = ast.item(item).kind else {
+                    continue;
+                };
+                if !holds(index, item) {
+                    continue;
+                }
+                let def = ast.def_type(def);
+                let written = match ast.get(def.dt).kind {
+                    ExprKind::Name(name) => names.get(name).to_owned(),
+                    _ => String::new(),
+                };
+                let def_type = match def.variant {
+                    Some((variant, _)) => format!("{written}::{}", names.get(variant)),
+                    None => written,
+                };
+                let path = ast
+                    .path(def.path)
+                    .iter()
+                    .filter_map(PathSegment::name)
+                    .map(|name| names.get(name))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let dir = self.scan.dirs.get(file.dir as usize);
+                return Some(Referenced {
+                    def_type,
+                    path,
+                    dir: dir.map(|dir| dir.path.clone()).unwrap_or_default(),
+                });
+            }
+        }
+        None
     }
 
     /// The top-level field or `def` of file `file` named `name`, a field of

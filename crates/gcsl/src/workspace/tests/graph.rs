@@ -1043,3 +1043,34 @@ fn a_step_knows_the_definition_whose_call_made_it() {
         "{needed:?}"
     );
 }
+
+#[test]
+fn a_step_knows_a_definition_made_with_a_variant() {
+    let files = [
+        (
+            "workspace.gcsl",
+            "#[attribute] #[defers] type step = {}\n\
+             #[step] def compile(src: String) -> String { \"{src}.o\" }\n\
+             enum Tool extensible<{*: String}>\n\
+             enum Tool::C<{cc: String}>\n\
+             #[def_type]\n\
+             def Tool<T>(name: String, kind: Variant<Tool, T>, f: fn() -> T) -> Tool { kind(f()) }\n\
+             def Tool::C gcc() { cc = compile(\"gcc\") }",
+        ),
+        ("app/build.gcsl", "def build app() { = (Tool::C gcc)() }"),
+    ];
+    let mut workspace = crate::workspace::tests::fileroot::rooted(&files).unwrap();
+    let call = workspace.prepare_call(("build", "app"), &[], &[]).unwrap();
+    let mut graph = Graph::new();
+    workspace.run_prepared(&call, &mut graph, every()).unwrap();
+    let (id, _) = graph
+        .nodes()
+        .find(|(_, node)| node.args() == [text("gcc")])
+        .unwrap();
+    // Nothing invokes it by name, so its def-type lists none, but its
+    // reference's call names it all the same, by its variant.
+    let definition = workspace.step_definition(&graph, id).unwrap();
+    assert_eq!(definition.def_type, "Tool::C");
+    assert_eq!(definition.path, "gcc");
+    assert_eq!(definition.dir, "");
+}
