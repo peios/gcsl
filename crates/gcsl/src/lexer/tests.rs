@@ -736,7 +736,8 @@ fn interning_gives_equal_names_for_equal_text() {
     assert_eq!(name(1), name(4));
     assert_ne!(name(0), name(1));
     assert_ne!(name(0), name(2));
-    assert_eq!(names.len(), 3);
+    // Beside the definition context's, which every table holds first.
+    assert_eq!(names.len(), 4);
 }
 
 #[test]
@@ -747,7 +748,7 @@ fn tokenize_with_shares_the_name_table_but_not_the_string_table() {
     let (second, second_strings) =
         tokenize_with(&SourceFile::new("b", "y x").unwrap(), &mut names).unwrap();
     assert_eq!(first[0].kind, second[1].kind);
-    assert_eq!(names.len(), 2);
+    assert_eq!(names.len(), 3);
     assert_eq!(first_strings.len(), 1);
     assert!(second_strings.is_empty());
 }

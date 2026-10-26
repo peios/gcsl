@@ -313,7 +313,7 @@ use super::{
 use super::builtins::{enum_builtin, secret_builtin};
 use super::kinds::{as_function, float_to_int, into_callee, mixed};
 use super::elements::element_builtin;
-use super::files::{dir_files, fetch, fetch_git, inside, make_file, read_file, unpack, which};
+use super::files::{dir_files, fetch, fetch_git, inside, read_file, unpack, which};
 use super::keychain::keychain;
 use super::graph::effect_builtin;
 use super::sandbox::{sandbox_entry, sandbox_exec};
@@ -390,7 +390,7 @@ impl Evaluator<'_> {
     /// the call `node`, to `first` and `second`, if it takes two (see
     /// [Files](crate::eval::files#files)).
     fn file_builtin(
-        &self,
+        &mut self,
         builtin: Builtin,
         first: Value,
         second: Option<Value>,
@@ -398,7 +398,7 @@ impl Evaluator<'_> {
     ) -> Flow<Value> {
         match (builtin, first, second) {
             (Builtin::File | Builtin::Dir, Value::Str(path), None) => {
-                make_file(builtin, &path, self.shared.effects, node)
+                self.make_file(builtin, &path, node)
             }
             (Builtin::FileRead, Value::File(file), None) => {
                 read_file(&file, self.shared.effects, node)
@@ -595,6 +595,18 @@ impl Evaluator<'_> {
                 return mistyped(arg, "an argument for a parameter the built-in lacks");
             };
             *entry = Some((value, span));
+        }
+        // A program's working directory is its definition's, resolved here,
+        // where its context is, before it can become a node, which runs
+        // apart from it (see [The working
+        // directory](crate::eval::files#the-working-directory)).
+        if matches!(
+            builtin,
+            Builtin::Exec | Builtin::ExecLive | Builtin::ExecSecret
+        ) && let Some(entry) = arguments.get_mut(1)
+            && let Some((options, span)) = entry.take()
+        {
+            *entry = Some((self.exec_options(options, node)?, span));
         }
         // An effect is a node, in graph mode (see [Graph
         // mode](crate::eval::graph#graph-mode)).

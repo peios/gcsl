@@ -44,11 +44,29 @@ pub(super) const PPK: &str = "import path\nimport fileroot\n\
 /// The workspace of `files`, each a path and a text, located at
 /// [`SCRATCH`], checked.
 pub(super) fn rooted(files: &[(&str, &str)]) -> Result<Workspace, Vec<Diagnostic>> {
+    checked_at(files, SCRATCH)
+}
+
+/// The workspace of `files`, each a path and a text, located at `root`, a
+/// directory that is there, checked, each file's directory made under it,
+/// for a definition's programs to run in.
+pub(super) fn rooted_at(files: &[(&str, &str)], root: &str) -> Result<Workspace, Vec<Diagnostic>> {
+    for (path, _) in files {
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(std::path::Path::new(root).join(dir)).unwrap();
+        }
+    }
+    checked_at(files, root)
+}
+
+/// The workspace of `files`, each a path and a text, located at `root`,
+/// checked.
+fn checked_at(files: &[(&str, &str)], root: &str) -> Result<Workspace, Vec<Diagnostic>> {
     let sources: Vec<SourceFile> = files
         .iter()
         .map(|&(path, text)| SourceFile::new(path, text).unwrap())
         .collect();
-    check_with_standard(&sources, &[], SCRATCH).1
+    check_with_standard(&sources, &[], root).1
 }
 
 /// The value of the file at `path` of the workspace of `files` located
@@ -370,4 +388,80 @@ fn fileroot_is_a_reserved_name() {
             "{files:?}"
         );
     }
+}
+
+/// A def-type, `build`, of definitions giving a `String`, and `named`, a
+/// memoised function giving the path of the file a relative path names.
+const BUILDS: &str = "#[def_type]\n\
+        def build(name: String, f: fn() -> String) -> String { f() }\n\
+        def named(p: String) -> String { file(p).path }";
+
+#[test]
+fn a_definition_s_relative_paths_are_its_own_directory_s_whoever_calls_it() {
+    let files = [
+        ("workspace.gcsl", ""),
+        ("_lib/builds.gcsl", BUILDS),
+        (
+            "lib.gcsl",
+            "import build from _lib/builds\n\
+                 import named from _lib/builds\n\
+                 def build lib() { file(\"lib.txt\").path }\n\
+                 def build lib_named() { named(\"lib.txt\") }\n\
+                 alone = build lib()",
+        ),
+        (
+            "app/app.gcsl",
+            "import build from _lib/builds\n\
+                 import named from _lib/builds\n\
+                 def build app() { build lib() }\n\
+                 def build app_named() { named(\"lib.txt\") }\n\
+                 through = build app()\n\
+                 memo = [build lib_named(), build app_named()]",
+        ),
+    ];
+    assert_eq!(
+        rooted_text(&files, "lib.gcsl"),
+        "{alone = \"<root>/lib.txt\"}"
+    );
+    // Built for `app`, `lib` is in its own directory still; a memoised
+    // function called in two definitions' bodies is in each one's.
+    assert_eq!(
+        rooted_text(&files, "app/app.gcsl"),
+        "{through = \"<root>/lib.txt\"; memo = [\"<root>/lib.txt\", \"<root>/app/lib.txt\"]}"
+    );
+}
+
+#[test]
+fn a_definition_s_relative_cwd_is_against_its_directory() {
+    let root = crate::workspace::tests::fs::fs_scratch("definition-cwd");
+    std::fs::create_dir_all(format!("{root}/app/sub")).unwrap();
+    let files = [
+        ("workspace.gcsl", ""),
+        ("_lib/builds.gcsl", BUILDS),
+        (
+            "lib.gcsl",
+            "import build from _lib/builds\n\
+                 def build lib() { exec([\"pwd\"], cwd = \".\").stdout }\n\
+                 def build lib_host() { exec([\"pwd\"]).stdout }\n\
+                 def build lib_sub() { exec([\"pwd\"], cwd = \"app/sub\").stdout }\n\
+                 def build lib_root() { exec([\"pwd\"], cwd = \"/\").stdout }",
+        ),
+        (
+            "app/app.gcsl",
+            "import build from _lib/builds\n\
+                 def build app() { \"{build lib()}{build lib_sub()}{build lib_root()}{build lib_host()}\" }\n\
+                 ran = build app()",
+        ),
+    ];
+    let mut workspace = rooted_at(&files, &root).unwrap_or_else(|errors| panic!("{errors:?}"));
+    let index = workspace.file("app/app.gcsl").unwrap();
+    let ran = workspace.run(index).unwrap().value.to_string();
+    std::fs::remove_dir_all(&root).unwrap();
+    // Its own directory as `.`, a relative `cwd` under it, an absolute one
+    // as it is, and with none, the host's: this process's.
+    let host = std::env::current_dir().unwrap().display().to_string();
+    assert_eq!(
+        ran,
+        format!("{{ran = \"{root}\\n{root}/app/sub\\n/\\n{host}\\n\"}}")
+    );
 }

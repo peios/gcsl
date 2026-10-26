@@ -142,6 +142,11 @@ step's effects reach the system. `Direct` uses the system as it is. Your
 own implementation can run each program in a sandbox, through
 `Effects::command`, and root file paths there, through
 `Effects::host_path`; GCSL's values keep the paths the code wrote.
+`Effects::working_dir` is the directory that relative paths outside a
+definition resolve against. If your code always runs in a directory of its
+own, as a step does, return `false` from `Effects::follows_definitions`,
+so that relative paths in a definition resolve against that directory
+rather than the definition's.
 
 If your sandboxes use bubblewrap, also implement
 `Effects::sandbox_command`, which runs the commands of a GCSL

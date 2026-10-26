@@ -454,9 +454,11 @@ pub(crate) const REFERENCE_DEFINITION: u32 = 1;
 /// call binds its own around all of it, and a definition's body binds
 /// itself around its own code, wherever it runs: so that every step and
 /// effect made in that call, whenever it is made, knows the definition it
-/// is of ([`crate::workspace::Workspace::step_definition`]). No context can
-/// be declared of it, since it is no name, and the parser interns it with
-/// each reference and definition it makes, so that lowering finds it.
+/// is of ([`crate::workspace::Workspace::step_definition`]), and resolves
+/// its relative paths against the definition's directory (see
+/// [Files](crate::eval::files#files)). No context can be declared of it,
+/// since it is no name, and every table of names holds it first,
+/// [`crate::names::DEFINITION`].
 pub const DEFINITION_CONTEXT: &str = "<definition>";
 use crate::types::{TyId, TypeTable};
 use crate::value::{Layout, ValueKind, int_to_float};

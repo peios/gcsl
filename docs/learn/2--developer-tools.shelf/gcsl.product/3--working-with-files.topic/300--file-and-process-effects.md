@@ -84,7 +84,7 @@ environment of its own instead of GCSL's.
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `cwd` | `""` | The working directory. `""` keeps GCSL's own; a relative path is relative to it. |
+| `cwd` | `""` | The working directory. `""` keeps GCSL's own; a relative path is relative to it, or in a definition to the definition's directory. |
 | `env` | `{}` | Variables set over the environment, as a record of strings. |
 | `panic` | `true` | A nonzero exit status fails the call with its standard error. When false, the status is data. |
 | `until` | `""` | When set, the program is stopped at the first line of output containing this text. |
@@ -120,10 +120,10 @@ let notes = file(path.join(directory, "notes.txt"))
 notes.read()
 ```
 
-`f.path` is the file's path, always absolute. A relative path given to
-`file` is resolved against the working directory, the same directory
-`exec` runs a program in by default. So once a command has written a file,
-the same relative path names it:
+`f.path` is the file's path, always absolute. Outside a definition, a
+relative path given to `file` is resolved against the working directory,
+the same directory `exec` runs a program in by default. So once a command
+has written a file, the same relative path names it:
 
 ```gcsl
 let tool = file("/bin/sh")
@@ -144,9 +144,25 @@ A `File` is a type of its own: a record with a `path` field isn't one, and
 a `String` path is never taken for one. That lets a build tool such as
 pekit find every file a step uses and produces, and move it in and out of
 the step's sandbox. Under plain GCSL, two files are equal when their paths
-are; a build tool can also compare their contents. When GCSL runs a program
-under a build tool, the tool chooses the working directory, so `file()`
-and `exec` agree there too.
+are; a build tool can also compare their contents. Under a build tool, the
+tool chooses the working directory. Pekit gives each step a directory of
+its own, which both `file()` and `exec` use.
+
+### Relative paths in a definition
+
+Inside a definition, such as `def build lib() { ... }`, a relative path is
+resolved against the directory of the definition's own file, whoever calls
+the definition. That covers `file`, `dir`, and a relative `cwd`, in the
+definition's body and in every function it calls. So `build lib()` reads
+the same `lib.c` whether you build it on its own or another definition, in
+another directory, builds it. You don't need `fileroot.this` to name a
+definition's own files.
+
+A program that `exec` runs with no `cwd` still runs in GCSL's own working
+directory, which stays the same for the whole run. That way, a memoised
+function that starts something once, such as a test machine, is one call
+for every definition that uses it. Pass `cwd = "."` to run a program in
+the definition's directory instead.
 
 ## Fetching
 

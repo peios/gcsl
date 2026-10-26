@@ -111,8 +111,13 @@ impl Name {
     }
 }
 
+/// The name of the context a definition's body binds to the definition
+/// ([`crate::lower::DEFINITION_CONTEXT`]): the first of every table, so that
+/// the evaluator reads that context with no table to look it up in.
+pub const DEFINITION: Name = Name(0);
+
 /// The interning table: each distinct text once, with its [`Name`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Names {
     /// The text of each name, indexed by [`Name`].
     texts: Vec<String>,
@@ -120,11 +125,22 @@ pub struct Names {
     lookup: HashMap<String, Name>,
 }
 
+impl Default for Names {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Names {
-    /// Creates an empty table.
+    /// Creates a table holding only [`DEFINITION`].
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let mut names = Self {
+            texts: Vec::new(),
+            lookup: HashMap::new(),
+        };
+        names.intern(crate::lower::DEFINITION_CONTEXT);
+        names
     }
 
     /// Returns the name of `text`, adding it to the table if it is new.
@@ -158,23 +174,24 @@ impl Names {
         &self.texts[name.index()]
     }
 
-    /// The number of distinct names interned.
+    /// The number of distinct names interned, [`DEFINITION`] among them.
     #[must_use]
     pub fn len(&self) -> usize {
         self.texts.len()
     }
 
-    /// Whether no name has been interned.
+    /// Whether the table holds no name: never, since it holds
+    /// [`DEFINITION`] from the start.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.texts.is_empty()
     }
 
     /// Forgets every name interned after the first `len`, so the table is
-    /// as it was when it held `len` names. Used by
+    /// as it was when it held `len` names, but never [`DEFINITION`]. Used by
     /// [`crate::session::Session`] to undo a failed input.
     pub(crate) fn truncate(&mut self, len: usize) {
-        for text in self.texts.drain(len.min(self.texts.len())..) {
+        for text in self.texts.drain(len.max(1).min(self.texts.len())..) {
             self.lookup.remove(&text);
         }
     }
@@ -433,14 +450,17 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(names.get(a), "hello-world");
         assert_eq!(names.get(b), "x");
-        assert_eq!(names.len(), 2);
+        // Beside the definition context's, which every table holds first.
+        assert_eq!(names.len(), 3);
+        assert_eq!(names.get(DEFINITION), crate::lower::DEFINITION_CONTEXT);
     }
 
     #[test]
     fn lookup_does_not_intern() {
         let mut names = Names::new();
         assert_eq!(names.lookup("Int"), None);
-        assert!(names.is_empty());
+        assert_eq!(names.len(), 1);
+        assert!(!names.is_empty());
         let int = names.intern("Int");
         assert_eq!(names.lookup("Int"), Some(int));
     }
@@ -451,15 +471,22 @@ mod tests {
         let a = names.intern("a");
         names.intern("b");
         names.intern("c");
-        names.truncate(1);
-        assert_eq!(names.len(), 1);
+        names.truncate(2);
+        assert_eq!(names.len(), 2);
         assert_eq!(names.lookup("b"), None);
         assert_eq!(names.lookup("a"), Some(a));
         // A re-interned text gets the next free name again.
         let b = names.intern("b");
         assert_eq!(names.get(b), "b");
-        assert_eq!(names.len(), 2);
+        assert_eq!(names.len(), 3);
         names.truncate(10);
-        assert_eq!(names.len(), 2);
+        assert_eq!(names.len(), 3);
+        // The definition context's is never forgotten.
+        names.truncate(0);
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            names.lookup(crate::lower::DEFINITION_CONTEXT),
+            Some(DEFINITION)
+        );
     }
 }
