@@ -709,6 +709,39 @@ fn archive_of_top(name: &str, compress: &str) -> Option<String> {
 }
 
 #[test]
+fn a_zip_archive_unpacks_as_a_tar_does() {
+    let dir = fs_scratch("unpack-zip");
+    std::fs::create_dir_all(format!("{dir}/src/top/sub")).unwrap();
+    std::fs::write(format!("{dir}/src/top/a.txt"), "a\n").unwrap();
+    std::fs::write(format!("{dir}/src/top/sub/b.txt"), "b\n").unwrap();
+    let archive = format!("{dir}/top.zip");
+    let made = std::process::Command::new("zip")
+        .current_dir(format!("{dir}/src"))
+        .args(["-q", "-r", &archive, "top"])
+        .status()
+        .is_ok_and(|status| status.success());
+    let has_unzip = std::process::Command::new("unzip")
+        .arg("-v")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !made || !has_unzip {
+        return;
+    }
+    let text = format!(
+        "import archive\n\
+         let whole = archive.unpack(file(\"{archive}\"))\n\
+         let stripped = archive.unpack(file(\"{archive}\"), strip = 1)\n\
+         let deeper = archive.unpack(file(\"{archive}\"), strip = 2)\n\
+         = [whole.file(\"top/a.txt\").read(), stripped.file(\"sub/b.txt\").read(), \
+         \"{{len(stripped.files())}}\", deeper.file(\"b.txt\").read(), \"{{len(deeper.files())}}\"]"
+    );
+    assert_eq!(
+        lone(&text).unwrap(),
+        "[\"a\\n\", \"b\\n\", \"2\", \"b\\n\", \"1\"]"
+    );
+}
+
+#[test]
 fn an_archive_unpacks_into_a_directory_of_its_own() {
     for compress in ["", ".gz", ".xz"] {
         let Some(archive) = archive_of_top(&format!("unpack{compress}"), compress) else {

@@ -209,7 +209,9 @@ once.
 
 The `archive` module's `unpack(archive, strip)` makes a directory of what
 a tar archive holds, compressed with gzip, xz, bzip2, or zstd, or not at
-all. `strip` leaves off the first components of each path, as
+all, or what a zip archive holds, such as a Python wheel. It tells which
+from the archive's first bytes, whatever the file is called. `strip`
+leaves off the first components of each path, as
 `tar --strip-components` does, which removes the single top-level
 directory most source archives have:
 
@@ -220,8 +222,9 @@ let zlib = archive.unpack(fetch("https://zlib.net/fossils/zlib-1.3.1.tar.gz",
 zlib.file("zlib.h")
 ```
 
-Plain GCSL runs `tar` to unpack. A build tool such as pekit unpacks
-archives itself and keeps the result, so each archive is unpacked once.
+Plain GCSL runs `tar` to unpack, or `unzip` for a zip archive. A build
+tool such as pekit unpacks archives itself and keeps the result, so each
+archive is unpacked once.
 
 ## Directories
 

@@ -91,10 +91,13 @@
 //!
 //! `archive.unpack(a, strip)`, the built-in `archive_unpack` (`unpack`),
 //! makes a new temporary directory of the run of what the tar archive `a`
-//! holds, gzip, xz, bzip2 or zstd compressed or not, the first `strip`
+//! holds, gzip, xz, bzip2 or zstd compressed or not, or the zip archive, as
+//! a wheel or a jar is, which its first bytes tell, the first `strip`
 //! components of each path left off, an entry with no more left out. It
-//! runs `tar` through the run's [`Effects`], owners and the time of each file
-//! not kept. A host may answer it itself, as pekit does, from its store when
+//! runs `tar`, or `unzip`, through the run's [`Effects`], owners and the
+//! time of each file not kept; `unzip` has no stripping of its own, so a
+//! zip is unpacked whole first, and what is `strip` directories down moved
+//! into place. A host may answer it itself, as pekit does, from its store when
 //! it has unpacked the same archive before.
 
 use std::collections::HashSet;
@@ -711,20 +714,74 @@ pub(super) fn unpack(
         Ok(target) => target,
         Err(reason) => return fail(format!("`archive.unpack` cannot use `{root}`: {reason}")),
     };
-    let mut tar = Command::new("tar");
-    tar.arg("--extract")
-        .arg("--file")
-        .arg(&source)
-        .arg("--directory")
-        .arg(&target)
-        .arg(format!("--strip-components={strip}"))
-        .args(["--no-same-owner", "--touch"]);
-    if let Err(reason) = run_through(effects, tar) {
+    let unpacked = if is_zip(&source) {
+        unzip(&source, &target, strip, effects)
+    } else {
+        let mut tar = Command::new("tar");
+        tar.arg("--extract")
+            .arg("--file")
+            .arg(&source)
+            .arg("--directory")
+            .arg(&target)
+            .arg(format!("--strip-components={strip}"))
+            .args(["--no-same-owner", "--touch"]);
+        run_through(effects, tar).map(|_| ())
+    };
+    if let Err(reason) = unpacked {
         return fail(format!(
             "`archive.unpack` could not unpack `{path}`: {reason}"
         ));
     }
     Ok(entry(true, Rc::from(root)))
+}
+
+/// Whether the file at `path` begins as a zip archive does: a local file's
+/// header, or the end of an empty archive's directory.
+fn is_zip(path: &Path) -> bool {
+    use std::io::Read as _;
+    let mut start = [0u8; 4];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut start))
+        .is_ok_and(|()| matches!(&start, b"PK\x03\x04" | b"PK\x05\x06"))
+}
+
+/// Unpacks the zip archive at `source` into `target` with `unzip`, through
+/// `effects`, into a directory of its own inside it first, and then moves
+/// each entry `strip` components down into `target` with those components
+/// left off, as `tar --strip-components` does: an entry with no more is
+/// left out.
+fn unzip(source: &Path, target: &Path, strip: i64, effects: &dyn Effects) -> Result<(), String> {
+    let whole = target.join(".unzipped");
+    let mut unzip = Command::new("unzip");
+    unzip.args(["-q", "-o"]).arg(source).arg("-d").arg(&whole);
+    run_through(effects, unzip)?;
+    let strip = usize::try_from(strip).unwrap_or(usize::MAX);
+    let moved = move_stripped(&whole, target, strip).map_err(|error| error.to_string());
+    let removed = fs::remove_dir_all(&whole).map_err(|error| error.to_string());
+    moved.and(removed)
+}
+
+/// Moves what is `strip` directories down in `from` into `to`, merging a
+/// directory into one already there.
+fn move_stripped(from: &Path, to: &Path, strip: usize) -> std::io::Result<()> {
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let path = entry.path();
+        let is_dir = entry.file_type()?.is_dir();
+        if strip > 0 {
+            if is_dir {
+                move_stripped(&path, to, strip - 1)?;
+            }
+            continue;
+        }
+        let at = to.join(entry.file_name());
+        if is_dir && fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir()) {
+            move_stripped(&path, &at, 0)?;
+        } else {
+            fs::rename(&path, &at)?;
+        }
+    }
+    Ok(())
 }
 
 /// Applies `which`, for the call `node`, to `name`: the program of that name
