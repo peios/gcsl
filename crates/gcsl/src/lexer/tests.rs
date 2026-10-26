@@ -435,15 +435,35 @@ fn attributes_are_tokens_and_every_other_hash_a_comment() {
         "#!/usr/bin/env gcsl",
         "# [x]",
         "#! [x]",
-        "#[x y]",
         "#[1]",
         "#[",
-        "#[x",
         "#[]",
         "#!x",
     ] {
-        let text = format!("{comment} a\n1");
+        // What follows on the line is no name, which `#[` would begin an
+        // attribute with.
+        let text = format!("{comment} 2 a\n1");
         assert_eq!(show(&text), vec!["Newline", "Int(1)", "Eof"], "{comment}");
+    }
+    // A name after `#[` begins an attribute, so one not of the shape is an
+    // error, not a comment hiding the rest of its line.
+    for (text, message) in [
+        (
+            "#[x y] fn f() -> Int { 1 }",
+            "expected `]` or `(` after the attribute's name",
+        ),
+        (
+            "#[x fn f() -> Int { 1 }",
+            "expected `]` or `(` after the attribute's name",
+        ),
+        (
+            "#[attrs.step] fn f() -> Int { 1 }",
+            "an attribute is named by one name",
+        ),
+        ("#![a.b]", "an attribute is named by one name"),
+    ] {
+        let error = tokenize(&SourceFile::new("test.gcsl", text).unwrap()).unwrap_err();
+        assert_eq!(error.message, message, "{text}");
     }
     // An attribute inside an interpolation is skipped by the scan as the
     // lexer lexes it, not as a comment to the end of the line.
@@ -716,7 +736,8 @@ fn interning_gives_equal_names_for_equal_text() {
     assert_eq!(name(1), name(4));
     assert_ne!(name(0), name(1));
     assert_ne!(name(0), name(2));
-    assert_eq!(names.len(), 3);
+    // Beside the definition context's, which every table holds first.
+    assert_eq!(names.len(), 4);
 }
 
 #[test]
@@ -727,7 +748,7 @@ fn tokenize_with_shares_the_name_table_but_not_the_string_table() {
     let (second, second_strings) =
         tokenize_with(&SourceFile::new("b", "y x").unwrap(), &mut names).unwrap();
     assert_eq!(first[0].kind, second[1].kind);
-    assert_eq!(names.len(), 2);
+    assert_eq!(names.len(), 3);
     assert_eq!(first_strings.len(), 1);
     assert!(second_strings.is_empty());
 }
@@ -1981,4 +2002,187 @@ fn comments_are_recorded_in_source_order_when_asked_for() {
     assert_eq!(comments.at(b + 2).map(|span| span.start), Some(b));
     assert_eq!(comments.at(x), None);
     assert_eq!(comments.at(b - 1), None);
+}
+
+#[test]
+fn duration_and_size_literals_are_exact() {
+    const S: i64 = 1_000_000_000;
+    let cases = [
+        ("30s", TokenKind::Duration(30 * S)),
+        ("500ms", TokenKind::Duration(500_000_000)),
+        ("1h30m", TokenKind::Duration(90 * 60 * S)),
+        ("2d", TokenKind::Duration(2 * 86_400 * S)),
+        ("1us", TokenKind::Duration(1_000)),
+        ("7ns", TokenKind::Duration(7)),
+        ("0s", TokenKind::Duration(0)),
+        // A fraction on the last component, exactly.
+        ("1m0.5s", TokenKind::Duration(60 * S + S / 2)),
+        ("1.5h", TokenKind::Duration(90 * 60 * S)),
+        ("0.000000001s", TokenKind::Duration(1)),
+        (
+            "2.5000000000000000000000000000000000000000000s",
+            TokenKind::Duration(2 * S + S / 2),
+        ),
+        ("1_000ms", TokenKind::Duration(S)),
+        (
+            "106751d23h47m16s854ms775us807ns",
+            TokenKind::Duration(i64::MAX),
+        ),
+        ("512B", TokenKind::Size(512)),
+        ("1KB", TokenKind::Size(1_000)),
+        ("1.5MB", TokenKind::Size(1_500_000)),
+        ("1KiB", TokenKind::Size(1_024)),
+        ("2GiB", TokenKind::Size(2 << 30)),
+        ("1PiB", TokenKind::Size(1 << 50)),
+        ("0.5KiB", TokenKind::Size(512)),
+        ("0.0009765625KiB", TokenKind::Size(1)),
+        ("8191PiB", TokenKind::Size(8191 << 50)),
+        ("9223372036854775807B", TokenKind::Size(i64::MAX)),
+    ];
+    for (text, kind) in cases {
+        assert_eq!(kinds(text), [kind, TokenKind::Eof], "{text}");
+    }
+    // A minus before one is negation, as before a number.
+    assert_eq!(
+        kinds("-30s"),
+        [TokenKind::Neg, TokenKind::Duration(30 * S), TokenKind::Eof]
+    );
+}
+
+#[test]
+fn each_mistake_in_a_duration_or_size_literal_is_its_own_error() {
+    // Each case, its error and the text it points at: the last such text,
+    // where it occurs more than once.
+    let cases = [
+        ("1m1h", "`h` cannot follow `m` in a duration", "h"),
+        ("1s1s", "`s` cannot follow `s` in a duration", "s"),
+        (
+            "1.5m30s",
+            "only the last component of a duration may have a fraction",
+            "1.5m",
+        ),
+        ("1h2GiB", "`GiB` is not a duration's unit", "GiB"),
+        ("1h30sec", "unknown unit `sec`", "sec"),
+        ("1GiB2MiB", "a size literal has one unit", "2MiB"),
+        (
+            "1.5ns",
+            "a duration literal must be a whole number of nanoseconds",
+            "1.5ns",
+        ),
+        (
+            "0.3B",
+            "a size literal must be a whole number of bytes",
+            "0.3B",
+        ),
+        (
+            "106751d23h47m16s854ms775us808ns",
+            "duration literal out of range for Duration",
+            "106751d23h47m16s854ms775us808ns",
+        ),
+        (
+            "106752d",
+            "duration literal out of range for Duration",
+            "106752d",
+        ),
+        (
+            "9223372036854775808B",
+            "size literal out of range for Size",
+            "9223372036854775808B",
+        ),
+        ("8192PiB", "size literal out of range for Size", "8192PiB"),
+        ("1e3s", "a number with an exponent cannot have a unit", "s"),
+        (
+            "1.000000000000000000000000000000000000001s",
+            "the fraction of a duration literal has too many digits",
+            "1.000000000000000000000000000000000000001s",
+        ),
+    ];
+    for (text, message, at) in cases {
+        let start = u32::try_from(text.rfind(at).unwrap()).unwrap();
+        let span = Span::new(start, start + u32::try_from(at.len()).unwrap());
+        assert_eq!(error(text), (message.to_owned(), span), "{text}");
+    }
+    // An unknown unit is noted with every unit, or, after a duration's
+    // component, a duration's.
+    let unknown = lex("1h30sec").unwrap_err();
+    assert_eq!(unknown.notes, [DURATION_UNITS_NOTE]);
+    let largest = lex("8192PiB").unwrap_err();
+    assert_eq!(
+        largest.notes,
+        ["the largest Size literal is 9223372036854775807B"]
+    );
+    // A malformed one is one error token, all its letters and digits.
+    let (tokens, errors) = lex_all("1m1h30s x");
+    assert_eq!(errors.len(), 1);
+    assert!(matches!(
+        tokens[..],
+        [TokenKind::Error, TokenKind::Ident(_), TokenKind::Eof]
+    ));
+}
+
+#[test]
+fn a_number_glued_to_letters_that_name_no_unit_is_still_a_number() {
+    // So a module path's `pkgs/7zip` still lexes as it did, and the parser
+    // reports `30sec` where an expression is expected.
+    assert_eq!(show("7zip"), ["Int(7)", "Ident(zip)", "Eof"]);
+    assert_eq!(show("30sec"), ["Int(30)", "Ident(sec)", "Eof"]);
+    assert_eq!(show("1.5x"), ["Float(1.5)", "Ident(x)", "Eof"]);
+    assert_eq!(show("1e5"), ["Float(100000.0)", "Eof"]);
+    // Units are case-sensitive.
+    assert_eq!(show("5gib"), ["Int(5)", "Ident(gib)", "Eof"]);
+    // The scan ends a literal where the lexer does.
+    for (text, end) in [("1h30m x", 5), ("7zip", 1), ("2GiB", 4), ("1.5s+", 4)] {
+        assert_eq!(number_end(text.as_bytes(), 0), end, "{text}");
+    }
+}
+
+#[test]
+fn an_attribute_with_arguments_opens_a_bracket_its_arguments_close() {
+    let (tokens, names, _) =
+        tokenize(&SourceFile::new("t", "#[device(\n  name = \"kvm\",\n)]\nfn").unwrap()).unwrap();
+    let kinds: Vec<String> = tokens
+        .iter()
+        .map(|token| match token.kind {
+            TokenKind::AttributeArgs(name) => format!("AttributeArgs({})", names.get(name)),
+            TokenKind::Ident(name) => format!("Ident({})", names.get(name)),
+            kind => format!("{kind:?}"),
+        })
+        .collect();
+    // No newline inside the brackets; the one after its `]` is an item's
+    // end as ever.
+    assert_eq!(
+        kinds[..],
+        [
+            "AttributeArgs(device)",
+            "LParen",
+            "Ident(name)",
+            "Eq",
+            "Str(StrId(0))",
+            "Comma",
+            "RParen",
+            "RBracket",
+            "Newline",
+            "Fn",
+            "Eof"
+        ]
+    );
+    // The token is its `#[` and name; spaces before the `(` are allowed.
+    assert_eq!(spans("#[retry (3)]")[0], (0, 7));
+    assert!(matches!(
+        kinds_of("#![x(1)]")[0],
+        TokenKind::InnerAttributeArgs(_)
+    ));
+    // Without `]` or `(` after its name, it is an error, not a comment.
+    for text in ["#[retry 3]", "#[retry"] {
+        let error = tokenize(&SourceFile::new("t", text).unwrap()).unwrap_err();
+        assert_eq!(
+            error.message,
+            "expected `]` or `(` after the attribute's name"
+        );
+        assert_eq!(error.span, Span::new(0, 7));
+    }
+}
+
+fn kinds_of(text: &str) -> Vec<TokenKind> {
+    kinds(text)
 }

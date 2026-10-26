@@ -1,6 +1,6 @@
 # A workspace whose packages are defined with a def-type: Jack's newpkgs,
 # with `ppk` stubbed by `_lib/ppk.gcsl`.
-import _lib.ppk
+import _lib/ppk
 import fileroot
 
 type PackageDef = {

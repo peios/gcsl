@@ -16,6 +16,10 @@
 #   `mkdir -p`; one already there is fine;
 # - `copy(from, to)`: copies the file `from`, its contents and permissions,
 #   to `to`, whose directory must exist, replacing a file there;
+# - `set_executable(p, executable)`: makes the file `p` executable by
+#   whoever can read it, or by no one if `executable` is false, as a
+#   downloaded program needs. A file of several hard links shares its mode
+#   with every other, so changing one is an error: copy it first;
 # - `temp_dir()`: makes a new empty directory, mode 0700, and returns its
 #   absolute path. Every directory it makes is removed, with everything in
 #   it, when the run is done, whether it succeeded or failed (but not if
@@ -27,7 +31,19 @@
 #   leaves no temporary file behind. A file it replaces does not keep its
 #   permissions: the new file has the mode any new file gets (0666 less the
 #   umask), and a symbolic link at `p` is replaced, not followed. `p` a
-#   directory is an error.
+#   directory is an error;
+# - `compose_dir(entries)`: a new directory of the run, removed as
+#   `temp_dir`'s are, of the record `entries`, whose every key is a path in
+#   it, `/` or `.` for the directory itself: a `Dir`'s tree is copied under
+#   its key, a `File` to its key, and each file of a `List<File>` under its
+#   key by its name. Directories merge; two entries placing one file is an
+#   error, as a key leaving the directory is. Everything is COPIED, its
+#   permissions kept and its symbolic links as links, so that a program
+#   writing in the directory changes nothing it was made of; a host that
+#   isolates steps, as pekit does, mounts instead;
+# - `compose(entries)`: `compose_dir`'s directory, but of the list
+#   `entries`, each `{at = PATH; place = WHAT}`, so that a path can be
+#   computed, `"include/{name}.h"`, as no record's key can.
 #
 # Like every standard file it is a scope of its own: it sees its own
 # declarations, the prelude's names, and `builtins`.
@@ -37,5 +53,8 @@ exists = builtins.fs_exists
 read = builtins.fs_read
 mkdir = builtins.fs_mkdir
 copy = builtins.fs_copy
+set_executable = builtins.fs_set_executable
 temp_dir = builtins.fs_temp_dir
 write = builtins.fs_write
+compose_dir = builtins.fs_compose_dir
+compose = builtins.fs_compose

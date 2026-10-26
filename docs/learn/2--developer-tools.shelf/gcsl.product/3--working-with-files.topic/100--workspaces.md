@@ -23,9 +23,37 @@ conflicting leaf is an error unless an earlier declaration explicitly
 permits shadowing.
 
 Sibling and child directories are not automatically in scope. Imports
-name paths from the workspace root. `import lib.helpers` names
-`lib/helpers.gcsl` or a directory of that path. Use `as` for a local alias,
-or import a named member with `from`.
+name paths from the workspace root, with `/` between directories, as the
+file system does. `import lib/helpers` names `lib/helpers.gcsl` or a
+directory of that path. Use `as` for a local alias, or import a named
+member with `from`.
+
+A directory or file name in a path is written as it is, dots and all, so
+`import pkgs/net.busybox.busybox as busybox` names the directory
+`pkgs/net.busybox.busybox`. An import without `as` is named after the
+path's last part, so that part must be a plain name; give a name such as
+`net.busybox.busybox` one with `as`.
+
+## Libraries
+
+A library is a module that lives apart from any workspace, named by a
+path in quotes:
+
+```text
+import "github.com/gcslib/gcc"
+import compile, link from "github.com/gcslib/gcc"
+```
+
+The `gcsl` program looks for the library's directory in each directory
+of `$GCSL_LIBRARY_PATH`, then in `.gcsl/libraries/` at the workspace's
+root, and uses the first it finds. A library is the `.gcsl` files directly
+in its directory, which share their public declarations as a workspace
+directory's files do.
+
+A library sees only its own files, the standard library, and the other
+libraries it imports: never anything of the workspace that uses it. So a
+library means the same in every workspace, and a name it uses can't be
+picked up from yours by accident.
 
 ## Boundaries and evaluation order
 

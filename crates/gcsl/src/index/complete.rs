@@ -34,6 +34,10 @@ pub struct Completion {
     /// What is written, when it is not the label: a name that is no
     /// identifier, quoted; a named argument's `name = `.
     pub insert: Option<String>,
+    /// The text it replaces, when that is not the name around the place:
+    /// in an import's path, the whole segment around it, dots and all
+    /// ([`module_segment_around`]).
+    pub range: Option<Span>,
 }
 
 /// What a [`Completion`] is.
@@ -45,6 +49,8 @@ pub enum CompletionKind {
     Field,
     /// A function, or a field or variable holding one.
     Function,
+    /// A method that applies to the value before the `.`.
+    Method,
     /// A directory, a file, a module of the standard library.
     Module,
     /// A type.
@@ -341,7 +347,7 @@ impl<'s> Tokens<'s> {
         let Some(previous) = previous else {
             return Place::Name;
         };
-        if let Some(import) = self.import_place(previous) {
+        if let Some(import) = self.import_place(previous, offset) {
             return import;
         }
         let kind = self.kind(previous);
@@ -360,8 +366,12 @@ impl<'s> Tokens<'s> {
             | TokenKind::Label(_)
             | TokenKind::Attribute(_)
             | TokenKind::InnerAttribute(_)
+            | TokenKind::AttributeArgs(_)
+            | TokenKind::InnerAttributeArgs(_)
             | TokenKind::Int(_)
             | TokenKind::Float(_)
+            | TokenKind::Duration(_)
+            | TokenKind::Size(_)
             | TokenKind::Str(_)
             | TokenKind::StrEnd(_)
             | TokenKind::True
@@ -378,7 +388,7 @@ impl<'s> Tokens<'s> {
             }
             // A name, then on its line another: a def-type reference.
             TokenKind::Ident(_) => Place::Definition {
-                def_type: (self.word(previous).to_owned(), self.span(previous)),
+                def_type: self.def_type_at(previous),
                 prefix: Vec::new(),
             },
             TokenKind::LParen | TokenKind::Comma if self.declares_parameters(previous) => {
@@ -391,7 +401,7 @@ impl<'s> Tokens<'s> {
     /// The place after token number `previous` if it is in the path of an
     /// `import`: its segments before it; `None` if it is in no `import`,
     /// and [`Place::Nothing`] where the path is not what is written.
-    fn import_place(&self, previous: usize) -> Option<Place> {
+    fn import_place(&self, previous: usize, offset: u32) -> Option<Place> {
         let mut first = self.line_start(previous);
         while matches!(
             self.kind(first),
@@ -411,14 +421,32 @@ impl<'s> Tokens<'s> {
             Some(from) => written.get(from + 1..).unwrap_or_default(),
             None => written.as_slice(),
         };
-        let mut prefix = Vec::new();
-        for pair in path.chunks(2) {
-            match *pair {
-                [name, dot] if self.is_ident(name) && self.kind(dot) == TokenKind::Dot => {
-                    prefix.push(self.word(name).to_owned());
-                }
-                _ => return Some(Place::Nothing),
-            }
+        // The path so far is one run of glued tokens, through the segment
+        // half-typed at `offset`: the segments before its last `/` are the
+        // prefix (see the parser's [Imports](crate::parser::imports#imports)).
+        let (Some(&start), Some(&end)) = (path.first(), path.last()) else {
+            return Some(Place::Import(Vec::new()));
+        };
+        let glued = path
+            .windows(2)
+            .all(|pair| matches!(*pair, [a, b] if self.span(a).end == self.span(b).start));
+        // The word half-typed, set aside, follows the path directly.
+        if !glued || self.span(end).end != name_around(self.text, offset).start {
+            return Some(Place::Nothing);
+        }
+        let text = self
+            .text
+            .get(self.span(start).start as usize..offset as usize)
+            .unwrap_or_default();
+        let Some((before, _)) = text.rsplit_once('/') else {
+            return Some(Place::Import(Vec::new()));
+        };
+        let prefix: Vec<String> = before.split('/').map(str::to_owned).collect();
+        if !prefix
+            .iter()
+            .all(|segment| lexer::is_module_segment(segment))
+        {
+            return Some(Place::Nothing);
         }
         Some(Place::Import(prefix))
     }
@@ -450,7 +478,7 @@ impl<'s> Tokens<'s> {
         match before {
             Some(before) if self.is_type_place(before) => Place::QualifiedType(chain),
             Some(before) if self.is_ident(before) => Place::Definition {
-                def_type: (self.word(before).to_owned(), self.span(before)),
+                def_type: self.def_type_at(before),
                 prefix: chain,
             },
             _ => Place::Member {
@@ -458,6 +486,22 @@ impl<'s> Tokens<'s> {
                 chain: Some(chain),
             },
         }
+    }
+
+    /// The def-type written ending at token number `at`, a name: `package`,
+    /// or with the def-type's name and `::` before it, a variant,
+    /// `Toolchain::C`; with where it is written.
+    fn def_type_at(&self, at: usize) -> (String, Span) {
+        let word = self.word(at);
+        if let Some(colons) = at.checked_sub(1)
+            && self.kind(colons) == TokenKind::ColonColon
+            && let Some(dt) = colons.checked_sub(1)
+            && self.is_ident(dt)
+        {
+            let span = Span::join(self.span(dt), self.span(at));
+            return (format!("{}::{word}", self.word(dt)), span);
+        }
+        (word.to_owned(), self.span(at))
     }
 
     /// Whether a type is written after token number `at`: after a `:`, a
@@ -515,6 +559,20 @@ impl Index {
     /// a name is declared, nor in a file not indexed.
     #[must_use]
     pub fn completion(&self, file: u32, offset: u32) -> Vec<Completion> {
+        self.completion_triggered(file, offset, None)
+    }
+
+    /// [`Index::completion`], asked for because `trigger` was typed, if it
+    /// was: a `/` offers only what an import's path may go on with, since
+    /// anywhere else it is a division, after which the client should not
+    /// open a list unasked.
+    #[must_use]
+    pub fn completion_triggered(
+        &self,
+        file: u32,
+        offset: u32,
+        trigger: Option<char>,
+    ) -> Vec<Completion> {
         if !self.checked(file) {
             return Vec::new();
         }
@@ -522,7 +580,11 @@ impl Index {
             return Vec::new();
         };
         let tokens = Tokens::new(source);
-        let mut found = match tokens.place(offset) {
+        let place = tokens.place(offset);
+        if trigger == Some('/') && !matches!(place, Place::Import(_)) {
+            return Vec::new();
+        }
+        let mut found = match place {
             Place::Nothing => Vec::new(),
             Place::Name => {
                 let mut found = self.named_arguments(file, &tokens, offset);
@@ -532,7 +594,14 @@ impl Index {
             Place::Member { dot, chain } => self.members(file, offset, dot, chain.as_deref()),
             Place::Type => self.types_at(file),
             Place::QualifiedType(chain) => self.qualified_types(file, &chain),
-            Place::Import(prefix) => self.modules_under(file, &prefix),
+            Place::Import(prefix) => {
+                let range = module_segment_around(source.text(), offset);
+                let mut found = self.modules_under(file, &prefix);
+                for completion in &mut found {
+                    completion.range = Some(range);
+                }
+                found
+            }
             Place::Definition { def_type, prefix } => self.definitions(file, &def_type, &prefix),
         };
         found.sort_by(|a, b| a.sort.cmp(&b.sort));
@@ -577,12 +646,14 @@ impl Index {
             .iter()
             .map(|param| param.name.as_deref())
             .collect();
-        let filled = Arguments::of(tokens, open, offset).filled(tokens, &named);
+        let rest = callee.params.iter().position(|param| param.rest);
+        let filled = Arguments::of(tokens, open, offset).filled(tokens, &named, rest);
         callee
             .params
             .iter()
             .zip(filled)
-            .filter(|(_, filled)| !filled)
+            // A rest parameter is given by position, never by name.
+            .filter(|(param, filled)| !filled && !param.rest)
             .filter_map(|(param, _)| {
                 let name = param.name.as_deref()?;
                 Some(Completion {
@@ -592,6 +663,7 @@ impl Index {
                     documentation: None,
                     sort: sort_text(NAMED, name),
                     insert: Some(format!("{name} = ")),
+                    range: None,
                 })
             })
             .collect()
@@ -619,7 +691,8 @@ impl Index {
             let ItemKind::Let { path, function, .. } = it.kind else {
                 continue;
             };
-            if !function && it.span.end >= offset {
+            // A method is named by no variable.
+            if (!function && it.span.end >= offset) || ast.method(item).is_some() {
                 continue;
             }
             let Some((name, at)) = first_segment(ast.path(path)) else {
@@ -666,6 +739,7 @@ impl Index {
                 documentation: None,
                 sort: sort_text(KEYWORD, keyword),
                 insert: None,
+                range: None,
             });
         }
         found
@@ -674,7 +748,8 @@ impl Index {
     /// The locals declared in `ast` in scope at `offset`, innermost and
     /// latest first, each name once: the names of the `let`s, `fn`s and
     /// fields of each block around it before the item it is in, the
-    /// parameters of each function whose body it is in, the variable of
+    /// parameters of each function whose body it is in, and those before
+    /// the parameter of each function whose default it is in, the variable of
     /// each `for` whose body or guard it is in, and the `let`s of each
     /// condition loop's header before it. The file's own top level is not
     /// among them.
@@ -692,11 +767,24 @@ impl Index {
                 }
                 ExprKind::Fn(function) => {
                     let decl = ast.fn_decl(function);
+                    let params = ast.params(decl.params);
                     let body = ast.get(decl.body).span;
-                    if body.start < offset && offset <= body.end {
-                        let params = ast
-                            .params(decl.params)
+                    // In the body every parameter, and in a default the
+                    // ones before it.
+                    let seen = if body.start < offset && offset <= body.end {
+                        Some(params.len())
+                    } else {
+                        params.iter().position(|param| {
+                            param.default.is_some_and(|default| {
+                                let at = ast.get(default).span;
+                                at.start <= offset && offset <= at.end
+                            })
+                        })
+                    };
+                    if let Some(seen) = seen {
+                        let params = params
                             .iter()
+                            .take(seen)
                             .map(|param| (param.name, self.param_name(param.name, param.span)))
                             .collect();
                         scopes.push((span.start, params));
@@ -777,6 +865,7 @@ impl Index {
             documentation: self.documentation_of(Symbol::Local { file, name: at }),
             sort: sort_text(group, text),
             insert: quoted(text),
+            range: None,
         }
     }
 
@@ -824,6 +913,7 @@ impl Index {
             documentation: symbol.and_then(|symbol| self.documentation_of(symbol)),
             sort: sort_text(group, text),
             insert: quoted(text),
+            range: None,
         }
     }
 
@@ -953,20 +1043,92 @@ impl Index {
                 Some(Symbol::Node(node)) => self.cells.get(node as usize).copied().and_then(known),
                 _ => None,
             });
-        self.record_members(ty, at_end.and_then(|found| found.symbol))
+        let mut found = self.record_members(ty, at_end.and_then(|found| found.symbol));
+        if let Some(ty) = ty {
+            found.extend(self.method_members(file, ty));
+        }
+        found
+    }
+
+    /// The methods file `file` sees that may apply to a value of type `ty`,
+    /// the value before a `.` (see the checker's "Methods"): its own, and
+    /// the `def` methods of other files it sees, each once.
+    fn method_members(&self, file: u32, ty: TyId) -> Vec<Completion> {
+        let Some(entry) = self.scan.files.get(file as usize) else {
+            return Vec::new();
+        };
+        let own = (0u32..)
+            .zip(entry.ast.methods())
+            .map(|(method, _)| (file, method));
+        let others = entry
+            .method_view
+            .values()
+            .flatten()
+            .map(|found| (found.file, found.method));
+        let mut seen: HashSet<Name> = HashSet::new();
+        let mut found = Vec::new();
+        for (at, method) in own.chain(others) {
+            let Some(owner) = self.scan.files.get(at as usize) else {
+                continue;
+            };
+            let Some(decl) = owner.ast.methods().get(method as usize) else {
+                continue;
+            };
+            let ItemKind::Let { value, .. } = owner.ast.item(decl.item).kind else {
+                continue;
+            };
+            let Some(method_ty) = self.expr_type(at, value) else {
+                continue;
+            };
+            let Some(sig) = self.types.fn_sig(self.types.strip(method_ty)) else {
+                continue;
+            };
+            let Some(&(_, receiver)) = sig.params.first() else {
+                continue;
+            };
+            if !self.types.may_receive(ty, receiver, sig.generic) || !seen.insert(decl.name) {
+                continue;
+            }
+            let text = self.scan.names.get(decl.name);
+            found.push(Completion {
+                label: text.to_owned(),
+                kind: CompletionKind::Method,
+                detail: self.signature_of(at, value, method_ty, "fn", text),
+                documentation: None,
+                sort: sort_text(FILE, text),
+                insert: None,
+                range: None,
+            });
+        }
+        found
     }
 
     /// The type of the field `name` of `ty`, if it is a record type with
-    /// one.
+    /// one, or a file and `name` is `path`.
     fn field_of(&self, ty: TyId, name: Name) -> Option<TyId> {
+        if matches!(self.types.strip(ty), TyId::FILE | TyId::DIR) {
+            return (self.scan.names.get(name) == "path").then_some(TyId::STRING);
+        }
         let fields = self.types.record_fields(self.types.strip(ty))?;
         fields.iter().find(|&&(f, _)| f == name).map(|&(_, ty)| ty)
     }
 
     /// The fields of `ty`, if it is a record type, each with its doc
     /// comment if `of`, what has it, is a record block written as the
-    /// value of a local or a node.
+    /// value of a local or a node; a file's one field, `path`, if it is a
+    /// file.
     fn record_members(&self, ty: Option<TyId>, of: Option<Symbol>) -> Vec<Completion> {
+        if ty.is_some_and(|ty| matches!(self.types.strip(ty), TyId::FILE | TyId::DIR)) {
+            return vec![Completion {
+                label: "path".to_owned(),
+                kind: CompletionKind::Field,
+                detail: self.short(TyId::STRING),
+                documentation: Some("Its path, absolute.".to_owned()),
+                sort: sort_text(FILE, "path"),
+                insert: quoted("path"),
+                range: None,
+            }];
+        }
         let Some(fields) = ty.and_then(|ty| self.types.record_fields(self.types.strip(ty))) else {
             return Vec::new();
         };
@@ -986,6 +1148,7 @@ impl Index {
                     documentation: of.and_then(|of| self.field_doc(of, name)),
                     sort: sort_text(FILE, text),
                     insert: quoted(text),
+                    range: None,
                 }
             })
             .collect()
@@ -1067,6 +1230,7 @@ impl Index {
                 documentation: None,
                 sort: sort_text(STANDARD, builtin),
                 insert: None,
+                range: None,
             });
         }
         found
@@ -1119,6 +1283,7 @@ impl Index {
             documentation: self.documentation_of(Symbol::Type(decl)),
             sort: sort_text(group, text),
             insert: None,
+            range: None,
         }
     }
 
@@ -1137,6 +1302,7 @@ impl Index {
                 documentation: None,
                 sort: sort_text(group, label),
                 insert: None,
+                range: None,
             });
         };
         if prefix.is_empty() {
@@ -1204,10 +1370,35 @@ impl Index {
     }
 
     /// The key of the namespace of the def-type named as `def_type` is,
-    /// written where it is, in file `file`: of a reference to or a
-    /// definition made with it in the file, or else in any file, the
-    /// def-type it names resolving to what the name does here.
+    /// written where it is, in file `file`, with its variant if it names
+    /// one, `Toolchain::C`: of a reference to or a definition made with it
+    /// in the file, or else in any file, the def-type it names resolving to
+    /// what the name does here.
     fn namespace_key(&self, file: u32, (text, _): &(String, Span)) -> Option<Name> {
+        let (dt, variant) = match text.split_once("::") {
+            Some((dt, variant)) => (dt, Some(variant)),
+            None => (text.as_str(), None),
+        };
+        let key = self.def_type_key(file, dt)?;
+        // The key of the namespace of the variant named, or of none, from
+        // the key of any of the def-type's.
+        let key = self.scan.names.get(key);
+        let path = names::key_def_type(key)?;
+        let (number, item) = names::key_numbers(key)?;
+        let base = path.split_once("::").map_or(path, |(base, _)| base);
+        let wanted = match variant {
+            Some(variant) => format!("{base}::{variant}"),
+            None => base.to_owned(),
+        };
+        self.scan
+            .names
+            .lookup(&names::namespace_key(&wanted, number, item))
+    }
+
+    /// The key of a namespace of the def-type named `text`, written in file
+    /// `file`, as the namespace's key is found, of its definitions
+    /// made with a variant or not.
+    fn def_type_key(&self, file: u32, text: &str) -> Option<Name> {
         let name = self.scan.names.lookup(text)?;
         let entry = self.scan.files.get(file as usize)?;
         let named = |ast: &Ast, dt| matches!(ast.get(dt).kind, ExprKind::Name(n) if n == name);
@@ -1269,6 +1460,32 @@ fn declared_at(ast: &Ast, offset: u32) -> Option<Name> {
             _ => None,
         }
     })
+}
+
+/// The segment of an import's module path around byte `offset` of `text`:
+/// the run of letters, digits, `_`, `-`, `+` and `.` either side of it, up
+/// to a `/` or anything else (see the parser's
+/// [Imports](crate::parser::imports#imports)). What a completion of a module there
+/// replaces, as [`name_around`] is elsewhere.
+#[must_use]
+pub fn module_segment_around(text: &str, offset: u32) -> Span {
+    let bytes = text.as_bytes();
+    let offset = (offset as usize).min(bytes.len());
+    let in_segment = |at: usize| {
+        bytes
+            .get(at)
+            .is_some_and(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'.'))
+    };
+    let mut start = offset;
+    while start.checked_sub(1).is_some_and(in_segment) {
+        start -= 1;
+    }
+    let mut end = offset;
+    while in_segment(end) {
+        end += 1;
+    }
+    let at = |offset: usize| u32::try_from(offset).unwrap_or(u32::MAX);
+    Span::new(at(start), at(end))
 }
 
 /// The span of the name being completed at byte `offset` of `text`, by
@@ -1469,7 +1686,7 @@ mod tests {
 
     #[test]
     fn a_name_is_completed_from_what_is_in_scope_nearest_first() {
-        let text = "import v from lib.x\n# The top.\ntop = 1\nfn helper(n: Int): Int { n }\n\
+        let text = "import v from lib/x\n# The top.\ntop = 1\nfn helper(n: Int): Int { n }\n\
                     fn g(p: Int): String {\n    let x = 1\n    let x = \"s\"\n    let y = |\n    let later = 2\n    x\n}\n\
                     r = g(1)\n";
         let files = [
@@ -1512,6 +1729,20 @@ mod tests {
     }
 
     #[test]
+    fn a_default_is_offered_the_parameters_before_it() {
+        let found = complete(
+            &[(
+                "app.gcsl",
+                "fn f(first: Int, second: Int = fir| + 1, third: Int = 0): Int { second }\n",
+            )],
+            "app.gcsl",
+        );
+        assert_eq!(named(&found, "first").detail.as_deref(), Some("Int"));
+        assert!(!labels(&found).contains(&"second"));
+        assert!(!labels(&found).contains(&"third"));
+    }
+
+    #[test]
     fn completion_works_in_a_file_with_another_error() {
         for broken in ["broken = (1 2)\n", "broken = 1 + \"a\"\n", "broken = q.\n"] {
             let text = format!(
@@ -1534,6 +1765,7 @@ mod tests {
         assert_eq!(v.detail.as_deref(), Some("{version: String}"));
         assert_eq!(v.documentation.as_deref(), Some("A version."));
         assert!(labels(&found).contains(&"Int") && labels(&found).contains(&"List"));
+        assert!(labels(&found).contains(&"Duration") && labels(&found).contains(&"Size"));
         // After `is`, in a parameter, and in a `type` item.
         for text in [
             "type V = Int\nfn f(v: |): Int { 1 }\n",
@@ -1553,12 +1785,30 @@ mod tests {
     #[test]
     fn an_import_s_path_is_completed_by_segment() {
         let files = [
-            ("app.gcsl", "import lib.|\n"),
+            ("app.gcsl", "import lib/|\n"),
             ("lib/x.gcsl", "v = 1\n"),
             ("lib/sub/y.gcsl", "w = 1\n"),
         ];
         let found = complete(&files, "app.gcsl");
         assert_eq!(labels(&found), ["x", "sub"]);
+        // A path of more than one level, and a directory whose name has
+        // dots in it.
+        let files = [
+            ("app.gcsl", "import lib/sub/|\n"),
+            ("lib/sub/y.gcsl", "w = 1\n"),
+            ("lib/sub/net.busybox.busybox/z.gcsl", "w = 1\n"),
+        ];
+        let found = complete(&files, "app.gcsl");
+        assert_eq!(labels(&found), ["y", "net.busybox.busybox"]);
+        // Half a segment typed, dots and all: what is offered replaces the
+        // whole segment.
+        let files = [
+            ("app.gcsl", "import pkgs/net.bu|\n"),
+            ("pkgs/net.busybox.busybox/z.gcsl", "w = 1\n"),
+        ];
+        let found = complete(&files, "app.gcsl");
+        assert_eq!(labels(&found), ["net.busybox.busybox"]);
+        assert_eq!(found[0].range, Some(Span::new(12, 18)));
         let files = [("app.gcsl", "import |\n"), ("lib/x.gcsl", "v = 1\n")];
         let found = complete(&files, "app.gcsl");
         for module in ["lib", "path", "fs", "prelude", "builtins", "fileroot"] {
@@ -1569,7 +1819,7 @@ mod tests {
             );
         }
         let files = [
-            ("app.gcsl", "import v from lib.|\n"),
+            ("app.gcsl", "import v from lib/|\n"),
             ("lib/x.gcsl", "v = 1\n"),
         ];
         assert_eq!(labels(&complete(&files, "app.gcsl")), ["x"]);
@@ -1698,5 +1948,97 @@ mod tests {
             ("workspace.gcsl", workspace),
         ];
         assert_eq!(labels(&complete(&files, "app.gcsl")), ["dev"]);
+        // A variant's definitions, apart from another's.
+        let workspace = "enum Tool extensible\nenum Tool::C<Int>\nenum Tool::D<Int>\n\
+                         #[def_type]\ndef Tool<T>(name: String, kind: Variant<Tool, T>, func: \
+                         fn(): T): T { func() }\n";
+        let files = [
+            ("app.gcsl", "r = Tool::C |\n"),
+            (
+                "pkg.gcsl",
+                "def Tool::C gcc() { 1 }\ndef Tool::D other() { 2 }\n",
+            ),
+            ("workspace.gcsl", workspace),
+        ];
+        assert_eq!(labels(&complete(&files, "app.gcsl")), ["gcc"]);
+    }
+
+    #[test]
+    fn a_dot_offers_the_methods_that_may_apply() {
+        let files = [
+            (
+                "lib/ints.gcsl",
+                "def (x: Int) twice(): Int { x * 2 }\ndef (s: String) loud(): String { s }",
+            ),
+            (
+                "app.gcsl",
+                "import lib/ints\nfn (xs: List<T>) first_or<T>(f: T): T { f }\nlet n = 3\nr = n.|\n",
+            ),
+        ];
+        let labels: Vec<(String, CompletionKind)> = complete(&files, "app.gcsl")
+            .into_iter()
+            .map(|completion| (completion.label, completion.kind))
+            .collect();
+        assert_eq!(labels, [("twice".to_owned(), CompletionKind::Method)]);
+        let files = [(
+            "app.gcsl",
+            "fn (xs: List<T>) first_or<T>(f: T): T { f }\nlet xs = [1]\nr = xs.|\n",
+        )];
+        let labels: Vec<String> = complete(&files, "app.gcsl")
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect();
+        // The prelude's methods of every list apply too.
+        assert_eq!(labels, ["contains", "first_or", "len", "unique"]);
+    }
+
+    #[test]
+    fn a_dot_after_a_file_offers_its_path_and_its_methods() {
+        let files = [(
+            "app.gcsl",
+            "fn f() -> String {
+    let src = file(\"/a\")
+    src.|
+}
+",
+        )];
+        let found = complete(&files, "app.gcsl");
+        let path = named(&found, "path");
+        assert_eq!(path.kind, CompletionKind::Field);
+        assert_eq!(path.detail.as_deref(), Some("String"));
+        for method in ["read", "exec"] {
+            assert_eq!(
+                named(&found, method).kind,
+                CompletionKind::Method,
+                "{method}"
+            );
+        }
+        // A directory, its path and its own methods.
+        let files = [(
+            "app.gcsl",
+            "fn f() -> String {\n    let root = dir(\"/a\")\n    root.|\n}\n",
+        )];
+        let found = complete(&files, "app.gcsl");
+        assert_eq!(named(&found, "path").kind, CompletionKind::Field);
+        for method in ["file", "dir", "files", "exec"] {
+            assert_eq!(
+                named(&found, method).kind,
+                CompletionKind::Method,
+                "{method}"
+            );
+        }
+        // A list of files offers the one that finds a file in it.
+        let files = [(
+            "app.gcsl",
+            "fn f() -> String {
+    let set: FileSet = []
+    set.|
+}
+",
+        )];
+        assert_eq!(
+            named(&complete(&files, "app.gcsl"), "file").kind,
+            CompletionKind::Method
+        );
     }
 }

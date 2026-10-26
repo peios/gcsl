@@ -110,7 +110,7 @@
 //! # Shadowed declarations
 //!
 //! A field item marked `#[shadowable]` (see the parser's
-//! [Attributes](crate::parser#attributes)) may be shadowed by a later one
+//! [Attributes](crate::parser::attributes#attributes)) may be shadowed by a later one
 //! that overlaps it (see [`crate::workspace`], "Shadowable declarations"):
 //! its leaf is shadowable ([`FieldLeaf::shadowable`]), and so is a node all
 //! of whose leaves are ([`FieldNode::shadowable`]). Before the tree is
@@ -210,13 +210,23 @@
 //! to it. The reads of types by name, in annotations, ascriptions,
 //! parameters, function types and `type` items alike, are listed apart
 //! ([`type_reads`]), for the workspace to resolve and expand.
+//!
+//! # Methods
+//!
+//! A method (see the parser's [Methods](crate::parser::functions#methods)) is a
+//! top-level function of the input, under its binding's name, which no
+//! source can write, so it is found, grouped and scheduled as any `fn` is.
+//! Which method a call `x.m(...)` means depends on `x`'s type, which is not
+//! known here, so a call of a field named `m`, of whatever, mentions every
+//! method of the input named `m`: conservatively, as a call of each.
 
 use std::collections::HashMap;
 use std::mem;
 
 use crate::ast::{
-    Ast, DefTypeId, ExprId, ExprKind, FnId, ForHead, ForId, ItemId, ItemKind, ItemRange, PathRange,
-    PathSegment, SegmentKind, StrPart, TypeExprId, TypeExprKind,
+    Ast, DefTypeId, ExprId, ExprKind, FnId, ForHead, ForId, ImportForm, ImportId, ImportMember,
+    ItemId, ItemKind, ItemRange, PathRange, PathSegment, SegmentKind, StrPart, TypeExprId,
+    TypeExprKind,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -283,8 +293,9 @@ pub struct TypeDecl {
     pub item: ItemId,
     /// The item's position among the outermost block's items.
     pub position: usize,
-    /// The type it stands for.
-    pub ty: TypeExprId,
+    /// The type it stands for; `None` for an enum, which is a type of its
+    /// own (see the checker's "Enums").
+    pub ty: Option<TypeExprId>,
 }
 
 /// A read of a type by its name, in a type expression of a tree
@@ -296,8 +307,11 @@ pub enum TypeRead {
     Named(Name),
     /// A qualified name, its path in the tree's path pool.
     Path(PathRange),
-    /// A name applied to a type argument, `NAME<TYPE>`.
-    Applied(Name),
+    /// A name applied to type arguments, `NAME<TYPE, ...>`, and how many.
+    Applied(Name, u32),
+    /// A qualified name applied to type arguments, `t.NAME<TYPE, ...>`, and
+    /// how many.
+    PathApplied(PathRange, u32),
 }
 
 /// A node of a file's view that other sources share and that has a leaf of
@@ -766,7 +780,17 @@ pub fn scan_except(ast: &Ast, shadowed: &[bool]) -> Mentions {
                 span: name_span,
                 item,
                 position,
-                ty,
+                ty: Some(ty),
+            }),
+            // An enum is a type of its own, defined by nothing.
+            ItemKind::Enum {
+                name, name_span, ..
+            } => Some(TypeDecl {
+                name,
+                span: name_span,
+                item,
+                position,
+                ty: None,
             }),
             _ => None,
         })
@@ -782,18 +806,22 @@ pub fn scan_except(ast: &Ast, shadowed: &[bool]) -> Mentions {
 
 /// Every type expression of `ast` that reads a type by its name, in order
 /// (by id), as it is written (see [Types](#types)): a name written bare, a
-/// qualified name and a name applied to a type argument, in annotations,
-/// ascriptions, parameters, function types and `type` items alike. Which
-/// are of declared types, and which of those it can name, is the
-/// workspace's to say.
+/// qualified name and either applied to type arguments, in annotations,
+/// ascriptions, parameters, function types and `type` items alike, but a
+/// name that is a type parameter in scope there ([`Ast::type_param`]),
+/// which no declared type can be. Which are of declared types, and which
+/// of those it can name, is the workspace's to say.
 #[must_use]
 pub fn type_reads(ast: &Ast) -> Vec<(TypeExprId, TypeRead)> {
     ast.type_ids()
         .filter_map(|id| {
             let read = match ast.written_type(id) {
+                // A type parameter in scope is no declared type's name.
+                TypeExprKind::Named(name) if ast.type_param(id, name).is_some() => return None,
                 TypeExprKind::Named(name) => TypeRead::Named(name),
                 TypeExprKind::Path(path) => TypeRead::Path(path),
-                TypeExprKind::Applied { name, .. } => TypeRead::Applied(name),
+                TypeExprKind::Applied { name, args, .. } => TypeRead::Applied(name, args.len()),
+                TypeExprKind::PathApplied { path, args } => TypeRead::PathApplied(path, args.len()),
                 _ => return None,
             };
             Some((id, read))
@@ -1624,6 +1652,16 @@ impl Walker<'_> {
             .dotted_defs_under(node, &mut |function| found.push((function, span)));
     }
 
+    /// Records, as mentioned at `span`, the binding of every method of the
+    /// file named `name`, which a call of a field of the name may mean (see
+    /// [Methods](#methods)).
+    fn method_calls(&mut self, name: Name, span: Span) {
+        let ast = self.ast;
+        for method in ast.methods().iter().filter(|method| method.name == name) {
+            self.function_name(method.binding, span);
+        }
+    }
+
     /// Records `name`, read as a variable at `span`, if it is a top-level
     /// function's and nothing shadows it.
     fn function_name(&mut self, name: Name, span: Span) {
@@ -1715,7 +1753,10 @@ impl Walker<'_> {
                     self.expr(value);
                 }
             }
-            // An import has no expression to walk. The names it binds are
+            // An import of a def-type's definitions reads its def-type, as a
+            // definition does.
+            ItemKind::Import(id) => self.import(id),
+            // Another import has no expression to walk. The names it binds are
             // the scope's: a workspace's resolves them ([`Resolve::root`]
             // finds an imported name after the declarations of the
             // directory chain, with which it cannot share a name), and a
@@ -1724,9 +1765,26 @@ impl Walker<'_> {
             // is a type's, read only in type positions (see
             // [Types](#types)).
             // What the parser could not parse mentions nothing.
-            ItemKind::Import(_) | ItemKind::Type { .. } | ItemKind::Error => {}
+            ItemKind::Type { .. }
+            | ItemKind::Enum { .. }
+            | ItemKind::Variant { .. }
+            | ItemKind::Context { .. }
+            | ItemKind::Error => {}
             ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } => {
                 self.def_type_def(def, value);
+            }
+        }
+    }
+
+    /// Walks the import `id`: the `DT` of its def-type member, `import DT *
+    /// from PATH`, if it has one, a read of the def-type.
+    fn import(&mut self, id: ImportId) {
+        let ImportForm::Members(range) = self.ast.import_decl(id).form else {
+            return;
+        };
+        for member in self.ast.import_members(range) {
+            if let ImportMember::DefType { def, .. } = *member {
+                self.expr(self.ast.def_type(def).dt);
             }
         }
     }
@@ -1802,9 +1860,53 @@ impl Walker<'_> {
         match ast.get(id).kind {
             ExprKind::Int(_)
             | ExprKind::Float(_)
+            | ExprKind::Duration(_)
+            | ExprKind::Size(_)
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
+            // A variant is a constant: it reads no declaration (see
+            // [Types](#types)).
+            | ExprKind::Variant { .. }
             | ExprKind::Error => {}
+            // A read of a context the file declares with a default may call
+            // the default's function, a binding of the file: it mentions it
+            // as its name would (see the checker's "Context").
+            ExprKind::ContextRead(name) => {
+                let binding = ast
+                    .contexts()
+                    .iter()
+                    .find(|context| context.name == name)
+                    .and_then(|context| context.binding);
+                if let Some(binding) = binding {
+                    self.name(binding, ast.get(id).span);
+                }
+            }
+            ExprKind::Assert { cond, message } => {
+                self.expr(cond);
+                self.expr(message);
+            }
+            // The failure's name is the fallback's.
+            ExprKind::Recover(id) => {
+                let decl = *ast.recover_decl(id);
+                self.expr(decl.body);
+                let depth = self.shadows.len();
+                if let Some((name, _)) = decl.error {
+                    self.shadows.push(name);
+                }
+                self.expr(decl.fallback);
+                self.shadows.truncate(depth);
+            }
+            // The bindings' values are read where the `with` is; their
+            // names are contexts', of no scope.
+            ExprKind::With { bindings, body } => {
+                for binding in ast.with_bindings(bindings) {
+                    if let Some(current) = binding.current {
+                        self.expr(current);
+                    }
+                    self.expr(binding.value);
+                }
+                self.expr(body);
+            }
             ExprKind::Interp(parts) => {
                 for &part in ast.parts(parts) {
                     if let StrPart::Expr(expr) = part {
@@ -1836,6 +1938,11 @@ impl Walker<'_> {
             ExprKind::Lazy(function) => self.expr(ast.fn_decl(function).body),
             ExprKind::Call { callee, args } | ExprKind::Unclosed { callee, args } => {
                 self.expr(callee);
+                // A call of a field may be a method's: it mentions every
+                // method of the file of the name (see [Methods](#methods)).
+                if let ExprKind::Field { name, .. } = ast.get(callee).kind {
+                    self.method_calls(name, ast.get(callee).span);
+                }
                 for arg in ast.args(args) {
                     self.expr(arg.value);
                 }
@@ -1864,14 +1971,20 @@ impl Walker<'_> {
     }
 
     /// Walks a function expression, whose parameters shadow names in its
-    /// body. Kept out of [`Walker::expr`], so that the frame each level of
+    /// body and each in the defaults after it. Kept out of [`Walker::expr`],
+    /// so that the frame each level of
     /// nesting takes on the native stack stays small.
     #[inline(never)]
     fn function(&mut self, function: FnId) {
         let decl = *self.ast.fn_decl(function);
         let depth = self.shadows.len();
-        self.shadows
-            .extend(self.ast.params(decl.params).iter().map(|param| param.name));
+        // Each default sees the parameters before it, and the body all.
+        for param in self.ast.params(decl.params) {
+            if let Some(default) = param.default {
+                self.expr(default);
+            }
+            self.shadows.push(param.name);
+        }
         self.expr(decl.body);
         self.shadows.truncate(depth);
     }

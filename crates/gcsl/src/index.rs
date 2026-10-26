@@ -55,6 +55,12 @@
 //!   an import, or the `fileroot` module); the field accesses after it are
 //!   accesses of the values' fields. A top-level field item's path is the
 //!   declaration of a node at each of its segments.
+//! - A method (see the checker's "Methods") is the [`Symbol::Local`] of
+//!   its binding, by its file and its name's span, shown by its name, never
+//!   its binding's; the name at each call of it is an occurrence of it, as
+//!   the check recorded which method the call is of, in its own file or
+//!   another, so a method's calls go to its declaration, are its
+//!   references and are renamed with it.
 //! - A field access that no node is, on any value, is an occurrence of the
 //!   field read, of the type the check gave it. It has a symbol only when
 //!   the record's origin is cheap to find (best effort): a record block
@@ -94,7 +100,8 @@
 //!
 //! A hover ([`Index::hover`]) is Markdown: the occurrence as GCSL, in a
 //! `gcsl` code block, `name: Type`, a function as its signature, `fn
-//! name(a: Int): Int` or `def name(...)`, its parameters named as its source
+//! name(a: Int): Int` or `def name(...)`, a method's with its receiver
+//! first, `fn (x: Int) twice(): Int`, its parameters named as its source
 //! names them, a mutable variable `mut name: Type`, a type `type Name =
 //! TYPE` with its expansion, a built-in type its name; then its
 //! documentation, if it has any (see "Documentation"); then, if useful, one
@@ -188,7 +195,7 @@
 //! file's text as it is, lexed again, and the index of it: while it is
 //! edited it is mostly broken, and the parser keeps what an editor leaves
 //! half-typed for it, `a.` and `f(` (see the parser's [Errors and
-//! recovery](crate::parser#errors-and-recovery)), so what is before the
+//! recovery](crate::parser::recovery#errors-and-recovery)), so what is before the
 //! place is checked and indexed. The tokens before the place, the word
 //! being typed at it set aside (the client filters by it; a name typed up
 //! to a `-`, `libcap-`, which the lexer takes for a `-` that is ambiguous,
@@ -212,12 +219,23 @@
 //!   value of a local or a node. The access is found in the tree, a
 //!   [`ExprKind::NoField`] or a [`ExprKind::Field`] whose name is being
 //!   typed; where the tree has none, a path of names is followed by its
-//!   names.
+//!   names. And of a value of a known type, the methods the file sees whose
+//!   receiver type it may fit ([`TypeTable::may_receive`]), each name once,
+//!   by its signature.
 //! - In an `import`'s path, after `import` or `from`, the modules under the
-//!   segments before the place: the directories and files of the directory
-//!   they name, and at the start the standard library's modules, every one
-//!   of them whether the scan loaded it or not, `builtins` and `fileroot`
-//!   (only those in a lone file).
+//!   segments before the place, those before its last `/`: the directories
+//!   and files of the directory they name, and at the start the standard
+//!   library's modules, every one of them whether the scan loaded it or
+//!   not, `builtins` and `fileroot` (only those in a lone file). The path
+//!   so far must be one run of glued tokens, as the parser reads it (see
+//!   its [Imports](crate::parser::imports#imports)), the word half-typed directly
+//!   after it. What each writes over is not the name around the place but
+//!   the whole segment around it, dots and all
+//!   ([`module_segment_around`], [`Completion::range`]), so that a
+//!   directory named `net.busybox.busybox` replaces `net.bu`. Asked for
+//!   because a `/` was typed ([`Index::completion_triggered`]), only this
+//!   place offers anything: anywhere else a `/` is a division, after which
+//!   no list should open unasked.
 //! - After a def-type's name, `package dev.`, the children of the node of
 //!   the path in the def-type's namespace: the definitions under it. The
 //!   namespace's key is a reference's or a definition's of the def-type
@@ -346,7 +364,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 pub use closing::{Closed, ClosedCache, Closing};
-pub use complete::{Completion, CompletionKind, name_around};
+pub use complete::{Completion, CompletionKind, module_segment_around, name_around};
 pub use inlay::{InlayHint, MAX_HINT};
 pub use rename::{Edit, Prepared};
 pub use signature::Signature;
@@ -356,7 +374,9 @@ use crate::ast::{
     Ast, ExprId, ExprKind, ForHead, ImportForm, ImportMember, ItemId, ItemKind, PathRange,
     PathSegment, TypeExprKind, TypeLink,
 };
-use crate::check::{BUILTIN_TYPE_NAMES, BindingKind, Builtin, Constant, Fileroot, Record, RecordedDecl};
+use crate::check::{
+    BUILTIN_TYPE_NAMES, BindingKind, Builtin, Constant, Fileroot, MethodSite, Record, RecordedDecl,
+};
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::lexer::Comments;
 use crate::mentions::Resolve;
@@ -815,7 +835,7 @@ impl Index {
     /// Adds the keys of `target`, `depth` views in, to `keys`.
     fn target_keys(&self, target: Target, depth: usize, keys: &mut Vec<Key>) {
         match target {
-            Target::Node(node) => keys.push(Key::Node(node)),
+            Target::Node(node) | Target::Through { node, .. } => keys.push(Key::Node(node)),
             Target::Part { file, node } => {
                 let global = self
                     .scan
@@ -1069,7 +1089,9 @@ impl Index {
                 format!("{}.{}", Fileroot::MODULE, member.name()),
                 "built-in".to_owned(),
             ),
-            Target::Node(_) | Target::View(_) => (String::new(), String::new()),
+            Target::Node(_) | Target::Through { .. } | Target::View(_) => {
+                (String::new(), String::new())
+            }
         };
         let ty = match target {
             Target::Fileroot(None) => None,
@@ -1097,14 +1119,16 @@ impl Index {
             .and_then(|f| f.declared.iter().find(|&&(item, _)| item == declared.item))
             .map(|&(_, ty)| ty)
             .and_then(known);
-        let shown = match expansion {
-            Some(ty) => self.pretty(&format!("type {name} = "), ty),
-            None => self
+        let shown = match (expansion, declared.ty) {
+            // An enum is its own type.
+            (_, None) => format!("enum {name} extensible"),
+            (Some(ty), Some(_)) => self.pretty(&format!("type {name} = "), ty),
+            (None, Some(written)) => self
                 .scan
                 .files
                 .get(declared.file as usize)?
                 .ast
-                .show_type_with(declared.ty, &self.scan.names),
+                .show_type_with(written, &self.scan.names),
         };
         let path = self
             .scan
@@ -1120,9 +1144,9 @@ impl Index {
 
     /// The signature of the function expression `function` of file `file`,
     /// of type `ty`, declared with `keyword` and named `name`: `fn name(a:
-    /// Int): Int`, each parameter named as the source names it, laid out a
-    /// parameter per line if it is too wide for one. `None` if `ty` is no
-    /// function's type.
+    /// Int): Int`, or `fn name<T>(a: T): T` for a generic one, each
+    /// parameter named as the source names it, laid out a parameter per line
+    /// if it is too wide for one. `None` if `ty` is no function's type.
     fn signature_of(
         &self,
         file: u32,
@@ -1153,6 +1177,27 @@ impl Index {
             })
             .collect();
         let tail = self.sig_tail(sig);
+        let name = match sig.generic {
+            Some(generic) => {
+                let params: Vec<&str> = table
+                    .generic_names(generic)
+                    .iter()
+                    .map(|&param| self.scan.names.get(param))
+                    .collect();
+                format!("{name}<{}>", params.join(", "))
+            }
+            None => name.to_owned(),
+        };
+        // A method's, its receiver before its name.
+        let method = ast.methods().iter().any(|method| {
+            matches!(ast.item(method.item).kind, ItemKind::Let { value, .. } if value == function)
+        });
+        if method && let Some((receiver, rest)) = params.split_first() {
+            return Some(format!(
+                "{keyword} ({receiver}) {name}({}{tail}",
+                rest.join(", ")
+            ));
+        }
         let one = format!("{keyword} {name}({}{tail}", params.join(", "));
         if one.chars().count() <= WIDTH || params.is_empty() {
             return Some(one);
@@ -1267,13 +1312,19 @@ impl Index {
     }
 
     /// The path of the `import` item `item` of file `file`, as written:
-    /// `lib.x`.
+    /// `lib/x`.
     fn import_path(&self, file: u32, item: ItemId) -> Option<String> {
         let ast = &self.scan.files.get(file as usize)?.ast;
         let &ItemKind::Import(id) = ast_item(ast, item)? else {
             return None;
         };
-        Some(self.show_segments(ast.path(ast.import_decl(id).path)))
+        let segments = ast.path(ast.import_decl(id).path);
+        let shown: Vec<&str> = segments
+            .iter()
+            .filter_map(PathSegment::name)
+            .map(|name| self.scan.names.get(name))
+            .collect();
+        Some(shown.join("/"))
     }
 
     /// `segments`, names joined by `.`.
@@ -1346,7 +1397,7 @@ impl Index {
     /// start.
     fn module_sites(&self, target: Target) -> Vec<Location> {
         match target {
-            Target::Node(node) => self.node_sites(node),
+            Target::Node(node) | Target::Through { node, .. } => self.node_sites(node),
             Target::View(view) => self.view_sites(view),
             Target::Part { file, node } => {
                 let mut found = Vec::new();
@@ -1410,7 +1461,8 @@ impl Index {
             Target::Dir(_) | Target::File(_) => target_roots(&self.scan, target),
             Target::View(view) => self.scan.view_names(view),
             Target::Part { .. } => self.scan.child_names(target),
-            Target::Node(_) | Target::Fileroot(_) => return None,
+            // A namespace, which nothing reads whole.
+            Target::Node(_) | Target::Through { .. } | Target::Fileroot(_) => return None,
         };
         let mut fields = Vec::with_capacity(names.len());
         for name in names {
@@ -1704,6 +1756,10 @@ struct Builder<'s> {
     order: Vec<(Span, Name)>,
     /// Where each name its check read from a binding was declared.
     uses: HashMap<ExprId, Span>,
+    /// The method each call of one is of, by the call's callee, as the
+    /// check recorded it: where the method's name is declared, in this file
+    /// (`None`) or another, if that is known.
+    methods: HashMap<ExprId, MethodSite>,
     /// Where its bindings' declarations are.
     sites: Sites,
     /// The field access directly on each expression that has one.
@@ -1768,6 +1824,7 @@ impl<'s> Builder<'s> {
             decls,
             order,
             uses: record.uses.into_iter().collect(),
+            methods: record.methods.into_iter().collect(),
             sites: Sites::default(),
             parents: HashMap::new(),
             covered: HashSet::new(),
@@ -1858,6 +1915,8 @@ impl<'s> Builder<'s> {
         if span.end <= span.start {
             return;
         }
+        // A method's binding is written as the method's name.
+        let name = name.map(|name| self.method_name(name).unwrap_or(name));
         self.occurrences.push(Occurrence {
             span,
             symbol,
@@ -1868,6 +1927,12 @@ impl<'s> Builder<'s> {
             ty,
             via: None,
         });
+    }
+
+    /// The name of the method whose binding is `name`, if it is one's (see
+    /// [`crate::names`], "Method bindings").
+    fn method_name(&self, name: Name) -> Option<Name> {
+        names::binding_method(self.text(name)).and_then(|method| self.scan.names.lookup(method))
     }
 
     /// Records an occurrence that is its symbol's declaration.
@@ -2044,10 +2109,12 @@ impl<'s> Builder<'s> {
             } else {
                 self.add(name, Some(symbol), Some(decl.name), decl.ty);
             }
+            // A method's binding is the method, by its name.
+            let local_name = self.method_name(decl.name).unwrap_or(decl.name);
             self.locals.insert(
                 name,
                 Local {
-                    name: decl.name,
+                    name: local_name,
                     ty: decl.ty,
                     what,
                     item,
@@ -2280,6 +2347,17 @@ impl<'s> Builder<'s> {
             if self.covered.contains(&id) || self.reads_namespace(id) {
                 continue;
             }
+            // A method's name at a call of it is the method's, a local
+            // function of the file that declares it.
+            if let Some(&declared) = self.methods.get(&id) {
+                let symbol = declared.map(|(file, at)| Symbol::Local {
+                    file: file.unwrap_or(self.index),
+                    name: at,
+                });
+                let span = member_span(ast, id, self.text(name));
+                self.add(span, symbol, Some(name), self.ty(id));
+                continue;
+            }
             let symbol = self
                 .symbols
                 .get(&record)
@@ -2412,6 +2490,8 @@ impl<'s> Builder<'s> {
         for id in ast.type_ids() {
             let span = ast.type_expr(id).span;
             match ast.written_type(id) {
+                // A type parameter is no declared type, whatever its name.
+                TypeExprKind::Named(name) if ast.type_param(id, name).is_some() => {}
                 TypeExprKind::Named(name) => {
                     let symbol = match self.file.type_view.get(&name) {
                         Some(&number) => decl_index(number).map(Symbol::Type),
@@ -2424,16 +2504,23 @@ impl<'s> Builder<'s> {
                     }
                 }
                 TypeExprKind::Applied { name, span: at, .. } => {
-                    if BUILTIN_TYPE_NAMES.contains(&self.text(name)) {
-                        self.add(at, Some(Symbol::BuiltinType(name)), Some(name), TyId::ERROR);
+                    let symbol = match self.file.type_view.get(&name) {
+                        Some(&number) => decl_index(number).map(Symbol::Type),
+                        None => BUILTIN_TYPE_NAMES
+                            .contains(&self.text(name))
+                            .then_some(Symbol::BuiltinType(name)),
+                    };
+                    if symbol.is_some() {
+                        self.add(at, symbol, Some(name), TyId::ERROR);
                     }
                 }
-                TypeExprKind::Path(path) => {
-                    let link = self.scan.qualified_type(self.file, ast.path(path), span);
+                TypeExprKind::Path(path) | TypeExprKind::PathApplied { path, .. } => {
+                    let at = path_span(ast.path(path)).unwrap_or(span);
+                    let link = self.scan.qualified_type(self.file, ast.path(path), at);
                     if let TypeLink::Decl(number) = link
                         && let Some(decl) = decl_index(number)
                     {
-                        self.add(span, Some(Symbol::Type(decl)), None, TyId::ERROR);
+                        self.add(at, Some(Symbol::Type(decl)), None, TyId::ERROR);
                     }
                 }
                 _ => {}

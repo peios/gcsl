@@ -48,7 +48,7 @@
 //! identifiers, which only the checker gives a meaning, in types. Nor is
 //! `type`: it is an identifier here, which the parser takes as the start of
 //! a `type` item only where an item starts and an identifier follows it on
-//! its line (see the parser's [Types](crate::parser#types)), so a variable
+//! its line (see the parser's [Types](crate::parser::types#types)), so a variable
 //! or field may still be named `type`.
 //!
 //! Operators are lexed greedily: `===` is one token, `==` another and `=`
@@ -64,7 +64,11 @@
 //! and two alone one [`TokenKind::DotDot`], the range; anywhere else a `.`
 //! is a [`TokenKind::Dot`]. So `1.x` is `1`, `.`, `x`, `0..10` is `0`,
 //! `..`, `10`, `1.5..2` is `1.5`, `..`, `2`, `0...5` is `0`, `...`, `5`,
-//! and `....` is `...`, `.`. A `,` is a
+//! and `....` is `...`, `.`. A number glued to the name of a unit, `30s`, `1h30m` or
+//! `2GiB`, is a duration or a size literal ([`TokenKind::Duration`],
+//! [`TokenKind::Size`]), its value converted exactly to nanoseconds or bytes
+//! (see `Lexer::quantity`); glued to any other letters, a number is still a
+//! number and the letters a name, so `7zip` is `7`, `zip`. A `,` is a
 //! [`TokenKind::Comma`], which separates the fields of a record type, the
 //! parameters of a function, the arguments of a call and the elements of a
 //! list. `[` and `]` are [`TokenKind::LBracket`] and
@@ -92,11 +96,21 @@
 //! interned as an identifier is: `#[NAME]` an outer one,
 //! [`TokenKind::Attribute`], which applies to the item after it, and
 //! `#![NAME]` an inner one, [`TokenKind::InnerAttribute`], which applies to
-//! the whole file (see the parser's [Attributes](crate::parser#attributes)).
-//! Every other `#` starts a comment to the end of its line, as it always
-//! has: so a shebang, `#!/usr/bin/env gcsl`, is a comment, and so is `#
-//! [x]`, with a space, and `#[x y]`, `#[` alone or `#[1]`, which are not of
-//! the shape. The scan of a string literal's interpolations (see [String
+//! the whole file (see the parser's [Attributes](crate::parser::attributes#attributes)).
+//! The name followed, after optional spaces or tabs, by `(` instead of `]`
+//! is an attribute with arguments: one token through its name,
+//! [`TokenKind::AttributeArgs`] or [`TokenKind::InnerAttributeArgs`], whose
+//! `[` the lexer leaves open on its bracket stack, as a list's, so that
+//! newlines in its arguments are not significant and the `]` after them,
+//! an ordinary [`TokenKind::RBracket`], closes it; the arguments are
+//! ordinary tokens. A `#[` or `#![` and a name that are not of the shape,
+//! `#[x y]`, `#[x` or `#[a.b]`, are an error, "an attribute is named by one
+//! name" for a dotted one, "expected `]` or `(` after the attribute's name"
+//! otherwise, rather than a comment that would hide the code after them on
+//! their line. Every other `#` starts a comment to the end of its line, as
+//! it always has: so a shebang, `#!/usr/bin/env gcsl`, is a comment, and so
+//! are `# [x]`, with a space, `#[` alone, `#[]` and `#[1]`. The scan of a
+//! string literal's interpolations (see [String
 //! literals](#string-literals)) tells the two apart by the same rule
 //! (`attribute_at`), so the lexer and the scan always agree on where a
 //! comment ends.
@@ -173,13 +187,15 @@
 //! The lexer goes on past every error ([`lex`]), reporting each once, in
 //! source order, and puts a [`TokenKind::Error`] where it is, which the
 //! parser reports nothing at (see the parser's [Errors and
-//! recovery](crate::parser#errors-and-recovery)), so that a mistake is no
+//! recovery](crate::parser::recovery#errors-and-recovery)), so that a mistake is no
 //! other token and nothing is reported of it twice:
 //!
 //! - An unexpected character, a `'` with no name after it, and an
 //!   ambiguous `-` are an error token of their own, one character.
 //! - A malformed number literal (a misplaced `_`, an exponent with no
-//!   digits, a literal too large for its type) is one error token with
+//!   digits, a literal too large for its type, a duration's units out of
+//!   order, a fraction that is no whole number of nanoseconds or bytes) is
+//!   one error token with
 //!   every ASCII letter, digit and `_` glued to it, a `.` followed by a
 //!   digit or `_`, and a sign after an `e` or `E`, so that no part of it is
 //!   lexed again as a number or a name.
@@ -222,6 +238,7 @@ use crate::diagnostic::{Diagnostic, InternalError};
 use crate::names::{Name, Names};
 use crate::source::{SourceFile, Span, offset_to_u32};
 use crate::strings::{StrId, Strings};
+use crate::value::{DURATION_UNITS, Quantity, SIZE_UNITS, Unit};
 
 /// One token: its kind (with the value, for literals) and where it came from.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -249,6 +266,12 @@ pub enum TokenKind {
     Int(i64),
     /// A float literal, already converted.
     Float(f64),
+    /// A duration literal, already converted: a number of nanoseconds (see
+    /// `Lexer::quantity`).
+    Duration(i64),
+    /// A size literal, already converted: a number of bytes (see
+    /// `Lexer::quantity`).
+    Size(i64),
     /// A string literal without interpolations: its whole text.
     Str(StrId),
     /// The text of an interpolated string literal before its first
@@ -314,6 +337,14 @@ pub enum TokenKind {
     /// An inner attribute, `#![NAME]`, holding its name (see
     /// [Attributes](#attributes)): it applies to the whole file.
     InnerAttribute(Name),
+    /// The start of an outer attribute with arguments, `#[NAME`, holding its
+    /// name, before the `(` of its arguments (see [Attributes](#attributes)).
+    /// Its `[` is open until the `]` after the arguments, an
+    /// [`TokenKind::RBracket`].
+    AttributeArgs(Name),
+    /// The start of an inner attribute with arguments, `#![NAME`, as
+    /// [`TokenKind::AttributeArgs`] is of an outer one.
+    InnerAttributeArgs(Name),
     /// The keyword `in`, between a `for`'s variable and what it iterates
     /// over.
     In,
@@ -359,6 +390,10 @@ pub enum TokenKind {
     Colon,
     /// `:=`
     ColonEq,
+    /// `::`, between an enum and its variant, `Toolchain::C`.
+    ColonColon,
+    /// `^`, before a context's name, `^arch`.
+    Caret,
     /// `->`, which marks an impure function's return type.
     Arrow,
     /// `->>`, which marks a memoised impure function's return type.
@@ -452,6 +487,8 @@ impl TokenKind {
             TokenKind::Ge => Some(">="),
             TokenKind::Colon => Some(":"),
             TokenKind::ColonEq => Some(":="),
+            TokenKind::ColonColon => Some("::"),
+            TokenKind::Caret => Some("^"),
             TokenKind::Arrow => Some("->"),
             TokenKind::MemoArrow => Some("->>"),
             TokenKind::Eq => Some("="),
@@ -470,6 +507,8 @@ impl TokenKind {
             TokenKind::Pipe => Some("|"),
             TokenKind::Int(_)
             | TokenKind::Float(_)
+            | TokenKind::Duration(_)
+            | TokenKind::Size(_)
             | TokenKind::Str(_)
             | TokenKind::StrStart(_)
             | TokenKind::StrMid(_)
@@ -478,6 +517,8 @@ impl TokenKind {
             | TokenKind::Label(_)
             | TokenKind::Attribute(_)
             | TokenKind::InnerAttribute(_)
+            | TokenKind::AttributeArgs(_)
+            | TokenKind::InnerAttributeArgs(_)
             | TokenKind::Newline
             | TokenKind::Error
             | TokenKind::Eof => None,
@@ -523,6 +564,22 @@ pub fn is_identifier(text: &str) -> bool {
     matches!(bytes.first(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
         && identifier_end(bytes, 0) == bytes.len()
         && keyword(text).is_none()
+}
+
+/// Whether `text` may be a segment of a module path (see
+/// [Imports](crate::parser::imports#imports)): ASCII letters, digits, `_`, `-`, `+` and `.`,
+/// starting with a letter, a digit or `_` and ending with one or `+`, as
+/// `gmp-c++` does, with no `..`.
+#[must_use]
+pub fn is_module_segment(text: &str) -> bool {
+    let word = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
+    let bytes = text.as_bytes();
+    bytes.first().is_some_and(word)
+        && bytes.last().is_some_and(|byte| word(byte) || *byte == b'+')
+        && !text.contains("..")
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'.'))
 }
 
 /// Lexes the whole of `source`, interning its names into a new table and
@@ -1017,10 +1074,12 @@ impl<'a> Lexer<'a> {
             b'.' => (TokenKind::Dot, 1),
             b',' => (TokenKind::Comma, 1),
             b'|' => (TokenKind::Pipe, 1),
+            b'^' => (TokenKind::Caret, 1),
             b'=' if self.peek_at(1) == Some(b'=') && self.peek_at(2) == Some(b'=') => {
                 (TokenKind::EqEqEq, 3)
             }
             b'=' => with_eq(TokenKind::Eq, TokenKind::EqEq),
+            b':' if self.peek_at(1) == Some(b':') => (TokenKind::ColonColon, 2),
             b':' => with_eq(TokenKind::Colon, TokenKind::ColonEq),
             b'<' => with_eq(TokenKind::Lt, TokenKind::Le),
             b'>' => with_eq(TokenKind::Gt, TokenKind::Ge),
@@ -1099,7 +1158,11 @@ impl<'a> Lexer<'a> {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
                 b'\n' if newlines_are_trivia => self.pos += 1,
                 // An attribute is a token (see [Attributes](#attributes)).
-                b'#' if attribute_at(self.bytes, self.pos).is_some() => break,
+                b'#' if attribute_at(self.bytes, self.pos).is_some()
+                    || attribute_attempt(self.bytes, self.pos).is_some() =>
+                {
+                    break;
+                }
                 // Skip to the newline, which is then either skipped or
                 // emitted like any other.
                 b'#' => {
@@ -1142,19 +1205,26 @@ impl<'a> Lexer<'a> {
     /// Lexes the attribute starting at `start`, which holds a `#` that
     /// `skip_trivia` found starts one (see [Attributes](#attributes)): an
     /// [`TokenKind::Attribute`] or an [`TokenKind::InnerAttribute`], its name
-    /// interned as an identifier's is.
+    /// interned as an identifier's is; or, for one with arguments, an
+    /// [`TokenKind::AttributeArgs`] or [`TokenKind::InnerAttributeArgs`]
+    /// through its name, its `[` left open on the bracket stack, as a list's
+    /// is, for the `]` after its arguments to close.
     fn attribute(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
-        let Some((inner, (from, to), end)) = attribute_at(self.bytes, start) else {
-            return Err(self.unexpected_character());
+        let Some((inner, (from, to), args, end)) = attribute_at(self.bytes, start) else {
+            return Err(self.malformed_attribute(start));
         };
         let name = self
             .names
             .intern(self.text.get(from..to).unwrap_or_default());
         self.pos = end;
-        Ok(if inner {
-            TokenKind::InnerAttribute(name)
-        } else {
-            TokenKind::Attribute(name)
+        if args {
+            self.brackets.push(Bracket::Square);
+        }
+        Ok(match (inner, args) {
+            (false, false) => TokenKind::Attribute(name),
+            (true, false) => TokenKind::InnerAttribute(name),
+            (false, true) => TokenKind::AttributeArgs(name),
+            (true, true) => TokenKind::InnerAttributeArgs(name),
         })
     }
 
@@ -1212,7 +1282,14 @@ impl<'a> Lexer<'a> {
     ///
     /// A literal with a fraction or an exponent is a float. A `.` not followed
     /// by a digit is not part of the literal. A `-` after a literal is never
-    /// part of it, except as the sign of an exponent.
+    /// part of it, except as the sign of an exponent. Letters glued to a
+    /// literal without an exponent that are a unit's name ([`unit_at`]) make
+    /// it a duration or a size (`Lexer::quantity`); after an exponent they
+    /// are "a number with an exponent cannot have a unit". Any other letters
+    /// end the literal, as they always did, and start a name: so a module
+    /// path's `pkgs/7zip` is still the number and the name it was, and the
+    /// parser reports `30sec` where an expression is expected (see the
+    /// parser's [Expressions](crate::parser::expressions#expressions)).
     fn number(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
         let mut has_underscore = self.digits()?;
         let mut is_float = false;
@@ -1229,6 +1306,9 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        if unit_at(self.bytes, self.pos) {
+            return self.quantity(start);
+        }
         if matches!(self.peek(), Some(b'e' | b'E')) {
             let exponent_start = self.pos;
             self.pos += 1;
@@ -1246,6 +1326,12 @@ impl<'a> Lexer<'a> {
                 }
             }
             is_float = true;
+            if unit_at(self.bytes, self.pos) {
+                return Err(Diagnostic::error(
+                    "a number with an exponent cannot have a unit",
+                    span(self.pos, letters_end(self.bytes, self.pos)),
+                ));
+            }
         }
 
         let literal_span = span(start, self.pos);
@@ -1285,6 +1371,97 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Lexes the duration or size literal starting at `start`, a digit: one
+    /// or more *components*, each digits with `_` separators, an optional
+    /// fraction, `.` and digits, and a unit glued to them, ASCII letters.
+    ///
+    /// ```text
+    /// duration  = component+     (each with a unit of `DURATION_UNITS`)
+    /// size      = component      (with a unit of `SIZE_UNITS`)
+    /// component = digits ( "." digits )? unit
+    /// ```
+    ///
+    /// A duration's components go from the largest unit to the smallest,
+    /// each unit at most once, and only the last may have a fraction:
+    /// `1h30m`, `1m0.5s`. Its value is the sum of its components' in
+    /// nanoseconds, computed exactly (`exact_amount`), and must be a whole
+    /// number of them; a size's, in bytes, likewise. Each mistake is its own
+    /// error, at what is wrong: an unknown unit, "unknown unit `sec`", noted
+    /// with the units there are; a unit out of order, "`h` cannot follow
+    /// `m` in a duration"; a fraction before the last component; a size
+    /// unit in a duration or a second component of a size; a fraction that
+    /// is no whole number of the type's smallest unit; one with more digits
+    /// than are kept; and a value too large for an `i64`, "duration literal
+    /// out of range for Duration" or "size literal out of range for Size".
+    fn quantity(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
+        self.pos = start;
+        let mut total: i128 = 0;
+        // The previous component's unit, and where it is written.
+        let mut previous: Option<(&'static Unit, Span)> = None;
+        // The previous component, if it has a fraction.
+        let mut fractional: Option<Span> = None;
+        loop {
+            let component_start = self.pos;
+            self.digits()?;
+            let whole_end = self.pos;
+            let mut fraction = None;
+            if self.peek() == Some(b'.') {
+                match self.peek_at(1) {
+                    Some(b'0'..=b'9') => {
+                        self.pos += 1;
+                        let fraction_start = self.pos;
+                        self.digits()?;
+                        fraction = Some((fraction_start, self.pos));
+                    }
+                    Some(b'_') => return Err(leading_underscore(self.pos + 1)),
+                    _ => {}
+                }
+            }
+            let unit_start = self.pos;
+            while self.peek().is_some_and(|byte| byte.is_ascii_alphabetic()) {
+                self.pos += 1;
+            }
+            let unit_span = span(unit_start, self.pos);
+            let unit = unit_named(&self.text[unit_start..self.pos], previous, unit_span)?;
+            if let Some(at) = fractional {
+                return Err(Diagnostic::error(
+                    "only the last component of a duration may have a fraction",
+                    at,
+                ));
+            }
+            let component = span(component_start, self.pos);
+            let whole = &self.text[component_start..whole_end];
+            let fraction = fraction.map_or("", |(from, to)| &self.text[from..to]);
+            let amount = exact_amount((whole, fraction), unit, component)?;
+            total = total
+                .checked_add(amount)
+                .ok_or_else(|| out_of_range(unit.quantity, span(start, self.pos)))?;
+            if !fraction.is_empty() {
+                fractional = Some(component);
+            }
+            previous = Some((unit, unit_span));
+            if !self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                break;
+            }
+            if unit.quantity == Quantity::Size {
+                let next = self.pos;
+                let end = malformed_number_end(self.bytes, next);
+                return Err(Diagnostic::error(
+                    "a size literal has one unit",
+                    span(next, end),
+                ));
+            }
+        }
+        let literal = span(start, self.pos);
+        let value = i64::try_from(total).map_err(|_| out_of_range(Quantity::Duration, literal));
+        match previous.map(|(unit, _)| unit.quantity) {
+            Some(Quantity::Size) => Ok(TokenKind::Size(
+                i64::try_from(total).map_err(|_| out_of_range(Quantity::Size, literal))?,
+            )),
+            _ => Ok(TokenKind::Duration(value?)),
+        }
+    }
+
     /// Consumes a group of digits with `_` separators, starting at a digit.
     /// Returns whether any `_` was seen.
     fn digits(&mut self) -> Result<bool, Diagnostic> {
@@ -1314,6 +1491,25 @@ impl<'a> Lexer<'a> {
             }
         }
         Ok(has_underscore)
+    }
+
+    /// The error for the attribute begun at `start` but not of the shape
+    /// (see [Attributes](#attributes)): "an attribute is named by one name"
+    /// for a dotted one, else "expected `]` or `(` after the attribute's
+    /// name", from its `#` through its name.
+    fn malformed_attribute(&self, start: usize) -> Diagnostic {
+        let Some(end) = attribute_attempt(self.bytes, start) else {
+            return self.unexpected_character();
+        };
+        let at = span(start, end);
+        if self.bytes.get(end) == Some(&b'.') {
+            return Diagnostic::error("an attribute is named by one name", at).with_note(
+                "import the attribute by its name, as in `import step from lib/attrs`, and write \
+                 `#[step]`",
+            );
+        }
+        Diagnostic::error("expected `]` or `(` after the attribute's name", at)
+            .with_note("`#[` before a name starts an attribute; any other `#` starts a comment")
     }
 
     fn unexpected_character(&self) -> Diagnostic {
@@ -1501,7 +1697,7 @@ impl<'a> Lexer<'a> {
                     pos + 1
                 }
                 b'#' => attribute_at(self.bytes, pos)
-                    .map_or_else(|| end_of_line(self.bytes, pos), |(_, _, end)| end),
+                    .map_or_else(|| end_of_line(self.bytes, pos), |(_, _, _, end)| end),
                 b'{' => {
                     depth += 1;
                     pos + 1
@@ -1786,8 +1982,176 @@ fn number_end(bytes: &[u8], start: usize) -> usize {
             pos += 1;
         }
         pos = digits(pos);
+    } else if unit_at(bytes, pos) {
+        // A unit, and the components after it, as in `1h30m`.
+        pos = letters_end(bytes, pos);
+        if bytes.get(pos).is_some_and(u8::is_ascii_digit) {
+            return number_end(bytes, pos);
+        }
     }
     pos
+}
+
+/// The offset just after the ASCII letters starting at `from`.
+fn letters_end(bytes: &[u8], from: usize) -> usize {
+    from + bytes
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphabetic())
+        .count()
+}
+
+/// Whether the ASCII letters at `from`, glued to a number, are the name of a
+/// duration's or a size's unit, which makes the number a duration or a size
+/// (see `Lexer::number`).
+fn unit_at(bytes: &[u8], from: usize) -> bool {
+    let letters = bytes
+        .get(from..letters_end(bytes, from))
+        .unwrap_or_default();
+    !letters.is_empty()
+        && DURATION_UNITS
+            .iter()
+            .chain(SIZE_UNITS.iter())
+            .any(|unit| unit.name.as_bytes() == letters)
+}
+
+/// The note of an error of a duration's or a size's unit: the units there
+/// are.
+const DURATION_UNITS_NOTE: &str = "a duration's units are `d`, `h`, `m`, `s`, `ms`, `us` and `ns`";
+pub(crate) const UNITS_NOTE: &str = "a duration's units are `d`, `h`, `m`, `s`, `ms`, `us` and `ns`, \
+     and a size's `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB` and `PiB`";
+
+/// The unit named `name`, written at `at`, of a component after one of the
+/// unit `previous` names, if any (see `Lexer::quantity`): an error if
+/// there is none of that name, if one comes after a duration's component
+/// that is no duration's unit, or if it is no smaller than the previous.
+fn unit_named(
+    name: &str,
+    previous: Option<(&'static Unit, Span)>,
+    at: Span,
+) -> Result<&'static Unit, Diagnostic> {
+    let found = DURATION_UNITS
+        .iter()
+        .chain(SIZE_UNITS.iter())
+        .find(|unit| unit.name == name);
+    let Some((before, _)) = previous else {
+        return found.ok_or_else(|| {
+            Diagnostic::error(format!("unknown unit `{name}`"), at).with_note(UNITS_NOTE)
+        });
+    };
+    match found {
+        None => {
+            Err(Diagnostic::error(format!("unknown unit `{name}`"), at)
+                .with_note(DURATION_UNITS_NOTE))
+        }
+        Some(unit) if unit.quantity != Quantity::Duration => Err(Diagnostic::error(
+            format!("`{name}` is not a duration's unit"),
+            at,
+        )
+        .with_note(DURATION_UNITS_NOTE)),
+        Some(unit) if unit.factor >= before.factor => Err(Diagnostic::error(
+            format!("`{name}` cannot follow `{}` in a duration", before.name),
+            at,
+        )
+        .with_note(
+            "a duration's components go from the largest unit to the smallest, each unit \
+             once, as in `1h30m`",
+        )),
+        Some(unit) => Ok(unit),
+    }
+}
+
+/// The most digits of a fraction, once its trailing zeros are dropped, that
+/// a duration or a size literal may have: as many as a `u128` always holds.
+const MAX_FRACTION_DIGITS: usize = 38;
+
+/// The amount, in the smallest unit of its measure, of the component
+/// written at `at` of digits `whole` and fraction digits `fraction`, each
+/// with `_` separators, and of unit `unit`: exact, computed with integer
+/// arithmetic, the fraction's power of ten cancelled against the unit's
+/// factors of 2 and 5. An error if it is no whole number of the smallest
+/// unit, if the fraction has more than [`MAX_FRACTION_DIGITS`] digits, or if
+/// it is beyond an `i128`, which the caller's range check then covers.
+fn exact_amount(
+    (whole, fraction): (&str, &str),
+    unit: &Unit,
+    at: Span,
+) -> Result<i128, Diagnostic> {
+    let out_of_range = || out_of_range(unit.quantity, at);
+    let digits = |text: &str| -> Result<u128, Diagnostic> {
+        text.bytes()
+            .filter(|&byte| byte != b'_')
+            .try_fold(0u128, |sum, byte| {
+                sum.checked_mul(10)?.checked_add(u128::from(byte - b'0'))
+            })
+            .ok_or_else(out_of_range)
+    };
+    let whole = digits(whole)?
+        .checked_mul(unit.factor)
+        .ok_or_else(out_of_range)?;
+    let fraction: String = fraction.chars().filter(|&c| c != '_').collect();
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.len() > MAX_FRACTION_DIGITS {
+        return Err(Diagnostic::error(
+            format!(
+                "the fraction of a {} literal has too many digits",
+                unit.quantity.name()
+            ),
+            at,
+        )
+        .with_note(format!(
+            "write at most {MAX_FRACTION_DIGITS} digits after the `.`"
+        )));
+    }
+    // `remainder / 10^k` of the unit, whole only if 10^k divides
+    // `remainder * factor`: its 2s and 5s from the factor first, the rest
+    // from the remainder.
+    let mut remainder = digits(fraction)?;
+    let mut factor = unit.factor;
+    let not_whole = || {
+        Diagnostic::error(
+            format!(
+                "a {} literal must be a whole number of {}",
+                unit.quantity.name(),
+                unit.quantity.smallest()
+            ),
+            at,
+        )
+    };
+    for prime in [2, 5] {
+        let mut needed = fraction.len();
+        while needed > 0 && factor.is_multiple_of(prime) {
+            factor /= prime;
+            needed -= 1;
+        }
+        while needed > 0 {
+            if !remainder.is_multiple_of(prime) {
+                return Err(not_whole());
+            }
+            remainder /= prime;
+            needed -= 1;
+        }
+    }
+    let part = remainder.checked_mul(factor).ok_or_else(out_of_range)?;
+    let amount = whole.checked_add(part).ok_or_else(out_of_range)?;
+    i128::try_from(amount).map_err(|_| out_of_range())
+}
+
+/// The error of a `quantity` literal, written at `at`, too large for an
+/// `i64` of its smallest unit.
+fn out_of_range(quantity: Quantity, at: Span) -> Diagnostic {
+    let (message, largest) = match quantity {
+        Quantity::Duration => (
+            "duration literal out of range for Duration",
+            "106751d23h47m16s854ms775us807ns",
+        ),
+        Quantity::Size => ("size literal out of range for Size", "9223372036854775807B"),
+    };
+    Diagnostic::error(message, at).with_note(format!(
+        "the largest {} literal is {largest}",
+        quantity.type_name()
+    ))
 }
 
 /// The offset just after the malformed number literal starting at `start`,
@@ -1825,9 +2189,11 @@ fn end_of_line(bytes: &[u8], from: usize) -> usize {
 
 /// The attribute written at `from` (see [Attributes](#attributes)), if the
 /// `#` there starts one rather than a comment: whether it is an inner one,
-/// `#![`, where its name starts and ends, and the offset just after its
-/// `]`. Shared by the lexer and the scan, so they always agree.
-fn attribute_at(bytes: &[u8], from: usize) -> Option<(bool, (usize, usize), usize)> {
+/// `#![`, where its name starts and ends, whether it has arguments, a `(`
+/// after its name, and the offset just after its `]`, or, for one with
+/// arguments, just after its name, where its arguments' tokens start.
+/// Shared by the lexer and the scan, so they always agree.
+fn attribute_at(bytes: &[u8], from: usize) -> Option<(bool, (usize, usize), bool, usize)> {
     if bytes.get(from) != Some(&b'#') {
         return None;
     }
@@ -1842,7 +2208,31 @@ fn attribute_at(bytes: &[u8], from: usize) -> Option<(bool, (usize, usize), usiz
     }
     let end = identifier_end(bytes, start);
     let close = end + whitespace_len(bytes, end);
-    (bytes.get(close) == Some(&b']')).then_some((inner, (start, end), close + 1))
+    match bytes.get(close) {
+        Some(b']') => Some((inner, (start, end), false, close + 1)),
+        Some(b'(') => Some((inner, (start, end), true, end)),
+        _ => None,
+    }
+}
+
+/// Where the name of an attribute begun at `from` ends, if the `#` there
+/// begins one, `#[` or `#![` and, after optional spaces or tabs, a name, but
+/// is not of an attribute's shape, which [`attribute_at`] reads (see
+/// [Attributes](#attributes)): `#[x y]`, `#[x` or `#[a.b]`, which the lexer
+/// reports rather than skipping as a comment, so that no code after it on
+/// its line is lost.
+fn attribute_attempt(bytes: &[u8], from: usize) -> Option<usize> {
+    if attribute_at(bytes, from).is_some() || bytes.get(from) != Some(&b'#') {
+        return None;
+    }
+    let inner = bytes.get(from + 1) == Some(&b'!');
+    let open = from + 1 + usize::from(inner);
+    if bytes.get(open) != Some(&b'[') {
+        return None;
+    }
+    let start = open + 1 + whitespace_len(bytes, open + 1);
+    matches!(bytes.get(start), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+        .then(|| identifier_end(bytes, start))
 }
 
 /// The number of spaces and tabs starting at `from`.

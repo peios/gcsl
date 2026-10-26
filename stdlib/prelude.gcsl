@@ -8,9 +8,8 @@
 # neither has a type a GCSL type can write yet, so a name bound directly to
 # one is that built-in, called by the checker's rule. Generic and call limits:
 # docs/learn/2--developer-tools.shelf/gcsl.product/2--language.topic/900--inference-limits.md.
-# `int`, `float`, `exec`, `exec_live`, `panic`, the
-# string built-ins, `compare_versions` and `sort_versions` are ordinary:
-# values of their function types. `sh` runs a shell command with `exec`, and
+# `int`, `float`, `panic`, the string built-ins, `compare_versions` and
+# `sort_versions` are ordinary: values of their function types. `sh` runs a shell command with `exec`, and
 # panics unless it succeeds; `sh_live` does the same with `exec_live`. Like
 # every standard file it is a scope of its own: it sees its own declarations
 # and what it imports, nothing else.
@@ -29,10 +28,46 @@ def half(n: Int): Float { float(n) / 2.0 }
 # returns `{status, stdout, stderr}`; `exec_live(argv)` does the same, and
 # also copies the program's standard output and standard error, line by line
 # as they arrive, to gcsl's standard error, so that a long build is seen as
-# it runs; `panic(message)` ends the run with the runtime error `message`.
-# All three are ordinary built-ins, not the alias rule's.
-exec = builtins.exec
-exec_live = builtins.exec_live
+# it runs. Each takes, by name, the options of the built-in it calls: `cwd`
+# the program's working directory, `""` for gcsl's own; `env` variables set
+# over gcsl's environment for it; `interactive` to give it gcsl's terminal,
+# capturing nothing; `panic`, true unless given false, to make a status other
+# than 0 a failure of the call; and `until`, some text whose line, in either
+# stream, ends the program, with the status 0. Neither gives a program a
+# secret: `exec_secret` does, and its result is a secret. Each fails at its
+# call, as `sh` and `sh_live` do: they are `#[track_caller]`.
+# `panic(message)` ends the run with the runtime error `message`, an
+# ordinary built-in, not the alias rule's.
+#[track_caller]
+def exec(
+    argv: Present<List<String>>,
+    cwd: Present<String> = "",
+    env: Present<{*: String}> = {},
+    interactive: Present<Bool> = false,
+    panic: Present<Bool> = true,
+    until: Present<String> = "",
+) -> {status: Int, stdout: String, stderr: String} {
+    builtins.exec(
+        argv,
+        {cwd = cwd; env = env; interactive = interactive; panic = panic; until = until},
+    )
+}
+
+#[track_caller]
+def exec_live(
+    argv: Present<List<String>>,
+    cwd: Present<String> = "",
+    env: Present<{*: String}> = {},
+    interactive: Present<Bool> = false,
+    panic: Present<Bool> = true,
+    until: Present<String> = "",
+) -> {status: Int, stdout: String, stderr: String} {
+    builtins.exec_live(
+        argv,
+        {cwd = cwd; env = env; interactive = interactive; panic = panic; until = until},
+    )
+}
+
 panic = builtins.panic
 
 # Strings: `split(s, sep)` the pieces of `s` between occurrences of `sep`,
@@ -63,8 +98,9 @@ sort_versions = builtins.sort_versions
 # Runs `script` with `/bin/sh -c` and returns its standard output, raw, its
 # trailing newline included; panics, with the script, its exit status and
 # its standard error, trimmed, unless it exits with status 0.
+#[track_caller]
 def sh(script: String) -> String {
-    let result = exec(["/bin/sh", "-c", script])
+    let result = exec(["/bin/sh", "-c", script], panic = false)
     if result.status != 0 {
         panic("`{script}` exited with status {result.status}: {trim(result.stderr)}")
     }
@@ -75,10 +111,344 @@ def sh(script: String) -> String {
 # standard error as it runs, and its standard output still returned. Its
 # panic has the script and its exit status, without its standard error, which
 # has been shown already.
+#[track_caller]
 def sh_live(script: String) -> String {
-    let result = exec_live(["/bin/sh", "-c", script])
+    let result = exec_live(["/bin/sh", "-c", script], panic = false)
     if result.status != 0 {
         panic("`{script}` exited with status {result.status}")
     }
     result.stdout
 }
+
+# Variants of enums: `kind.matches(value)` is whether `value`, a value of an
+# enum, is of the variant `kind`, and `kind.payload(value)` its payload, a
+# runtime error if it is another variant's. So a variant passed as a value,
+# `Toolchain::C`, is a key: `get<T>(kind: Variant<Toolchain, T>)` can find a
+# value of it and take out its `T`.
+def (kind: Variant<E, T>) matches<E, T>(value: E): Bool {
+    builtins.variant_matches(kind, value)
+}
+def (kind: Variant<E, T>) payload<E, T>(value: E): T {
+    builtins.variant_payload(kind, value)
+}
+
+# Partial records: `partial.matches(full)` is whether every field `partial`
+# holds equals `full`'s of its name, as `{ arch = "x86_64" }` matches every
+# platform whose `arch` is "x86_64".
+def (partial: Partial<T>) matches<T>(full: T): Bool {
+    builtins.partial_matches(partial, full)
+}
+
+# Secrets: `s.unsafe_value()` is the secret's value, the deliberate escape
+# from what keeps it from leaking, for a linter or a strict mode to flag.
+# `s.reveal()` is the secret revealed, which only a program may be given, as
+# an environment variable of `exec_secret`'s `secrets`. `secret(value,
+# identity)` makes one; a secret shows as `***`.
+def (s: Secret<T>) unsafe_value<T>(): T {
+    builtins.secret_value(s)
+}
+def (s: Secret<T>) reveal<T>(): Revealed<T> {
+    builtins.secret_reveal(s)
+}
+def secret<T>(value: T, identity: String): Secret<T> {
+    builtins.secret(value, identity)
+}
+
+# `exec_secret(argv, secrets = {TOKEN = token.reveal()})` runs a program as
+# `exec` does, given each revealed secret of `secrets` as an environment
+# variable, never as a word of `argv`, which any user of the machine can
+# read. What it reports is a secret, since the program may tell of what it
+# was given: `r.stdout` is a `Secret<String>`. It fails, unless given
+# `panic = false`, with "a program given a secret failed", naming neither
+# its status nor its output; that failure may be recovered and retried. It
+# copies nothing as it runs and has no terminal, either of which would
+# show its output. Files the program writes are not secrets.
+#[track_caller]
+def exec_secret(
+    argv: Present<List<String>>,
+    secrets: Present<{*: Revealed<String>}>,
+    cwd: Present<String> = "",
+    env: Present<{*: String}> = {},
+    panic: Present<Bool> = true,
+    until: Present<String> = "",
+) -> Secret<{status: Int, stdout: String, stderr: String}> {
+    builtins.exec_secret(
+        argv,
+        {cwd = cwd; env = env; panic = panic; secrets = secrets; until = until},
+    )
+}
+
+# Files: `file(path)` is the file at `path`, a relative one against the
+# working directory, the one `exec` runs a program in unless told otherwise,
+# so that `cc.exec("-o", out)` then `file(out)` finds what the program wrote.
+# Nothing is read until `f.read()`, its contents as text. `f.path` is its
+# path, absolute. `f.exec(...words)` runs the file as a program with the
+# arguments `words`, as `exec` does, with its options. A `List<File>` is a
+# `FileSet`, and `files.file(name)` the one file of it whose path is `name`
+# or ends in `/name`, a panic if none is or several are. Each fails at its
+# call: they are `#[track_caller]`.
+type FilePath = String
+type FileSet = List<File>
+
+file = builtins.file
+
+# `fetch(url, sha256)` downloads the file at `url`, which must have the
+# SHA-256 digest `sha256`, so that it is the same file wherever and whenever
+# it is fetched; without one it fails with the digest it found, to pin it
+# with. A build tool keeps fetched files by their digests, and fetches each
+# once. It fails at its call: it is `#[track_caller]`.
+#[track_caller]
+def fetch(url: String, sha256: String = "") -> File {
+    builtins.fetch(url, sha256)
+}
+# `fetch_git(url, commit)` gives the files of the git repository at `url`
+# as the commit `commit` has them, without the repository's `.git` or its
+# submodules. `commit` is the commit's whole name, 40 hexadecimal digits,
+# which names its files as a digest does: a branch or a tag, which can move,
+# is an error. A build tool keeps repositories, and fetches each commit
+# once.
+def fetch_git(url: String, commit: String) -> Dir {
+    builtins.fetch_git(url, commit)
+}
+
+#[track_caller]
+def (f: File) read() -> String {
+    builtins.file_read(f)
+}
+
+#[track_caller]
+def (f: File) exec(
+    ...words: Present<String>,
+    cwd: Present<String> = "",
+    env: Present<{*: String}> = {},
+    interactive: Present<Bool> = false,
+    panic: Present<Bool> = true,
+    until: Present<String> = "",
+) -> {status: Int, stdout: String, stderr: String} {
+    exec(
+        [f.path, ...words],
+        cwd = cwd,
+        env = env,
+        interactive = interactive,
+        panic = panic,
+        until = until,
+    )
+}
+
+# Directories: `dir(path)` is the directory at `path`, resolved as `file`
+# resolves one. A tree of files is a `Dir`: an unpacked archive, a
+# toolchain's root, what a step leaves in a directory. `d.path` is its path;
+# `d.file(path)` and `d.dir(path)` the file and the directory at `path` in
+# it, which must not leave it; `d.files()` every file of it, by path; and
+# `d.exec(...words)` runs `words[0]` with the arguments `words[1..]` in it,
+# as `exec` does, with its options but `cwd`, which it is. Each fails at its
+# call: they are `#[track_caller]`.
+dir = builtins.dir
+
+#[track_caller]
+def (d: Dir) file(path: String): File {
+    builtins.dir_file(d, path)
+}
+
+#[track_caller]
+def (d: Dir) dir(path: String): Dir {
+    builtins.dir_dir(d, path)
+}
+
+#[track_caller]
+def (d: Dir) files() -> List<File> {
+    builtins.dir_files(d)
+}
+
+#[track_caller]
+def (d: Dir) exec(
+    ...words: Present<String>,
+    env: Present<{*: String}> = {},
+    interactive: Present<Bool> = false,
+    panic: Present<Bool> = true,
+    until: Present<String> = "",
+) -> {status: Int, stdout: String, stderr: String} {
+    exec(
+        words,
+        cwd = d.path,
+        env = env,
+        interactive = interactive,
+        panic = panic,
+        until = until,
+    )
+}
+
+# Sandboxes: `d.sandbox(cwd, env)` is a sandbox of a copy of the directory
+# `d`, whose commands run with the copy as their `/`, in `cwd` and with the
+# environment `env` by default, nothing of gcsl's: `s.exec(...words)` runs
+# one, as `exec` does, and `s.file(path)` and `s.dir(path)` are what it has
+# at `path`, absolute in it or relative to its `cwd`, so far. One directory
+# backs any number of sandboxes, and none changes it. A sandbox needs
+# bubblewrap, `bwrap`. Each fails at its call: they are `#[track_caller]`.
+#[track_caller]
+def (d: Dir) sandbox(cwd: Present<String> = "/", env: Present<{*: String}> = {}) -> Sandbox {
+    builtins.dir_sandbox(d, {cwd = cwd; env = env})
+}
+
+#[track_caller]
+def (s: Sandbox) exec(
+    ...words: Present<String>,
+    cwd: Present<String> = "",
+    env: Present<{*: String}> = {},
+    interactive: Present<Bool> = false,
+    panic: Present<Bool> = true,
+    until: Present<String> = "",
+) -> {status: Int, stdout: String, stderr: String} {
+    builtins.sandbox_exec(
+        s,
+        {
+            argv = words
+            cwd = cwd
+            env = env
+            interactive = interactive
+            panic = panic
+            until = until
+        },
+    )
+}
+
+#[track_caller]
+def (s: Sandbox) file(path: String): File {
+    builtins.sandbox_file(s, path)
+}
+
+#[track_caller]
+def (s: Sandbox) dir(path: String): Dir {
+    builtins.sandbox_dir(s, path)
+}
+
+#[track_caller]
+def (files: List<File>) file(name: String): File {
+    let found = for f in files if f.path == name or ends_with(f.path, "/" + name) { f }
+    if len(found) == 0 {
+        let among = if len(files) == 1 { "the one file" } else { "{len(files)} files" }
+        panic("no file `{name}` among {among}")
+    }
+    if len(found) > 1 {
+        let paths = join(for f in found { "`{f.path}`" }, ", ")
+        panic("`{name}` names {len(found)} files: {paths}")
+    }
+    found[0]
+}
+
+# Methods: the functions above, and three that are methods only, as methods
+# of the value each takes first, so that an editor offers them after a `.`:
+# `s.split(sep)`, `s.starts_with(prefix)`, `s.ends_with(suffix)`, `s.trim()`,
+# `s.strip_prefix(prefix)`, `s.strip_suffix(suffix)`, `s.lines()`,
+# `s.fields()`, `s.contains(part)`, whether `part` is in `s`, and
+# `a.compare_version(b)`, of strings; `parts.join(sep)` and
+# `vs.sort_versions()`, of lists of strings; and `xs.len()`, `xs.unique()`,
+# `xs` without the elements that equal an earlier one, in order, and
+# `xs.contains(x)`, whether an element equals `x`, of any list. `unique` and
+# `contains` compare elements as `===` does, and an element holding a function
+# or a future, which have no equality, fails them. A method of a file's own, or of another
+# file it sees, of a receiver type one of these applies to, is called in its
+# place. Each fails at its call: they are `#[track_caller]`.
+#[track_caller]
+def (s: String) split(sep: String): List<String> { builtins.split(s, sep) }
+#[track_caller]
+def (s: String) starts_with(prefix: String): Bool { builtins.starts_with(s, prefix) }
+#[track_caller]
+def (s: String) ends_with(suffix: String): Bool { builtins.ends_with(s, suffix) }
+#[track_caller]
+def (s: String) trim(): String { builtins.trim(s) }
+#[track_caller]
+def (s: String) strip_prefix(prefix: String): String { builtins.strip_prefix(s, prefix) }
+#[track_caller]
+def (s: String) strip_suffix(suffix: String): String { builtins.strip_suffix(s, suffix) }
+#[track_caller]
+def (s: String) lines(): List<String> { builtins.lines(s) }
+#[track_caller]
+def (s: String) fields(): List<String> { builtins.fields(s) }
+#[track_caller]
+def (s: String) contains(part: String): Bool { builtins.contains(s, part) }
+#[track_caller]
+def (a: String) compare_version(b: String): Int { builtins.compare_versions(a, b) }
+#[track_caller]
+def (parts: List<String>) join(sep: String): String { builtins.join(parts, sep) }
+#[track_caller]
+def (vs: List<String>) sort_versions(): List<String> { builtins.sort_versions(vs) }
+#[track_caller]
+def (xs: List<T>) len<T>(): Int { len(xs) }
+#[track_caller]
+def (xs: List<T>) unique<T>(): List<T> { builtins.list_unique(xs) }
+#[track_caller]
+def (xs: List<T>) contains<T>(x: T): Bool { builtins.list_contains(xs, x) }
+
+# Building. A build tool, such as pekit, runs the calls of a function marked
+# `#[hermetic]` as cached steps, each in a sandbox holding only its
+# arguments; plain GCSL runs them at once, as any call. `#[scratch]` gives a
+# step a directory of its own kept between its runs, which plain GCSL ignores.
+# A `build` definition, `def build hello() { ... }`, is a target: its body
+# gives whatever it builds, a file or a record of them, which a build tool
+# builds when it is named.
+#[attribute] #[defers] type hermetic = {on: Bool = true}
+#[attribute] type scratch = {}
+# `#[device("kvm")]` gives a step a device of the machine it runs on, where
+# the machine has it: `kvm`, for a virtual machine to run at speed. It
+# changes how fast a step runs, never what it gives, so it keys nothing, and
+# a step runs on a machine without it all the same.
+#[attribute] type device = {name: String}
+#[def_type] def build<T>(name: String, f: fn() -> T) -> T { f() }
+
+# Packages. A `package` definition, `def package dev.example.greet() {
+# version = "1.0-1"; files = {"bin/greet" = build app()} }`, is a package of
+# any format: its name, the definition's path; its version; and its files,
+# each at its path under `/usr`, as `fs.compose_dir` places them, a
+# directory's tree under its path, a file at it, and a list's files under it
+# by their names. A packager library, such as gcslib's `ppk`, packs one.
+type PackageDef = {version: String, files: {*: Dir | File | List<File>}}
+type Package = {name: String, version: String, files: {*: Dir | File | List<File>}}
+#[def_type] def package(name: String, f: fn() -> PackageDef) -> Package {
+    let made = f()
+    name = name
+    version = made.version
+    files = made.files
+}
+
+# Tests. A `test` definition, `def test runs(prog: File = build app()) {
+# ... }`, passes if its body succeeds, and fails if it fails: an `assert`, a
+# program that exits with an error, or any other failure. Its body is a
+# step, `#[hermetic]` by default, given what its parameters' defaults
+# build, so a test that passed is not run again for the same inputs;
+# `#[hermetic(false)]` runs one that cannot be a step every time.
+# `test NAME()` is a `TestResult`, its name, whether it passed and the
+# failure's message, and never itself a failure: its body's failure, after
+# its retries, is recovered outside the step.
+type TestResult = {name: String, passed: Bool, message: String}
+#[def_type] #[hermetic]
+def test(name: String, f: fn() -> {}) -> TestResult {
+    let outcome = recover {
+        await f()
+        = {passed = true; message = ""}
+    } else (failure) {
+        = {passed = false; message = failure.message}
+    }
+    name = name
+    passed = outcome.passed
+    message = outcome.message
+}
+
+# Scripts. A `script` definition, `def script deploy() { ... }`, is a task a
+# person runs, as `pekit run deploy` does, whose effects may change the world
+# outside the build. Only a run of a script binds `^script_session`, which
+# has no default, and a script's body may need it: so a script may call
+# another, and nothing that a build, a test or a package calls can call one.
+# A script builds what it calls as any build does. `^script_session.args`
+# are the words it was given after its name.
+type ScriptSession = {args: List<String>}
+context script_session: ScriptSession
+#[def_type] def script<T>(name: String, f: fn(^script_session) -> T) -> T { f() }
+
+# Platforms: an architecture and an operating system, as Rust names them.
+# `^host_platform` is where steps run: in plain GCSL this machine; a build
+# tool sets it to where it runs them. `^platform` is what is being built
+# for, by default where the steps run.
+type Platform = {arch: String, os: String}
+context host_platform: Platform = {arch = builtins.host_arch(); os = builtins.host_os()}
+context platform: Platform = {...^host_platform}

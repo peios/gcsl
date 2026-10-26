@@ -24,6 +24,8 @@ pub enum SymbolKind {
     Variable,
     /// A `fn` or a `def`.
     Function,
+    /// A method, `fn (x: T) name(...)` or `def (x: T) name(...)`.
+    Method,
     /// A `type` item.
     Type,
     /// The file's imports, and each of them.
@@ -127,6 +129,18 @@ impl Index {
                 let [first] = ast.path(path) else {
                     return None;
                 };
+                // A method by its name, not its binding's.
+                if let Some(method) = ast.method(item) {
+                    let ty = self.expr_type(file, unparen(ast, value));
+                    return Some(DocumentSymbol {
+                        name: self.scan.names.get(method.name).to_owned(),
+                        detail: ty.and_then(|ty| self.short(ty)),
+                        kind: SymbolKind::Method,
+                        span,
+                        selection: method.name_span,
+                        children: Vec::new(),
+                    });
+                }
                 let name = first.name()?;
                 let function =
                     function || matches!(ast.get(unparen(ast, value)).kind, ExprKind::Fn(_));
@@ -273,12 +287,17 @@ impl Index {
             }
             ImportForm::Whole(None) => module,
             ImportForm::Members(members) => {
-                let shown: Vec<&str> = ast
+                let shown: Vec<String> = ast
                     .import_members(members)
                     .iter()
-                    .map(|member| match member {
-                        ImportMember::Named { name, .. } => self.scan.names.get(name.name),
-                        ImportMember::All(_) => "*",
+                    .map(|member| match *member {
+                        ImportMember::Named { name, .. } => {
+                            self.scan.names.get(name.name).to_owned()
+                        }
+                        ImportMember::All(_) => "*".to_owned(),
+                        ImportMember::DefType { def, every, .. } => {
+                            ast.show_def_type_member(def, every)
+                        }
                     })
                     .collect();
                 format!("{} from {module}", shown.join(", "))

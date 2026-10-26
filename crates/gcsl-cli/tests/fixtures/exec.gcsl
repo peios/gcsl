@@ -1,3 +1,4 @@
-# `exec` runs a program and reports what it did; `sh` runs a shell command.
-r = exec(["sh", "-c", "echo out; echo err >&2; exit 3"])
+# `exec` runs a program and reports what it did, its status as data with
+# `panic = false`; `sh` runs a shell command.
+r = exec(["sh", "-c", "echo out; echo err >&2; exit 3"], panic = false)
 out = sh("echo hi")

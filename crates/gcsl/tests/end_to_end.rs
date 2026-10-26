@@ -1265,14 +1265,14 @@ fn defaults_are_kept_across_repl_inputs() {
 #[test]
 fn a_default_error_renders_exactly() {
     assert_eq!(
-        rendered("let x = 1\nfn f(p: Int = x + 1): Int { p }\n"),
-        "error: a parameter's default must be a constant\n\
-         \x20--> calc.gcsl:2:15\n\
+        rendered("fn f(a: Int = b, b: Int = 1): Int { a }\n"),
+        "error: undefined variable `b`\n\
+         \x20--> calc.gcsl:1:15\n\
          \x20 |\n\
-         2 | fn f(p: Int = x + 1): Int { p }\n\
-         \x20 |               ^^^^^\n\
+         1 | fn f(a: Int = b, b: Int = 1): Int { a }\n\
+         \x20 |               ^  ------ `b` is a parameter from here on\n\
          \x20 |\n\
-         \x20 = note: a literal, or a list or record of literals\n"
+         \x20 = note: a parameter's default sees only the parameters before it\n"
     );
     assert_eq!(
         rendered("fn f(p: Int = \"one\"): Int { p }\n"),
@@ -2933,4 +2933,135 @@ fn list_elements_without_a_join_render_exactly() {
          \x20 = note: the list is `List<Int | String>`; annotate it with that type if both are \
          meant, or tell them apart with `is`\n"
     );
+}
+
+/// A file of `name`'s own under the system's temporary directory, removed
+/// when dropped: a counter a test's program can count its attempts in.
+struct Counter(std::path::PathBuf);
+
+impl Counter {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("gcsl-e2e-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+
+    /// The shell command that counts one more attempt and prints the count.
+    fn bump(&self) -> String {
+        let path = self.0.display();
+        format!("c=$(cat {path} 2>/dev/null || echo 0); echo $((c+1)) > {path}; echo $((c+1))")
+    }
+
+    /// How many attempts were counted.
+    fn count(&self) -> u32 {
+        std::fs::read_to_string(&self.0).map_or(0, |text| text.trim().parse().unwrap())
+    }
+}
+
+impl Drop for Counter {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn a_call_with_retry_runs_again_until_it_succeeds_or_runs_out() {
+    let counter = Counter::new("retry");
+    let flaky = |times: u32| {
+        format!(
+            "#[retry({times})]\nfn flaky() -> String {{\n    \
+             let n = exec([\"sh\", \"-c\", \"{}\"]).stdout\n    \
+             if n == \"3\\n\" {{ \"ok on 3\" }} else {{ panic(\"failed {{n}}\") }}\n}}\n\
+             flaky()",
+            counter.bump()
+        )
+    };
+    assert_eq!(run(&flaky(5)).unwrap(), Value::Str(Rc::from("ok on 3")));
+    assert_eq!(counter.count(), 3);
+    // Out of retries: the last attempt's error, noted with the attempts.
+    let counter = Counter::new("retry-out");
+    let text = format!(
+        "#[retry(1)]\nfn flaky() -> String {{\n    exec([\"sh\", \"-c\", \"{}\"])\n    panic(\"no\")\n}}\nflaky()",
+        counter.bump()
+    );
+    let errors = run(&text).unwrap_err();
+    assert_eq!(errors[0].message, "no");
+    assert_eq!(errors[0].notes, ["`flaky` was tried 2 times"]);
+    assert_eq!(counter.count(), 2);
+}
+
+#[test]
+fn a_memoised_call_retries_and_records_only_its_success() {
+    let counter = Counter::new("memo-retry");
+    let text = format!(
+        "#[retry(5)]\nfn flaky() ->> String {{\n    \
+         let n = exec([\"sh\", \"-c\", \"{}\"]).stdout\n    \
+         if n == \"2\\n\" {{ \"ok\" }} else {{ panic(\"failed\") }}\n}}\n\
+         a = flaky()\nb = flaky()",
+        counter.bump()
+    );
+    run(&text).unwrap();
+    assert_eq!(counter.count(), 2);
+}
+
+#[test]
+fn a_call_that_runs_past_its_timeout_fails_and_its_program_is_killed() {
+    let started = std::time::Instant::now();
+    let errors =
+        run("#[timeout(200ms)]\nfn slow() -> Int { exec([\"sleep\", \"30\"]).status }\nslow()")
+            .unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(errors[0].message, "`slow` timed out after 200ms");
+    // Pure code too, in a loop or in calls.
+    let errors =
+        run("#[timeout(100ms)]\nfn spin() -> Int {\n    let mut i = 0\n    for true { i := i + 1 }\n    i\n}\nspin()")
+            .unwrap_err();
+    assert_eq!(errors[0].message, "`spin` timed out after 100ms");
+    let errors = run(
+        "fn fib(n: Int): Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\n\
+         #[timeout(100ms)]\nfn f() -> Int { fib(60) }\nf()",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].message, "`f` timed out after 100ms");
+    // In time, it is as any call.
+    assert_eq!(
+        run("#[timeout(30s)]\nfn quick() -> Int { 1 }\nquick()").unwrap(),
+        Value::Int(1)
+    );
+}
+
+#[test]
+fn an_enclosing_timeout_is_never_retried_and_a_call_s_own_is() {
+    // The outer deadline passes inside `inner`, whose retries do not run it
+    // again.
+    let counter = Counter::new("outer-timeout");
+    let text = format!(
+        "#[timeout(200ms)]\nfn outer() -> Int {{ inner() }}\n\
+         #[retry(5)] #[timeout(30s)]\nfn inner() -> Int {{\n    \
+         exec([\"sh\", \"-c\", \"{}\"])\n    exec([\"sleep\", \"30\"]).status\n}}\nouter()",
+        counter.bump()
+    );
+    let errors = run(&text).unwrap_err();
+    assert_eq!(errors[0].message, "`outer` timed out after 200ms");
+    assert_eq!(counter.count(), 1);
+    // Its own timeout is its failure, which it retries, each attempt timed
+    // afresh.
+    let counter = Counter::new("own-timeout");
+    let text = format!(
+        "#[retry(2)] #[timeout(100ms)]\nfn slow() -> Int {{\n    \
+         exec([\"sh\", \"-c\", \"{}\"])\n    exec([\"sleep\", \"30\"]).status\n}}\nslow()",
+        counter.bump()
+    );
+    let errors = run(&text).unwrap_err();
+    assert_eq!(errors[0].message, "`slow` timed out after 100ms");
+    assert_eq!(errors[0].notes, ["`slow` was tried 3 times"]);
+    assert_eq!(counter.count(), 3);
+}
+
+#[test]
+fn a_spread_of_an_impure_function_s_list_parameter_awaits_its_elements() {
+    let text = "fn run(words: List<String>) -> String { exec([\"echo\", ...words]).stdout }\n\
+                let later = lazy \"two\"\n\
+                = run([\"one\", later])";
+    assert_eq!(run(text).unwrap().to_string(), "one two\n");
 }

@@ -1,6 +1,7 @@
 use super::*;
 use crate::ast::{AstBuilder, Expr, Item};
 use crate::check::check;
+use crate::ir::{FnKind, LazyField, ListShape, ShapedOperands, StepAt, StepMode};
 use crate::lexer::tokenize;
 use crate::names::Names;
 use crate::parser::parse;

@@ -7,7 +7,8 @@ Newlines or semicolons separate items.
 A file can return a value or construct a record of public fields.
 All reachable source is checked before execution.
 .SH LEXICAL STRUCTURE
-A comment begins with # and continues to the end of the line, except for the attribute forms #[NAME] and #![NAME].
+A comment begins with # and continues to the end of the line, except for the attribute forms #[NAME], #[NAME(...)] and #![NAME].
+A #[ or #![ followed by a name that is not one of those forms, such as #[x y] or #[a.b], is an error, not a comment.
 Identifiers begin with an ASCII letter or underscore and continue with ASCII letters, digits, underscores, and permitted internal hyphens.
 Write spaces around binary subtraction to distinguish it from a hyphenated identifier.
 Field names can also be plain quoted strings.
@@ -16,6 +17,12 @@ Integer values are signed 64-bit integers; arithmetic overflow is an error.
 Float values use IEEE 754 binary64.
 Integer literals adapt to an expected numeric type; a bound Int does not implicitly convert to Float.
 Conditions require Bool.
+.PP
+A duration literal is a number glued to units from largest to smallest, each at most once: d (24 hours), h, m, s, ms, us and ns, as in 1h30m.
+A size literal is a number glued to one unit: B, the decimal KB, MB, GB, TB and PB, or the binary KiB, MiB, GiB, TiB and PiB, as in 2GiB.
+Only the last part may have a fraction, and the value must be a whole number of nanoseconds or bytes.
+Durations and sizes are signed 64-bit amounts of nanoseconds and bytes; overflow is an error.
+A number glued to letters that are no unit, as in 30sec, is an unknown unit where an expression is expected.
 .PP
 Strings use one double quote or a matching run of at least three double quotes at each end.
 A leading r makes a string raw, without escapes or interpolation.
@@ -60,7 +67,10 @@ Private let, let mut, and fn names do not become directory declarations.
 Top-level named functions and public fields support forward references subject to dependency checks.
 Inner record blocks retain ordered construction.
 .SH TYPES
-The built-in value types include Int, Float, Bool, String, records, lists, functions, futures, and unions.
+The built-in value types include Int, Float, Bool, String, Duration, Size, File, records, lists, functions, futures, and unions.
+File is nominal: it holds a file's absolute path, read as f.path, and the content identity a host gives it; no record fits it, files compare equal by both and have no order.
+Dir, a tree of files, is nominal in the same way, with the same one field, path.
+Sandbox, a live copy of a directory that commands run in as their /, is nominal and has no fields; sandboxes are equal only if they are one, and have no source form.
 The empty record type is {}.
 List<T> and T[] are equivalent.
 Type aliases are structural and do not create nominal runtime identities.
@@ -80,7 +90,7 @@ A value with additional record fields can satisfy a narrower expected shape; a l
 A rest-field, *: TYPE, gives the type of every field a record type does not name:
 .PP
 .nf
-    type File = {to: String, from: String, *: Int}
+    type Entry = {to: String, from: String, *: Int}
     let files: {*: String} = {"bin/*" = "bin/*"}
 .fi
 .PP
@@ -92,7 +102,13 @@ Typed equality, is, and as compare and test the fields a rest-field covers.
 .PP
 An empty list needs an expected element type.
 Function signatures declare parameter and result types.
-General type parameters, intersections, and a None value are not supported.
+A type may declare type parameters, as in type Pair<A, B> = {first: A, second: B}; each use gives as many type arguments, as in Pair<Int, String>, and is the definition with them in place of the parameters.
+A type without parameters takes no type arguments, a generic type cannot refer to itself, and a type parameter cannot be spread.
+An extensible enum is declared as enum NAME extensible<BOUND>, and each variant as enum NAME::VARIANT<PAYLOAD>; the payload must fit the bound.
+NAME::VARIANT is a value of type Variant<NAME, PAYLOAD>; calling it makes a value of the enum, and kind.matches(value) and kind.payload(value) test and unwrap a value of the variant kind.
+Enums are nominal; value is NAME tests a value's enum, and == compares values of an enum that has a bound.
+Partial<T> holds any of the fields of the record type T; partial.matches(full) tests whether every field it holds equals full's, and its fields are not read by name.
+Intersections and a None value are not supported.
 .SH RECORD COMPOSITION
 Dotted fields such as server.host and server.port merge into an open nested record.
 A whole-field definition cannot be extended by a later dotted definition.
@@ -106,6 +122,7 @@ Arithmetic uses +, -, *, /, //, and %.
 The / operator returns Float, including for integer operands.
 The // and % operators use integer floor division and modulo.
 String + concatenates strings.
+A Duration or Size adds to and subtracts from one of its type, multiplies by an Int, floor-divides by an Int or by one of its type (giving an Int), and takes the remainder by one of its type; / is an error for them, and they mix with no other type.
 Boolean operations are and, or, and not, with short-circuit evaluation for and and or.
 Comparisons are not associative.
 .PP
@@ -133,8 +150,24 @@ Any other statement whose value is not {} is an unused value, which is an error.
 Closures capture values when they are created.
 .PP
 Calls accept positional and named arguments, evaluated in source order.
+After a named argument, a name alone, as in f(x, out = 1, compiler), is shorthand for compiler = compiler.
 A trailing block supplies the final parameter.
-Parameter defaults are constant expressions and belong to a function declaration, not a written function type.
+A rest parameter,
+.IR ... name : T ,
+takes every positional argument from its place, a
+.BI List< T >
+in the body; the parameters after it are given by name, and a spread argument,
+.IR ... list ,
+passes a list's elements to it.
+A function has at most one, with no default.
+A named function may declare type parameters after its name, as in fn first<T>(items: List<T>, fallback: T): T; each call infers them from its arguments' types.
+A value of a type parameter can be passed, returned and stored, and nothing else; a generic function must be called, not used as a value.
+A method is declared at the top level with its receiver before its name, as in fn (n: Int) twice(): Int, and called on a value, as in 21.twice(); the method whose receiver type fits the value's type is chosen, the most specific when several fit.
+A method has no name of its own; a field and a method of one name that both apply are an error.
+A fn method is visible in its own file; a def method also in the other files of its directory and the directories below, and in every file that imports its module in any form.
+Parameter defaults belong to a function declaration, not a written function type.
+A default may be any expression; it sees the parameters before it and the scope the function is written in, has the function's effect, and is evaluated for each call that leaves its parameter out, after the written arguments and before the body.
+Only a call that names the function directly gives defaults.
 Memoized calls cache successful results by closure and arguments within the execution context, including supported ambient inputs they read.
 External file or environment changes do not invalidate the cache.
 .SH FUTURES
@@ -182,6 +215,112 @@ Break'NAME and continue'NAME target a loop.
 Return'NAME leaves the named loop or block with a single result, not its accumulated list.
 An unlabeled return leaves a function or lazy body.
 No jump crosses a function boundary.
+.SH FAILURE
+.B assert
+.I COND
+.RB [ ,
+.IR MESSAGE ]
+is a statement that fails the run with "assertion failed: MESSAGE" when the condition is false; the default message is the condition as written, and each side of a comparison is shown with its value.
+.B recover {
+.I BODY
+.B } else
+.RB [ (
+.IB NAME )
+.B ] {
+.I FALLBACK
+.B }
+evaluates the fallback instead of the body if the body fails, with
+.I NAME
+bound to the failure,
+.BR "{message: String}" .
+It catches what
+.B #[retry]
+would retry: never a bug in GCSL, nor the timeout of an enclosing call.
+.SH SECRETS
+.BI Secret< T >
+is a value of the present type
+.I T
+that never leaks; it is shown as
+.BR *** .
+.BI secret( VALUE ", " IDENTITY )
+makes one, with a public identity;
+.B .unsafe_value()
+takes its value, and
+.B .reveal()
+makes it a
+.BI Revealed< T > ,
+which only the secrets of
+.B exec_secret
+accept, as environment variables: the program receives the value, GCSL shows it as
+.BR *** ,
+and everything the program reports is a secret.
+No argument of a program, and no variable of plain exec, is a secret.
+Computing on revealed secrets alone gives a revealed one.
+An operator with a secret operand, a secret interpolated, a field of a secret record and an element of a secret list are secrets, as is any comparison of values that hold a secret, each identified by its derivation: the operation, the identities of the secrets it used, and its plain operands.
+Elsewhere, in
+.B ===
+of fields a type does not name and in a memoised call's arguments, secrets compare by identity alone.
+A secret decides nothing: it is no condition, no operand of
+.B and
+or
+.BR or ,
+and no subject of
+.B is
+or
+.BR as .
+A failure of an operation on a secret is "an operation on a secret failed", which neither
+.B recover
+nor
+.B #[retry]
+handles.
+.SH CONTEXT
+.B context
+.I NAME
+.B :
+.I TYPE
+.B =
+.I DEFAULT
+declares a context, a value that reaches every call without being passed; the default may be left out.
+A context name is declared once in a workspace and is visible in every file without an import.
+.BI ^ NAME
+reads the context's current value.
+.I EXPR
+.B with {
+.I NAME
+.B =
+.I VALUE
+.B }
+evaluates the call or field access
+.I EXPR
+with the context set, and so does every call it makes; it must be on the line where
+.I EXPR
+ends.
+.B with { ... } { ... }
+sets contexts for a block.
+A dotted name,
+.BR "with { platform.arch = ... }" ,
+sets one field of a record context.
+A parameter written
+.BI ^ NAME
+defaults to the context of that name, and takes its type if none is written.
+A default is pure and is evaluated where the context is read, in the context of the read.
+A function that reads a context with no default, with no
+.B with
+of its own around the read, needs it, and so does every call of it; its type shows it,
+.BR "fn(^arch): String" ,
+and a written function type needs nothing.
+A call whose needs no
+.B with
+around it sets is the check-time error "context `arch` has no value here".
+A context read through another's default is needed unless the caller sets that one,
+.BR "fn(^arch | ^target): String" .
+A
+.BI ^ NAME
+parameter's default is the caller's, so it needs nothing of the function.
+A definition cannot need a context.
+A
+.B lazy
+keeps the context it was made in.
 .SH WORKSPACES AND IMPORTS
 The file workspace.gcsl marks a root and is ordinary source.
 Each directory shares its public fields, def functions, and types among its files.
@@ -189,14 +328,26 @@ A child sees its own directory and ancestors through the root.
 Imports reach other directories or files by root-relative paths:
 .PP
 .nf
-    import lib.helpers
-    import lib.helpers as helpers
-    import helper from lib.helpers
-    import helper as run_helper from lib.helpers
-    import * from lib.helpers
+    import lib/helpers
+    import lib/helpers as helpers
+    import helper from lib/helpers
+    import helper as run_helper from lib/helpers
+    import * from lib/helpers
+    import pkgs/net.busybox.busybox as busybox
+    import package * from pkgs/*
+    import Toolchain::C * from lib/tools
+    import Toolchain::* from lib/tools
+    import build greet from app/greet
+    import Toolchain::C gcc from lib/tools
 .fi
 .PP
+A path separates directories with /, and names each directory or file as it is, dots included.
+A whole import is named after the path's last part unless it gives a name with as, so a last part that is not a plain name needs one.
 An imported directory exposes its own merged declarations, not an automatic recursive import of its children.
+import DT * from PATH imports every definition of the definition type DT, and nothing else, from what PATH names; PATH/* reads every directory directly in PATH, PATH/** every directory at any depth below it, and * or ** alone the workspace root's, skipping hidden directories and what is below them.
+Two of those directories defining one name is an error at the import; finding none is not.
+For a definition type whose definitions are made with a variant, import DT::V * from PATH imports those made with the variant V, and import DT::* from PATH those made with any; import DT * from PATH is then an error, as is a variant for a definition type that takes none.
+A definition's path in place of the *, as in import build greet from app/greet or import Toolchain::C gcc from lib/tools, imports that one definition and no other; finding it nowhere PATH names is an error.
 A file and directory with the same module name are ambiguous.
 A file outside any workspace can import standard modules only.
 Hidden names, symbolic-link directories, and nested workspace trees are excluded from workspace discovery.
@@ -222,6 +373,29 @@ It is not valid on a REPL input.
 Mark a top-level def as a definition type.
 Its first parameter is String and its second is the function type of definitions it accepts.
 Additional parameters are invocation arguments.
+Alternatively its second parameter is Variant<E, T> and its third the function type: each definition then names a variant of E, def DT::V PATH(), and so does each reference, DT::V PATH.
+The variant's payload binds T, and each variant has its own definitions.
+Such a definition type may be generic, and is not invoked by name.
+.TP
+.B #[attribute]
+Mark a top-level type as an attribute whose arguments are that record type.
+Its fields must hold only constants: Int, Float, Bool, String, Duration, Size, or lists and records of them.
+It is declared, imported and named like any type.
+.TP
+.B #[defers]
+Mark an attribute's declaration as deferring: a call of an impure function it is on, whatever its arguments, may give a future that a host resolves later, so the function's result type stays T | Future<T> and every use of a result is awaited.
+Plain GCSL runs such calls at once.
+A pure function, or a result type that cannot be a future, is an error; a definition keeps its definition type's function type, and the definition type's invocation is deferred.
+.TP
+.B #[NAME] #[NAME(ARGUMENTS)]
+Apply an attribute to the following fn, def or definition.
+Arguments are constants, by name, or by position for an attribute of one field; fields left out take their defaults.
+Attributes on a definition type are defaults for its definitions, and a definition's own attribute of the same name replaces one.
+GCSL's own attributes are retry(times: Int), timeout(limit: Duration) and track_caller, which takes no arguments.
+A call with retry that fails, other than by an enclosing call's timeout, runs its body again with the same arguments, up to times more times; its effects repeat.
+A call with timeout that runs longer than limit fails, and a program it is running is killed; its own retry may retry it, each attempt timed afresh.
+Retry on a pure function is a warning.
+A call of a function with track_caller that fails with an error raised in the function's own body, a fn written in it included, reports the error at the call, the error's labels in the body dropped and its notes kept; an error of a function it calls without track_caller, or of a function value it is given, stays where it was raised.
 .SH DEFINITION TYPES AND METADATA
 A definition-type declaration is followed by definitions of this form:
 .PP

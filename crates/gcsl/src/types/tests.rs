@@ -10,7 +10,7 @@ fn setup() -> (TypeTable, Names, [Name; 3]) {
 #[test]
 fn the_constants_are_pre_interned_in_order() {
     let mut table = TypeTable::new();
-    assert_eq!(table.len(), 7);
+    assert_eq!(table.len(), 12);
     assert!(!table.is_empty());
     assert_eq!(table.intern(TyKind::Int), TyId::INT);
     assert_eq!(table.intern(TyKind::Float), TyId::FLOAT);
@@ -19,18 +19,34 @@ fn the_constants_are_pre_interned_in_order() {
     assert_eq!(table.record([]), TyId::EMPTY);
     assert_eq!(table.intern(TyKind::UntypedInt), TyId::UNTYPED_INT);
     assert_eq!(table.intern(TyKind::Error), TyId::ERROR);
-    assert_eq!(table.len(), 7);
-    assert_eq!(TypeTable::default().len(), 7);
+    assert_eq!(
+        table.intern(TyKind::Quantity(Quantity::Duration)),
+        TyId::DURATION
+    );
+    assert_eq!(table.intern(TyKind::Quantity(Quantity::Size)), TyId::SIZE);
+    assert_eq!(table.intern(TyKind::File), TyId::FILE);
+    assert_eq!(table.intern(TyKind::Dir), TyId::DIR);
+    assert_eq!(table.intern(TyKind::Sandbox), TyId::SANDBOX);
+    assert_eq!(table.len(), 12);
+    assert_eq!(TypeTable::default().len(), 12);
+    // Each quantity's type, and back.
+    for quantity in [Quantity::Duration, Quantity::Size] {
+        assert_eq!(TyId::of_quantity(quantity).quantity(), Some(quantity));
+    }
+    assert_eq!(TyId::INT.quantity(), None);
 }
 
 #[test]
 fn a_kind_is_small() {
     // A record type's defaults and rest-field are behind a thin
     // pointer, which a record type with neither, nearly every one,
-    // leaves null: so a record type is 24 bytes, and a kind no larger
-    // than before, a function type's signature being the largest.
+    // leaves null: so a record type is 24 bytes. A function type's
+    // signature is the largest kind: its parameters' box, its result, its
+    // meta, its effect and its generic's 4-byte id, which a 16-bit id
+    // would fit in 32 bytes only by limiting a table to 65535 generic
+    // functions.
     assert_eq!(size_of::<RecordTy>(), 24);
-    assert_eq!(size_of::<TyKind>(), 32);
+    assert_eq!(size_of::<TyKind>(), 40);
 }
 
 #[test]

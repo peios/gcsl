@@ -11,6 +11,46 @@
 //! one table for its whole lifetime and lends it to each input, so equal
 //! names in different inputs are equal `Name`s.
 //!
+//! # Method bindings
+//!
+//! A method (`def (xs: List<T>) unique<T>(): List<T>`) binds no name a
+//! source can read: it is called on a value of its receiver type, never
+//! named. Its function is still a binding of its file, so that it is
+//! declared, checked, captured and lowered as a top-level `fn` is, of a
+//! name no source can write, `<method unique@0>` ([`method_binding`]): its
+//! name and an ordinal, the first that makes a name the table does not
+//! hold yet. A session's inputs share one table, so no two methods of a
+//! session have one binding, and a later input finds an earlier one's
+//! methods among the bindings it inherits ([`binding_method`]). A name
+//! holding `<` and `@` but no `#` is neither kind of namespace key, so a
+//! method's binding is never mistaken for one.
+//!
+//! # Context bindings and keys
+//!
+//! A context's default (`context arch: String = "x86_64"`) is a function of
+//! its file, pure and of no parameters, bound as a method's function is, to
+//! a name no source can write, `<default of context arch@0>`
+//! ([`context_binding`]): its name and the first ordinal that makes a name
+//! the table does not hold yet. A context declaration has a key, its
+//! identity at runtime, `<context arch@stdlib/platform.gcsl>`
+//! ([`context_key`]), of its name and its file's path, or `input N` for a
+//! session's input, so that a later input's declaration of a name is not
+//! the earlier one's. Neither holds `#`, so neither is a namespace key.
+//!
+//! # Enum keys
+//!
+//! An enum is nominal (see the checker's "Enums"), and so is each of its
+//! variants, so each has an identity a type or a value carries: a *key*, a
+//! name no source can write, of its name and of what declares it, the path
+//! of its file, or `input N` for a session's input. A key is the same for
+//! every scan of one file, so that the standard library's enums, which
+//! every input of a session scans again, are one enum in all of them, and
+//! a value of an earlier input is of the enum a later one names. An enum's
+//! key is [`enum_key`]'s, a variant's [`variant_key`]'s, which holds its
+//! enum's, so that two enums' variants of one name are two. A key holds no
+//! `#` before digits and a `.`, so it is no namespace key, and does not
+//! start `<method `, so it is no method's binding.
+//!
 //! # Namespace keys
 //!
 //! The definitions made with a def-type (`def package x() { ... }`) are kept
@@ -29,6 +69,13 @@
 //! written, `package org.gnu.gmp-c++`, `package org.golang.go-stage0-1.24`;
 //! none holds `<`, `#`, `@` or `>`, and a key holds only the def-type's
 //! path, made of identifiers, so no key reads differently for them.
+//!
+//! A def-type whose definitions are made with a variant (see the checker's
+//! "Def-types", "Variant def-types"), `def Toolchain::C gcc()`, has a
+//! namespace for each variant: its key's path is the def-type's, `::` and
+//! the variant's name, `<Toolchain::C#3.17>` ([`variant_namespace_key`]),
+//! so that `Toolchain::C gcc` and `Toolchain::Rust gcc` are two
+//! definitions, and a path under it is shown `Toolchain::C gcc`.
 //!
 //! The metas of a def-type's definitions (`defmeta package x { ... }`) are
 //! kept apart, one namespace per def-type and DIRECTORY, since a meta
@@ -59,13 +106,18 @@ pub struct Name(u32);
 
 impl Name {
     /// The name as an index into its table.
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
 }
 
+/// The name of the context a definition's body binds to the definition
+/// ([`crate::lower::DEFINITION_CONTEXT`]): the first of every table, so that
+/// the evaluator reads that context with no table to look it up in.
+pub const DEFINITION: Name = Name(0);
+
 /// The interning table: each distinct text once, with its [`Name`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Names {
     /// The text of each name, indexed by [`Name`].
     texts: Vec<String>,
@@ -73,11 +125,22 @@ pub struct Names {
     lookup: HashMap<String, Name>,
 }
 
+impl Default for Names {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Names {
-    /// Creates an empty table.
+    /// Creates a table holding only [`DEFINITION`].
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let mut names = Self {
+            texts: Vec::new(),
+            lookup: HashMap::new(),
+        };
+        names.intern(crate::lower::DEFINITION_CONTEXT);
+        names
     }
 
     /// Returns the name of `text`, adding it to the table if it is new.
@@ -111,23 +174,24 @@ impl Names {
         &self.texts[name.index()]
     }
 
-    /// The number of distinct names interned.
+    /// The number of distinct names interned, [`DEFINITION`] among them.
     #[must_use]
     pub fn len(&self) -> usize {
         self.texts.len()
     }
 
-    /// Whether no name has been interned.
+    /// Whether the table holds no name: never, since it holds
+    /// [`DEFINITION`] from the start.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.texts.is_empty()
     }
 
     /// Forgets every name interned after the first `len`, so the table is
-    /// as it was when it held `len` names. Used by
+    /// as it was when it held `len` names, but never [`DEFINITION`]. Used by
     /// [`crate::session::Session`] to undo a failed input.
     pub(crate) fn truncate(&mut self, len: usize) {
-        for text in self.texts.drain(len.min(self.texts.len())..) {
+        for text in self.texts.drain(len.max(1).min(self.texts.len())..) {
             self.lookup.remove(&text);
         }
     }
@@ -141,6 +205,44 @@ pub fn namespace_key(path: &str, number: u32, item: u32) -> String {
     format!("<{path}#{number}.{item}>")
 }
 
+/// The text of the namespace key of the definitions made with the variant
+/// `variant` of the def-type whose namespace key is `key`:
+/// `<Toolchain::C#3.17>` for `<Toolchain#3.17>` and `C` (see [Namespace
+/// keys](#namespace-keys)). `None` if `key` is no namespace key.
+#[must_use]
+pub fn variant_namespace_key(key: &str, variant: &str) -> Option<String> {
+    let path = key_def_type(key)?;
+    let (number, item) = key_numbers(key)?;
+    Some(namespace_key(&format!("{path}::{variant}"), number, item))
+}
+
+/// Whether `text` is the namespace key of the definitions made with a
+/// variant of the def-type whose namespace key is `key`: `<Toolchain::C#3.17>`
+/// and `<Toolchain::Rust#3.17>` of `<Toolchain#3.17>`, but neither
+/// `<Toolchain#3.17>` itself nor another declaration's `<Toolchain::C#4.2>`
+/// (see [Namespace keys](#namespace-keys)).
+#[must_use]
+pub fn is_variant_key_of(text: &str, key: &str) -> bool {
+    let (Some(path), Some(of)) = (key_def_type(text), key_def_type(key)) else {
+        return false;
+    };
+    path.strip_prefix(of)
+        .and_then(|rest| rest.strip_prefix("::"))
+        .is_some_and(|variant| !variant.is_empty())
+        && key_numbers(text) == key_numbers(key)
+}
+
+/// Whether `path` could be the path of a def-type in a key: identifiers,
+/// which may hold `-`, joined by `.`, then optionally `::` and a variant's
+/// name. So no other key, an enum's or a method binding's, whose origin may
+/// hold `#`, is one.
+fn key_path(path: &str) -> bool {
+    !path.is_empty()
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
 /// The path of the def-type whose namespace key is `text`, as its
 /// declaration writes it, if `text` is a namespace key: `package` for
 /// `<package#3.17>` (see [Namespace keys](#namespace-keys)).
@@ -150,7 +252,7 @@ pub fn key_def_type(text: &str) -> Option<&str> {
     let (path, numbers) = inner.rsplit_once('#')?;
     let (number, item) = numbers.split_once('.')?;
     let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
-    (digits(number) && digits(item)).then_some(path)
+    (key_path(path) && digits(number) && digits(item)).then_some(path)
 }
 
 /// The number of the file or session input that declares the def-type
@@ -191,7 +293,7 @@ pub fn key_meta(text: &str) -> Option<&str> {
     let (path, numbers) = key.rsplit_once('#')?;
     let (number, item) = numbers.split_once('.')?;
     let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
-    (digits(number) && digits(item)).then_some(path)
+    (key_path(path) && digits(number) && digits(item)).then_some(path)
 }
 
 /// Whether `text` is a namespace key, a def-type's or the meta key of a
@@ -200,6 +302,73 @@ pub fn key_meta(text: &str) -> Option<&str> {
 #[must_use]
 pub fn is_namespace_key(text: &str) -> bool {
     key_def_type(text).is_some() || key_meta(text).is_some()
+}
+
+/// The text of the name of the binding of the method `name` of a file or
+/// session input, its `ordinal`-th method (see [Method
+/// bindings](#method-bindings)): `<method name@ordinal>`.
+#[must_use]
+pub fn method_binding(name: &str, ordinal: u32) -> String {
+    format!("<method {name}@{ordinal}>")
+}
+
+/// Whether `text` is the name of a method's binding (see [Method
+/// bindings](#method-bindings)).
+#[must_use]
+pub fn is_method_binding(text: &str) -> bool {
+    binding_method(text).is_some()
+}
+
+/// The name of the method whose binding's name is `text`, if it is one's:
+/// `unique` for `<method unique@0>` (see [Method bindings](#method-bindings)).
+#[must_use]
+pub fn binding_method(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix("<method ")?.strip_suffix('>')?;
+    let (name, ordinal) = inner.rsplit_once('@')?;
+    (!ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit())).then_some(name)
+}
+
+/// The text of the name of the binding of the default of the context
+/// `name` of a file or session input, its `ordinal`-th of the name (see
+/// [Context bindings and keys](#context-bindings-and-keys)): `<default of
+/// context arch@0>`.
+#[must_use]
+pub fn context_binding(name: &str, ordinal: u32) -> String {
+    format!("<default of context {name}@{ordinal}>")
+}
+
+/// The text of the key of the declaration of the context `name` that
+/// `origin` declares, the path of its file, or `input N` for a session's
+/// input (see [Context bindings and keys](#context-bindings-and-keys)):
+/// `<context arch@stdlib/platform.gcsl>`.
+#[must_use]
+pub fn context_key(name: &str, origin: &str) -> String {
+    format!("<context {name}@{origin}>")
+}
+
+/// The name of the context whose declaration's key's text is `text`, if it
+/// is one: `arch` for `<context arch@stdlib/platform.gcsl>` (see [Context
+/// bindings and keys](#context-bindings-and-keys)).
+#[must_use]
+pub fn key_context(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix("<context ")?.strip_suffix('>')?;
+    inner.split_once('@').map(|(name, _)| name)
+}
+
+/// The text of the key of the enum `name` that `origin` declares, the path
+/// of its file, or `input N` for a session's input (see [Enum
+/// keys](#enum-keys)): `<enum Toolchain@stdlib/toolchain.gcsl>`.
+#[must_use]
+pub fn enum_key(name: &str, origin: &str) -> String {
+    format!("<enum {name}@{origin}>")
+}
+
+/// The text of the key of the variant `name` of the enum whose key's text is
+/// `of` that `origin` declares (see [Enum keys](#enum-keys)):
+/// `<variant C of <enum Toolchain@stdlib/toolchain.gcsl>@stdlib/toolchain.gcsl>`.
+#[must_use]
+pub fn variant_key(name: &str, of: &str, origin: &str) -> String {
+    format!("<variant {name} of {of}@{origin}>")
 }
 
 /// The path of names `path`, as a diagnostic shows it: joined by `.`, but a
@@ -257,6 +426,24 @@ mod tests {
         let key = namespace_key("t.package", 3, 17);
         assert_eq!(key_numbers(&key), Some((3, 17)));
         assert_eq!(key_numbers("package"), None);
+        let variant = variant_namespace_key(&key, "C").unwrap();
+        assert_eq!(variant, "<t.package::C#3.17>");
+        assert_eq!(key_def_type(&variant), Some("t.package::C"));
+        assert_eq!(key_numbers(&variant), Some((3, 17)));
+        // A variant's key is of its def-type's declaration alone.
+        assert!(is_variant_key_of(&variant, &key));
+        assert!(!is_variant_key_of(&key, &key));
+        assert!(!is_variant_key_of(
+            &namespace_key("t.package::C", 4, 2),
+            &key
+        ));
+        assert!(!is_variant_key_of(
+            &namespace_key("t.packages::C", 3, 17),
+            &key
+        ));
+        assert!(!is_variant_key_of("t.package::C", &key));
+        // Other keys whose origin holds `#` are none.
+        assert_eq!(key_def_type(&enum_key("S", "a#1.2")), None);
         let text = meta_key(&key, 2).unwrap();
         assert_eq!(text, "<defmeta t.package#3.17@2>");
         assert_eq!(key_meta(&text), Some("t.package"));
@@ -291,14 +478,17 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(names.get(a), "hello-world");
         assert_eq!(names.get(b), "x");
-        assert_eq!(names.len(), 2);
+        // Beside the definition context's, which every table holds first.
+        assert_eq!(names.len(), 3);
+        assert_eq!(names.get(DEFINITION), crate::lower::DEFINITION_CONTEXT);
     }
 
     #[test]
     fn lookup_does_not_intern() {
         let mut names = Names::new();
         assert_eq!(names.lookup("Int"), None);
-        assert!(names.is_empty());
+        assert_eq!(names.len(), 1);
+        assert!(!names.is_empty());
         let int = names.intern("Int");
         assert_eq!(names.lookup("Int"), Some(int));
     }
@@ -309,15 +499,22 @@ mod tests {
         let a = names.intern("a");
         names.intern("b");
         names.intern("c");
-        names.truncate(1);
-        assert_eq!(names.len(), 1);
+        names.truncate(2);
+        assert_eq!(names.len(), 2);
         assert_eq!(names.lookup("b"), None);
         assert_eq!(names.lookup("a"), Some(a));
         // A re-interned text gets the next free name again.
         let b = names.intern("b");
         assert_eq!(names.get(b), "b");
-        assert_eq!(names.len(), 2);
+        assert_eq!(names.len(), 3);
         names.truncate(10);
-        assert_eq!(names.len(), 2);
+        assert_eq!(names.len(), 3);
+        // The definition context's is never forgotten.
+        names.truncate(0);
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            names.lookup(crate::lower::DEFINITION_CONTEXT),
+            Some(DEFINITION)
+        );
     }
 }

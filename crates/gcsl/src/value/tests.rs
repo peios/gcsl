@@ -240,6 +240,12 @@ fn one_function(display: &str) -> Rc<Ir> {
         name: None,
         display: Box::from(display),
         slot_names: Box::default(),
+        attributes: Box::default(),
+        defers: false,
+        retry: 0,
+        timeout: None,
+        name_text: None,
+        needs: Box::default(),
     };
     Rc::new(builder.finish_program(root, (0, Vec::new()), vec![code], (0, 0)))
 }
@@ -358,7 +364,8 @@ fn exec_and_panic_show_as_their_types() {
     assert_eq!(exec.kind(), ValueKind::Fn);
     assert_eq!(
         exec.to_string(),
-        "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}"
+        "fn(argv: List<String>, options: {cwd: String, env: {*: String}, interactive: Bool, \
+         panic: Bool, until: String}) -> {status: Int, stderr: String, stdout: String}"
     );
     assert_eq!(exec.repr().to_string(), exec.to_string());
     assert_eq!(
@@ -383,7 +390,7 @@ fn list(values: Vec<Value>) -> Value {
 
 #[test]
 fn lists_are_small_and_the_empty_list_allocates_nothing() {
-    assert_eq!(size_of::<List>(), 2 * size_of::<usize>());
+    assert_eq!(size_of::<List>(), size_of::<usize>());
     assert_eq!(size_of::<Value>(), 24);
     let empty = List::from_vec(Vec::new());
     assert!(empty.is_empty());
@@ -581,4 +588,72 @@ fn dropping_a_long_chain_of_futures_does_not_recurse() {
     assert_eq!(Rc::strong_count(&inner), 1);
     drop(inner);
     assert_eq!(Rc::strong_count(&code), 1);
+}
+
+#[test]
+fn a_quantity_shows_as_its_canonical_literal() {
+    const S: i64 = 1_000_000_000;
+    let cases = [
+        (Quantity::Duration, 0, "0s"),
+        (Quantity::Duration, 90 * S, "1m30s"),
+        (Quantity::Duration, S + S / 2, "1s500ms"),
+        (Quantity::Duration, -30 * S, "-30s"),
+        (Quantity::Duration, 2 * 86_400 * S + 1, "2d1ns"),
+        (
+            Quantity::Duration,
+            i64::MAX,
+            "106751d23h47m16s854ms775us807ns",
+        ),
+        (
+            Quantity::Duration,
+            i64::MIN,
+            "-106751d23h47m16s854ms775us808ns",
+        ),
+        (Quantity::Size, 0, "0B"),
+        (Quantity::Size, 2 << 30, "2GiB"),
+        (Quantity::Size, 1_500, "1500B"),
+        (Quantity::Size, 1_000_000, "1MB"),
+        // 1000KiB rather than 1024KB: the larger unit.
+        (Quantity::Size, 1_024_000, "1000KiB"),
+        (Quantity::Size, -512, "-512B"),
+        (Quantity::Size, 1 << 50, "1PiB"),
+    ];
+    for (quantity, amount, shown) in cases {
+        let value = Value::Quantity(quantity, amount);
+        assert_eq!(value.to_string(), shown, "{amount}");
+        assert_eq!(value.repr().to_string(), shown, "{amount}");
+        assert_eq!(value.kind(), ValueKind::Quantity(quantity));
+    }
+}
+
+#[test]
+fn every_shown_quantity_is_a_literal_of_its_value() {
+    // But the most negative duration, whose magnitude no literal reaches,
+    // as no `Int` literal reaches `i64::MIN`'s.
+    let amounts = [
+        0,
+        1,
+        7,
+        999,
+        1_000,
+        59_999_999_999,
+        86_400_000_000_001,
+        i64::MAX,
+        -42,
+    ];
+    for quantity in [Quantity::Duration, Quantity::Size] {
+        for amount in amounts {
+            let shown = Value::Quantity(quantity, amount).to_string();
+            let source =
+                crate::source::SourceFile::new("t", shown.trim_start_matches('-')).unwrap();
+            let (tokens, _, _) = crate::lexer::tokenize(&source).unwrap();
+            let read = match tokens[0].kind {
+                crate::lexer::TokenKind::Duration(read) | crate::lexer::TokenKind::Size(read) => {
+                    read
+                }
+                other => panic!("{shown}: {other:?}"),
+            };
+            assert_eq!(if amount < 0 { -read } else { read }, amount, "{shown}");
+        }
+    }
 }

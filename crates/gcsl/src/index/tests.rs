@@ -127,6 +127,11 @@ const LOCALS: &str = "fn f(a: Int): Int {\n    let b = a + 1\n    let xs = for i
 const PACKAGE: &str = "#[def_type]\ndef package(name: String, func: fn(): String): String { \
                            func() }\n";
 
+/// An enum and a generic def-type whose definitions are made with its
+/// variants.
+const TOOL: &str = "enum Tool extensible\nenum Tool::C<Int>\n#[def_type]\ndef Tool<T>(name: \
+                        String, kind: Variant<Tool, T>, func: fn(): T): T { func() }\n";
+
 /// The cases of the index's answers.
 fn cases() -> Vec<Case> {
     let mut cases = local_cases();
@@ -239,20 +244,20 @@ fn field_cases() -> Vec<Case> {
         Case {
             name: "an imported name",
             files: vec![
-                ("app.gcsl", "import v from lib.x\nr = v + 1\n"),
+                ("app.gcsl", "import v from lib/x\nr = v + 1\n"),
                 ("lib/x.gcsl", "v = 1\n"),
             ],
             at: ("app.gcsl", "r = |v"),
-            hover: Some(vec!["v: Int", "imported from `lib.x`"]),
+            hover: Some(vec!["v: Int", "imported from `lib/x`"]),
             definition: vec![("lib/x.gcsl", "|v", 1)],
         },
         Case {
             name: "an import's path",
             files: vec![
-                ("app.gcsl", "import v from lib.x\nr = v + 1\n"),
+                ("app.gcsl", "import v from lib/x\nr = v + 1\n"),
                 ("lib/x.gcsl", "v = 1\n"),
             ],
-            at: ("app.gcsl", "lib.|x"),
+            at: ("app.gcsl", "lib/|x"),
             hover: Some(vec!["lib.x: {v: Int}", "file `lib/x.gcsl`"]),
             definition: vec![("lib/x.gcsl", "|", 0)],
         },
@@ -284,6 +289,39 @@ fn other_cases() -> Vec<Case> {
             at: ("pkg.gcsl", "dev.|x"),
             hover: Some(vec!["def package dev.x(): String"]),
             definition: vec![("workspace.gcsl", "def |package", 7)],
+        },
+        Case {
+            name: "a reference made with a variant",
+            files: vec![
+                ("app.gcsl", "r = Tool::C gcc()\n"),
+                ("pkg.gcsl", "def Tool::C gcc() { 1 }\n"),
+                ("workspace.gcsl", TOOL),
+            ],
+            at: ("app.gcsl", "C |gcc"),
+            hover: Some(vec!["Tool::C gcc", "definition of def-type `Tool::C`"]),
+            definition: vec![("pkg.gcsl", "C |gcc", 3)],
+        },
+        Case {
+            name: "a definition's path after a variant",
+            files: vec![
+                ("app.gcsl", "r = Tool::C gcc()\n"),
+                ("pkg.gcsl", "def Tool::C gcc() { 1 }\n"),
+                ("workspace.gcsl", TOOL),
+            ],
+            at: ("pkg.gcsl", "C |gcc"),
+            hover: Some(vec!["def Tool::C gcc(): Int"]),
+            definition: vec![("workspace.gcsl", "def |Tool<", 4)],
+        },
+        Case {
+            name: "the def-type of a reference made with a variant",
+            files: vec![
+                ("app.gcsl", "r = Tool::C gcc()\n"),
+                ("pkg.gcsl", "def Tool::C gcc() { 1 }\n"),
+                ("workspace.gcsl", TOOL),
+            ],
+            at: ("app.gcsl", "|Tool::C gcc"),
+            hover: Some(vec!["def Tool<T>"]),
+            definition: vec![("workspace.gcsl", "def |Tool<", 4)],
         },
         Case {
             name: "a type's name",
@@ -441,12 +479,24 @@ fn a_long_record_type_is_cut_short() {
 }
 
 #[test]
+fn a_quantity_is_shown_by_its_type() {
+    let text = "t = 30s\nm = 2GiB\nr = t\ns = m\n";
+    let Indexed { index, .. } = indexed(&[("app.gcsl", text)]);
+    let mut index = index.unwrap();
+    let file = index.file("app.gcsl").unwrap();
+    for (at, ty) in [("r = |t", "Duration"), ("s = |m", "Size")] {
+        let hover = index.hover(file, offset(text, at)).unwrap();
+        assert!(hover.text.contains(ty), "{at}: {}", hover.text);
+    }
+}
+
+#[test]
 fn a_wide_record_type_shows_its_rest_field_after_its_named_fields() {
     // Too wide for one line, a field per line, the rest-field last; the
     // named fields are never lost to it.
-    let text = "type File = {destination_path: String, source_path_in_build: String, \
+    let text = "type PackageFile = {destination_path: String, source_path_in_build: String, \
                 *: {mode: String, owner_principal: String}}\n\
-                f: File = { destination_path = \"a\"; source_path_in_build = \"b\" }\n\
+                f: PackageFile = { destination_path = \"a\"; source_path_in_build = \"b\" }\n\
                 r = f\n";
     let Indexed { index, .. } = indexed(&[("workspace.gcsl", text)]);
     let mut index = index.unwrap();
@@ -566,12 +616,24 @@ fn references_of_a_definition_include_its_path_and_its_references() {
     let all = places(&files, &[("app.gcsl", "dev.|x"), ("pkg.gcsl", "dev.|x")]);
     assert_eq!(references(&files, ("pkg.gcsl", "dev.|x"), true), all);
     assert_eq!(references(&files, ("pkg.gcsl", "dev.|x"), false), all[..1]);
+    // One variant's definition is not another's of its path.
+    let files = [
+        ("app.gcsl", "r = Tool::C gcc()\ns = Tool::D gcc()\n"),
+        (
+            "pkg.gcsl",
+            "def Tool::C gcc() { 1 }\ndef Tool::D gcc() { 2 }\n",
+        ),
+        ("workspace.gcsl", "enum Tool::D<Int>\n"),
+        ("tool.gcsl", TOOL),
+    ];
+    let c = places(&files, &[("app.gcsl", "C |gcc"), ("pkg.gcsl", "C |gcc")]);
+    assert_eq!(references(&files, ("pkg.gcsl", "C |gcc"), true), c);
 }
 
 #[test]
 fn references_of_an_imported_name() {
     let files = [
-        ("app.gcsl", "import v from lib.x\nr = v + 1\n"),
+        ("app.gcsl", "import v from lib/x\nr = v + 1\n"),
         ("lib/x.gcsl", "v = 1\n"),
     ];
     let all = places(
@@ -658,7 +720,7 @@ fn a_rename_renames_every_file_and_keeps_an_import_s_alias() {
     let files = [
         ("sub/app.gcsl", "x = base + 1\ny = base\n"),
         ("sub/lib.gcsl", "base = 1\n"),
-        ("other.gcsl", "import base as b from sub.lib\nz = b\n"),
+        ("other.gcsl", "import base as b from sub/lib\nz = b\n"),
     ];
     let at = index_of(&files, "sub/lib.gcsl");
     assert_eq!(
@@ -678,7 +740,7 @@ fn a_rename_renames_every_file_and_keeps_an_import_s_alias() {
             ("sub/lib.gcsl".to_owned(), "root = 1\n".to_owned()),
             (
                 "other.gcsl".to_owned(),
-                "import root as b from sub.lib\nz = b\n".to_owned()
+                "import root as b from sub/lib\nz = b\n".to_owned()
             ),
         ])
     );
@@ -742,6 +804,68 @@ fn a_rename_of_a_definition_s_segment_renames_its_meta_and_its_references() {
 }
 
 /// Why renaming what is at `at` of `files` to `new` is refused.
+#[test]
+fn renaming_a_variable_keeps_a_shorthand_argument_naming_its_parameter() {
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "app.gcsl",
+            "fn f(out: Int, compiler: Int): Int { out + compiler }\n\
+             let compiler = 2\n\
+             r = f(out = 1, compiler)\n",
+        ),
+    ];
+    let changed = renamed(&files, ("app.gcsl", "let |compiler"), "cc").unwrap();
+    assert_eq!(
+        changed,
+        [(
+            "app.gcsl".to_owned(),
+            "fn f(out: Int, compiler: Int): Int { out + compiler }\n\
+             let cc = 2\n\
+             r = f(out = 1, compiler = cc)\n"
+                .to_owned()
+        )]
+    );
+}
+
+#[test]
+fn a_parameter_read_in_a_later_default_is_one_symbol() {
+    // A default that is no constant is its own function in the checker,
+    // whose parameters copy the earlier ones: reading one there is still
+    // the parameter, as is a name it captures from where `f` is written.
+    let text = "let base = 1\nfn f(a: Int, b: Int = a + base): Int { a * b }\nr = f(2)\n";
+    let files = [("app.gcsl", text)];
+    let all = places(
+        &files,
+        &[
+            ("app.gcsl", "fn f(|a"),
+            ("app.gcsl", "= |a + base"),
+            ("app.gcsl", "{ |a * b"),
+        ],
+    );
+    assert_eq!(references(&files, ("app.gcsl", "= |a + base"), true), all);
+    assert_eq!(references(&files, ("app.gcsl", "{ |a * b"), true), all);
+    assert_eq!(
+        renamed(&files, ("app.gcsl", "= |a + base"), "first"),
+        Ok(vec![(
+            "app.gcsl".to_owned(),
+            text.replace("f(a: Int", "f(first: Int")
+                .replace("= a + base", "= first + base")
+                .replace("{ a * b", "{ first * b")
+        )])
+    );
+    let base = places(
+        &files,
+        &[("app.gcsl", "let |base"), ("app.gcsl", "a + |base")],
+    );
+    assert_eq!(references(&files, ("app.gcsl", "a + |base"), true), base);
+    let Indexed { index, .. } = indexed(&files);
+    let mut index = index.unwrap();
+    let file = index.file("app.gcsl").unwrap();
+    let hover = index.hover(file, offset(text, "= |a + base")).unwrap();
+    assert!(hover.text.contains("Int"), "{}", hover.text);
+}
+
 fn renamed_err(files: &[(&str, &str)], at: (&str, &str), new: &str) -> String {
     renamed(files, at, new).unwrap_err()
 }
@@ -831,7 +955,7 @@ fn what_the_standard_library_a_directory_or_a_string_declares_is_not_renamed() {
         ),
         (
             &[
-                ("app.gcsl", "import lib.x\nr = x.v\n"),
+                ("app.gcsl", "import lib/x\nr = x.v\n"),
                 ("lib/x.gcsl", "v = 1\n"),
             ],
             ("app.gcsl", "import |lib"),
@@ -839,7 +963,7 @@ fn what_the_standard_library_a_directory_or_a_string_declares_is_not_renamed() {
         ),
         (
             &[
-                ("app.gcsl", "import lib.x\nr = x.v\n"),
+                ("app.gcsl", "import lib/x\nr = x.v\n"),
                 ("lib/x.gcsl", "v = 1\n"),
             ],
             ("app.gcsl", "r = |x"),
@@ -866,7 +990,7 @@ fn what_the_standard_library_a_directory_or_a_string_declares_is_not_renamed() {
 
 #[test]
 fn a_file_s_symbols_nest_record_blocks_three_deep() {
-    let text = "import lib.x\n\
+    let text = "import lib/x\n\
                     type V = {version: String}\n\
                     let helper = 1\n\
                     fn twice(n: Int): Int { n * 2 }\n\
@@ -1041,7 +1165,7 @@ fn a_file_that_needs_one_that_failed_is_indexed_and_reports_nothing() {
             "b.gcsl",
             "y = x\nz = y + 1\nw = undefined_name\nfn f(n: Int): Int { n }\n",
         ),
-        ("c.gcsl", "import v from lib.l\nu = v + 1\n"),
+        ("c.gcsl", "import v from lib/l\nu = v + 1\n"),
         ("lib/l.gcsl", "v = 1\nworse = 1 + \"a\"\n"),
     ];
     let Indexed {
@@ -1213,4 +1337,119 @@ fn a_rename_that_would_make_a_scan_error_is_refused() {
         refused.contains("field `x` is defined in two files"),
         "{refused}"
     );
+}
+
+#[test]
+fn an_attribute_s_uses_are_references_of_its_type() {
+    let text = "#[attribute] type hermetic = {on: Bool = true}\n\
+                #[hermetic] def a(): Int { 1 }\n\
+                #[hermetic(false)] def b(): Int { 2 }\n";
+    let files = [("app.gcsl", text)];
+    let all = places(
+        &files,
+        &[
+            ("app.gcsl", "type |hermetic"),
+            ("app.gcsl", "#[|hermetic]"),
+            ("app.gcsl", "#[|hermetic(false)"),
+        ],
+    );
+    assert_eq!(references(&files, ("app.gcsl", "#[|hermetic]"), true), all);
+    assert_eq!(
+        renamed(&files, ("app.gcsl", "type |hermetic"), "sealed"),
+        Ok(vec![(
+            "app.gcsl".to_owned(),
+            text.replace("hermetic", "sealed")
+        )])
+    );
+}
+
+#[test]
+fn a_method_is_a_symbol_of_its_name_and_no_name_to_complete() {
+    let text = "fn (x: Int) twice(): Int { x * 2 }\nr = 3.twice()\n";
+    let files = [("app.gcsl", text)];
+    let (index, file) = index_of(&files, "app.gcsl");
+    let symbols = index.document_symbols(file);
+    let top: Vec<(&str, SymbolKind, Option<&str>)> = symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.detail.as_deref()))
+        .collect();
+    assert_eq!(
+        top,
+        [
+            ("twice", SymbolKind::Method, Some("fn(x: Int): Int")),
+            ("r", SymbolKind::Field, Some("Int")),
+        ]
+    );
+    let at = offset(text, "r = ") + 4;
+    let labels: Vec<String> = index
+        .completion(file, at)
+        .into_iter()
+        .map(|completion| completion.label)
+        .collect();
+    assert!(
+        labels.iter().all(|label| !label.contains('<')),
+        "{labels:?}"
+    );
+}
+
+#[test]
+fn a_method_s_call_goes_to_its_declaration_in_any_file() {
+    let lib = "def (x: Int) twice(): Int { x * 2 }\n";
+    let text =
+        "import lib/ints\nfn (s: String) loud(): String { s }\nr = 3.twice()\nt = \"a\".loud()\n";
+    let files = [("lib/ints.gcsl", lib), ("app.gcsl", text)];
+    let (mut index, file) = index_of(&files, "app.gcsl");
+    let hover = |index: &mut Index, needle: &str| {
+        index
+            .hover(file, offset(text, needle) + 1)
+            .map(|hover| hover.text)
+    };
+    assert_eq!(
+        hover(&mut index, ".twice").as_deref(),
+        Some("```gcsl\nfn (x: Int) twice(): Int\n```")
+    );
+    assert_eq!(
+        hover(&mut index, "loud(): String").as_deref(),
+        Some("```gcsl\nfn (s: String) loud(): String\n```")
+    );
+    let shown_of = |needle: &str| {
+        shown(
+            &index,
+            &files,
+            &index.definition(file, offset(text, needle) + 1),
+        )
+    };
+    assert_eq!(
+        shown_of(".twice"),
+        [("lib/ints.gcsl".to_owned(), "twice@13".to_owned())]
+    );
+    assert_eq!(
+        shown_of(".loud"),
+        [("app.gcsl".to_owned(), "loud@31".to_owned())]
+    );
+}
+
+#[test]
+fn a_method_renames_at_its_declaration_and_every_call() {
+    let files = [
+        ("lib/ints.gcsl", "def (x: Int) twice(): Int { x * 2 }\n"),
+        ("app.gcsl", "import lib/ints\nr = 3.twice()\n"),
+    ];
+    let expected = vec![
+        (
+            "lib/ints.gcsl".to_owned(),
+            "def (x: Int) double(): Int { x * 2 }\n".to_owned(),
+        ),
+        (
+            "app.gcsl".to_owned(),
+            "import lib/ints\nr = 3.double()\n".to_owned(),
+        ),
+    ];
+    for at in [("app.gcsl", "twice()"), ("lib/ints.gcsl", "twice()")] {
+        assert_eq!(
+            renamed(&files, at, "double"),
+            Ok(expected.clone()),
+            "{at:?}"
+        );
+    }
 }

@@ -1,0 +1,99 @@
+# The toolchain module: a module of GCSL's standard library, compiled into
+# every build and loaded by a run that imports it (`import toolchain`). A
+# library asks it for a tool, such as a C compiler, the same way under any
+# host, and never asks which host it runs under: plain GCSL answers with the
+# host's own tools, a build tool such as pekit with the toolchains a
+# workspace registers.
+#
+# - `Toolchain`: every kind of toolchain is a variant of it, whose layout
+#   holds only files and directories, so a toolchain is plain data that can
+#   be given to a step. A kind is one line, `enum Toolchain::C<{...}>`.
+# - `Toolchain::C`: a C toolchain, a `CToolchain`: `root`, its whole install, which its
+#   tools need beside them; `runtime`, a root its tools run on, `/` for the
+#   host's; `cc`, `ar` and `ld`; and `sysroot`, the headers and libraries it
+#   builds against.
+# - `def Toolchain::C NAME() { ... }`: a toolchain, of the kind its variant
+#   names, its body a `ToolchainDef` of that kind's layout: the platforms it
+#   runs on and builds for, partial, a field it does not state matching any,
+#   and what it `provides`.
+# - `context toolchains`: the registered toolchains, each its definition,
+#   `Toolchain::C gcc`, in order, the first that matches winning; plain
+#   GCSL's are the host's own, `system_c`. A registered toolchain's kind is
+#   known before its definition runs, and its definition is run once, when
+#   a `get` of its kind first comes to it: it is memoised. So a toolchain
+#   built with another, a tool compiled with `Toolchain::Rust` say, is
+#   never run by a `get` of that other's kind, and can be registered in any
+#   order.
+# - `get(kind)`: the layout of the first registered toolchain of the kind
+#   `kind`, such as `Toolchain::C`, whose platforms match `^host_platform`
+#   and `^platform`; it fails, naming the kind and both platforms, if none
+#   does. Resolve it in a parameter default, `cchain =
+#   toolchain.get(Toolchain::C)`, so that a step is given the toolchain as an
+#   argument and reads no context.
+import builtins
+
+enum Toolchain extensible<{*: File | Dir}>
+
+type CToolchain = {root: Dir, runtime: Dir, cc: File, ar: File, ld: File, sysroot: Dir}
+
+enum Toolchain::C<CToolchain>
+
+type ToolchainDef<T> = {host_platform: Partial<Platform>, platform: Partial<Platform>, provides: T}
+
+type Registered = {host_platform: Partial<Platform>, platform: Partial<Platform>, provides: Toolchain}
+
+# A registered toolchain: the name of its kind, known before its definition
+# runs, and its definition, run when a `get` of its kind comes to it, in the
+# context of that `get`, memoised. A definition's body is its own
+# definition's wherever it runs, so what it makes is named by it.
+type Entry = {kind_name: String, made: fn() ->> Registered}
+
+#[def_type]
+def Toolchain<T>(name: String, kind: Variant<Toolchain, T>, f: fn() -> ToolchainDef<T>) ->> Entry {
+    kind_name = show(kind)
+    made = fn() ->> Registered {
+        let made = f()
+        = {host_platform = made.host_platform; platform = made.platform; provides = kind(made.provides)}
+    }
+}
+
+context toolchains: List<fn() ->> Entry> = [Toolchain::C system_c]
+
+# The host's own C toolchain, found on `PATH`, for wherever GCSL runs: it
+# runs on the host and builds for it, never for another platform.
+def Toolchain::C system_c() {
+    host_platform = ^host_platform
+    platform = ^host_platform
+    provides = {
+        root = dir("/usr")
+        runtime = dir("/")
+        cc = builtins.which("cc")
+        ar = builtins.which("ar")
+        ld = builtins.which("ld")
+        sysroot = dir("/")
+    }
+}
+
+#[track_caller]
+def get<T>(kind: Variant<Toolchain, T>, ^toolchains, ^host_platform, ^platform) -> T {
+    let wanted = show(kind)
+    for each in toolchains {
+        # Another kind's definition is never run, so it may be built with
+        # this kind's toolchain.
+        let entry = each()
+        if entry.kind_name != wanted {
+            continue
+        }
+        let registered = entry.made()
+        let provides: Toolchain = registered.provides
+        let runs_here = registered.host_platform.matches(host_platform)
+        let builds_for = registered.platform.matches(platform)
+        if kind.matches(provides) and runs_here and builds_for {
+            return kind.payload(provides)
+        }
+    }
+    panic(
+        "no toolchain of kind `{show(kind)}` runs on `{host_platform.arch}-{host_platform.os}` and \
+         builds for `{platform.arch}-{platform.os}`",
+    )
+}

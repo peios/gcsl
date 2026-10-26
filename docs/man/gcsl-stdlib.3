@@ -78,29 +78,106 @@ No epoch, revision, or filename-suffix processing is applied.
 .TP
 .B sort_versions(vs: List<String>): List<String>
 Return a stable ascending sort in compare_versions order, retaining duplicates.
+.TP
+.B Methods of String: split, starts_with, ends_with, trim, strip_prefix, strip_suffix, lines, fields, contains(part: String): Bool, compare_version(b: String): Int
+Each does what the function of its name does, its receiver the function's first argument; contains tests whether part occurs in the string, comparing bytes, and compare_version is compare_versions.
+.TP
+.B Methods of List<String>: join(sep: String): String, sort_versions(): List<String>
+.TP
+.B Methods of List<T>: len(): Int, unique(): List<T>, contains(x: T): Bool
+unique keeps the first of each group of equal elements, wherever they are, in order; contains tests whether an element equals x.
+Both use total equality, as === does: every field of a record, and secrets by identity.
+An element, or x, that holds a function or a future is a runtime error.
+.PP
+A method a file declares, or sees from another file, takes the place of one of these that applies to the same receiver.
 .SH PROCESS FUNCTIONS
 .TP
-.B exec(argv: List<String>) -> {status: Int, stdout: String, stderr: String}
+.B exec(argv: List<String>, cwd: String = \(dq\(dq, env: {*: String} = {}, interactive: Bool = false, panic: Bool = true, until: String = \(dq\(dq) -> {status: Int, stdout: String, stderr: String}
 Run argv[0] with argv[1..] as literal arguments, without a shell.
-Search PATH if the program name contains no slash.
-Inherit the host working directory and environment and supply null standard input.
+No word and no variable is a secret: exec_secret gives a program secrets.
+Search PATH if the program name contains no slash, a PATH given in env included.
+Run in cwd, relative to the host working directory, or in that directory for the empty string.
+Inherit the host environment with the variables of env set over it.
+Supply null standard input.
 Capture standard output and standard error in memory.
 Decode captured bytes as UTF-8, replacing invalid sequences.
-Return a nonzero exit status as data; a signal termination uses 128 plus the signal number.
+A nonzero status is a runtime error, "`cc` exited with status 1", noted with the trimmed standard error; with panic false it is returned as data instead.
+A signal termination is status 128 plus the signal number.
+With until, kill the program, and the processes it started in its process group, once a line of either stream contains the text; return the output read so far with status 0.
+With interactive, give the program the host's standard input, output and error, and capture nothing; until cannot be combined with it.
+A program run with until or under a timeout runs in a process group of its own, so it does not receive a terminal's interrupt.
 An empty argument list or failure to start the program is a runtime error.
+Every runtime error is reported at the call: exec is track_caller.
 .TP
-.B exec_live(argv: List<String>) -> {status: Int, stdout: String, stderr: String}
+.B exec_live(argv: List<String>, cwd, env, interactive, panic, until) -> {status: Int, stdout: String, stderr: String}
 Run as exec does and also copy both output streams to GCSL standard error as complete lines arrive.
 A final unterminated line is copied at end of stream.
 Captured output is still retained in memory.
+Its failure on a nonzero status is not noted with the standard error, which has been copied already.
+.TP
+.B exec_secret(argv: List<String>, secrets: {*: Revealed<String>}, cwd: String = \(dq\(dq, env: {*: String} = {}, panic: Bool = true, until: String = \(dq\(dq) -> Secret<{status: Int, stdout: String, stderr: String}>
+Run as exec does, with the variables of secrets, each a secret revealed with
+.BR reveal() ,
+set over env as the program's environment variables: the program receives their values.
+The result is a secret, whose identity is derived from argv, the options and the secrets' identities.
+A nonzero status, unless panic is false, is the runtime error "a program given a secret failed", naming neither the status nor the output; recover and retry handle it.
+Nothing is copied to the terminal as it runs, and the program has no terminal.
+Files the program writes are not secrets.
 .TP
 .B sh(script: String) -> String
 Run /bin/sh -c with script and return its raw standard output, including a trailing newline.
-A nonzero status fails the GCSL run with the script, status, and trimmed standard error.
+A nonzero status fails the GCSL run with the script, status, and trimmed standard error, reported at the call.
 .TP
 .B sh_live(script: String) -> String
 Run as sh does with live output copying.
 A failure message omits standard error already copied to the terminal.
+.TP
+.B file(path: String) -> File
+Return the file at path, a relative path resolved against the working directory exec uses by default, then normalised lexically: . segments and repeated slashes dropped and each .. removing the segment before it, never above /, with no symbolic link resolved.
+Nothing is read, so a missing file is found when it is read.
+An empty path is a runtime error.
+f.path is its absolute path; under plain GCSL two files are equal when their paths are.
+.TP
+.B File.read() -> String
+Return the file's contents, which must be UTF-8; a file that cannot be read, or is not UTF-8, is a runtime error at the call.
+.TP
+.B File.exec(...words: String, cwd, env, interactive, panic, until) -> {status: Int, stdout: String, stderr: String}
+Run the file as a program with words as its arguments, as exec runs [f.path, ...words] with the same options.
+.TP
+.B List<File>.file(name: String): File
+Return the one file whose path is name or ends with /name; none, or several, is a runtime error at the call.
+.TP
+.B type FileSet = List<File>, type FilePath = String
+Aliases for lists of files and for paths.
+A FileSet is a list of loose files; a tree of files is a Dir.
+.TP
+.B dir(path: String) -> Dir
+Return the directory at path, resolved and normalised as file resolves a file's; nothing is read.
+d.path is its absolute path; under plain GCSL two directories are equal when their paths are.
+.TP
+.B Dir.file(path: String): File, Dir.dir(path: String): Dir
+Return the file or directory at path in d, relative, a leading slash meaning d's root, normalised lexically.
+A path that would leave d is a runtime error, and Dir.file needs a path below d; neither reads anything.
+.TP
+.B Dir.files() -> List<File>
+Return every entry of d's tree that is no directory, symbolic links included and never followed, sorted by path.
+.TP
+.B Dir.exec(...words: String, env, interactive, panic, until) -> {status: Int, stdout: String, stderr: String}
+Run words[0] with words[1..] in d, as exec does with cwd d.path.
+.TP
+.B Dir.sandbox(cwd: String = \(dq/\(dq, env: {*: String} = {}) -> Sandbox
+Copy d's tree into a new directory of the run and return a sandbox of it, its commands run in cwd, made if missing, with the environment env by default.
+.TP
+.B Sandbox.exec(...words: String, cwd, env, interactive, panic, until) -> {status: Int, stdout: String, stderr: String}
+Run words[0] with words[1..] as exec does, under bwrap, with the sandbox's copy bound as /, a /proc, a /dev and a /tmp of its own, in new user and pid namespaces, killed with bwrap.
+Its working directory is cwd, absolute in the sandbox or relative to its own, or the sandbox's for the empty string.
+Its environment is exactly the sandbox's, with env set over it; words[0] is found through that environment's PATH, or the default /bin:/usr/bin.
+The network is not shut off.
+Without bwrap on PATH, the call is the runtime error "a sandbox needs bubblewrap (`bwrap`), which is not installed".
+.TP
+.B Sandbox.file(path: String): File, Sandbox.dir(path: String): Dir
+Return the file or directory at path in the sandbox, absolute in it or relative to its working directory; a path that would leave it is a runtime error.
+Their paths are the host's paths of the copy, and they show what its commands have left so far.
 .TP
 .B panic(message: String): Never
 Stop evaluation with a runtime diagnostic containing message.
@@ -152,6 +229,12 @@ The parent directory must exist.
 Replacement uses ordinary new-file permissions, 0666 reduced by the process umask, rather than preserving old permissions.
 A symbolic link at p is replaced, not followed.
 Failure removes the temporary file.
+.TP
+.B fs.compose_dir(entries: {*: Dir | File | List<File>}) -> Dir
+Make a new directory of the run, removed as temporary directories are, and place each entry of entries at its key, a path in it, / or . meaning the directory itself.
+A Dir's tree is copied under its key, a File to its key, and each file of a List<File> under its key by its name; directories merge.
+Everything is copied, permissions kept and symbolic links copied as links, so a program writing in the directory changes nothing it was made of.
+Two entries placing one path, a key outside the directory, and a file at the directory itself are runtime errors.
 .TP
 .B fs.temp_dir() -> String
 Create a distinct empty directory with mode 0700 and return its absolute path.

@@ -1,0 +1,42 @@
+# The packaging module: a module of GCSL's standard library, compiled into
+# every build and loaded by a run that imports it (`import packaging`). It
+# packs a `package` definition with each packager a workspace uses, and
+# never knows a package format: each packager is a library's.
+#
+# - `Packager`: a packager, as a packager library gives one: its `name`;
+#   `pack`, a function, hermetic in any library worth the name, of a
+#   package to the directory it packed it into; and `publish`, of a package,
+#   that directory and a store, which copies the packed package into the
+#   store, changing the world outside the build.
+# - `context packagers`: the packagers a workspace uses, which a host such
+#   as pekit sets from the workspace's configuration.
+# - `pack(pkg)`: the package `pkg` packed by each packager, in order, each
+#   with its packager's name.
+# - `publish(pkg, store)`: the same, each then published into `store`, a
+#   path or a URL, as each packager reads it. The store is an argument, not
+#   a context, so that packing for one store is packing for any.
+import builtins
+
+type Packed = {packager: String, packed: Dir}
+
+type Packager = {
+    name: String,
+    pack: fn(pkg: Package) -> Dir,
+    publish: fn(pkg: Package, packed: Dir, store: String) -> {},
+}
+
+context packagers: List<Packager> = []
+
+def pack(pkg: Package, ^packagers) -> List<Packed> {
+    = for each in packagers {
+        = {packager = each.name; packed = each.pack(pkg)}
+    }
+}
+
+def publish(pkg: Package, store: String, ^packagers) -> List<Packed> {
+    = for each in packagers {
+        let packed = each.pack(pkg)
+        let published = each.publish(pkg, packed, store)
+        = {packager = each.name; packed = packed}
+    }
+}

@@ -1,2 +1,2 @@
-import a.one
+import a/one
 second = one.first

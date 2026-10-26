@@ -31,9 +31,149 @@ fn scale(value: Int, factor: Int = 2): Int { value * factor }
 scale(value = 21)
 ```
 
-Defaults are constants. Positional and named arguments are evaluated in
-source order. A trailing block supplies the last parameter, which is
-useful for functions that accept a configuration record.
+Positional and named arguments are evaluated in source order. A trailing
+block supplies the last parameter, which is useful for functions that
+accept a configuration record.
+
+A default can be any expression. It can use the parameters before it and
+anything visible where the function is written:
+
+```gcsl
+let suffix = ".o"
+fn object(source: String, output: String = "{source}{suffix}"): String {
+    output
+}
+main = object("main.c")
+lib = object("lib.c", output = "lib.a")
+```
+
+A default is evaluated each time a call leaves its parameter out, after
+the arguments that are written and before the function's body runs. It
+has the function's effect, so a pure function's default cannot call an
+impure function. A default cannot use its own parameter or a later one.
+Only a call by the function's own name uses its defaults. A call through
+a copy, such as `g` after `let g = object`, or through a parameter must
+supply every argument.
+
+After a named argument, a name on its own is shorthand for passing the
+variable of that name to the parameter of that name. These two calls are
+the same:
+
+```gcsl
+fn build(source: String, output: String, compiler: String): String {
+    "{compiler} {source} -o {output}"
+}
+let compiler = "cc"
+short = build("main.c", output = "main.o", compiler)
+long = build("main.c", output = "main.o", compiler = compiler)
+```
+
+Before any named argument, a name on its own is an ordinary positional
+argument.
+
+## Rest parameters
+
+A rest parameter, written `...name: T`, takes every positional argument
+from its place on, and the body sees it as a `List<T>`. Parameters after it
+are given by name. A spread argument, `...list`, passes a list's elements
+to it, among single arguments:
+
+```gcsl
+fn command(program: String, ...words: String, quiet: Bool = false): String {
+    let all = join([program, ...words], " ")
+    if quiet { "{all} >/dev/null" } else { all }
+}
+let flags = ["-O2", "-Wall"]
+plain = command("cc")
+compile = command("cc", "-c", ...flags, "main.c")
+silent = command("make", "install", quiet = true)
+```
+
+A function has at most one rest parameter, and it has no default: given
+nothing, it is the empty list. Its arguments are written together, so that
+they run in the order they are written. A function type shows its rest
+parameter too, `fn(...words: String): Int`, and only a function with a rest
+parameter in the same place fits it.
+
+## Generic functions
+
+A function can work on values of any type. Name its type parameters in
+angle brackets after its name, and use them as types in its signature and
+body:
+
+```gcsl
+fn first<T>(items: List<T>, fallback: T): T {
+    if len(items) > 0 { items[0] } else { fallback }
+}
+port = first([8080, 9090], 80)
+name = first([], "none")
+```
+
+Each call works out the type parameters from its arguments: here `T` is
+`Int` in the first call and `String` in the second. Inside the function, a
+value of type `T` can be passed on, returned, or put in a list or record,
+but nothing else, because `T` could be anything. A call where nothing binds
+a type parameter, such as one that only returns a `List<T>`, is an error.
+
+## Methods
+
+A method is a function you call on a value with a dot. Write its
+receiver in parentheses before its name:
+
+```gcsl
+fn (n: Int) twice(): Int { n * 2 }
+fn (items: List<T>) first_or<T>(fallback: T): T {
+    if len(items) > 0 { items[0] } else { fallback }
+}
+doubled = 21.twice()
+port = [8080].first_or(80)
+```
+
+The value before the dot is the receiver. GCSL chooses the method by
+the receiver's type, so methods with the same name can serve different
+types. When more than one fits, the one for the more specific type is
+used: a method for `List<Int>` is chosen over one for `List<T>` when
+the receiver is a `List<Int>`. A method's other parameters, defaults, and
+effects work as a function's do.
+
+A method has no name of its own: `twice` alone is not a variable, and
+`x.twice` without parentheses reads a field. A record field and a method
+with the same name are an error when both could apply.
+
+Methods are declared at the top level of a file. A `fn` method is
+visible only in its own file. A `def` method is also visible to the
+other files of its directory and the directories below it, and to every
+file that imports its module, whatever the form of the import. In the
+REPL, methods are visible to later lines.
+
+### Methods of strings and lists
+
+The standard functions on strings and lists are also methods, so an
+editor offers them after a `.`:
+
+```gcsl
+words = "a b  c".fields()
+padded = " name ".trim()
+has_space = "hello world".contains(" ")
+csv = ["a", "b"].join(",")
+distinct = [3, 1, 3, 2].unique()
+count = [1, 2, 3].len()
+found = [1, 2, 3].contains(2)
+```
+
+Strings have `split`, `starts_with`, `ends_with`, `trim`, `strip_prefix`,
+`strip_suffix`, `lines`, `fields`, `contains`, and `compare_version`.
+Lists of strings have `join` and `sort_versions`, and every list has
+`len`, `unique` and `contains`. `unique` keeps the first of each group of
+equal elements, in order, and `contains` tells whether any element equals
+the value given. Both compare as `===` does: whole values, with every
+field a record has, and secrets by identity. They can't compare functions
+or unawaited `lazy` values, so a list whose elements hold either makes
+them fail.
+
+A method you declare takes the place of a standard one that would apply
+to the same receiver, as your own names take the place of the
+prelude's.
 
 ## Calling for effects
 

@@ -26,9 +26,8 @@
 //! no code or captures, since it is implemented in Rust. It is a function
 //! ([`ValueKind::Fn`]): a call of it through a value, a parameter say, is
 //! applied by the evaluator (see [`crate::eval`]). It shows as its type, as
-//! the type table shows it (`fn(argv: List<String>) -> {status: Int,
-//! stderr: String, stdout: String}` for `exec`, its record's fields by
-//! name, and `fn(message: String): Never` for `panic`), or as `builtin len`
+//! the type table shows it (`fn(x: Float): Int` for `int`, and
+//! `fn(message: String): Never` for `panic`), or as `builtin len`
 //! for one whose typing is special, and two compare equal when they are the
 //! same built-in, which no program can ask, since the checker rejects
 //! comparing functions. The record `exec` returns is an ordinary
@@ -41,9 +40,12 @@ use std::rc::Rc;
 
 use crate::ast::FnId;
 use crate::check::Builtin;
+use crate::diagnostic::Diagnostic;
 use crate::ir::Ir;
 use crate::names::Name;
 use crate::strings::{FieldName, Quoted};
+
+pub use list::List;
 
 /// The kind of value an expression produces: all that the IR and the
 /// evaluator need to know of its type. Every record, the empty record
@@ -59,6 +61,8 @@ pub enum ValueKind {
     Bool,
     /// A `String`, [`Value::Str`].
     String,
+    /// A `Duration` or a `Size`, [`Value::Quantity`].
+    Quantity(Quantity),
     /// A record: [`Value::Empty`] or [`Value::Record`].
     Record,
     /// A list, [`Value::List`].
@@ -80,6 +84,94 @@ pub enum ValueKind {
     /// ends in one. Every walker evaluates such a node, which always
     /// unwinds (see [`crate::eval`]); no [`Value`] is of it.
     Never,
+}
+
+/// A quantity with a unit: a duration, of time in whole nanoseconds, or a
+/// size, of data in whole bytes. Each is an `i64` of its smallest unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Quantity {
+    /// A `Duration`, of nanoseconds.
+    Duration,
+    /// A `Size`, of bytes.
+    Size,
+}
+
+impl Quantity {
+    /// What it is, in prose: `duration` or `size`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Quantity::Duration => "duration",
+            Quantity::Size => "size",
+        }
+    }
+
+    /// The name of its type: `Duration` or `Size`.
+    #[must_use]
+    pub const fn type_name(self) -> &'static str {
+        match self {
+            Quantity::Duration => "Duration",
+            Quantity::Size => "Size",
+        }
+    }
+
+    /// Its smallest unit, in the plural: `nanoseconds` or `bytes`.
+    #[must_use]
+    pub const fn smallest(self) -> &'static str {
+        match self {
+            Quantity::Duration => "nanoseconds",
+            Quantity::Size => "bytes",
+        }
+    }
+}
+
+/// A unit of a duration or a size literal: its name, its quantity, and
+/// how many of the smallest unit, a nanosecond or a byte, it is.
+pub(crate) struct Unit {
+    /// Its name, as written after the number.
+    pub(crate) name: &'static str,
+    /// What it is a unit of.
+    pub(crate) quantity: Quantity,
+    /// How many of the smallest unit it is.
+    pub(crate) factor: u128,
+}
+
+/// A duration's units, from the largest to the smallest, the order its
+/// components are written in. A day is exactly 24 hours.
+pub(crate) const DURATION_UNITS: [Unit; 7] = [
+    unit("d", Quantity::Duration, 86_400_000_000_000),
+    unit("h", Quantity::Duration, 3_600_000_000_000),
+    unit("m", Quantity::Duration, 60_000_000_000),
+    unit("s", Quantity::Duration, 1_000_000_000),
+    unit("ms", Quantity::Duration, 1_000_000),
+    unit("us", Quantity::Duration, 1_000),
+    unit("ns", Quantity::Duration, 1),
+];
+
+/// A size's units: the byte, the decimal ones, powers of 1000, and the
+/// binary ones, powers of 1024. There are none of exabytes: `1E5` is a
+/// float.
+pub(crate) const SIZE_UNITS: [Unit; 11] = [
+    unit("B", Quantity::Size, 1),
+    unit("KB", Quantity::Size, 1_000),
+    unit("MB", Quantity::Size, 1_000_000),
+    unit("GB", Quantity::Size, 1_000_000_000),
+    unit("TB", Quantity::Size, 1_000_000_000_000),
+    unit("PB", Quantity::Size, 1_000_000_000_000_000),
+    unit("KiB", Quantity::Size, 1 << 10),
+    unit("MiB", Quantity::Size, 1 << 20),
+    unit("GiB", Quantity::Size, 1 << 30),
+    unit("TiB", Quantity::Size, 1 << 40),
+    unit("PiB", Quantity::Size, 1 << 50),
+];
+
+/// The unit `name` of `quantity`, `factor` of its smallest unit.
+const fn unit(name: &'static str, quantity: Quantity, factor: u128) -> Unit {
+    Unit {
+        name,
+        quantity,
+        factor,
+    }
 }
 
 /// The field names of a record, in definition order. Built once per record
@@ -138,98 +230,6 @@ impl Drop for Record {
     }
 }
 
-/// A list: its elements, in order, in one reference-counted slice, or
-/// nothing for the empty list, which therefore needs no allocation. Cloning
-/// a list shares its elements. See the module documentation.
-#[derive(Clone, Debug, Default)]
-pub struct List(Option<Rc<[Value]>>);
-
-impl List {
-    /// The empty list.
-    pub const EMPTY: List = List(None);
-
-    /// The list of `values`, in order: one allocation, which copies them
-    /// out of the vector, or none if there are none.
-    #[must_use]
-    pub fn from_vec(values: Vec<Value>) -> Self {
-        if values.is_empty() {
-            List::EMPTY
-        } else {
-            List(Some(Rc::from(values)))
-        }
-    }
-
-    /// The list of the values `values` yields, in order, which must be an
-    /// iterator of exactly known length, such as a map over a range, so
-    /// that the slice is allocated once, at its size, and filled in place;
-    /// no allocation if it yields none.
-    #[must_use]
-    pub fn from_exact(values: impl ExactSizeIterator<Item = Value>) -> Self {
-        if values.len() == 0 {
-            List::EMPTY
-        } else {
-            List(Some(values.collect()))
-        }
-    }
-
-    /// The elements, in order.
-    #[must_use]
-    pub fn values(&self) -> &[Value] {
-        self.0.as_deref().unwrap_or_default()
-    }
-
-    /// The number of elements.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.values().len()
-    }
-
-    /// Whether the list has no elements.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_none()
-    }
-
-    /// Whether this list and `other` are the same list, sharing their
-    /// elements, as a clone does: two empty lists always are.
-    #[must_use]
-    pub fn shares(&self, other: &List) -> bool {
-        match (&self.0, &other.0) {
-            (Some(mine), Some(theirs)) => Rc::ptr_eq(mine, theirs),
-            (None, None) => true,
-            _ => false,
-        }
-    }
-
-    /// The elements, if nothing else holds them, for dropping them.
-    fn unique_mut(&mut self) -> Option<&mut [Value]> {
-        self.0.as_mut().and_then(Rc::get_mut)
-    }
-}
-
-/// Dropping a list frees its nested records, lists, closures and futures
-/// iteratively, as dropping a record does, so a list nested in a list as
-/// deeply as a program runs is freed without recursion. A list whose
-/// elements are shared elsewhere is merely released.
-impl Drop for List {
-    fn drop(&mut self) {
-        if let Some(values) = self.unique_mut() {
-            drop_nested(values);
-        }
-    }
-}
-
-/// Lists compare element by element, in order, deeply, as [`Value`]'s
-/// equality compares each: two lists are equal when they have the same
-/// length and equal elements at every index. Nested records and lists are
-/// compared through a work list, as a record's fields are (see [`Record`]'s
-/// equality).
-impl PartialEq for List {
-    fn eq(&self, other: &Self) -> bool {
-        deep_equal(Pair::Lists(self.values(), other.values()))
-    }
-}
-
 /// A uniquely owned value that holds other values: what the iterative drop
 /// of records, lists, closures and futures frees level by level.
 enum Nested {
@@ -251,6 +251,12 @@ enum Nested {
 fn drop_nested(values: &mut [Value]) {
     let mut pending = Vec::new();
     take_nested(values, &mut pending);
+    free_nested(pending);
+}
+
+/// Frees what is on `pending`, and all it holds in turn, through the work
+/// list [`drop_nested`] starts from: what a list's drop starts from too.
+fn free_nested(mut pending: Vec<Nested>) {
     while let Some(nested) = pending.pop() {
         match nested {
             Nested::Record(record) => {
@@ -262,9 +268,7 @@ fn drop_nested(values: &mut [Value]) {
             }
             Nested::List(mut list) => {
                 // Emptied, its own drop finds nothing left to free.
-                if let Some(values) = list.unique_mut() {
-                    take_nested(values, &mut pending);
-                }
+                list.take_held(&mut pending);
             }
             Nested::Closure(closure) => {
                 if let Ok(mut closure) = Rc::try_unwrap(closure) {
@@ -326,6 +330,17 @@ impl Closure {
             .find_function(self.function)
             .map_or("", |code| &code.display)
     }
+
+    /// The attributes of the closure's function, in source order: what a
+    /// host reads of how to run a call of it (see the parser's
+    /// [Attributes](crate::parser::attributes#attributes)). Empty for a function that
+    /// is no function item, or has none.
+    #[must_use]
+    pub fn attributes(&self) -> &[crate::check::Attribute] {
+        self.code
+            .find_function(self.function)
+            .map_or(&[], |code| &code.attributes)
+    }
 }
 
 /// Shows the function and what it captured, not the IR it belongs to.
@@ -369,6 +384,11 @@ pub(crate) enum FutureState {
     Running,
     /// Run: the value it yielded, which every later await yields.
     Done(Value),
+    /// A step's result that a host has yet to give, the step its node of
+    /// the action graph, by number (see [Graph mode](crate::eval::graph#graph-mode)).
+    Host(u32),
+    /// A step's failure, which a host gave, and which every await raises.
+    Failed(Box<Diagnostic>),
 }
 
 /// What an await finds when it starts to await a [`Future`], from
@@ -381,6 +401,11 @@ pub(crate) enum Begin {
     /// The future had not run: its captured values, taken out, and it is
     /// now running. The await must end it with [`Future::finish`].
     Pending(Box<[Value]>),
+    /// The future is a step's result that a host has yet to give, the step
+    /// its node, by number.
+    Host(u32),
+    /// The future is a step's failure.
+    Failed(Diagnostic),
 }
 
 /// A future: the function of a `lazy` in a program's IR, with the values it
@@ -400,6 +425,60 @@ pub struct Future {
     /// the future, which its body runs with, whoever awaits it (see
     /// [`crate::eval`], "Callers and helpers").
     pub(crate) made: Caller,
+    /// The context it was made in, which its body runs with, whoever awaits
+    /// it (see [`crate::eval`], "Context").
+    pub(crate) context: Option<Rc<ContextFrame>>,
+    /// The node of an action graph whose result it stands for, if it is a
+    /// step's, kept once the host has given it, so that a key it is in is
+    /// the same on every attempt (see [Graph mode](crate::eval::graph#graph-mode)).
+    node: Option<u32>,
+}
+
+/// A frame of the context, what one `with` binds (see [`crate::eval`],
+/// "Context"): each context it binds, by its declaration's key, with its
+/// value, over the context it was evaluated in.
+#[derive(Debug)]
+pub(crate) struct ContextFrame {
+    /// Its identity, new for each `with` evaluated, by which a memoised
+    /// call tells whether a read of a context is of its binding.
+    pub(crate) id: u64,
+    /// What it binds.
+    pub(crate) binds: Box<[(Name, Value)]>,
+    /// The context it was evaluated in.
+    pub(crate) outer: Option<Rc<ContextFrame>>,
+}
+
+impl ContextFrame {
+    /// The nearest binding of the context of the declaration key `key` in
+    /// the context `context`: the identity of the frame binding it and its
+    /// value; `None` if no frame does, so that its default is read.
+    pub(crate) fn find(context: Option<&Rc<Self>>, key: Name) -> Option<(u64, &Value)> {
+        let mut at = context;
+        while let Some(frame) = at {
+            if let Some((_, value)) = frame.binds.iter().find(|&&(bound, _)| bound == key) {
+                return Some((frame.id, value));
+            }
+            at = frame.outer.as_ref();
+        }
+        None
+    }
+
+    /// Every context the context `context` binds, by its declaration's key,
+    /// with the value of its nearest binding, in order of key.
+    pub(crate) fn flattened(context: Option<&Rc<Self>>) -> Vec<(Name, Value)> {
+        let mut found: Vec<(Name, Value)> = Vec::new();
+        let mut at = context;
+        while let Some(frame) = at {
+            for (key, value) in &frame.binds {
+                if !found.iter().any(|(seen, _)| seen == key) {
+                    found.push((*key, value.clone()));
+                }
+            }
+            at = frame.outer.as_ref();
+        }
+        found.sort_by_key(|&(key, _)| key);
+        found
+    }
 }
 
 /// What a running frame has of its caller (see [`crate::eval`], "Callers
@@ -427,22 +506,105 @@ impl Future {
     /// run's table of directories, and an origin no frame has.
     #[must_use]
     pub fn new(code: Rc<Ir>, function: FnId, captures: Box<[Value]>) -> Self {
-        Self::made_by(code, function, captures, Caller::default())
+        Self::made_by(code, function, captures, (Caller::default(), None))
     }
 
     /// [`Future::new`], made by a frame whose caller, helper flag and
-    /// origin are `made`, which its body runs with.
+    /// origin are `made`, in the context `context`, both of which its body
+    /// runs with.
     pub(crate) fn made_by(
         code: Rc<Ir>,
         function: FnId,
         captures: Box<[Value]>,
-        made: Caller,
+        (made, context): (Caller, Option<Rc<ContextFrame>>),
     ) -> Self {
         Self {
             code,
             function,
             state: RefCell::new(FutureState::Pending(captures)),
             made,
+            context,
+            node: None,
+        }
+    }
+
+    /// A future that stands for the result of the step that node number
+    /// `node` of an action graph is, a call of the function `function` of
+    /// `code`, made by `made` in `context`, until a host gives it (see
+    /// [Graph mode](crate::eval::graph#graph-mode)).
+    pub(crate) fn host(
+        code: Rc<Ir>,
+        function: FnId,
+        node: u32,
+        (made, context): (Caller, Option<Rc<ContextFrame>>),
+    ) -> Self {
+        Self {
+            code,
+            function,
+            state: RefCell::new(FutureState::Host(node)),
+            made,
+            context,
+            node: Some(node),
+        }
+    }
+
+    /// The number of the node of an action graph whose result the future
+    /// stands for, if it is a step's, given or not.
+    #[must_use]
+    pub(crate) fn step_node(&self) -> Option<u32> {
+        self.node
+    }
+
+    /// The number of the node of an action graph whose result the future
+    /// stands for, while a host has yet to give it.
+    #[must_use]
+    pub(crate) fn host_node(&self) -> Option<u32> {
+        match self.state.try_borrow().as_deref() {
+            Ok(FutureState::Host(node)) => Some(*node),
+            _ => None,
+        }
+    }
+
+    /// Gives the future, a step's result, what its step came to: its value,
+    /// which every await then yields, or its failure, which every await
+    /// raises. Returns `false`, changing nothing, if the future is no step's
+    /// waiting result.
+    pub(crate) fn resolve(&self, outcome: Result<Value, Diagnostic>) -> bool {
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            return false;
+        };
+        if !matches!(*state, FutureState::Host(_)) {
+            return false;
+        }
+        *state = match outcome {
+            Ok(value) => FutureState::Done(value),
+            Err(error) => FutureState::Failed(Box::new(error)),
+        };
+        true
+    }
+
+    /// The values the future holds while it has not run, its captures, for
+    /// a walk of a value through it; none once it has run or for a step's.
+    pub(crate) fn with_captures<T>(&self, f: impl FnOnce(&[Value]) -> T) -> Option<T> {
+        match self.state.try_borrow().as_deref() {
+            Ok(FutureState::Pending(captures)) => Some(f(captures)),
+            _ => None,
+        }
+    }
+
+    /// The failure the future raised, if it has run and failed.
+    pub(crate) fn failure(&self) -> Option<Diagnostic> {
+        match self.state.try_borrow().as_deref() {
+            Ok(FutureState::Failed(error)) => Some((**error).clone()),
+            _ => None,
+        }
+    }
+
+    /// The value the future yielded, if it has run.
+    pub(crate) fn value(&self) -> Option<Value> {
+        match self.state.try_borrow().as_deref() {
+            Ok(FutureState::Done(value)) => Some(value.clone()),
+            _ => None,
         }
     }
 
@@ -472,9 +634,24 @@ impl Future {
         if let FutureState::Done(value) = &*state {
             return Some(Begin::Done(value.clone()));
         }
+        match &*state {
+            FutureState::Host(node) => return Some(Begin::Host(*node)),
+            FutureState::Failed(error) => return Some(Begin::Failed((**error).clone())),
+            _ => {}
+        }
         Some(match std::mem::replace(&mut *state, FutureState::Running) {
             FutureState::Pending(captures) => Begin::Pending(captures),
             FutureState::Running => Begin::Running,
+            // Handled above; put back unchanged if they were reached.
+            FutureState::Host(node) => {
+                *state = FutureState::Host(node);
+                Begin::Host(node)
+            }
+            FutureState::Failed(error) => {
+                let raised = (*error).clone();
+                *state = FutureState::Failed(error);
+                Begin::Failed(raised)
+            }
             // Handled above; put back unchanged if it were reached.
             FutureState::Done(value) => {
                 *state = FutureState::Done(value.clone());
@@ -504,7 +681,7 @@ impl Future {
         match self.state.get_mut() {
             FutureState::Pending(captures) => captures,
             FutureState::Done(value) => std::slice::from_mut(value),
-            FutureState::Running => &mut [],
+            FutureState::Running | FutureState::Host(_) | FutureState::Failed(_) => &mut [],
         }
     }
 
@@ -514,6 +691,8 @@ impl Future {
             Ok(FutureState::Pending(_)) => "pending",
             Ok(FutureState::Running) | Err(_) => "running",
             Ok(FutureState::Done(_)) => "done",
+            Ok(FutureState::Host(_)) => "waiting",
+            Ok(FutureState::Failed(_)) => "failed",
         }
     }
 }
@@ -657,6 +836,8 @@ pub enum Value {
     Bool(bool),
     /// A `String`.
     Str(Rc<str>),
+    /// A `Duration`, of nanoseconds, or a `Size`, of bytes.
+    Quantity(Quantity, i64),
     /// `{}`, the empty record. Unboxed, so that the many statements whose
     /// value it is produce it without allocating.
     Empty,
@@ -675,6 +856,113 @@ pub enum Value {
     /// it is. Only the driver of a workspace makes one, writing each into
     /// its cell as it lays out the frame (see [`crate::workspace`]).
     Builtin(Builtin),
+    /// A variant of an enum as a value, `Toolchain::C`: of kind
+    /// [`ValueKind::Fn`], since a call of it makes a value of the enum, and
+    /// compared by which variant it is (see the checker's "Enums").
+    Tag(Rc<Tag>),
+    /// A value of an enum: a variant and its payload, compared by both.
+    Variant(Rc<Variant>),
+    /// A secret: a value that never leaks, shown as `***` (see
+    /// [`crate::eval`], "Secrets"), compared by its identity alone.
+    Secret(Rc<Secret>),
+    /// A file: its path and the content identity a host gives it (see
+    /// [Files](crate::eval::files#files)), compared by both.
+    File(Rc<File>),
+    /// A directory, a tree of files: its path and the content identity a
+    /// host gives it, as a file's (see [Files](crate::eval::files#files)),
+    /// compared by both.
+    Dir(Rc<File>),
+    /// A sandbox: a live copy of a directory, which commands run in as
+    /// their `/`, with the working directory and environment they are
+    /// given by default (see [Sandboxes](crate::eval::sandbox#sandboxes)),
+    /// compared by its copy alone.
+    Sandbox(Rc<Sandbox>),
+}
+
+/// A sandbox, as values carry it (see
+/// [Sandboxes](crate::eval::sandbox#sandboxes)).
+#[derive(Debug)]
+pub struct Sandbox {
+    /// The copy, its `/`, as an absolute path of the host's: a directory of
+    /// the run's, its own.
+    pub root: Rc<str>,
+    /// The working directory of its commands by default, absolute, inside
+    /// it.
+    pub cwd: Rc<str>,
+    /// The environment of its commands by default, the whole of it.
+    pub env: Box<[(Rc<str>, Rc<str>)]>,
+}
+
+/// Two sandboxes are equal if they are one copy: each has its own.
+impl PartialEq for Sandbox {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+    }
+}
+
+impl Eq for Sandbox {}
+
+impl std::hash::Hash for Sandbox {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.root.hash(state);
+    }
+}
+
+/// A file or a directory, as values carry it (see
+/// [Files](crate::eval::files#files)): [`Value::File`] or [`Value::Dir`]
+/// says which.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct File {
+    /// Its path, absolute.
+    pub path: Rc<str>,
+    /// The identity of its content, as a host records it, a directory's of
+    /// its whole tree: `None` under plain GCSL, which never looks at a
+    /// file's content to make one.
+    pub identity: Option<Rc<str>>,
+}
+
+/// A secret, as values carry it (see [`crate::eval`], "Secrets").
+#[derive(Debug)]
+pub struct Secret {
+    /// Its value, never a secret itself.
+    pub value: Value,
+    /// Its public identity, what a host's receipts record of it.
+    pub identity: Rc<str>,
+    /// Whether it is revealed, `Revealed<T>`, which a program may be given.
+    pub revealed: bool,
+}
+
+/// Two secrets are equal if their identities are, whatever their values,
+/// and they are both revealed or both not: a comparison that is not itself
+/// a secret, total equality's of fields a type does not name or a memoised
+/// call's of its arguments, must not tell of a secret's value (see
+/// [`crate::eval`], "Secrets"), and whether one is revealed is public, its
+/// type's. A comparison of secrets' values is the checker's, of their
+/// values, into a secret.
+impl PartialEq for Secret {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.revealed == other.revealed
+    }
+}
+
+/// A variant of an enum, as values carry it (see the checker's "Enums").
+#[derive(Debug, PartialEq, Eq)]
+pub struct Tag {
+    /// Its key, its identity ([`crate::names::variant_key`]).
+    pub key: Name,
+    /// Its enum's key ([`crate::names::enum_key`]).
+    pub of: Name,
+    /// How it is shown, `Toolchain::C`.
+    pub shown: Rc<str>,
+}
+
+/// A value of an enum: its variant and its payload.
+#[derive(Debug, PartialEq)]
+pub struct Variant {
+    /// The variant.
+    pub tag: Rc<Tag>,
+    /// The payload.
+    pub payload: Value,
 }
 
 impl Value {
@@ -683,14 +971,100 @@ impl Value {
     pub const fn kind(&self) -> ValueKind {
         match self {
             Value::Int(_) => ValueKind::Int,
+            &Value::Quantity(quantity, _) => ValueKind::Quantity(quantity),
             Value::Float(_) => ValueKind::Float,
             Value::Bool(_) => ValueKind::Bool,
             Value::Str(_) => ValueKind::String,
             Value::Empty | Value::Record(_) => ValueKind::Record,
             Value::List(_) => ValueKind::List,
-            Value::Fn(_) | Value::Builtin(_) => ValueKind::Fn,
+            Value::Fn(_) | Value::Builtin(_) | Value::Tag(_) => ValueKind::Fn,
             Value::Future(_) => ValueKind::Deferred,
+            // A value of an enum is of no kind of its own: present, of the
+            // kind a node of an enum's type has; and so is a secret.
+            Value::Variant(_)
+            | Value::Secret(_)
+            | Value::File(_)
+            | Value::Dir(_)
+            | Value::Sandbox(_) => ValueKind::Mixed,
         }
+    }
+
+    /// This value written as the derivation of a secret computed on it,
+    /// every secret in it as its identity (see [`Derivation`]).
+    #[must_use]
+    pub fn derivation(&self) -> Derivation<'_> {
+        Derivation(self)
+    }
+
+    /// The identities of the secrets this value holds, in a field, an
+    /// element or a payload at any depth, in the order met, each once:
+    /// what a host records of a value's secrets, never their values (see
+    /// [`crate::eval`], "Secrets"). A closure's or a future's captures are
+    /// not looked into.
+    #[must_use]
+    pub fn secret_identities(&self) -> Vec<Rc<str>> {
+        let mut found: Vec<Rc<str>> = Vec::new();
+        let mut pending: Vec<&Value> = vec![self];
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::Secret(secret) => {
+                    if !found.contains(&secret.identity) {
+                        found.push(Rc::clone(&secret.identity));
+                    }
+                }
+                Value::Record(record) => pending.extend(record.values.iter().rev()),
+                Value::List(list) => pending.extend(list.values().iter().rev()),
+                Value::Variant(variant) => pending.push(&variant.payload),
+                _ => {}
+            }
+        }
+        found
+    }
+
+    /// The files this value holds, in a field, an element or a payload at
+    /// any depth, in the order met, each once: what a host takes into a
+    /// step's sandbox of its arguments, and back out of its result (see
+    /// [Files](crate::eval::files#files)). A closure's or a future's captures are not
+    /// looked into, nor a secret's value. A directory is no file: see
+    /// [`Value::dirs`].
+    #[must_use]
+    pub fn files(&self) -> Vec<Rc<File>> {
+        self.found(|value| match value {
+            Value::File(file) => Some(file),
+            _ => None,
+        })
+    }
+
+    /// The directories this value holds, as [`Value::files`] finds its
+    /// files: each a tree a host takes into a step's sandbox whole.
+    #[must_use]
+    pub fn dirs(&self) -> Vec<Rc<File>> {
+        self.found(|value| match value {
+            Value::Dir(dir) => Some(dir),
+            _ => None,
+        })
+    }
+
+    /// What `pick` picks of the values this value holds, in a field, an
+    /// element or a payload at any depth, in the order met, each once.
+    fn found(&self, pick: impl Fn(&Value) -> Option<&Rc<File>>) -> Vec<Rc<File>> {
+        let mut found: Vec<Rc<File>> = Vec::new();
+        let mut pending: Vec<&Value> = vec![self];
+        while let Some(value) = pending.pop() {
+            if let Some(picked) = pick(value) {
+                if !found.contains(picked) {
+                    found.push(Rc::clone(picked));
+                }
+                continue;
+            }
+            match value {
+                Value::Record(record) => pending.extend(record.values.iter().rev()),
+                Value::List(list) => pending.extend(list.values().iter().rev()),
+                Value::Variant(variant) => pending.push(&variant.payload),
+                _ => {}
+            }
+        }
+        found
     }
 
     /// The value as it would be written in a program, for the REPL and the
@@ -709,6 +1083,26 @@ impl Value {
     pub(crate) fn into_int(self) -> Option<i64> {
         match self {
             Value::Int(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The amount of the duration the value is, if it is one, as
+    /// [`Value::into_int`] takes an `Int`.
+    #[must_use]
+    pub(crate) fn into_duration(self) -> Option<i64> {
+        match self {
+            Value::Quantity(Quantity::Duration, amount) => Some(amount),
+            _ => None,
+        }
+    }
+
+    /// The amount of the size the value is, if it is one, as
+    /// [`Value::into_int`] takes an `Int`.
+    #[must_use]
+    pub(crate) fn into_size(self) -> Option<i64> {
+        match self {
+            Value::Quantity(Quantity::Size, amount) => Some(amount),
             _ => None,
         }
     }
@@ -752,6 +1146,9 @@ impl Value {
 /// show as `inf`, `-inf` and `nan`. A `Bool` shows as `true` or `false`, and
 /// a `String` as its text with no quotes or escaping.
 ///
+/// A duration or a size shows as its canonical literal ([`write_quantity`]):
+/// `1m30s`, `2GiB`.
+///
 /// A record shows as GCSL syntax, the same as its [`Value::repr`]: its
 /// fields in definition order, separated by `;` as items are, each value in
 /// `repr` form, so strings are quoted, as in
@@ -770,11 +1167,23 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(value) => write!(f, "{value}"),
+            &Value::Quantity(quantity, amount) => write_quantity(f, quantity, amount),
             Value::Bool(value) => write!(f, "{value}"),
             Value::Str(text) => f.write_str(text),
             Value::Empty => f.write_str("{}"),
             Value::Fn(closure) => f.write_str(closure.display()),
             Value::Builtin(builtin) => f.write_str(builtin.display()),
+            Value::Tag(tag) => f.write_str(&tag.shown),
+            Value::Variant(variant) => {
+                write!(f, "{}({})", variant.tag.shown, variant.payload.repr())
+            }
+            // The one way a secret is shown, wherever it is.
+            Value::Secret(_) => f.write_str("***"),
+            // As the call that makes it, which reads back as an equal file.
+            Value::File(file) => write!(f, "file({})", Quoted(&file.path)),
+            Value::Dir(dir) => write!(f, "dir({})", Quoted(&dir.path)),
+            // No call makes one again: it is a live directory, not data.
+            Value::Sandbox(sandbox) => write!(f, "<sandbox {}>", sandbox.root),
             Value::Future(future) => f.write_str(future.display()),
             Value::Record(record) => {
                 f.write_str("{")?;
@@ -807,6 +1216,57 @@ impl fmt::Display for Value {
     }
 }
 
+/// A [`Value`] written as the derivation of a secret computed on it (see
+/// [`crate::eval`], "Secrets"): as [`Repr`] writes it, but every secret in
+/// it as `$(identity)`, its identity with `\` and `)` escaped, so that two
+/// derivations are written alike only if they are alike. Returned by
+/// [`Value::derivation`].
+#[derive(Clone, Copy, Debug)]
+pub struct Derivation<'a>(&'a Value);
+
+impl fmt::Display for Derivation<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Value::Secret(secret) => {
+                f.write_str("$(")?;
+                for c in secret.identity.chars() {
+                    if c == '\\' || c == ')' {
+                        f.write_str("\\")?;
+                    }
+                    write!(f, "{c}")?;
+                }
+                f.write_str(")")
+            }
+            Value::Record(record) => {
+                f.write_str("{")?;
+                for (index, (text, value)) in
+                    record.layout.texts.iter().zip(&record.values).enumerate()
+                {
+                    if index > 0 {
+                        f.write_str("; ")?;
+                    }
+                    write!(f, "{} = {}", FieldName(text), Derivation(value))?;
+                }
+                f.write_str("}")
+            }
+            Value::List(list) => {
+                f.write_str("[")?;
+                for (index, value) in list.values().iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    Derivation(value).fmt(f)?;
+                }
+                f.write_str("]")
+            }
+            Value::Variant(variant) => {
+                write!(f, "{}({})", variant.tag.shown, Derivation(&variant.payload))
+            }
+            value => value.repr().fmt(f),
+        }
+    }
+}
+
 /// A [`Value`] shown as it would be written in a program. Returned by
 /// [`Value::repr`].
 #[derive(Clone, Copy, Debug)]
@@ -831,9 +1291,52 @@ pub(crate) const fn int_to_float(value: i64) -> f64 {
     value as f64
 }
 
+mod list;
+
 #[cfg(test)]
 #[expect(
     clippy::float_cmp,
     reason = "these tests check exact IEEE 754 results, not approximations"
 )]
 mod tests;
+
+/// Writes the canonical literal of the `quantity` of `amount` of its
+/// smallest unit, a literal of the same value: a duration's components that
+/// are not zero, from days down to nanoseconds, as in `1m30s` and
+/// `1s500ms`, or `0s`; a size in the largest unit, decimal or binary, that
+/// divides it exactly, as in `2GiB`, `1500B` and `1MB`, or `0B`. A negative
+/// one is `-` and the literal of its magnitude.
+pub(crate) fn write_quantity(
+    f: &mut fmt::Formatter<'_>,
+    quantity: Quantity,
+    amount: i64,
+) -> fmt::Result {
+    if amount < 0 {
+        f.write_str("-")?;
+    }
+    let magnitude = u128::from(amount.unsigned_abs());
+    match quantity {
+        Quantity::Duration if magnitude == 0 => f.write_str("0s"),
+        Quantity::Duration => {
+            let mut rest = magnitude;
+            for unit in &DURATION_UNITS {
+                let count = rest / unit.factor;
+                rest %= unit.factor;
+                if count > 0 {
+                    write!(f, "{count}{}", unit.name)?;
+                }
+            }
+            Ok(())
+        }
+        // Every unit divides zero: it is in bytes.
+        Quantity::Size if magnitude == 0 => f.write_str("0B"),
+        Quantity::Size => {
+            let unit = SIZE_UNITS
+                .iter()
+                .filter(|unit| magnitude.is_multiple_of(unit.factor))
+                .max_by_key(|unit| unit.factor)
+                .unwrap_or(&SIZE_UNITS[0]);
+            write!(f, "{}{}", magnitude / unit.factor, unit.name)
+        }
+    }
+}

@@ -238,13 +238,14 @@ use crate::Outcome;
 use crate::ast::{Ast, TypeStore};
 use crate::check::{CheckOutput, Scope};
 use crate::diagnostic::{self, Diagnostic};
-use crate::eval::{self, MemoTables, TempDirs};
+use crate::eval::graph::GraphRun;
+use crate::eval::{self, Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::lower;
 use crate::names::{Name, Names};
 use crate::source::SourceFile;
 use crate::types::{TyId, TypeTable};
-use crate::value::{Layout, Value};
+use crate::value::{Layout, Value, ContextFrame};
 use crate::workspace::{self, Alias, Earlier, Standard};
 
 /// A sequence of inputs sharing their top-level variables. See the module
@@ -289,7 +290,14 @@ pub struct Session {
     /// The def-types of the committed inputs that no later one has
     /// shadowed, each by its path, with its namespace's key, which the next
     /// input inherits (see [Def-types](#def-types)).
-    def_types: Vec<(Vec<Name>, Name)>,
+    def_types: Vec<workspace::InheritedDefType>,
+    /// The variants of the committed inputs that no later one has shadowed,
+    /// each by its enum's key and its name, with its own key, which the next
+    /// input inherits.
+    variants: Vec<workspace::InheritedVariant>,
+    /// The contexts of the committed inputs that no later one has
+    /// redeclared, which the next input inherits.
+    contexts: Vec<workspace::InheritedContext>,
 }
 
 impl Default for Session {
@@ -323,6 +331,8 @@ impl Session {
                 type_store: TypeStore::new(),
                 declared_types: Vec::new(),
                 def_types: Vec::new(),
+                variants: Vec::new(),
+                contexts: Vec::new(),
             },
             Err(diagnostics) => Self {
                 names: Names::new(),
@@ -339,6 +349,8 @@ impl Session {
                 type_store: TypeStore::new(),
                 declared_types: Vec::new(),
                 def_types: Vec::new(),
+                variants: Vec::new(),
+                contexts: Vec::new(),
             },
         }
     }
@@ -412,8 +424,10 @@ impl Session {
             types: &self.declared_types,
             store: &mut self.type_store,
             def_types: &self.def_types,
+            variants: &self.variants,
+            contexts: &self.contexts,
         };
-        let (ir, output, (mut imports, declared_types, def_types)) = workspace::check_input(
+        let (ir, output, inherited) = workspace::check_input(
             &standard,
             (source, earlier),
             (&mut self.names, &mut self.types),
@@ -421,25 +435,61 @@ impl Session {
             input,
         )?;
         let committed = self.committed_mutables();
+        let direct = Direct {
+            temp_dirs: Some(&self.temp_dirs),
+        };
         let context = (
             &mut self.memo,
             self.exec_result.as_ref(),
             &standard.dirs[..],
-            &*self.temp_dirs,
+            &direct as &dyn Effects,
         );
         match run_input(ir, &mut self.frame, context) {
             Ok(value) => {
                 // A name the input bound that its scan could not see, as a
                 // spread's, shadows an import of it too.
                 let declared: HashSet<Name> = output.scope.names().skip(self.scope.len()).collect();
-                imports.retain(|alias| !declared.contains(&alias.name));
-                self.imports = imports;
-                self.declared_types = declared_types;
+                let mut inherited = inherited;
+                inherited
+                    .imports
+                    .retain(|alias| !declared.contains(&alias.name));
+                self.imports = inherited.imports;
+                self.declared_types = inherited.types;
                 // A name the input binds shadows an earlier def-type under
                 // it, but a def-type the input declares.
                 self.def_types
                     .retain(|(path, _)| path.first().is_none_or(|name| !declared.contains(name)));
-                self.def_types.extend(def_types);
+                // Each other name it binds is no def-type of its name for
+                // the later inputs, the prelude's among them.
+                let defined: HashSet<Name> = inherited
+                    .def_types
+                    .iter()
+                    .filter_map(|(path, _)| path.first().copied())
+                    .collect();
+                for &name in declared.iter().filter(|name| !defined.contains(name)) {
+                    self.def_types.push((vec![name], None));
+                }
+                self.def_types.extend(
+                    inherited
+                        .def_types
+                        .into_iter()
+                        .map(|(path, key)| (path, Some(key))),
+                );
+                // A variant the input declares shadows an earlier one of its
+                // enum and name.
+                self.variants.retain(|&(of, name, _)| {
+                    !inherited
+                        .variants
+                        .iter()
+                        .any(|&(later_of, later, _)| later_of == of && later == name)
+                });
+                self.variants.extend(inherited.variants);
+                // A context the input declares shadows an earlier one of its
+                // name.
+                self.contexts.retain(|&(name, ..)| {
+                    !inherited.contexts.iter().any(|&(later, ..)| later == name)
+                });
+                self.contexts.extend(inherited.contexts);
                 self.scope = output.scope;
                 self.value_type = output.ty;
                 self.sources.push(source.clone());
@@ -511,14 +561,26 @@ pub(crate) fn lower_checked(
 pub(crate) fn run_input(
     ir: Ir,
     frame: &mut Vec<Value>,
-    (memo, exec_result, dirs, temp_dirs): RunContext,
+    context: RunContext,
 ) -> Result<Value, Diagnostic> {
-    let ir = Rc::new(ir);
+    run_input_in(&Rc::new(ir), frame, context, (None, None))
+}
+
+/// [`run_input`], of `ir`, in the root context `root`, the frame of the
+/// contexts a host sets for the run, and as the run of a unit in graph mode,
+/// `graph`, if it is one (see [`eval::eval_rooted`]).
+pub(crate) fn run_input_in(
+    ir: &Rc<Ir>,
+    frame: &mut Vec<Value>,
+    (memo, exec_result, dirs, effects): RunContext,
+    (root, graph): (Option<Rc<ContextFrame>>, Option<&GraphRun<'_>>),
+) -> Result<Value, Diagnostic> {
     let frame_size = ir.frame_size() as usize;
     if frame.len() < frame_size {
         frame.resize(frame_size, Value::Empty);
     }
-    eval::eval_with(&ir, frame, memo, (exec_result, dirs, Some(temp_dirs)))
+    let extras = (exec_result, dirs, effects);
+    eval::eval_rooted(ir, (frame, memo), extras, (root, graph))
 }
 
 /// What [`run_input`] runs an input with besides its frame: the memo tables
@@ -528,7 +590,7 @@ pub(crate) type RunContext<'a> = (
     &'a mut MemoTables,
     Option<&'a Rc<Layout>>,
     &'a [Rc<str>],
-    &'a TempDirs,
+    &'a dyn Effects,
 );
 
 #[cfg(test)]

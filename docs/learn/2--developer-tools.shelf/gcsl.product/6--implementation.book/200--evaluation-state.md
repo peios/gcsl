@@ -51,4 +51,5 @@ A program can still loop indefinitely, allocate large values, capture
 large process output, or retain many memoized results. The embedding host
 owns any execution timeout and memory limit.
 
-The main implementation lives in `eval.rs`, `value.rs`, and `session.rs`.
+The main implementation lives in `eval.rs` and the modules under `eval/`,
+`value.rs`, and `session.rs`.

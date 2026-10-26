@@ -53,7 +53,8 @@ rust_test(
 rust_test(
     name = "cli-test",
     size = "large",
-    srcs = ["tests/cli.rs"],
+    srcs = glob(["tests/cli/*.rs"]),
+    crate_root = "tests/cli/main.rs",
     data = [
         ":gcsl",
         "//:test-fixtures",

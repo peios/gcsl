@@ -98,7 +98,9 @@
 //!
 //! What the syntax tree says is kept as written, untouched: inside a
 //! def-type's path (`org.gnu.gmp-c++`, `go-stage0-1.24`), whose glued
-//! tokens make one name; and inside the position of an index segment of a
+//! tokens make one name; inside an import's module path
+//! (`pkgs/net.busybox.busybox`), whose glued tokens make its segments; and
+//! inside the position of an index segment of a
 //! `:=` path (`xs[i+1] := v`), whose text the tree keeps, and its printer
 //! shows. So is every string literal's text, its lines and
 //! indentation, a multi-line or raw one's included; and in an
@@ -280,13 +282,16 @@ struct Facts {
     ascriptions: HashSet<usize>,
     /// Each `for` header, by offset: from the `for` to its body's `{`.
     headers: Vec<(usize, usize)>,
-    /// What is kept as written, by offset: def-types' paths and the
+    /// What is kept as written, by offset: def-types' paths, module paths and the
     /// positions of the index segments of `:=` paths, in no order.
     verbatim: Vec<(usize, usize)>,
     /// The last token of each def-type's path.
     path_ends: HashSet<usize>,
     /// The `*` of every rest-field, which is no operator.
     rests: HashSet<usize>,
+    /// The keyword of every method, `fn` or `def`, spaced from its
+    /// receiver's `(` as no function expression's `fn` is.
+    methods: HashSet<usize>,
 }
 
 impl Facts {
@@ -360,14 +365,28 @@ impl Facts {
                         .filter(|&at| input.kind(at) == TokenKind::LParen);
                     facts.lists.extend(at);
                 }
+                // The `<` is the first token after the name, whatever space
+                // is between them.
                 TypeExprKind::Applied { span, .. } => {
+                    let open = input.first_from(span.end);
+                    if input.kind(open) == TokenKind::Lt {
+                        facts.angles.insert(open);
+                    }
                     let close = ty.span.end.saturating_sub(1);
-                    facts.angles.extend(input.token_at(span.end, TokenKind::Lt));
+                    facts.angles.extend(input.token_at(close, TokenKind::Gt));
+                }
+                TypeExprKind::PathApplied { path, .. } => {
+                    let open = input.first_from(crate::ast::path_span(ast.path(path)).end);
+                    if input.kind(open) == TokenKind::Lt {
+                        facts.angles.insert(open);
+                    }
+                    let close = ty.span.end.saturating_sub(1);
                     facts.angles.extend(input.token_at(close, TokenKind::Gt));
                 }
                 _ => {}
             }
         }
+        declaration_facts(input, &mut facts);
         for (_, used) in ast.def_types() {
             let path = crate::ast::path_span(ast.path(used.path));
             facts
@@ -382,19 +401,31 @@ impl Facts {
                     .extend(input.token_at(used.span.start, TokenKind::LParen));
             }
         }
+        facts.items_kept(ast);
+        facts
+    }
+
+    /// Records what items of `ast` keep as written: an import's module path,
+    /// whose glued tokens make its segments, and the position of each index
+    /// segment of a `:=` path.
+    fn items_kept(&mut self, ast: &Ast) {
         for item in ast.item_arena() {
-            if let ItemKind::Rebind { path, .. } = item.kind {
-                for segment in ast.path(path) {
-                    if matches!(segment.kind, SegmentKind::Index { .. }) {
-                        let span = segment.span;
-                        facts
-                            .verbatim
-                            .push((span.start as usize, span.end as usize));
+            match item.kind {
+                ItemKind::Import(id) => {
+                    let path = ast.import_decl(id).path_at;
+                    self.verbatim.push((path.start as usize, path.end as usize));
+                }
+                ItemKind::Rebind { path, .. } => {
+                    for segment in ast.path(path) {
+                        if matches!(segment.kind, SegmentKind::Index { .. }) {
+                            let span = segment.span;
+                            self.verbatim.push((span.start as usize, span.end as usize));
+                        }
                     }
                 }
+                _ => {}
             }
         }
-        facts
     }
 
     /// Whether the gap from `start` to `end` is inside what is kept as
@@ -834,9 +865,13 @@ impl<'a> Printer<'a> {
         if number_dot || (self.facts.path_ends.contains(&prev) && n == K::LParen) {
             return written;
         }
-        if matches!(p, K::Dot | K::LParen | K::LBracket)
-            || matches!(n, K::Dot | K::Comma | K::Semi | K::RParen | K::RBracket)
-        {
+        if matches!(
+            p,
+            K::Dot | K::LParen | K::LBracket | K::ColonColon | K::Caret
+        ) || matches!(
+            n,
+            K::Dot | K::Comma | K::Semi | K::RParen | K::RBracket | K::ColonColon
+        ) {
             return "";
         }
         match (p, n) {
@@ -863,7 +898,14 @@ impl<'a> Printer<'a> {
         // A call's, a function's, an index's `(` or `[`, or another.
         if matches!(n, K::LParen | K::LBracket) {
             let glued = if n == K::LParen {
-                matches!(p, K::Ident(_) | K::RParen | K::RBracket | K::Fn)
+                matches!(
+                    p,
+                    K::Ident(_)
+                        | K::RParen
+                        | K::RBracket
+                        | K::AttributeArgs(_)
+                        | K::InnerAttributeArgs(_)
+                ) || (p == K::Fn && !self.facts.methods.contains(&prev))
             } else {
                 matches!(
                     p,
@@ -1131,6 +1173,55 @@ fn internal(message: &'static str) -> Diagnostic {
     .into()
 }
 
+/// Adds to `facts` what the declarations of `input`'s tree say: the
+/// brackets of each generic function's or type's parameters, `<T, U>`,
+/// which are bracketed as type arguments are, the token before its first
+/// parameter and the first `>` after its last; and the keyword of each
+/// method.
+fn declaration_facts(input: &Input<'_>, facts: &mut Facts) {
+    let ast = &input.ast;
+    for method in ast.methods() {
+        let start = ast.item(method.item).span.start;
+        facts.methods.extend(input.token_at(start, TokenKind::Fn));
+    }
+    // An enum's bound and a variant's payload are bracketed as a type's
+    // argument is: the `<` after the name, the `>` that ends the item.
+    for &item in ast.items(ast.root()) {
+        let (open, ty) = match ast.item(item).kind {
+            // After `enum`, the name and `extensible`.
+            ItemKind::Enum {
+                bound: Some(ty), ..
+            } => (input.first_from(ast.item(item).span.start) + 3, ty),
+            ItemKind::Variant {
+                name_span,
+                payload: Some(ty),
+                ..
+            } => (input.first_from(name_span.end), ty),
+            _ => continue,
+        };
+        let close = input.first_from(ast.type_expr(ty).span.end);
+        if input.kind(open) == TokenKind::Lt && input.kind(close) == TokenKind::Gt {
+            facts.angles.insert(open);
+            facts.angles.insert(close);
+        }
+    }
+    let angles = &mut facts.angles;
+    for generics in ast.all_generics() {
+        let (Some(first), Some(last)) = (generics.params.first(), generics.params.last()) else {
+            continue;
+        };
+        if let Some(open) = input.first_from(first.1.start).checked_sub(1)
+            && input.kind(open) == TokenKind::Lt
+        {
+            angles.insert(open);
+        }
+        let close = input.first_from(last.1.end);
+        if input.kind(close) == TokenKind::Gt {
+            angles.insert(close);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,6 +1245,137 @@ mod tests {
         for &(input, expected) in cases {
             assert_eq!(fmt(input), expected, "formatting {input:?}");
         }
+    }
+
+    #[test]
+    fn a_method_s_keyword_is_spaced_from_its_receiver() {
+        check(&[
+            (
+                "fn (x:Int)twice():Int { x*2 }\n",
+                "fn (x: Int) twice(): Int { x * 2 }\n",
+            ),
+            (
+                "def ( xs: List<T> ) first<T>( fallback: T ): T { fallback }\n",
+                "def (xs: List<T>) first<T>(fallback: T): T { fallback }\n",
+            ),
+            (
+                "f = fn (x: Int): Int { x }\n",
+                "f = fn(x: Int): Int { x }\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn enums_glue_their_colons_and_bracket_their_types() {
+        check(&[
+            (
+                "enum  Shape   extensible< {*: Int} >\n",
+                "enum Shape extensible<{*: Int}>\n",
+            ),
+            (
+                "enum Shape :: Sq< {side: Int} >\n",
+                "enum Shape::Sq<{side: Int}>\n",
+            ),
+            (
+                "x = Shape :: Sq({ side = 1 })\n",
+                "x = Shape::Sq({ side = 1 })\n",
+            ),
+            (
+                "let k: Variant< Shape,Int > = y\n",
+                "let k: Variant<Shape, Int> = y\n",
+            ),
+            (
+                "def  Tool :: C   gcc() {\n    1\n}\n",
+                "def Tool::C gcc() {\n    1\n}\n",
+            ),
+            ("r = t.Tool :: C  gcc()\n", "r = t.Tool::C gcc()\n"),
+        ]);
+    }
+
+    #[test]
+    fn assertions_and_recovers_are_spaced_as_statements_and_blocks() {
+        check(&[
+            ("assert  x == 1 ,  \"why\"\n", "assert x == 1, \"why\"\n"),
+            (
+                "r = recover {  f() }  else  ( e ) { e.message }\n",
+                "r = recover { f() } else (e) { e.message }\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_context_s_caret_is_glued_to_its_name() {
+        check(&[
+            (
+                "context  arch : String = \"x\"\n",
+                "context arch: String = \"x\"\n",
+            ),
+            ("r = ^ arch\n", "r = ^arch\n"),
+            (
+                "fn f( ^ arch ): String { arch }\n",
+                "fn f(^arch): String { arch }\n",
+            ),
+            (
+                "r = f()  with { arch = \"y\" }\n",
+                "r = f() with { arch = \"y\" }\n",
+            ),
+            (
+                "r = with { arch = \"y\" }  { f() }\n",
+                "r = with { arch = \"y\" } { f() }\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn type_parameters_are_bracketed_as_type_arguments() {
+        check(&[
+            ("fn id< T >(x: T): T { x }\n", "fn id<T>(x: T): T { x }\n"),
+            (
+                "def pair<A,B>(a: A, b: B): A { a }\n",
+                "def pair<A, B>(a: A, b: B): A { a }\n",
+            ),
+            ("x = 1<2\n", "x = 1 < 2\n"),
+            (
+                "type Pair< A,B > = {first: A, second: B}\n",
+                "type Pair<A, B> = {first: A, second: B}\n",
+            ),
+            (
+                "x: t.Pair< Int,String > = y\n",
+                "x: t.Pair<Int, String> = y\n",
+            ),
+            (
+                "x: t.Pair <Int, String> = y\n",
+                "x: t.Pair<Int, String> = y\n",
+            ),
+            ("x: List <Int> = y\n", "x: List<Int> = y\n"),
+        ]);
+    }
+
+    #[test]
+    fn an_attribute_s_arguments_are_formatted_as_a_call_s() {
+        check(&[
+            (
+                "#[retry( 3 )]\nfn f(): Int { 1 }\n",
+                "#[retry(3)]\nfn f(): Int { 1 }\n",
+            ),
+            (
+                "#[device(name =\"kvm\" , count=2)]   #[retry (1)]\nfn f(): Int { 1 }\n",
+                "#[device(name = \"kvm\", count = 2)] #[retry(1)]\nfn f(): Int { 1 }\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_duration_or_a_size_is_kept_as_it_is_written() {
+        check(&[
+            ("a  =  1h30m\n", "a = 1h30m\n"),
+            ("b = -1_000ms\n", "b = -1_000ms\n"),
+            ("c = 2GiB+1.5KB\n", "c = 2GiB + 1.5KB\n"),
+            (
+                "fn f(t: Duration = 30s, s: Size = 0B): Duration { t }\n",
+                "fn f(t: Duration = 30s, s: Size = 0B): Duration { t }\n",
+            ),
+        ]);
     }
 
     #[test]
@@ -1363,6 +1585,11 @@ mod tests {
                 "x = build  org.gnu.gcc-libstdc++-devel",
                 "x = build org.gnu.gcc-libstdc++-devel\n",
             ),
+            // An import's module path: its `/`s are no divisions.
+            (
+                "import pkgs/net.busybox.busybox  as  b\nimport x,y from lib/a-b/c",
+                "import pkgs/net.busybox.busybox as b\nimport x, y from lib/a-b/c\n",
+            ),
             // The position of an index segment of a `:=` path.
             (
                 "let mut xs = [1]\nxs[0+0]:=2",
@@ -1476,7 +1703,7 @@ mod tests {
 
     #[test]
     fn a_formatted_file_is_left_as_it_is() {
-        let text = "# A file.\nimport _lib.files\n\ntype T = {\n    a: Int,\n    b: List<String> = [],\n}\n\ndef f(t: T) -> {} {\n    let xs = for i in 0..t.a if i > 1 { i * 2 }\n    g(\n        a = xs, # the list\n        b = \"{t.b}\",\n    )\n}\n";
+        let text = "# A file.\nimport _lib/files\n\ntype T = {\n    a: Int,\n    b: List<String> = [],\n}\n\ndef f(t: T) -> {} {\n    let xs = for i in 0..t.a if i > 1 { i * 2 }\n    g(\n        a = xs, # the list\n        b = \"{t.b}\",\n    )\n}\n";
         assert_eq!(fmt(text), text);
     }
 

@@ -845,7 +845,7 @@ fn completion_and_signature_help_are_offered() {
     let capabilities = &result["capabilities"];
     assert_eq!(
         capabilities["completionProvider"],
-        json!({ "triggerCharacters": ["."], "resolveProvider": false })
+        json!({ "triggerCharacters": [".", "/"], "resolveProvider": false })
     );
     assert_eq!(
         capabilities["signatureHelpProvider"],
@@ -894,6 +894,47 @@ fn a_completion_just_after_a_dot_is_typed_is_of_the_new_text_in_each_encoding() 
         assert_eq!(completion_labels(&list), Vec::<String>::new(), "{encoding}");
         client.shut_down().unwrap();
     }
+}
+
+#[test]
+fn a_slash_opens_a_list_only_in_an_import_s_path() {
+    let scratch = Scratch::workspace("complete-slash", "");
+    scratch.write("pkgs/net.busybox.busybox/pkg.gcsl", "w = 1\n");
+    let text = "import pkgs/net.bu\nx = 6 / 2\n";
+    let uri = scratch.write("app.gcsl", text);
+    let (mut client, _) = Client::start(&["utf-8"]);
+    client.open(&uri, text);
+    client.published(&uri);
+    let triggered = |client: &mut Client, at: (u32, u32), trigger: &str| {
+        let position = json!({ "line": at.0, "character": at.1 });
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": position,
+            "context": { "triggerKind": 2, "triggerCharacter": trigger },
+        });
+        client
+            .request("textDocument/completion", params)
+            .response_result
+            .unwrap()
+    };
+    // After a division's `/`, typed: nothing, so no list opens.
+    let list = triggered(&mut client, (1, 7), "/");
+    assert_eq!(completion_labels(&list), Vec::<String>::new());
+    // Asked for there without the trigger: names, as after any operator.
+    let list = client.ask("textDocument/completion", &uri, (1, 7));
+    assert!(completion_labels(&list).iter().any(|label| label == "len"));
+    // In an import's path, half a segment typed: the module, replacing
+    // the whole segment, dots and all.
+    let list = triggered(&mut client, (0, 18), "/");
+    assert_eq!(completion_labels(&list), ["net.busybox.busybox"]);
+    let edit = &list["items"][0]["textEdit"];
+    let replaced = if edit["range"].is_null() {
+        &edit["replace"]
+    } else {
+        &edit["range"]
+    };
+    assert_eq!(as_range(replaced), range((0, 12), (0, 18)));
+    client.shut_down().unwrap();
 }
 
 #[test]

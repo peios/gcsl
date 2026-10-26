@@ -1,6 +1,7 @@
 use super::*;
 use crate::check::Builtin;
 use crate::diagnostic::Severity;
+use crate::source::Span;
 
 fn eval(session: &mut Session, text: &str) -> Result<Outcome, Vec<Diagnostic>> {
     session.eval(&SourceFile::new("<test>", text).unwrap())
@@ -39,6 +40,19 @@ fn value_type(session: &Session) -> String {
         .types()
         .display(session.value_type(), session.names())
         .to_string()
+}
+
+#[test]
+fn a_default_that_is_no_constant_reaches_later_inputs() {
+    // The function's closure keeps its default's, made in the input that
+    // declares it, so a later input's call gives it.
+    let mut session = Session::new();
+    value(
+        &mut session,
+        "let base = 5\nfn f(a: Int, b: Int = a + base): Int { b }",
+    );
+    assert_eq!(value(&mut session, "f(1)").to_string(), "6");
+    assert_eq!(value(&mut session, "let base = 50\nf(2)").to_string(), "7");
 }
 
 #[test]
@@ -259,9 +273,9 @@ fn a_session_runs_the_standard_library_first() {
     // The standard files are its first inputs, and the built-in
     // functions' cells its first slots, written as the frame was laid
     // out.
-    assert_eq!(first(), 3);
+    assert_eq!(first(), 7);
     assert_eq!(
-        session.source(2).map(SourceFile::name),
+        session.source(5).map(SourceFile::name),
         Some("<stdlib>/prelude.gcsl")
     );
     assert!(session.source(first()).is_none());
@@ -325,8 +339,8 @@ fn a_conflict_with_the_prelude_names_its_file() {
     assert_eq!(error.message, "field `len` is defined in two files");
     assert_eq!(error.input, None);
     let inputs: Vec<Option<u32>> = error.labels.iter().map(|label| label.input).collect();
-    assert_eq!(inputs, [Some(2), None]);
-    let prelude = session.source(2).unwrap();
+    assert_eq!(inputs, [Some(5), None]);
+    let prelude = session.source(5).unwrap();
     assert_eq!(prelude.slice(error.labels[0].span), "len");
 }
 
@@ -1433,9 +1447,9 @@ fn a_union_variable_is_used_by_later_inputs() {
 #[test]
 fn a_session_runs_exec_panic_and_sh() {
     let mut session = Session::new();
-    // The twenty-four built-in functions' cells are its first slots.
+    // The fifty-five built-in functions' cells are its first slots.
     assert_eq!(
-        &session.frame[..24],
+        &session.frame[..55],
         Builtin::ALL.map(Value::Builtin).as_slice()
     );
     // On the first input, and on later ones, through a variable.
@@ -1451,7 +1465,10 @@ fn a_session_runs_exec_panic_and_sh() {
     value(&mut session, "let r = exec([\"cat\"])");
     value(&mut session, "let e = exec");
     assert_eq!(
-        value(&mut session, "e([\"sh\", \"-c\", \"exit 4\"]).status"),
+        value(
+            &mut session,
+            "e([\"sh\", \"-c\", \"exit 4\"], \"\", {}, false, false, \"\").status"
+        ),
         Value::Int(4)
     );
     assert_eq!(value(&mut session, "r.stdout"), Value::Str("".into()));
@@ -1461,7 +1478,8 @@ fn a_session_runs_exec_panic_and_sh() {
     );
     // Every record `exec` builds, in any input, has the session's one
     // layout.
-    let Value::Record(record) = value(&mut session, "e([\"true\"])") else {
+    let Value::Record(record) = value(&mut session, "e([\"true\"], \"\", {}, false, false, \"\")")
+    else {
         panic!("expected a record");
     };
     let layout = Rc::clone(session.exec_result.as_ref().unwrap());
@@ -1471,12 +1489,14 @@ fn a_session_runs_exec_panic_and_sh() {
     };
     assert!(Rc::ptr_eq(&earlier.layout, &layout));
     // A panic fails its input, which the session forgets; a failing `sh`
-    // is the prelude's panic, input 2.
+    // is the prelude's panic, at the input's call: `sh` is
+    // `#[track_caller]`.
     assert_eq!(messages(&mut session, "let x = panic(\"stop\")"), ["stop"]);
     assert_eq!(messages(&mut session, "x"), ["undefined variable `x`"]);
     let failed = eval(&mut session, "sh(\"exit 3\")").unwrap_err();
     assert_eq!(failed[0].message, "`exit 3` exited with status 3: ");
-    assert_eq!(failed[0].input, Some(2));
+    assert_eq!(failed[0].input, None);
+    assert_eq!(failed[0].span, Span::new(0, 12));
     assert_eq!(
         value(&mut session, "exec([\"true\"]).status"),
         Value::Int(0)
@@ -1484,7 +1504,10 @@ fn a_session_runs_exec_panic_and_sh() {
     // A later input shadows them as any earlier name.
     value(&mut session, "let exec = 2");
     assert_eq!(
-        value(&mut session, "exec + e([\"true\"]).status"),
+        value(
+            &mut session,
+            "exec + e([\"true\"], \"\", {}, false, false, \"\").status"
+        ),
         Value::Int(2)
     );
 }
@@ -1495,7 +1518,7 @@ fn a_session_has_the_string_built_ins_and_path() {
     // Every standard module was loaded as it started, each a scope of
     // its own, in path order.
     assert_eq!(
-        session.source(1).map(SourceFile::name),
+        session.source(4).map(SourceFile::name),
         Some("<stdlib>/path.gcsl")
     );
     // `split` on the first input.
@@ -1666,9 +1689,9 @@ fn a_session_is_in_its_working_directory() {
 #[test]
 fn a_session_has_fs_and_owns_its_temporary_directories() {
     let mut session = Session::new();
-    // Loaded as the session started, its first input.
+    // Loaded as the session started, its second input, after `archive`.
     assert_eq!(
-        session.source(0).map(SourceFile::name),
+        session.source(1).map(SourceFile::name),
         Some("<stdlib>/fs.gcsl")
     );
     // `import fs` then a read, in that input and a later one.
@@ -1718,4 +1741,154 @@ fn a_session_has_fs_and_owns_its_temporary_directories() {
     }
     assert!(!std::path::Path::new(&*first).parent().unwrap().exists());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn attributes_and_def_type_defaults_reach_later_inputs() {
+    let mut session = Session::new();
+    value(
+        &mut session,
+        "#[attribute] type hermetic = {on: Bool = true}\n\
+         #[def_type] #[hermetic]\n\
+         def test(name: String, f: fn(): Int): fn(): Int { f }",
+    );
+    // An attribute declared by an earlier input, on a function of this one.
+    let shown = |value: &Value| -> Vec<String> {
+        let Value::Fn(closure) = value else {
+            panic!("{value} is no closure");
+        };
+        closure
+            .attributes()
+            .iter()
+            .map(|attribute| format!("{}{:?}", attribute.id.name(), attribute.args))
+            .collect()
+    };
+    let later = value(&mut session, "#[hermetic(false)] fn f(): Int { 1 }\nf");
+    assert_eq!(shown(&later), [r#"hermetic[("on", Bool(false))]"#]);
+    // A definition of an earlier input's def-type takes its attributes.
+    let definition = value(&mut session, "def test a() { 1 }\n(test a)()");
+    assert_eq!(shown(&definition), [r#"hermetic[("on", Bool(true))]"#]);
+}
+
+#[test]
+fn a_generic_type_persists_for_later_inputs() {
+    let mut session = Session::new();
+    assert_eq!(value(&mut session, "type Box<T> = {v: T}"), Value::Empty);
+    assert_eq!(
+        value(&mut session, "type Two<T> = Box<Box<T>>"),
+        Value::Empty
+    );
+    assert_eq!(
+        value(&mut session, "let b: Two<Int> = { v = { v = 3 } }\nb.v.v"),
+        Value::Int(3)
+    );
+    assert_eq!(
+        messages(&mut session, "let c: Box = { v = 1 }"),
+        ["type `Box` needs its type arguments"]
+    );
+    assert_eq!(
+        messages(&mut session, "let c: Box<Int, Int> = { v = 1 }"),
+        ["type `Box` takes 1 type argument, given 2"]
+    );
+}
+
+#[test]
+fn a_method_persists_for_later_inputs() {
+    let mut session = Session::new();
+    assert_eq!(
+        value(&mut session, "fn (x: Int) twice(): Int { x * 2 }"),
+        Value::Empty
+    );
+    assert_eq!(value(&mut session, "3.twice()"), Value::Int(6));
+    // A later input's method of the name, for another type, adds to it.
+    assert_eq!(
+        value(
+            &mut session,
+            "fn (x: String) twice(): String { \"{x}{x}\" }"
+        ),
+        Value::Empty
+    );
+    assert_eq!(value(&mut session, "\"a\".twice()").to_string(), "aa");
+    assert_eq!(value(&mut session, "4.twice()"), Value::Int(8));
+    assert_eq!(
+        value(&mut session, "fn (x: Int) add(y: Int = 10): Int { x + y }"),
+        Value::Empty
+    );
+    assert_eq!(value(&mut session, "1.add()"), Value::Int(11));
+}
+
+#[test]
+fn enums_and_variants_persist_for_later_inputs() {
+    let mut session = Session::new();
+    assert_eq!(
+        value(&mut session, "enum Shape extensible<Int>"),
+        Value::Empty
+    );
+    assert_eq!(value(&mut session, "enum Shape::A<Int>"), Value::Empty);
+    assert_eq!(
+        value(&mut session, "let a = Shape::A(1)\na").to_string(),
+        "Shape::A(1)"
+    );
+    assert_eq!(value(&mut session, "Shape::A(1) == a"), Value::Bool(true));
+    assert_eq!(
+        value(&mut session, "Shape::A.matches(a)"),
+        Value::Bool(true)
+    );
+    // A later input's variant of the name shadows the earlier one.
+    assert_eq!(value(&mut session, "enum Shape::A<Int>"), Value::Empty);
+    assert_eq!(value(&mut session, "Shape::A(1) == a"), Value::Bool(false));
+}
+
+#[test]
+fn definitions_made_with_a_variant_persist_for_later_inputs() {
+    let mut session = Session::new();
+    for input in [
+        "enum K extensible",
+        "enum K::A<Int>",
+        "#[def_type] def K<T>(name: String, kind: Variant<K, T>, f: fn(): T): T { f() }",
+        "def K::A x() { 1 }",
+    ] {
+        value(&mut session, input);
+    }
+    assert_eq!(value(&mut session, "K::A x()"), Value::Int(1));
+    // A later input's definitions are its namespace, as a later input's
+    // fields of a root are, so `x` is no longer seen.
+    value(&mut session, "def K::A y() { 2 }");
+    assert_eq!(value(&mut session, "K::A y()"), Value::Int(2));
+}
+
+#[test]
+fn contexts_persist_for_later_inputs_and_a_later_declaration_shadows() {
+    let mut session = Session::new();
+    value(&mut session, "context n: Int = 1");
+    assert_eq!(value(&mut session, "^n"), Value::Int(1));
+    value(&mut session, "fn f(): Int { ^n * 10 }");
+    assert_eq!(value(&mut session, "f() with { n = 2 }"), Value::Int(20));
+    // A later declaration is another context: `f` reads the one it saw.
+    value(&mut session, "context n: Int = 5");
+    assert_eq!(value(&mut session, "^n"), Value::Int(5));
+    assert_eq!(value(&mut session, "f()"), Value::Int(10));
+}
+
+#[test]
+fn an_input_s_def_types_and_names_shadow_the_prelude_s_in_later_inputs() {
+    let mut session = Session::new();
+    // The prelude's `build` until an input declares its own.
+    assert_eq!(
+        value(&mut session, "def build a() { 1 }\nbuild a()").to_string(),
+        "1"
+    );
+    value(
+        &mut session,
+        "#[def_type]\ndef build(name: String, f: fn(): Int): String { \"{name}:{f()}\" }\n\
+         def build b() { 2 }",
+    );
+    assert_eq!(value(&mut session, "build b()").to_string(), "b:2");
+    // A later binding of the name ends every def-type of it, the prelude's
+    // too.
+    value(&mut session, "build = 1");
+    assert_eq!(
+        messages(&mut session, "build b()"),
+        ["`build` is not a def-type"]
+    );
 }

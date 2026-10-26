@@ -1,7 +1,7 @@
 # The root of the newpkgs GCSL workspace: imports are absolute from here,
 # and every directory below sees what is declared here, the `package`
 # def-type and its types.
-import _lib.ppk
+import _lib/ppk
 import fileroot
 
 # One version a package can be built at: an entry of its meta's `versions`.

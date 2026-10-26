@@ -56,6 +56,20 @@
 //! a [`ListShape`] ([`Ir::list_shape`]) in the same table, gives. Total
 //! equality, `===` and `!==`, compares whole values and needs none.
 //!
+//! # Quantities
+//!
+//! A duration or a size is an `i64` amount of its smallest unit, and is
+//! tagged with its quantity at run time, [`crate::value::Value::Quantity`],
+//! so that a host, `gcsl run` and an `is` test see what it measures. Its
+//! nodes are of kind [`ValueKind::Quantity`]. Arithmetic and comparison
+//! reuse the checked `Int` nodes: an `IntAdd`, `IntCmp` and the like may
+//! have quantity operands, whose amounts the `Int` walker takes, and a
+//! quantity's result is the `Int` node wrapped in a [`IrKind::Quantity`],
+//! which gives it its unit and its kind. So `1s + 1m` is `(quantity
+//! duration (int-add (quantity duration (int ...)) (quantity duration (int
+//! ...))))`, `1h // 1m` an `IntFloorDiv` of two quantities, of kind `Int`,
+//! and a literal or a constant a `Quantity` of an `IntConst`.
+//!
 //! # Lists
 //!
 //! A list literal lowers to an [`IrKind::MakeList`] of its elements in
@@ -158,10 +172,17 @@
 //!
 //! A function expression lowers to a [`IrKind::MakeClosure`], whose items
 //! are loads, in the frame creating the closure, of the values it captures,
-//! in capture order. A call is a [`IrKind::Call`] whose items are
+//! in capture order, followed by a `MakeClosure` of each default function
+//! of its parameters' defaults that are no constants, in parameter order
+//! (see the checker's "Calls"): so a function's closure keeps, after its own
+//! captures, the closures of its default functions, made where it is and
+//! capturing there. A call is a [`IrKind::Call`] whose items are
 //! [`IrKind::Arg`] nodes in source order, each naming the parameter its
 //! value is passed as, followed by one for each parameter the call gives
-//! its default, the default's constant, in parameter order.
+//! its default, in parameter order: the default's constant, or an
+//! [`ArgValue::Default`], which the call evaluates once the arguments
+//! before it are in the callee's frame, by calling the default function the
+//! callee closure keeps with the values of the parameters before it.
 //!
 //! A definition made with a def-type that declares a meta (see the
 //! checker's "Metas") has its meta's closure in a cell of the top level's
@@ -278,12 +299,24 @@ use std::mem;
 use std::rc::Rc;
 
 use crate::ast::FnId;
-use crate::check::Slot;
+use crate::check::{Attribute, Slot};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::{FieldName, Quoted};
 use crate::types::ValueTest;
-use crate::value::{Layout, ValueKind};
+use crate::value::{Layout, Quantity, ValueKind};
+use std::time::Duration;
+
+/// What a node's kind is, as [`IrKind::kind_step`] finds it.
+#[derive(Clone, Copy)]
+enum KindStep {
+    /// Its own.
+    Own(ValueKind),
+    /// The node's of this id.
+    Child(IrId),
+    /// An `if`'s, of its `then` and `else` branches.
+    Branches(IrId, IrId),
+}
 
 /// Index of an [`IrNode`] in its [`Ir`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -649,8 +682,29 @@ pub struct ShapedOperands {
     pub rhs: IrId,
 }
 
+/// The value of an [`IrKind::Arg`]: a node, evaluated in the caller's
+/// frame, or, for a parameter the call leaves out whose default is no
+/// constant, that default (see [Functions](#functions)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgValue {
+    /// The value of the node.
+    Node(IrId),
+    /// The result of calling the default function whose closure is the
+    /// callee closure's capture number `capture`, after the function's own,
+    /// with the values of the parameters before it, in the callee's new
+    /// frame. Of the parameter's kind, `kind`.
+    Default {
+        /// The index of the default function's closure among the callee
+        /// closure's captures.
+        capture: u32,
+        /// The kind of the parameter's value.
+        kind: ValueKind,
+    },
+}
+
 /// What an [`IrNode`] computes. Operand ids of `Int*` nodes always refer to
-/// Int-typed nodes, of `Float*` nodes (except [`IrKind::IntToFloat`]) to
+/// Int-typed nodes or quantity nodes, a duration's or a size's, whose
+/// amounts they compute on, of `Float*` nodes (except [`IrKind::IntToFloat`]) to
 /// Float-typed nodes, of `Str*` nodes to String-typed nodes, of `Bool*`,
 /// `And`, `Or` and `Not` nodes, an `If`'s condition, a `For`'s guard and a
 /// `Loop`'s condition to Bool-typed nodes, and of `Record*`, `Field` and
@@ -793,6 +847,11 @@ pub enum IrKind {
     /// Converts an `Int` operand to the nearest `Float`. Inserted by lowering
     /// for concrete `Int` operands of `/`.
     IntToFloat(IrId),
+    /// The value of the `Int` node given as a value of the quantity given,
+    /// a duration's or a size's amount of its smallest unit: what gives a
+    /// quantity's literal, arithmetic and negation their unit, and so their
+    /// kind (see [Quantities](crate::ir#quantities)).
+    Quantity(Quantity, IrId),
     /// The empty record `{}`.
     Empty,
     /// Reads a variable's slot. Carries the kind of the variable's value so
@@ -1016,13 +1075,117 @@ pub enum IrKind {
         /// The index of the parameter it fills.
         param: u32,
         /// Its value.
-        value: IrId,
+        value: ArgValue,
     },
     /// Reads one of the values the closure being run captured, by its index
     /// in capture order. Carries the value's kind, as a `Load` does.
     LoadCapture(u32, ValueKind),
     /// Yields the closure being run: a function's reference to itself.
     LoadCallee,
+    /// A variant of an enum as a value, `Toolchain::C` (see the checker's
+    /// "Enums"), of kind `Fn`: its key, its enum's, and how it is shown, an
+    /// index into the IR's string table.
+    Tag {
+        /// Its key.
+        key: Name,
+        /// Its enum's key.
+        of: Name,
+        /// How it is shown.
+        shown: ConstId,
+    },
+    /// A read of a context, `^arch` (see [`crate::eval`], "Context"): the
+    /// value the nearest `with` around the read, at runtime, binds the
+    /// context of the declaration key `key` to; with none, the value its
+    /// default's function, `default`, a node of kind `Fn`, returns, called
+    /// with no arguments; with no default either, the runtime error
+    /// "context `arch` has no value here", the context's name taken from
+    /// the key's text ([`Ir::name_text`]). Of kind `kind`.
+    ContextRead {
+        /// The key of the context's declaration.
+        key: Name,
+        /// The node of its default's function, or an [`IrKind::Empty`] if it
+        /// has no default.
+        default: IrId,
+        /// The kind of the read.
+        kind: ValueKind,
+        /// The read's depth in the body of the frame it is evaluated in,
+        /// for the nesting budget of its default's call, as an
+        /// [`IrKind::Call`]'s. Lowering sets it once every node is built.
+        depth: u16,
+    },
+    /// `BODY with { ... }` (see [`crate::eval`], "Context"): evaluates each
+    /// of its bindings, each a [`IrKind::ContextBind`], in order, and then
+    /// its body, of kind `kind`, with the contexts of their keys bound to
+    /// their values.
+    With {
+        /// The bindings, then the body.
+        parts: IrRange,
+        /// The kind of the body, and of the node.
+        kind: ValueKind,
+    },
+    /// `assert COND, MESSAGE` (see [`crate::eval`], "Failure"): evaluates
+    /// `cond`, a `Bool` node, or, for a comparison, its operands, each once,
+    /// and compares them; if it is false, the runtime error "assertion
+    /// failed: MESSAGE", of `message`, a `String` node evaluated only then,
+    /// each operand of a comparison labelled with its value. Of kind
+    /// [`ValueKind::Record`], `{}`.
+    Assert {
+        /// The condition.
+        cond: IrId,
+        /// The message.
+        message: IrId,
+    },
+    /// `recover { BODY } else { FALLBACK }` (see [`crate::eval`],
+    /// "Failure"): evaluates `body`; if it fails, as `#[retry]` would retry,
+    /// evaluates `fallback` instead, with the failure the one an
+    /// [`IrKind::Failure`] reads. Of kind `kind`.
+    Recover {
+        /// The body.
+        body: IrId,
+        /// The fallback.
+        fallback: IrId,
+        /// The kind of both, and of the node.
+        kind: ValueKind,
+    },
+    /// The value of `value`, a node of any kind, if it is a secret, and the
+    /// value itself if it is not (see [`crate::eval`], "Secrets"): what an
+    /// operation on secrets computes on, each of its operands one of these, so
+    /// that a failure of an operand is told from the operation's own. If
+    /// `deep`, every secret the value holds, in a field, an element or a
+    /// payload at any depth, is its value too, as a comparison compares them.
+    /// Each secret's identity is kept for the innermost [`IrKind::SecretWrap`].
+    /// Of kind `kind`.
+    SecretValue {
+        /// The secret, or the value holding secrets.
+        value: IrId,
+        /// The kind of what it is unwrapped to.
+        kind: ValueKind,
+        /// Whether every secret it holds is unwrapped too.
+        deep: bool,
+    },
+    /// An operation on secrets (see [`crate::eval`], "Secrets"): the value
+    /// of the node, of any kind, which computes on the values of secrets,
+    /// as a secret, its identity derived from theirs, revealed if the flag
+    /// says, as the checker found every secret computed on to be; a failure
+    /// of it names none of them, and nothing recovers or retries it. Of kind
+    /// [`ValueKind::Mixed`].
+    SecretWrap(IrId, bool),
+    /// The failure the innermost `recover` running its fallback caught, a
+    /// record `{message: String}` of the layout it names. Of kind
+    /// [`ValueKind::Record`].
+    Failure(LayoutId),
+    /// One binding of an [`IrKind::With`], only ever one of its `binds`:
+    /// the context of the declaration key `key`, bound to the value of
+    /// `value`, a node of any kind.
+    ContextBind {
+        /// The key of the context's declaration.
+        key: Name,
+        /// Its value.
+        value: IrId,
+    },
+    /// `f.path`: the path of the file or directory the node, of any kind,
+    /// is (see [`crate::eval`], "Files"). Of kind [`ValueKind::String`].
+    FilePath(IrId),
     /// `fileroot.caller`: yields the text of the running frame's caller, the
     /// directory of the file whose code made the call the frame runs for,
     /// and records it as a dependency of the memoised calls it can affect
@@ -1123,9 +1286,19 @@ impl IrKind {
     ///
     /// Panics if a list of this node does not belong to `pool`.
     pub(crate) fn children(self, pool: &[IrId]) -> impl DoubleEndedIterator<Item = IrId> + '_ {
+        let (head, tail) = self.operands();
+        head.into_iter()
+            .chain(self.list(pool).iter().copied())
+            .chain(tail.into_iter().flatten())
+    }
+
+    /// The children of the node outside a list of them ([`IrKind::list`]):
+    /// the one before the list, and those after it, in order. Its match is
+    /// exhaustive: a kind of node with a list has none here but what is
+    /// outside it.
+    const fn operands(self) -> (Option<IrId>, [Option<IrId>; 3]) {
         const NONE: [Option<IrId>; 3] = [None; 3];
-        // The child before the list, the list, and the children after it.
-        let (head, list, tail): (Option<IrId>, &[IrId], [Option<IrId>; 3]) = match self {
+        match self {
             IrKind::IntConst(_)
             | IrKind::FloatConst(_)
             | IrKind::BoolConst(_)
@@ -1133,30 +1306,52 @@ impl IrKind {
             | IrKind::Empty
             | IrKind::Load(..)
             | IrKind::LoadCapture(..)
+            | IrKind::Arg {
+                value: ArgValue::Default { .. },
+                ..
+            }
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Tag { .. }
+            | IrKind::Failure(_)
             | IrKind::Caller
-            | IrKind::Helper => (None, &[], NONE),
-            IrKind::IntNeg(operand)
-            | IrKind::FloatNeg(operand)
-            | IrKind::IntToFloat(operand)
-            | IrKind::Not(operand)
-            | IrKind::Field {
-                record: operand, ..
+            | IrKind::Helper
+            | IrKind::Interp(_)
+            | IrKind::MakeRecord { .. }
+            | IrKind::MakeList { .. }
+            | IrKind::For { .. }
+            | IrKind::Loop { .. }
+            | IrKind::Update { .. }
+            | IrKind::With { .. }
+            | IrKind::MakeClosure { .. }
+            | IrKind::MakeFuture { .. } => (None, NONE),
+            IrKind::IntNeg(child)
+            | IrKind::FloatNeg(child)
+            | IrKind::IntToFloat(child)
+            | IrKind::Quantity(_, child)
+            | IrKind::Not(child)
+            | IrKind::Field { record: child, .. }
+            | IrKind::Store(_, child)
+            | IrKind::Arg {
+                value: ArgValue::Node(child),
+                ..
             }
-            | IrKind::Store(_, operand)
-            | IrKind::Arg { value: operand, .. }
-            | IrKind::Spread(operand)
-            | IrKind::ListLen(operand)
-            | IrKind::Show(operand)
-            | IrKind::Is { value: operand, .. }
-            | IrKind::As { value: operand, .. }
-            | IrKind::Await { value: operand, .. }
-            | IrKind::Catch { body: operand, .. }
-            | IrKind::Meta(operand) => (None, &[], [Some(operand), None, None]),
+            | IrKind::Spread(child)
+            | IrKind::ListLen(child)
+            | IrKind::Show(child)
+            | IrKind::Is { value: child, .. }
+            | IrKind::As { value: child, .. }
+            | IrKind::Await { value: child, .. }
+            | IrKind::Catch { body: child, .. }
+            | IrKind::ContextBind { value: child, .. }
+            | IrKind::SecretValue { value: child, .. }
+            | IrKind::SecretWrap(child, _)
+            | IrKind::ContextRead { default: child, .. }
+            | IrKind::FilePath(child)
+            | IrKind::Meta(child) => (None, [Some(child), None, None]),
             IrKind::Break { value, .. }
             | IrKind::Continue { value, .. }
-            | IrKind::Return { value, .. } => (None, &[], [value, None, None]),
+            | IrKind::Return { value, .. } => (None, [value, None, None]),
             IrKind::IntAdd(Operands { lhs, rhs, .. })
             | IrKind::IntSub(Operands { lhs, rhs, .. })
             | IrKind::IntMul(Operands { lhs, rhs, .. })
@@ -1193,28 +1388,138 @@ impl IrKind {
                 list: lhs,
                 index: rhs,
                 ..
-            } => (None, &[], [Some(lhs), Some(rhs), None]),
-            IrKind::If { cond, then, else_ } => (None, &[], [Some(cond), Some(then), Some(else_)]),
+            } => (None, [Some(lhs), Some(rhs), None]),
+            IrKind::If { cond, then, else_ } => (None, [Some(cond), Some(then), Some(else_)]),
+            IrKind::Assert { cond, message } => (None, [Some(cond), Some(message), None]),
+            IrKind::Recover { body, fallback, .. } => (None, [Some(body), Some(fallback), None]),
+            IrKind::Block { result, .. } => (None, [Some(result), None, None]),
+            IrKind::Call { callee, .. } => (Some(callee), NONE),
+        }
+    }
+
+    /// The list of the node's children, of the kinds that hold one: a
+    /// block's items, a call's arguments, and the parts, values or captures
+    /// of the others (see [`IrKind::children`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list does not belong to `pool`.
+    fn list(self, pool: &[IrId]) -> &[IrId] {
+        match self {
             IrKind::Interp(items)
             | IrKind::MakeRecord { values: items, .. }
             | IrKind::MakeList { items, .. }
             | IrKind::For { parts: items, .. }
             | IrKind::Loop { parts: items, .. }
             | IrKind::Update { parts: items, .. }
+            | IrKind::With { parts: items, .. }
             | IrKind::MakeClosure {
                 captures: items, ..
             }
             | IrKind::MakeFuture {
                 captures: items, ..
-            } => (None, items.resolve(pool), NONE),
-            IrKind::Block { items, result } => {
-                (None, items.resolve(pool), [Some(result), None, None])
             }
-            IrKind::Call { callee, args, .. } => (Some(callee), args.resolve(pool), NONE),
-        };
-        head.into_iter()
-            .chain(list.iter().copied())
-            .chain(tail.into_iter().flatten())
+            | IrKind::Block { items, .. }
+            | IrKind::Call { args: items, .. } => items.resolve(pool),
+            _ => &[],
+        }
+    }
+
+    /// The kind of value the node produces, as [`Ir::kind_of`] gives it, or
+    /// whose it is: a block's is its result's, an argument's of a node and a
+    /// binding's of a `with` their values', and an `if`'s its branches'.
+    const fn kind_step(self) -> KindStep {
+        match self {
+            IrKind::Block { result, .. } => KindStep::Child(result),
+            IrKind::If { then, else_, .. } => KindStep::Branches(then, else_),
+            IrKind::Arg {
+                value: ArgValue::Node(value),
+                ..
+            }
+            | IrKind::ContextBind { value, .. } => KindStep::Child(value),
+            IrKind::BoolConst(_)
+            | IrKind::IntCmp(..)
+            | IrKind::FloatCmp(..)
+            | IrKind::StrCmp(..)
+            | IrKind::BoolEq(..)
+            | IrKind::RecordEq(_)
+            | IrKind::RecordNe(_)
+            | IrKind::RecordSame(_)
+            | IrKind::RecordNotSame(_)
+            | IrKind::ListEq(_)
+            | IrKind::ListNe(_)
+            | IrKind::ListSame(_)
+            | IrKind::ListNotSame(_)
+            | IrKind::ValueSame(_)
+            | IrKind::ValueNotSame(_)
+            | IrKind::Is { .. }
+            | IrKind::And(_)
+            | IrKind::Or(_)
+            | IrKind::Not(_) => KindStep::Own(ValueKind::Bool),
+            IrKind::StrConst(_)
+            | IrKind::StrConcat(_)
+            | IrKind::Interp(_)
+            | IrKind::Show(_)
+            | IrKind::Caller
+            | IrKind::FilePath(_) => KindStep::Own(ValueKind::String),
+            IrKind::IntConst(_)
+            | IrKind::IntNeg(_)
+            | IrKind::IntAdd(_)
+            | IrKind::IntSub(_)
+            | IrKind::IntMul(_)
+            | IrKind::IntFloorDiv(_)
+            | IrKind::IntRem(_)
+            | IrKind::ListLen(_) => KindStep::Own(ValueKind::Int),
+            IrKind::MakeList { .. }
+            | IrKind::Spread(_)
+            | IrKind::Range(..)
+            | IrKind::For { collect: true, .. }
+            | IrKind::Loop { collect: true, .. } => KindStep::Own(ValueKind::List),
+            IrKind::Break { .. } | IrKind::Continue { .. } | IrKind::Return { .. } => {
+                KindStep::Own(ValueKind::Never)
+            }
+            IrKind::FloatConst(_)
+            | IrKind::FloatNeg(_)
+            | IrKind::FloatAdd(_)
+            | IrKind::FloatSub(_)
+            | IrKind::FloatMul(_)
+            | IrKind::FloatDiv(_)
+            | IrKind::IntToFloat(_) => KindStep::Own(ValueKind::Float),
+            IrKind::Quantity(quantity, _) => KindStep::Own(ValueKind::Quantity(quantity)),
+            IrKind::Empty
+            | IrKind::Store(..)
+            | IrKind::MakeRecord { .. }
+            | IrKind::UpdateField { .. }
+            | IrKind::Assert { .. }
+            | IrKind::Failure(_)
+            | IrKind::Helper
+            | IrKind::For { collect: false, .. }
+            | IrKind::Loop { collect: false, .. } => KindStep::Own(ValueKind::Record),
+            IrKind::Load(_, kind)
+            | IrKind::Field { kind, .. }
+            | IrKind::Update { kind, .. }
+            | IrKind::Index { kind, .. }
+            | IrKind::Call { kind, .. }
+            | IrKind::LoadCapture(_, kind)
+            | IrKind::Arg {
+                value: ArgValue::Default { kind, .. },
+                ..
+            }
+            | IrKind::Await { kind, .. }
+            | IrKind::As { kind, .. }
+            | IrKind::Catch { kind, .. }
+            | IrKind::ContextRead { kind, .. }
+            | IrKind::SecretValue { kind, .. }
+            | IrKind::Recover { kind, .. }
+            | IrKind::With { kind, .. }
+            | IrKind::Top(_, kind) => KindStep::Own(kind),
+            IrKind::MakeClosure { .. }
+            | IrKind::LoadCallee
+            | IrKind::Meta(_)
+            | IrKind::Tag { .. } => KindStep::Own(ValueKind::Fn),
+            IrKind::SecretWrap(..) => KindStep::Own(ValueKind::Mixed),
+            IrKind::MakeFuture { .. } => KindStep::Own(ValueKind::Deferred),
+        }
     }
 
     /// The source symbol of an operator node, or `None` for every other
@@ -1251,6 +1556,7 @@ impl IrKind {
             | IrKind::If { .. }
             | IrKind::Interp(_)
             | IrKind::IntToFloat(_)
+            | IrKind::Quantity(..)
             | IrKind::Empty
             | IrKind::Load(..)
             | IrKind::Store(..)
@@ -1265,6 +1571,15 @@ impl IrKind {
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Assert { .. }
+            | IrKind::Recover { .. }
+            | IrKind::Failure(_)
+            | IrKind::SecretValue { .. }
+            | IrKind::SecretWrap(..)
+            | IrKind::ContextRead { .. }
+            | IrKind::With { .. }
+            | IrKind::ContextBind { .. }
+            | IrKind::Tag { .. }
             | IrKind::Caller
             | IrKind::Helper
             | IrKind::MakeFuture { .. }
@@ -1282,12 +1597,13 @@ impl IrKind {
             | IrKind::Catch { .. }
             | IrKind::Is { .. }
             | IrKind::As { .. }
+            | IrKind::FilePath(_)
             | IrKind::Meta(_) => None,
         }
     }
 
     /// The node's name in [`Ir::pretty`] output.
-    const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             IrKind::IntConst(_) => "int",
             IrKind::FloatConst(_) => "float",
@@ -1355,6 +1671,7 @@ impl IrKind {
             IrKind::FloatMul(_) => "float-mul",
             IrKind::FloatDiv(_) => "float-div",
             IrKind::IntToFloat(_) => "int-to-float",
+            IrKind::Quantity(..) => "quantity",
             IrKind::Empty => "empty",
             IrKind::Load(..) => "load",
             IrKind::Store(..) => "store",
@@ -1370,7 +1687,17 @@ impl IrKind {
             IrKind::Top(_, ValueKind::Fn) => "fn",
             IrKind::Top(..) => "top",
             IrKind::LoadCallee => "load-callee",
+            IrKind::Tag { .. } => "tag",
+            IrKind::ContextRead { .. } => "context-read",
+            IrKind::Assert { .. } => "assert",
+            IrKind::Recover { .. } => "recover",
+            IrKind::Failure(_) => "failure",
+            IrKind::SecretValue { .. } => "secret-value",
+            IrKind::SecretWrap(..) => "secret-wrap",
+            IrKind::With { .. } => "with",
+            IrKind::ContextBind { .. } => "context-bind",
             IrKind::Caller => "caller",
+            IrKind::FilePath(_) => "file-path",
             IrKind::Helper => "helper",
             IrKind::MakeFuture { .. } => "make-future",
             IrKind::Await { .. } => "await",
@@ -1448,6 +1775,7 @@ impl IrNode {
             | IrKind::If { .. }
             | IrKind::Interp(_)
             | IrKind::IntToFloat(_)
+            | IrKind::Quantity(..)
             | IrKind::Empty
             | IrKind::Load(..)
             | IrKind::Store(..)
@@ -1462,12 +1790,22 @@ impl IrNode {
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Assert { .. }
+            | IrKind::Recover { .. }
+            | IrKind::Failure(_)
+            | IrKind::SecretValue { .. }
+            | IrKind::SecretWrap(..)
+            | IrKind::ContextRead { .. }
+            | IrKind::With { .. }
+            | IrKind::ContextBind { .. }
+            | IrKind::Tag { .. }
             | IrKind::Caller
             | IrKind::Helper
             | IrKind::MakeFuture { .. }
             | IrKind::Await { .. }
             | IrKind::Is { .. }
             | IrKind::As { .. }
+            | IrKind::FilePath(_)
             | IrKind::Meta(_) => return None,
         };
         Some(crate::ast::symbol_span(symbol, start))
@@ -1510,6 +1848,30 @@ pub struct FnCode {
     /// For each slot of the body's frame, the name of the last variable
     /// assigned to it. For [`Ir::pretty`] only.
     pub slot_names: Box<[Name]>,
+    /// The function's attributes, in source order, if it is a function item
+    /// that has any (see [`crate::check::Attribute`]): what a host reads of
+    /// how to run it, through any of its closures
+    /// ([`crate::value::Closure::attributes`]).
+    pub attributes: Box<[Attribute]>,
+    /// Whether a deferring attribute is on it, so that a host may run its
+    /// calls as steps (see the checker's [Deferring
+    /// attributes](crate::check::attributes#deferring-attributes)).
+    pub defers: bool,
+    /// How many more times a call that fails runs its body, by the
+    /// function's `#[retry]`: 0 without one.
+    pub retry: u32,
+    /// How long a call may run, by the function's `#[timeout]`, if it has
+    /// one.
+    pub timeout: Option<Duration>,
+    /// The text of [`FnCode::name`], for the errors of `#[retry]` and
+    /// `#[timeout]`; `None` for a function without either, or without a name.
+    pub name_text: Option<Box<str>>,
+    /// The contexts with no default its type needs, by their declarations'
+    /// keys, sorted: the first context of each of its needs (see
+    /// [Needs](crate::types::needs#needs)). A call of it can read no other
+    /// context with no default, so a host keys a step of it by no other
+    /// ([`crate::workspace::Workspace::step_inputs`]).
+    pub needs: Box<[Name]>,
 }
 
 /// A lowered program: an arena of [`IrNode`]s, the item pool, the string
@@ -1765,9 +2127,10 @@ impl Ir {
     }
 
     /// The text of `name`, if it is the name of an [`IrKind::UpdateField`],
-    /// of a field an [`IrKind::Update`]'s path steps to, or of a field a
-    /// test looks at: what the evaluator shows a field it adds to a record,
-    /// or that fails a test, as.
+    /// of a field an [`IrKind::Update`]'s path steps to, of a field a test
+    /// looks at, or of a field an operation on a secret reads: what the
+    /// evaluator shows a field it adds to a record, or that fails a test,
+    /// as, and names a secret's field in its derivation.
     #[must_use]
     pub fn name_text(&self, name: Name) -> Option<&str> {
         self.name_texts.get(&name).map(AsRef::as_ref)
@@ -1940,91 +2303,18 @@ impl Ir {
         // A block's kind is its result's, and an `if`'s its branches'; follow
         // nested ones by looping, not recursing.
         loop {
-            return match self.get(id).kind {
-                IrKind::Block { result, .. } => {
-                    id = result;
-                    continue;
-                }
+            id = match self.get(id).kind.kind_step() {
+                KindStep::Own(kind) => return kind,
+                KindStep::Child(child) => child,
                 // A branch that never completes says nothing of the `if`'s
                 // kind, unless both are such.
-                IrKind::If { then, else_, .. } => {
-                    id = if self.kind_of(then) == ValueKind::Never {
+                KindStep::Branches(then, else_) => {
+                    if self.kind_of(then) == ValueKind::Never {
                         else_
                     } else {
                         then
-                    };
-                    continue;
+                    }
                 }
-                IrKind::Arg { value, .. } => {
-                    id = value;
-                    continue;
-                }
-                IrKind::BoolConst(_)
-                | IrKind::IntCmp(..)
-                | IrKind::FloatCmp(..)
-                | IrKind::StrCmp(..)
-                | IrKind::BoolEq(..)
-                | IrKind::RecordEq(_)
-                | IrKind::RecordNe(_)
-                | IrKind::RecordSame(_)
-                | IrKind::RecordNotSame(_)
-                | IrKind::ListEq(_)
-                | IrKind::ListNe(_)
-                | IrKind::ListSame(_)
-                | IrKind::ListNotSame(_)
-                | IrKind::ValueSame(_)
-                | IrKind::ValueNotSame(_)
-                | IrKind::Is { .. }
-                | IrKind::And(_)
-                | IrKind::Or(_)
-                | IrKind::Not(_) => ValueKind::Bool,
-                IrKind::StrConst(_)
-                | IrKind::StrConcat(_)
-                | IrKind::Interp(_)
-                | IrKind::Show(_)
-                | IrKind::Caller => ValueKind::String,
-                IrKind::IntConst(_)
-                | IrKind::IntNeg(_)
-                | IrKind::IntAdd(_)
-                | IrKind::IntSub(_)
-                | IrKind::IntMul(_)
-                | IrKind::IntFloorDiv(_)
-                | IrKind::IntRem(_)
-                | IrKind::ListLen(_) => ValueKind::Int,
-                IrKind::MakeList { .. }
-                | IrKind::Spread(_)
-                | IrKind::Range(..)
-                | IrKind::For { collect: true, .. }
-                | IrKind::Loop { collect: true, .. } => ValueKind::List,
-                IrKind::Break { .. } | IrKind::Continue { .. } | IrKind::Return { .. } => {
-                    ValueKind::Never
-                }
-                IrKind::FloatConst(_)
-                | IrKind::FloatNeg(_)
-                | IrKind::FloatAdd(_)
-                | IrKind::FloatSub(_)
-                | IrKind::FloatMul(_)
-                | IrKind::FloatDiv(_)
-                | IrKind::IntToFloat(_) => ValueKind::Float,
-                IrKind::Empty
-                | IrKind::Store(..)
-                | IrKind::MakeRecord { .. }
-                | IrKind::UpdateField { .. }
-                | IrKind::Helper
-                | IrKind::For { collect: false, .. }
-                | IrKind::Loop { collect: false, .. } => ValueKind::Record,
-                IrKind::Load(_, kind)
-                | IrKind::Field { kind, .. }
-                | IrKind::Update { kind, .. }
-                | IrKind::Index { kind, .. }
-                | IrKind::Call { kind, .. }
-                | IrKind::LoadCapture(_, kind)
-                | IrKind::Await { kind, .. }
-                | IrKind::As { kind, .. }
-                | IrKind::Catch { kind, .. }
-                | IrKind::Top(_, kind) => kind,
-                IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Meta(_) => ValueKind::Fn,
-                IrKind::MakeFuture { .. } => ValueKind::Deferred,
             };
         }
     }
@@ -2298,6 +2588,14 @@ impl IrBuilder {
     }
 
     /// Appends `items` to the item pool as one list and returns its range.
+    /// The nodes of the list `range`, pushed by [`IrBuilder::push_item_list`].
+    pub(crate) fn items(&self, range: IrRange) -> &[IrId] {
+        let start = range.start as usize;
+        self.item_lists
+            .get(start..start + range.len as usize)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn push_item_list(&mut self, items: &[IrId]) -> IrRange {
         let start = u32::try_from(self.item_lists.len()).unwrap_or(u32::MAX);
         self.item_lists.extend_from_slice(items);
@@ -2390,6 +2688,9 @@ impl IrBuilder {
                     depth: node_depth, ..
                 }
                 | IrKind::Update {
+                    depth: node_depth, ..
+                }
+                | IrKind::ContextRead {
                     depth: node_depth, ..
                 } = &mut node.kind
                 {
@@ -2643,6 +2944,7 @@ impl Pretty<'_> {
     fn test(&self, f: &mut fmt::Formatter<'_>, test: &ValueTest) -> fmt::Result {
         match test {
             ValueTest::Pass => f.write_str("*"),
+            ValueTest::Enum(key) => write!(f, "enum {}", self.names.get(*key)),
             ValueTest::Kind(kind) => f.write_str(match kind {
                 ValueKind::Int => "int",
                 ValueKind::Float => "float",
@@ -2654,6 +2956,7 @@ impl Pretty<'_> {
                 ValueKind::Deferred => "deferred",
                 ValueKind::Mixed => "mixed",
                 ValueKind::Never => "never",
+                ValueKind::Quantity(quantity) => quantity.name(),
             }),
             ValueTest::Record(fields) => {
                 f.write_str("{")?;
@@ -2773,10 +3076,15 @@ impl Pretty<'_> {
             IrKind::MakeClosure { function, .. } | IrKind::MakeFuture { function, .. } => {
                 write!(f, " {function}")?;
             }
+            IrKind::Quantity(quantity, _) => write!(f, " {}", quantity.name())?,
             IrKind::Await { shape, .. } if shape != LazyShapeId::NONE => {
                 f.write_str(" ")?;
                 self.lazy_shape(f, shape)?;
             }
+            IrKind::Arg {
+                param,
+                value: ArgValue::Default { capture, .. },
+            } => write!(f, " {param} default {capture}")?,
             IrKind::Arg { param, .. } | IrKind::LoadCapture(param, _) => write!(f, " {param}")?,
             IrKind::For { slot, parts, .. } => {
                 self.slot(f, slot)?;

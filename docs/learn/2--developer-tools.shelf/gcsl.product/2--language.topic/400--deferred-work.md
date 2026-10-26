@@ -24,8 +24,10 @@ function cannot await a future. Resolve the value in an impure caller
 before passing it into a pure calculation that needs the value itself.
 
 The checker inserts implicit awaits at uses that need a value's contents,
-such as arithmetic or a required present argument. It applies the same
-purity restriction to explicit and implicit awaits. A call to a pure
+such as arithmetic or a required present argument. A spread is one of
+those uses: spreading a list whose elements might be futures into a list
+of present values awaits each element. It applies the same purity
+restriction to explicit and implicit awaits. A call to a pure
 function never secretly starts deferred work inside that function.
 
 ## Writing contracts

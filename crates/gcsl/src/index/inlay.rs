@@ -226,6 +226,8 @@ fn spelled(ast: &Ast, value: ExprId) -> bool {
     match ast.get(unparen(ast, value)).kind {
         ExprKind::Int(_)
         | ExprKind::Float(_)
+        | ExprKind::Duration(_)
+        | ExprKind::Size(_)
         | ExprKind::Bool(_)
         | ExprKind::Str(_)
         | ExprKind::Interp(_)
@@ -238,7 +240,7 @@ fn spelled(ast: &Ast, value: ExprId) -> bool {
             operand,
         } => matches!(
             ast.get(unparen(ast, operand)).kind,
-            ExprKind::Int(_) | ExprKind::Float(_)
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Duration(_) | ExprKind::Size(_)
         ),
         ExprKind::Block { items, .. } => {
             let items = ast.items(items);
