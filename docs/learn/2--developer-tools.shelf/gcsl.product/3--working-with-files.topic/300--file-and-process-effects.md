@@ -92,8 +92,10 @@ environment of its own instead of GCSL's.
 
 `until` suits a program that keeps running once it's ready, such as a
 server or an emulator. The result holds the output read so far, and its
-status is 0 because the condition was met. The program and anything it
-started are stopped together. `until` can't be combined with
+status is 0 because the condition was met. A line counts as soon as the
+text is written, before its newline, so a prompt that waits on the line
+it asks is met. The program and anything it started are stopped
+together. `until` can't be combined with
 `interactive`, because an interactive program's output isn't captured.
 
 ```gcsl

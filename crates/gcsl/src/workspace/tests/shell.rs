@@ -604,6 +604,17 @@ fn exec_until_ends_its_program_at_a_line_with_the_text() {
             .unwrap(),
         "ready\n"
     );
+    // A prompt, its newline never written, written in pieces.
+    let prompted = std::time::Instant::now();
+    assert_eq!(
+        lone(
+            "= exec([\"sh\", \"-c\", \"printf 'Please press '; sleep 1; printf 'Enter: '; sleep 30\"], \
+             until = \"press Enter\").stdout"
+        )
+        .unwrap(),
+        "Please press Enter: "
+    );
+    assert!(prompted.elapsed() < std::time::Duration::from_secs(10));
     // An interactive program's output is not there to watch.
     let error = lone_error("r = exec([\"true\"], until = \"x\", interactive = true)");
     assert_eq!(

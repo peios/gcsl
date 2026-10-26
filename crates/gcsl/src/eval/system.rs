@@ -570,8 +570,10 @@ struct Reader<'a> {
 
 impl Reader<'_> {
     /// Reads `stream` to its end, copying each line as [`copy_lines`] does
-    /// if `live`, and setting `met` once a line contains `until`; `open` is
-    /// made one fewer as it ends, read whole or failing.
+    /// if `live`, and setting `met` once a line contains `until`, as far as
+    /// the line has been written: a prompt waits for its answer on the line
+    /// it asks, and its newline may never come. `open` is made one fewer as
+    /// it ends, read whole or failing.
     fn read(self, stream: impl Read) -> io::Result<Vec<u8>> {
         let read = self.lines(stream);
         self.open.fetch_sub(1, AtomicOrdering::Release);
@@ -579,27 +581,49 @@ impl Reader<'_> {
     }
 
     /// What [`Reader::read`] reads, before it marks its stream ended.
-    fn lines(self, stream: impl Read) -> io::Result<Vec<u8>> {
-        let mut stream = BufReader::new(stream);
+    fn lines(self, mut stream: impl Read) -> io::Result<Vec<u8>> {
         let mut read = Vec::new();
+        let mut buffer = [0u8; 8192];
+        // Where the line being written began, and how much is copied.
+        let (mut line, mut copied) = (0, 0);
         loop {
-            let start = read.len();
-            if stream.read_until(b'\n', &mut read)? == 0 {
+            let count = match stream.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if count == 0 {
+                self.copy(read.get(copied..));
                 return Ok(read);
             }
-            let Some(line) = read.get(start..) else {
-                continue;
-            };
-            if self.live {
-                // A copy that cannot be shown changes nothing else.
-                let _ = io::stderr().lock().write_all(line);
+            let start = read.len();
+            read.extend_from_slice(buffer.get(..count).unwrap_or_default());
+            if let Some(until) = self.until {
+                // Only what could hold it anew is looked at: the line so
+                // far, from just before what was read.
+                let from = line.max(start.saturating_sub(until.len()));
+                if read
+                    .get(from..)
+                    .is_some_and(|text| String::from_utf8_lossy(text).contains(until))
+                {
+                    self.met.store(true, AtomicOrdering::Release);
+                }
             }
-            if self
-                .until
-                .is_some_and(|until| String::from_utf8_lossy(line).contains(until))
+            if let Some(last) = read.iter().rposition(|byte| *byte == b'\n')
+                && last >= start
             {
-                self.met.store(true, AtomicOrdering::Release);
+                line = last + 1;
+                self.copy(read.get(copied..line));
+                copied = line;
             }
+        }
+    }
+
+    /// Copies `lines` to this process's standard error, if `live`.
+    fn copy(self, lines: Option<&[u8]>) {
+        if let (true, Some(lines)) = (self.live, lines.filter(|lines| !lines.is_empty())) {
+            // A copy that cannot be shown changes nothing else.
+            let _ = io::stderr().lock().write_all(lines);
         }
     }
 }
