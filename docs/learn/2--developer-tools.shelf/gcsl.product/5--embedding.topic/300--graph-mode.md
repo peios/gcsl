@@ -120,8 +120,12 @@ cache hit hides none. Each context is also told to your
 does anything with it, so you can give the step that context's files only
 then.
 
-`Workspace::step_definition` tells you which definition's call made a
-step: the innermost `DT PATH()` around where it was made. Name a step's
+`Workspace::step_definition` tells you which definition made a step: the
+one whose body was running where it was made, or else the innermost
+`DT PATH()` around it. A definition's body is its own wherever it runs,
+so a def-type that keeps its definition in a closure and runs it later,
+as the toolchain registry does, still gives the definition its steps.
+Name a step's
 outputs by it rather than by the target you were asked to build, so that
 `build lib()` gives the same steps whether you build `lib` itself or a
 target that calls it. A step made by a prepared call's own code is its

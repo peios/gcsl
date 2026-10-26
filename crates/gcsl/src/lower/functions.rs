@@ -434,7 +434,47 @@ impl Lowerer<'_> {
         );
         let body = self.lower_expr(self.ast.fn_decl(function).body);
         (self.loops, self.catches) = outer;
-        self.enter_function(id, function, (kind, body?))
+        let body = body?;
+        let body = if self.definitions.contains(&function) {
+            self.as_definition(id, body)?
+        } else {
+            body
+        };
+        self.enter_function(id, function, (kind, body))
+    }
+
+    /// `body`, the body of the function expression `id`, a definition's
+    /// value, in a `with` that binds the function being run, the
+    /// definition, to the context of [`DEFINITION_CONTEXT`]: so that every
+    /// node its body makes knows the definition it is of, wherever it is
+    /// called from, a def-type's closure that runs it later say, as a
+    /// reference's call binds it around the def-type's.
+    fn as_definition(&mut self, id: ExprId, body: IrId) -> Result<IrId, InternalError> {
+        let span = self.ast.get(id).span;
+        let mistyped = InternalError {
+            message: "a definition whose value has no function type",
+            span,
+        };
+        let key = self
+            .ast
+            .names()
+            .lookup(DEFINITION_CONTEXT)
+            .ok_or(InternalError {
+                message: "a definition whose context the parser did not name",
+                span,
+            })?;
+        let ret = self
+            .table
+            .fn_sig(self.expr_types.get(id))
+            .map(|sig| sig.ret)
+            .ok_or(mistyped)?;
+        let kind = self.table.value_kind(ret).ok_or(mistyped)?;
+        let callee = self.builder.alloc(IrKind::LoadCallee, span);
+        let bind = self
+            .builder
+            .alloc(IrKind::ContextBind { key, value: callee }, span);
+        let parts = self.builder.push_item_list(&[bind, body]);
+        Ok(self.builder.alloc(IrKind::With { parts, kind }, span))
     }
 
     /// Enters function `function`, of kind `kind`, the function expression

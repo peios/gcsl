@@ -617,6 +617,9 @@ impl Parser<'_> {
             body: inner,
             span: Span::join(open.span, close.span),
         });
+        // The key of the context its body binds to itself, which lowering
+        // finds by its text.
+        self.names.intern(crate::lower::DEFINITION_CONTEXT);
         self.finish_item(
             keyword,
             (ItemKind::DefTypeDef { def, value }, value),

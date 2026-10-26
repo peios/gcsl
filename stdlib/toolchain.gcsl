@@ -43,7 +43,9 @@ type ToolchainDef<T> = {host_platform: Partial<Platform>, platform: Partial<Plat
 type Registered = {host_platform: Partial<Platform>, platform: Partial<Platform>, provides: Toolchain}
 
 # A registered toolchain: the name of its kind, known before its definition
-# runs, and its definition, run when a `get` of its kind comes to it.
+# runs, and its definition, run when a `get` of its kind comes to it, in the
+# context of that `get`, memoised. A definition's body is its own
+# definition's wherever it runs, so what it makes is named by it.
 type Entry = {kind_name: String, made: fn() ->> Registered}
 
 #[def_type]

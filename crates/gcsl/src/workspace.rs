@@ -836,10 +836,11 @@ impl Workspace {
             .map_or_else(Vec::new, |closure| self.scan.needed(closure.code.input()))
     }
 
-    /// The definition whose call made the node `id` of `graph`, a step or an
-    /// effect: the innermost call of a def-type reference, `DT PATH()`,
-    /// around where it was made, whose definition every node it makes knows
-    /// through a context of its own
+    /// The definition that made the node `id` of `graph`, a step or an
+    /// effect: the one whose body was running where it was made, which binds
+    /// itself wherever it is called from, or else the innermost call of a
+    /// def-type reference, `DT PATH()`, around where it was made, whose
+    /// definition every node it makes knows through a context of its own
     /// ([`DEFINITION_CONTEXT`](crate::lower::DEFINITION_CONTEXT)), named as
     /// [`Workspace::definition_of`] names a reference's. A prepared call
     /// binds its own definition so too ([`Workspace::run_prepared`]), so a

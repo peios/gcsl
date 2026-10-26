@@ -1149,3 +1149,88 @@ fn a_step_s_run_tells_what_it_read_of_its_context() {
     // A step that reads nothing.
     assert_eq!(reads_of(&mut workspace, &mut graph, 1).0, []);
 }
+
+#[test]
+fn a_lazy_made_in_a_memoised_call_and_awaited_after_converges() {
+    let (mut workspace, file) = lone_workspace(
+        "fn made(x: String) ->> {name: String, later: Future<String>} {\n\
+         \x20   name = x\n\
+         \x20   later = lazy { exec([\"echo\", x]).stdout }\n\
+         }\n\
+         fn get() -> String {\n\
+         \x20   let entry = made(\"a\")\n\
+         \x20   = await entry.later\n\
+         }\n\
+         = get()",
+    );
+    let mut graph = Graph::new();
+    let result = loop {
+        match workspace.run_graph(file, &mut graph, every()).unwrap() {
+            Progress::Paused(effect) => {
+                let job = workspace.effect_job(&graph, effect).unwrap();
+                let plain = on_a_thread(job, None).unwrap();
+                let value = workspace.from_plain(&plain);
+                assert!(graph.resolve(effect, Ok(value)));
+            }
+            Progress::Done(value) => break value,
+        }
+    };
+    assert_eq!(result, text("a\n"));
+}
+
+#[test]
+fn a_registered_toolchain_s_definition_converges_in_graph_mode() {
+    let (mut workspace, file) = lone_workspace(
+        "import toolchain\n\
+         import Toolchain from toolchain\n\
+         let on = {arch = \"x86_64\"; os = \"linux\"}\n\
+         = with { host_platform = on; platform = on } { toolchain.get(Toolchain::C).cc.path }",
+    );
+    let mut graph = Graph::new();
+    let mut attempts = 0;
+    let result = loop {
+        attempts += 1;
+        assert!(attempts < 10);
+        match workspace.run_graph(file, &mut graph, every()) {
+            Ok(Progress::Paused(effect)) => {
+                let job = workspace.effect_job(&graph, effect).unwrap();
+                let plain = on_a_thread(job, None).unwrap();
+                let value = workspace.from_plain(&plain);
+                assert!(graph.resolve(effect, Ok(value)));
+            }
+            Ok(Progress::Done(value)) => break value,
+            Err(errors) => panic!("{errors:?}"),
+        }
+    };
+    assert!(matches!(result, Value::Str(_)), "{result:?}");
+}
+
+#[test]
+fn a_definition_s_body_is_its_own_wherever_it_runs() {
+    // A def-type that runs its definition later, in a closure it gives, as
+    // the toolchain registry does: a node the definition's body makes is
+    // the definition's, though another definition runs the closure.
+    let files = [
+        (
+            "workspace.gcsl",
+            "#[attribute] #[defers] type step = {}\n\
+             #[step] def compile(src: String) -> String { \"{src}.o\" }\n\
+             #[def_type] def later(name: String, f: fn() -> String) ->> {run: fn() ->> String} {\n\
+             \x20   run = fn() ->> String { f() }\n\
+             }\n\
+             def later tool() { = compile(\"tool\") }",
+        ),
+        ("app/build.gcsl", "def build app() { = later tool().run() }"),
+    ];
+    let mut workspace = crate::workspace::tests::fileroot::rooted(&files).unwrap();
+    let call = workspace.prepare_call(("build", "app"), &[], &[]).unwrap();
+    let mut graph = Graph::new();
+    workspace.run_prepared(&call, &mut graph, every()).unwrap();
+    let found: Vec<String> = graph
+        .nodes()
+        .filter(|(_, node)| node.args() == [text("tool")])
+        .filter_map(|(id, _)| workspace.step_definition(&graph, id))
+        .map(|definition| definition.qualified())
+        .collect();
+    assert_eq!(found, ["/tool"]);
+}

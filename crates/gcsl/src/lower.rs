@@ -412,7 +412,7 @@
 //! combination the checker should have ruled out is reported as an
 //! [`InternalError`] rather than a panic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     Ast, BinaryOp, ExprId, ExprKind, FnId, ForId, ItemId, ItemKind, ItemRange, PathSegment,
@@ -451,11 +451,12 @@ pub(crate) const REFERENCE_DEFINITION: u32 = 1;
 
 /// The text of the key of the context a def-type reference's call binds,
 /// around its def-type's call, to the definition it calls, as a prepared
-/// call binds its own around all of it: so that every step and effect made
-/// in that call, whenever it is made, knows the definition it is of
-/// ([`crate::workspace::Workspace::step_definition`]).
-/// No context can be declared of it, since it is no name, and the parser
-/// interns it with each reference it makes, so that lowering finds it.
+/// call binds its own around all of it, and a definition's body binds
+/// itself around its own code, wherever it runs: so that every step and
+/// effect made in that call, whenever it is made, knows the definition it
+/// is of ([`crate::workspace::Workspace::step_definition`]). No context can
+/// be declared of it, since it is no name, and the parser interns it with
+/// each reference and definition it makes, so that lowering finds it.
 pub const DEFINITION_CONTEXT: &str = "<definition>";
 use crate::types::{TyId, TypeTable};
 use crate::value::{Layout, ValueKind, int_to_float};
@@ -522,6 +523,7 @@ pub fn lower(
         reads_caller: Vec::new(),
         meta_captures: Vec::new(),
         references: Vec::new(),
+        definitions: definitions_of(ast),
     };
     let root = ast.root();
     let kind = lowerer.body_kind(root)?;
@@ -671,6 +673,25 @@ struct Lowerer<'a> {
     /// The functions made for def-type references, every one (see
     /// [`Ir::is_reference`]).
     references: Vec<FnId>,
+    /// The functions that are definitions' values, `def build app() { ... }`'s
+    /// say, whose bodies bind their own definition to the context of
+    /// [`DEFINITION_CONTEXT`] wherever they are called.
+    definitions: HashSet<FnId>,
+}
+
+/// The functions of `ast` that are definitions' values: each top-level
+/// definition made with a def-type, `def build app() { ... }`.
+fn definitions_of(ast: &Ast) -> HashSet<FnId> {
+    ast.items(ast.root())
+        .iter()
+        .filter_map(|&item| match ast.item(item).kind {
+            ItemKind::DefTypeDef { value, .. } => match ast.get(value).kind {
+                ExprKind::Fn(function) => Some(function),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 impl Lowerer<'_> {
