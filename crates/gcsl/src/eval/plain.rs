@@ -106,6 +106,10 @@ pub enum Plain {
         /// What it captures, as keys.
         captures: Vec<Plain>,
     },
+    /// A step's result, by the number of its node in its graph, for a host's
+    /// identity of a step that is given it alone (see
+    /// [`to_identity_plain`]): never a step's argument or result, nor a key.
+    Step(u32),
 }
 
 impl Plain {
@@ -145,7 +149,7 @@ impl Plain {
 /// What it holds that is no data: "a step's result must be plain data: it
 /// holds a function".
 pub fn to_plain(value: &Value, names: &Names) -> Result<Plain, String> {
-    plain_of(value, names, false)
+    plain_of(value, names, Mode::Data)
 }
 
 /// `value` as plain data for a host's key (see [Keys of
@@ -157,12 +161,40 @@ pub fn to_plain(value: &Value, names: &Names) -> Result<Plain, String> {
 /// What it holds that is no data and no function, a future that has not run
 /// say, as [`to_plain`] says.
 pub fn to_key_plain(value: &Value, names: &Names) -> Result<Plain, String> {
-    plain_of(value, names, true)
+    plain_of(value, names, Mode::Key)
 }
 
-/// `value` as plain data, its functions by their code if `closures`, else
-/// refused (see [`to_plain`], [`to_key_plain`]).
-fn plain_of(value: &Value, names: &Names, closures: bool) -> Result<Plain, String> {
+/// `value` as plain data for a host's identity of a step: as
+/// [`to_key_plain`] makes it, but each step's result it holds as
+/// [`Plain::Step`], by its node, whether it has been given or not, so that a
+/// host can name a step before the steps it waits for have run, and names
+/// it the same however far they have got.
+///
+/// # Errors
+///
+/// What it holds that is no data, no function and no step's result, as
+/// [`to_key_plain`] says.
+pub fn to_identity_plain(value: &Value, names: &Names) -> Result<Plain, String> {
+    plain_of(value, names, Mode::Identity)
+}
+
+/// What a value is made plain for: see [`to_plain`], [`to_key_plain`] and
+/// [`to_identity_plain`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// A step's argument or result: data alone.
+    Data,
+    /// A key: data, and functions by their code.
+    Key,
+    /// A step's identity: a key's, and steps' results not given yet by their
+    /// nodes.
+    Identity,
+}
+
+/// `value` as plain data, as `mode` says (see [`to_plain`], [`to_key_plain`]
+/// and [`to_identity_plain`]).
+fn plain_of(value: &Value, names: &Names, mode: Mode) -> Result<Plain, String> {
+    let closures = mode != Mode::Data;
     let refused = |what: &str| {
         Err(format!(
             "a step's result must be plain data: it holds {what}"
@@ -178,25 +210,25 @@ fn plain_of(value: &Value, names: &Names, closures: bool) -> Result<Plain, Strin
         Value::Record(record) => {
             let mut fields = Vec::with_capacity(record.values.len());
             for (name, value) in record.layout.texts.iter().zip(record.values.iter()) {
-                fields.push((name.to_string(), plain_of(value, names, closures)?));
+                fields.push((name.to_string(), plain_of(value, names, mode)?));
             }
             Plain::Record(fields)
         }
         Value::List(list) => Plain::List(
             list.values()
                 .iter()
-                .map(|value| plain_of(value, names, closures))
+                .map(|value| plain_of(value, names, mode))
                 .collect::<Result<_, _>>()?,
         ),
         Value::Tag(tag) => plain_variant(tag, None, names),
         Value::Variant(variant) => {
-            let payload = plain_of(&variant.payload, names, closures)?;
+            let payload = plain_of(&variant.payload, names, mode)?;
             plain_variant(&variant.tag, Some(payload), names)
         }
         Value::Secret(secret) => Plain::Secret {
             identity: secret.identity.to_string(),
             revealed: secret.revealed,
-            value: Box::new(plain_of(&secret.value, names, closures)?),
+            value: Box::new(plain_of(&secret.value, names, mode)?),
         },
         Value::File(file) => Plain::File {
             path: file.path.to_string(),
@@ -206,12 +238,13 @@ fn plain_of(value: &Value, names: &Names, closures: bool) -> Result<Plain, Strin
             path: dir.path.to_string(),
             identity: dir.identity.as_deref().map(str::to_owned),
         },
-        Value::Future(future) => match future.value() {
-            Some(done) => plain_of(&done, names, closures)?,
-            None if future.host_node().is_some() => {
-                return refused("a step's result not given yet");
-            }
-            None => return refused("a future that has not run"),
+        // A step's result is its step's for an identity, given or not, so
+        // that what names a step never depends on how far the build got.
+        Value::Future(future) => match (future.step_node(), future.value()) {
+            (Some(node), _) if mode == Mode::Identity => Plain::Step(node),
+            (_, Some(done)) => plain_of(&done, names, mode)?,
+            (Some(_), None) => return refused("a step's result not given yet"),
+            (None, None) => return refused("a future that has not run"),
         },
         Value::Fn(closure) if closures => Plain::Closure {
             input: closure.code.input(),
@@ -219,7 +252,7 @@ fn plain_of(value: &Value, names: &Names, closures: bool) -> Result<Plain, Strin
             captures: closure
                 .captures
                 .iter()
-                .map(|value| plain_of(value, names, closures))
+                .map(|value| plain_of(value, names, mode))
                 .collect::<Result<_, _>>()?,
         },
         Value::Fn(_) | Value::Builtin(_) => return refused("a function"),
@@ -256,9 +289,10 @@ pub fn from_plain(plain: &Plain, names: &mut Names) -> Value {
         Plain::Bool(b) => Value::Bool(*b),
         Plain::Str(s) => Value::Str(Rc::from(s.as_str())),
         Plain::Quantity(quantity, amount) => Value::Quantity(*quantity, *amount),
-        // A closure's is a key's alone, never a step's argument or result,
-        // so never made a value again.
-        Plain::Empty | Plain::Closure { .. } => Value::Empty,
+        // A closure's is a key's alone, and a step's result not given yet
+        // an identity's, never a step's argument or result, so never made a
+        // value again.
+        Plain::Empty | Plain::Closure { .. } | Plain::Step(_) => Value::Empty,
         Plain::Record(fields) if fields.is_empty() => Value::Empty,
         Plain::Record(fields) => {
             let layout = Layout {

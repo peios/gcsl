@@ -254,6 +254,9 @@ pub struct Graph {
     /// Every node met, by its unit and position, with the key it was met
     /// with there.
     positions: HashMap<Position, (Box<[u8]>, NodeId)>,
+    /// Where each unit first met each node it met: the input and span of
+    /// the call, which another unit's node it is need not be.
+    met: HashMap<(u32, NodeId), (u32, Span)>,
 }
 
 /// Where a node is met: its unit, and a hash of its scope's path and its
@@ -350,6 +353,15 @@ impl Graph {
     /// whatever already holds them.
     pub fn forget_unit(&mut self, unit: u32) {
         self.positions.retain(|&(met_in, _), _| met_in != unit);
+        self.met.retain(|&(met_in, _), _| met_in != unit);
+    }
+
+    /// Where the unit `unit` first met the node `id`, if it met it: the
+    /// input and span of its call, which are the node's own only if the unit
+    /// made it, since a deferred call two units make is one node.
+    #[must_use]
+    pub fn met_at(&self, unit: u32, id: NodeId) -> Option<(u32, Span)> {
+        self.met.get(&(unit, id)).copied()
     }
 
     /// The nodes whose results `value` holds and that are waiting: its holes,
@@ -649,7 +661,7 @@ impl<'g> GraphRun<'g> {
     fn meet(
         &self,
         key: Box<[u8]>,
-        span: Span,
+        (input, span): (u32, Span),
         new_node: impl FnOnce(&Graph, Option<NodeId>) -> Node,
     ) -> Result<NodeId, Diagnostic> {
         let position = (self.unit, self.next_position());
@@ -682,6 +694,7 @@ impl<'g> GraphRun<'g> {
                 id
             });
             graph.positions.insert(position, (key, id));
+            graph.met.entry((self.unit, id)).or_insert((input, span));
             id
         };
         self.last.set(Some(id));
@@ -757,10 +770,10 @@ impl Evaluator<'_> {
         for value in &given {
             encode(value, &mut key);
         }
-        encode_context(context.as_ref(), &mut key);
+        encode_context(context.as_ref(), true, &mut key);
         let made = self.callee_caller();
         let reported = self.reported();
-        let id = run.meet(key.into(), node.span, |graph, after| {
+        let id = run.meet(key.into(), (self.ir.input(), node.span), |graph, after| {
             let mut data = Vec::new();
             graph.holes_into(&given, &mut data);
             graph.holes_into(&closure.captures, &mut data);
@@ -825,9 +838,9 @@ impl Evaluator<'_> {
         for value in given {
             encode(value, &mut key);
         }
-        encode_context(context.as_ref(), &mut key);
+        encode_context(context.as_ref(), false, &mut key);
         let reported = self.reported();
-        let id = run.meet(key.into(), node.span, |graph, after| {
+        let id = run.meet(key.into(), (self.ir.input(), node.span), |graph, after| {
             let mut data = Vec::new();
             graph.holes_into(given, &mut data);
             Node {
@@ -1228,9 +1241,17 @@ pub(crate) fn flattened(context: Option<&Rc<ContextFrame>>) -> Vec<(crate::names
 }
 
 /// Appends the flattened context `context` to the key `out`: its bindings,
-/// never a frame's identity, which is new each time a `with` runs.
-fn encode_context(context: Option<&Rc<ContextFrame>>, out: &mut Vec<u8>) {
-    let bound = flattened(context);
+/// never a frame's identity, which is new each time a `with` runs, and, for
+/// a deferred call, never the definition it was made in, which the call's
+/// code cannot read (its host runs it in a directory of its own, see
+/// [Files](crate::eval::files#the-working-directory)), so that the same
+/// call made for two definitions, two targets of one build say, is one
+/// node and runs once.
+fn encode_context(context: Option<&Rc<ContextFrame>>, deferred: bool, out: &mut Vec<u8>) {
+    let mut bound = flattened(context);
+    if deferred {
+        bound.retain(|(key, _)| *key != crate::names::DEFINITION);
+    }
     out.push(b'c');
     out.extend_from_slice(&u32::try_from(bound.len()).unwrap_or(u32::MAX).to_le_bytes());
     for (key, value) in &bound {

@@ -120,17 +120,24 @@ cache hit hides none. Each context is also told to your
 does anything with it, so you can give the step that context's files only
 then.
 
+A deferred call is one node however many times, and wherever, it is
+made: by its function, its arguments and the context it was made in, but
+not the definition whose body made it, which a step can't read. So two
+targets that make the same call share one step, and a graph records where
+each unit met each node, which `Graph::met_at` gives you, for messages
+about a unit's own code.
+
+Name a step's outputs by what it is, so that they're at the same path in
+every build that makes it, whatever else you build.
+`Workspace::step_identity` gives the step's inputs as
+`Workspace::step_inputs` does, its function among them, but a result of
+another step as `Plain::Step` with that step's node, whether or not it's
+been given. Name each step after the steps whose results it's given, and
+you can name every step as soon as it's made, before any runs.
+
 `Workspace::step_definition` tells you which definition made a step: the
-one whose body was running where it was made, or else the innermost
-`DT PATH()` around it. A definition's body is its own wherever it runs,
-so a def-type that keeps its definition in a closure and runs it later,
-as the toolchain registry does, still gives the definition its steps.
-Name a step's
-outputs by it rather than by the target you were asked to build, so that
-`build lib()` gives the same steps whether you build `lib` itself or a
-target that calls it. A step made by a prepared call's own code is its
-definition's too, so two targets that make the same call make a step
-each, and a step's name never depends on what else you build with it.
+one whose body was running where it was first made, or else the innermost
+`DT PATH()` around it.
 
 `Plain::files` lists the files and directories in a value, which is what
 a sandbox needs to contain. Results go back with `Workspace::from_plain`,
