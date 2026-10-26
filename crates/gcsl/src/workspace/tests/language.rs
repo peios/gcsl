@@ -1320,6 +1320,31 @@ fn a_def_type_generic_in_its_result_types_each_definition_by_its_body() {
         messages.iter().any(|m| m.starts_with("mismatched types")),
         "{messages:?}"
     );
+    // A definition with parameters of its own gives its body's result, the
+    // body run with their defaults.
+    let files = [
+        files[0],
+        (
+            "app.gcsl",
+            "def made n(k: Int = 2) { k * 3 }\n\
+             x: {name: String, made: Int} = (made n)()",
+        ),
+    ];
+    assert_eq!(
+        rooted_text(&files, "app.gcsl"),
+        "{x = {name = \"n\"; made = 6}}"
+    );
+    // Its reference takes no argument for them, which is an error, not a
+    // check that fails silently.
+    let files = [
+        files[0],
+        (
+            "app.gcsl",
+            "def made n(k: Int = 2) { k * 3 }\n\
+             x = (made n)(4)",
+        ),
+    ];
+    assert_eq!(rooted_messages(&files), ["expected 0 arguments, found 1"]);
 }
 
 /// Two registered C toolchains of no files of their own, one for each
