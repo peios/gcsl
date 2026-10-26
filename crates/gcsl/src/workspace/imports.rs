@@ -81,6 +81,16 @@
 //! declaration however many definitions it finds; through the aliases, it
 //! needs the files of the definitions it reads.
 //!
+//! A def-type whose definitions are made with a variant keeps each
+//! variant's in a namespace of its own (see [`crate::names`], "Namespace
+//! keys"). `import Toolchain::C * from PATH` binds the namespace of `C`'s,
+//! the key the use's variant gives it, and `import Toolchain::* from PATH`
+//! every variant's namespace each directory has, each a root of its tree
+//! whose key is a variant's of the def-type's ([`names::is_variant_key_of`]),
+//! so that a variant declared in any library is found. The checker reports
+//! `import Toolchain * from PATH`, which would find none, and a variant
+//! written for a def-type that takes none.
+//!
 //! A reference that ends on a cell reads that cell's slot: a `def`'s is its
 //! function's slot, since the merged node of a `def` is never written. A
 //! record read whole (a directory, a file, a file's part of a shared node,
@@ -99,7 +109,7 @@ use crate::ast::{
 use crate::check::Fileroot;
 use crate::diagnostic::Diagnostic;
 use crate::lexer;
-use crate::names::Name;
+use crate::names::{self, Name};
 use crate::source::Span;
 
 use super::parse::is_library_path;
@@ -192,9 +202,9 @@ pub(super) fn imports(
                 let decl = file.ast.import_decl(id);
                 let path = file.ast.path(decl.path);
                 let before = own_errors.len();
-                if let Some((def, span)) = def_type_member(&file.ast, decl) {
+                if let Some(member) = def_type_member(&file.ast, decl) {
                     let at = (file, item, decl);
-                    def_type_import(scan, &modules, at, (def, span), aliases, &mut own_errors);
+                    def_type_import(scan, &modules, at, member, aliases, &mut own_errors);
                     if own_errors.len() > before {
                         failed_imports.push((item, None));
                         blind = true;
@@ -776,15 +786,16 @@ fn star_aliases(
 }
 
 /// The def-type member of the import `decl` of `ast`, `DT *`, with where it
-/// is written, if it has one, its only member.
-fn def_type_member(ast: &Ast, decl: &ImportDecl) -> Option<(DefTypeId, Span)> {
+/// is written and whether it is of every variant, `DT::*`, if it has one,
+/// its only member.
+fn def_type_member(ast: &Ast, decl: &ImportDecl) -> Option<(DefTypeId, Span, bool)> {
     let ImportForm::Members(range) = decl.form else {
         return None;
     };
     ast.import_members(range)
         .iter()
         .find_map(|member| match *member {
-            ImportMember::DefType { def, span } => Some((def, span)),
+            ImportMember::DefType { def, span, every } => Some((def, span, every)),
             _ => None,
         })
 }
@@ -793,15 +804,16 @@ fn def_type_member(ast: &Ast, decl: &ImportDecl) -> Option<(DefTypeId, Span)> {
 /// the import `item` of `file`, `decl`, written at `written`, names, in
 /// each directory its path and glob name (see [Imports of
 /// definitions](#imports-of-definitions)): for each, the root of the
-/// def-type's namespace in it, as an alias of its key, which the file's view
-/// merges. A def-type the file does not see is "`x` is no def-type"; a path
-/// that names nothing, the usual error; a glob on a file's path "a glob
-/// names directories, and `a/b` is a file".
+/// def-type's namespace in it, or of its variant's, as an alias of its key,
+/// which the file's view merges; for `DT::*`, `every`, the root of each of
+/// its variants' namespaces. A def-type the file does not see is "`x` is no
+/// def-type"; a path that names nothing, the usual error; a glob on a
+/// file's path "a glob names directories, and `a/b` is a file".
 fn def_type_import(
     scan: &Scan,
     modules: &Modules,
     (file, item, decl): (&File, ItemId, &ImportDecl),
-    (used, written): (DefTypeId, Span),
+    (used, written, every): (DefTypeId, Span, bool),
     aliases: &mut Vec<Alias>,
     errors: &mut Vec<Diagnostic>,
 ) {
@@ -856,17 +868,28 @@ fn def_type_import(
             return;
         }
     };
+    let of = scan.names.get(key);
     for target in targets {
-        if let Some(child) = scan.target_child(target, key) {
-            aliases.push(Alias {
-                name: key,
-                span: written,
-                item: Some(item),
-                target: child,
-                whole: false,
-                implicit: false,
-                inherited: false,
-            });
+        let keys = if every {
+            target_roots(scan, target)
+                .into_iter()
+                .filter(|&root| names::is_variant_key_of(scan.names.get(root), of))
+                .collect()
+        } else {
+            vec![key]
+        };
+        for name in keys {
+            if let Some(child) = scan.target_child(target, name) {
+                aliases.push(Alias {
+                    name,
+                    span: written,
+                    item: Some(item),
+                    target: child,
+                    whole: false,
+                    implicit: false,
+                    inherited: false,
+                });
+            }
         }
     }
 }

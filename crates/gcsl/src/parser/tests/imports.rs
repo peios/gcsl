@@ -274,6 +274,8 @@ fn an_import_of_a_def_type_s_definitions_prints_as_written() {
         "import package * from *",
         "import package * from **",
         "import pekit.package * from pkgs/dev.peios/*",
+        "import Toolchain::C * from lib",
+        "import Toolchain::* from lib/*",
     ] {
         assert_eq!(shape(text), text, "{text}");
     }
@@ -289,12 +291,43 @@ fn an_import_of_a_def_type_s_definitions_prints_as_written() {
     let ImportForm::Members(range) = decl.form else {
         panic!("expected members");
     };
-    let [ImportMember::DefType { def, span }] = ast.import_members(range) else {
+    let [ImportMember::DefType { def, span, every }] = ast.import_members(range) else {
         panic!("expected a def-type member");
     };
     assert_eq!(*span, Span::new(7, 16));
+    assert!(!every);
     assert_eq!(ast.def_type(*def).role, DefTypeRole::Import);
     assert!(ast.path(ast.def_type(*def).path).is_empty());
+    // A variant is the use's; every variant, the member's, through its `*`.
+    let member = |text: &str| {
+        let ast = parse_text(text).unwrap();
+        let ItemKind::Import(id) = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an import");
+        };
+        let ImportForm::Members(range) = ast.import_decl(id).form else {
+            panic!("expected members");
+        };
+        let [ImportMember::DefType { def, span, every }] = ast.import_members(range) else {
+            panic!("expected a def-type member");
+        };
+        let variant = ast
+            .def_type(*def)
+            .variant
+            .map(|(name, at)| (ast.names().get(name).to_owned(), at));
+        (variant, *span, *every)
+    };
+    assert_eq!(
+        member("import Toolchain::C * from lib"),
+        (
+            Some(("C".to_owned(), Span::new(18, 19))),
+            Span::new(7, 21),
+            false
+        )
+    );
+    assert_eq!(
+        member("import Toolchain::* from lib"),
+        (None, Span::new(7, 19), true)
+    );
 }
 
 #[test]
@@ -321,6 +354,25 @@ fn an_import_of_a_def_type_s_definitions_has_one_member_and_globs_have_it() {
     assert_eq!(
         message("import package * pkgs"),
         "expected `from`, found `pkgs`"
+    );
+    // After `::`, a variant's name or `*`; after the name, `*`.
+    assert_eq!(
+        error("import Toolchain::( from lib"),
+        (
+            "expected a variant's name or `*` after `::`".to_owned(),
+            Span::new(18, 19)
+        )
+    );
+    assert_eq!(
+        error("import Toolchain::C gcc from lib"),
+        (
+            "expected `*` after the variant, found `gcc`".to_owned(),
+            Span::new(20, 23)
+        )
+    );
+    assert_eq!(
+        message("import Toolchain::* * from lib"),
+        "expected `from`, found `*`"
     );
     // A path ending in `/` with no glob after it is the usual error.
     assert_eq!(

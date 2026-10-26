@@ -602,3 +602,79 @@ fn an_import_of_definitions_names_a_def_type_and_directories() {
         );
     }
 }
+
+/// Definitions made with each variant of the toolchain def-type, in a
+/// directory of their own, and `app`, which imports them as `import` says
+/// and is `body` after.
+fn variants(import: &str, body: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (language::TOOLCHAIN.0, language::TOOLCHAIN.1.to_owned()),
+        (
+            "tools/t.gcsl",
+            "def Toolchain::C gcc() {\n    arch = \"x86_64\"\n    provides = { cc = \"gcc\" }\n}\n\
+             def Toolchain::C clang() {\n    arch = \"riscv64\"\n    provides = { cc = \"clang\" }\n}\n\
+             def Toolchain::Rust rustc() {\n    arch = \"aarch64\"\n    provides = { rustc = \"rustc\" }\n}"
+                .to_owned(),
+        ),
+        ("app/main.gcsl", format!("{import}\n{body}")),
+    ]
+}
+
+#[test]
+fn a_variant_s_definitions_or_every_variant_s_are_imported() {
+    let both = "let gcc = Toolchain::C gcc()\nlet clang = Toolchain::C clang()\n\
+                v = [gcc.arch, clang.arch]";
+    let files = variants("import Toolchain::C * from tools", both);
+    assert_eq!(
+        value(&borrowed(&files), "app/main.gcsl"),
+        "{v = [\"x86_64\", \"riscv64\"]}"
+    );
+    let every = "let gcc = Toolchain::C gcc()\nlet rustc = Toolchain::Rust rustc()\n\
+                 v = [gcc.arch, rustc.arch]";
+    let files = variants("import Toolchain::* from tools", every);
+    assert_eq!(
+        value(&borrowed(&files), "app/main.gcsl"),
+        "{v = [\"x86_64\", \"aarch64\"]}"
+    );
+    // One variant's are not another's.
+    let files = variants(
+        "import Toolchain::C * from tools",
+        "v = Toolchain::Rust rustc()",
+    );
+    assert_eq!(
+        messages(&borrowed(&files), "app/main.gcsl"),
+        ["`Toolchain::Rust` has no definition `rustc`"]
+    );
+}
+
+#[test]
+fn an_import_of_definitions_names_a_variant_if_and_only_if_they_have_one() {
+    for (import, message) in [
+        (
+            "import Toolchain * from tools",
+            "`Toolchain`'s definitions are made with a variant",
+        ),
+        (
+            "import Toolchain::Nope * from tools",
+            "no variant `Nope` of `Toolchain`",
+        ),
+    ] {
+        let files = variants(import, "v = 1");
+        assert_eq!(
+            messages(&borrowed(&files), "app/main.gcsl"),
+            [message],
+            "{import}"
+        );
+    }
+    for app in [
+        "import build::C * from pkgs/*\nv = 1",
+        "import build::* from pkgs/*\nv = 1",
+    ] {
+        let files = globbed(app);
+        assert_eq!(
+            messages(&borrowed(&files), "image/app.gcsl"),
+            ["`build` takes no variant"],
+            "{app}"
+        );
+    }
+}

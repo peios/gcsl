@@ -114,6 +114,18 @@ type receives the variant as its `kind` argument. Hosts don't invoke these
 definitions by name: programs reach them through references, for example
 in a list of registered toolchains.
 
+To import such definitions, name the variant, or import every variant's:
+
+```text
+import Tool::C * from "github.com/example/tools"
+import Tool::* from "github.com/example/tools"
+```
+
+The first brings in only the `Tool::C` definitions, the second every
+`Tool::C`, `Tool::Rust` and any other variant's. Without a variant,
+`import Tool * from ...` would find nothing, so it's an error, as is a
+variant for a definition type that takes none.
+
 ## Definitions of any result
 
 A definition type can be generic without a variant. Each definition's

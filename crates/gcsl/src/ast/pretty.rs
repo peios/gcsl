@@ -203,8 +203,13 @@ impl<A: Annotate> Pretty<'_, A> {
                             }
                         }
                         ImportMember::All(_) => f.write_str("*")?,
-                        ImportMember::DefType { def, .. } => {
-                            write!(f, "{} *", ast.show_def_type(def).0)?;
+                        ImportMember::DefType { def, every, .. } => {
+                            let (dt, _) = ast.show_def_type(def);
+                            if every {
+                                write!(f, "{dt}::*")?;
+                            } else {
+                                write!(f, "{dt} *")?;
+                            }
                         }
                     }
                 }

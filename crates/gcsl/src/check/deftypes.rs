@@ -140,6 +140,13 @@
 //! [`crate::workspace`], "Def-types by name"): its definitions are reached by
 //! references alone.
 //!
+//! An import of its definitions names a variant, `import Toolchain::C *
+//! from PATH`, found as a definition's is, or every one, `import
+//! Toolchain::* from PATH`; one that names none would find none, and is
+//! "`Toolchain`'s definitions are made with a variant", and a variant, or
+//! every one, imported of a def-type of the other shape is "`package` takes
+//! no variant" (`Checker::check_def_type_import`).
+//!
 //! # Generic results
 //!
 //! A generic def-type whose definitions are made with no variant is generic
@@ -350,6 +357,57 @@ impl Checker<'_> {
             shape,
             tag,
         })
+    }
+
+    /// Checks the variant of `def`, an import of the definitions of the
+    /// def-type of type `dt_ty`, every variant's if `every` (see [Variant
+    /// def-types](#variant-def-types)): one of a def-type whose definitions
+    /// are made with a variant names one, `Toolchain::C *`, or every one,
+    /// `Toolchain::*`, "`Toolchain`'s definitions are made with a variant"
+    /// otherwise, since `Toolchain *` would find none; the variant named is
+    /// found as a definition's is; and one of any other def-type names none,
+    /// "`package` takes no variant". Nothing for a `dt_ty` that is no
+    /// def-type's, which its declaration reports.
+    pub(super) fn check_def_type_import(&mut self, def: DefTypeId, dt_ty: TyId, every: bool) {
+        let Some(shape) = self.types.def_type_shape(dt_ty) else {
+            return;
+        };
+        let use_ = *self.ast.def_type(def);
+        let dt: Vec<&str> = self
+            .ast
+            .def_type_names(def)
+            .into_iter()
+            .map(|name| self.ast.names().get(name))
+            .collect();
+        let shown = dt.join(".");
+        match (shape.variant, use_.variant, every) {
+            (Some(at), Some(variant), _) => {
+                if let Some(sig) = self.types.fn_sig(self.types.strip(dt_ty)).cloned() {
+                    self.variant_signature(&sig, at, variant, &shown);
+                }
+            }
+            (Some(_), None, false) => self.errors.push(
+                Diagnostic::error(
+                    format!("`{shown}`'s definitions are made with a variant"),
+                    use_.span,
+                )
+                .with_note(format!(
+                    "import those of one, `import {shown}::V * from PATH`, or of every one, \
+                     `import {shown}::* from PATH`"
+                )),
+            ),
+            (None, Some((_, at)), _) => self.errors.push(
+                Diagnostic::error(format!("`{shown}` takes no variant"), at).with_note(format!(
+                    "its definitions are imported `import {shown} * from PATH`"
+                )),
+            ),
+            (None, None, true) => self.errors.push(
+                Diagnostic::error(format!("`{shown}` takes no variant"), use_.span).with_note(
+                    format!("its definitions are imported `import {shown} * from PATH`"),
+                ),
+            ),
+            (Some(_), None, true) | (None, None, false) => {}
+        }
     }
 
     /// The signature `sig` of a def-type whose definitions are made with a

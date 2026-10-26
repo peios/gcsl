@@ -438,8 +438,9 @@ pub enum DefTypeRole {
     /// The meta of a definition, `defmeta DT PATH { ... }`.
     Meta,
     /// An import of every definition of the def-type, `import DT * from
-    /// PATH` (see the parser's [Imports](crate::parser::imports#imports)):
-    /// its PATH is empty.
+    /// PATH`, or of its variant, `import DT::V * from PATH` (see the
+    /// parser's [Imports](crate::parser::imports#imports)): its PATH is
+    /// empty.
     Import,
 }
 
@@ -527,12 +528,16 @@ pub enum ImportMember {
     All(Span),
     /// `DT *`, the import's one member: every definition of the def-type
     /// `DT`, the use `def`, in what the path names, written at the span,
-    /// `DT` through `*`.
+    /// `DT` through `*`. `DT::V *` is every definition made with its
+    /// variant `V`, the use's variant, and `DT::*`, `every`, every
+    /// definition made with any of its variants.
     DefType {
         /// The def-type's use, of [`DefTypeRole::Import`].
         def: DefTypeId,
         /// Where it is written.
         span: Span,
+        /// Whether it is `DT::*`, of every variant.
+        every: bool,
     },
 }
 

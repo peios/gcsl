@@ -216,6 +216,22 @@ pub fn variant_namespace_key(key: &str, variant: &str) -> Option<String> {
     Some(namespace_key(&format!("{path}::{variant}"), number, item))
 }
 
+/// Whether `text` is the namespace key of the definitions made with a
+/// variant of the def-type whose namespace key is `key`: `<Toolchain::C#3.17>`
+/// and `<Toolchain::Rust#3.17>` of `<Toolchain#3.17>`, but neither
+/// `<Toolchain#3.17>` itself nor another declaration's `<Toolchain::C#4.2>`
+/// (see [Namespace keys](#namespace-keys)).
+#[must_use]
+pub fn is_variant_key_of(text: &str, key: &str) -> bool {
+    let (Some(path), Some(of)) = (key_def_type(text), key_def_type(key)) else {
+        return false;
+    };
+    path.strip_prefix(of)
+        .and_then(|rest| rest.strip_prefix("::"))
+        .is_some_and(|variant| !variant.is_empty())
+        && key_numbers(text) == key_numbers(key)
+}
+
 /// Whether `path` could be the path of a def-type in a key: identifiers,
 /// which may hold `-`, joined by `.`, then optionally `::` and a variant's
 /// name. So no other key, an enum's or a method binding's, whose origin may
@@ -414,6 +430,18 @@ mod tests {
         assert_eq!(variant, "<t.package::C#3.17>");
         assert_eq!(key_def_type(&variant), Some("t.package::C"));
         assert_eq!(key_numbers(&variant), Some((3, 17)));
+        // A variant's key is of its def-type's declaration alone.
+        assert!(is_variant_key_of(&variant, &key));
+        assert!(!is_variant_key_of(&key, &key));
+        assert!(!is_variant_key_of(
+            &namespace_key("t.package::C", 4, 2),
+            &key
+        ));
+        assert!(!is_variant_key_of(
+            &namespace_key("t.packages::C", 3, 17),
+            &key
+        ));
+        assert!(!is_variant_key_of("t.package::C", &key));
         // Other keys whose origin holds `#` are none.
         assert_eq!(key_def_type(&enum_key("S", "a#1.2")), None);
         let text = meta_key(&key, 2).unwrap();

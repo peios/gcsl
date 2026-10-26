@@ -185,8 +185,9 @@ impl<'a> Checker<'a> {
             && let ImportForm::Members(range) = self.ast.import_decl(decl).form
         {
             for member in self.ast.import_members(range) {
-                if let ImportMember::DefType { def, .. } = *member {
-                    self.check_def_type_expr(self.ast.def_type(def).dt);
+                if let ImportMember::DefType { def, every, .. } = *member {
+                    let ty = self.check_def_type_expr(self.ast.def_type(def).dt);
+                    self.check_def_type_import(def, ty, every);
                 }
             }
         }
