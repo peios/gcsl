@@ -9,6 +9,7 @@ use crate::check::{Builtin, Fileroot, Place, Slot};
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::names::{self, Name, Names};
 
+use super::parse::is_foreign_path;
 use super::{
     DeclaredContext, DeclaredType, DeclaredVariant, Dir, File, Function, InheritedContext,
     InheritedDefType, InheritedVariant, Merged, Node, ROOT, STANDARD_DIR, Target, ViewNode,
@@ -703,6 +704,10 @@ impl Scan {
             dir,
             this: text(dir),
             workspace: text(0),
+            foreign: self
+                .files
+                .get(index as usize)
+                .is_some_and(|file| is_foreign_path(&file.path)),
         }
     }
 

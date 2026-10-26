@@ -561,6 +561,7 @@ pub fn lower(
         functions,
         (input, resolution.place().dir),
     );
+    ir.set_foreign(resolution.place().foreign);
     ir.set_paths(dotted_paths(ast, resolution));
     ir.set_metas(metas);
     ir.set_references(lowerer.references);

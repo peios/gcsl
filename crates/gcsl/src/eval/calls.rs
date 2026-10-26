@@ -84,6 +84,28 @@
 //! diagnostic, [`Diagnostic::input`], unless an inner call has already, so
 //! the innermost foreign frame wins.
 //!
+//! # Errors in a library
+//!
+//! Code foreign to a workspace, a library's or the standard library's
+//! ([`Ir::is_foreign`](crate::ir::Ir::is_foreign)), is not the workspace's
+//! to change, so an error raised in it is reported where the workspace's
+//! own code called into it: at the innermost call, from a frame of the
+//! workspace's code, whose callee was foreign or reached foreign code,
+//! the place it was raised kept as a label, "failed here, in library
+//! code", in its own input ([`Evaluator::left`]). So `gcc.compile(...)`
+//! failing inside the library is reported at that call in the build file.
+//! It is the innermost such call, not the outermost: a library calling back
+//! into a function of the workspace, which fails, reports the failure in
+//! that function, and a library's error that leaves through the library's
+//! own frames, or through another library's, is moved at the first frame
+//! of the workspace it reaches. A diagnostic marked with a foreign input
+//! by an inner call says so ([`Diagnostic::foreign`]), so that the call
+//! that reaches the workspace knows to move it. A step's failure, which
+//! no frame of its maker is left running to move, is moved as its node
+//! records ([`crate::eval::graph`], "Errors in a library"). An input of a
+//! session, or a run with no workspace, is foreign to nothing: its errors
+//! are where they were raised.
+//!
 //! # Located at the call
 //!
 //! A function item marked `#[track_caller]` reports the errors raised in
@@ -301,7 +323,8 @@ use crate::{CALL_LEVELS, MAX_DEPTH};
 use crate::ast::AttributeId;
 use crate::check::{Builtin, TRACK_CALLER};
 use crate::diagnostic::Diagnostic;
-use crate::ir::{ArgValue, ConstId, FnKind, IrId, IrKind, IrNode, IrRange};
+use crate::diagnostic::Label;
+use crate::ir::{ArgValue, ConstId, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange};
 use crate::names::Name;
 use crate::source::Span;
 use crate::value::{Closure, List, Tag, Value, ValueKind, Variant, int_to_float};
@@ -338,16 +361,46 @@ impl Evaluator<'_> {
         let Some(code) = closure.code.find_function(closure.function) else {
             return mistyped(node, "a closure of a function its IR lacks");
         };
+        // A call from the workspace's own code into foreign code is where a
+        // step that code makes reports its failure (see [Errors in a
+        // library](#errors-in-a-library)).
+        let crossing = closure.code.is_foreign() && !self.ir.is_foreign();
+        if crossing {
+            self.shared
+                .sites
+                .borrow_mut()
+                .push((self.ir.input(), node.span));
+        }
+        let outcome = self.call_closure(&closure, code, (args, depth), node);
+        if crossing {
+            self.shared.sites.borrow_mut().pop();
+        }
+        outcome
+    }
+
+    /// [`Evaluator::call`] of `closure`, whose code is `code`.
+    fn call_closure(
+        &mut self,
+        closure: &Rc<Closure>,
+        code: &FnCode,
+        (args, depth): (IrRange, u16),
+        node: &IrNode,
+    ) -> Flow<Value> {
         if self.past_deadline() {
             return self.timed_out(node);
         }
         // A step the host takes, in graph mode (see [Graph
         // mode](crate::eval::graph#graph-mode)).
+        // Each evaluates its arguments, a foreign callee's defaults among them.
         if self.defers(code) {
-            return self.defer_call((&closure, code), (args, depth), node);
+            return self
+                .defer_call((closure, code), (args, depth), node)
+                .map_err(|unwind| self.argument_failed(unwind, node));
         }
         if code.kind == FnKind::Memo {
-            return self.memo_call((&closure, code), (args, depth), node);
+            return self
+                .memo_call((closure, code), (args, depth), node)
+                .map_err(|unwind| self.argument_failed(unwind, node));
         }
         let entering = self.levels + usize::from(depth) + CALL_LEVELS;
         if entering + code.height as usize > MAX_DEPTH {
@@ -358,20 +411,20 @@ impl Evaluator<'_> {
             .resize(base + code.frame_size as usize, Value::Empty);
         // An argument may fail, or stop for a loop around the call, after
         // the frame has grown: either way the frame goes.
-        if let Err(unwind) = self.arguments(args, base, (&closure, depth)) {
+        if let Err(unwind) = self.arguments(args, base, (closure, depth)) {
             self.stack.truncate(base);
-            return Err(unwind);
+            return Err(self.argument_failed(unwind, node));
         }
         let passed = self.callee_caller();
         if code.retry > 0 || code.timeout.is_some() {
-            return self.guarded_call(&closure, base, (passed, entering), node);
+            return self.guarded_call(closure, base, (passed, entering), node);
         }
         let result = Evaluator {
             ir: &closure.code,
             stack: self.stack,
             base,
             captures: &closure.captures,
-            callee: Some(&closure),
+            callee: Some(closure),
             memo: self.memo,
             shared: self.shared,
             caller: passed,
@@ -383,7 +436,7 @@ impl Evaluator<'_> {
         // its body: the checker sees to it.
         result
             .or_else(|unwind| unwind.returned(node.span))
-            .map_err(|error| self.call_error(error, &closure, node).into())
+            .map_err(|error| self.call_error(error, closure, node).into())
     }
 
     /// Applies `builtin`, one of the built-ins of files and directories, for
@@ -488,16 +541,58 @@ impl Evaluator<'_> {
         closure: &Closure,
         node: &IrNode,
     ) -> Diagnostic {
-        if error.input.is_some() {
-            return error;
-        }
-        if raised_in_tracked(&error, closure) {
+        if error.input.is_none() && raised_in_tracked(&error, closure) {
             error.span = node.span;
             error.labels.retain(|label| label.input.is_some());
-        } else if closure.code.input() != self.ir.input() {
-            error.input = Some(closure.code.input());
+            return error;
+        }
+        self.left(error, &closure.code, node)
+    }
+
+    /// `error`, out of a frame of the program `callee` through the call
+    /// `node` of this frame (see [Errors in a library](#errors-in-a-library)):
+    /// located in foreign code, where it was raised or where an inner call
+    /// marked it, it is reported at `node` if this frame is the workspace's
+    /// own code ([`moved_to`]); raised in another input than this frame's, it
+    /// is marked with that input and whether it is foreign, unless an inner
+    /// call has marked it, so the innermost foreign frame wins.
+    pub(super) fn left(&self, error: Diagnostic, callee: &Ir, node: &IrNode) -> Diagnostic {
+        self.reported_here(self.marked(error, callee), node)
+    }
+
+    /// `error`, out of a frame of the program `callee`, marked with its
+    /// input and whether it is foreign if it was raised in another input than
+    /// this frame's and no inner call has marked it.
+    fn marked(&self, mut error: Diagnostic, callee: &Ir) -> Diagnostic {
+        if error.input.is_none() && callee.input() != self.ir.input() {
+            error.input = Some(callee.input());
+            error.foreign = callee.is_foreign();
         }
         error
+    }
+
+    /// `error`, marked as located in foreign code, reported at `node` if
+    /// this frame is the workspace's own code ([`moved_to`]); as it is
+    /// otherwise.
+    fn reported_here(&self, error: Diagnostic, node: &IrNode) -> Diagnostic {
+        match error.input {
+            Some(from) if error.foreign && !self.ir.is_foreign() => {
+                moved_to(error, from, (None, node.span))
+            }
+            _ => error,
+        }
+    }
+
+    /// `unwind`, out of the arguments of the call `node`: an error of a
+    /// foreign callee's parameter default, which `default_arg` marks, is
+    /// reported at the call if this frame is the workspace's own code (see
+    /// [Errors in a library](#errors-in-a-library)); an argument written
+    /// here fails where it is.
+    fn argument_failed(&self, unwind: Unwind, node: &IrNode) -> Unwind {
+        match unwind {
+            Unwind::Error(error) => Unwind::Error(self.reported_here(error, node)),
+            stop @ Unwind::Stop(_) => stop,
+        }
     }
 
     /// Evaluates the `Call` `node` of the built-in function `builtin` with
@@ -804,13 +899,10 @@ impl Evaluator<'_> {
         }
         .value(code.body);
         self.stack.truncate(base);
-        match result.or_else(|unwind| unwind.returned(node.span)) {
-            Err(mut error) if error.input.is_none() && default.code.input() != self.ir.input() => {
-                error.input = Some(default.code.input());
-                Err(error.into())
-            }
-            result => result.map_err(Unwind::from),
-        }
+        // Its call, not this argument, reports it ([`Evaluator::argument_failed`]).
+        result
+            .or_else(|unwind| unwind.returned(node.span))
+            .map_err(|error| self.marked(error, &default.code).into())
     }
 
     /// Evaluates the `Call` `node` of `callee` with the arguments `args`, at
@@ -916,4 +1008,36 @@ pub(crate) fn raised_in_tracked(error: &Diagnostic, closure: &Closure) -> bool {
                 let body = closure.code.get(code.body).span;
                 body.start <= error.span.start && error.span.end <= body.end
             })
+}
+
+/// `error`, raised in foreign code, at `span` of `input`, `None` for the
+/// frame's own, where the workspace's code called into it (see [Errors in a
+/// library](#errors-in-a-library)): its place, in `from`, kept as a label,
+/// with its own label's text, or "failed here, in library code", and its
+/// other labels of `from` kept, which no suggestion is.
+pub(super) fn moved_to(
+    mut error: Diagnostic,
+    from: u32,
+    (input, span): (Option<u32>, Span),
+) -> Diagnostic {
+    let text = error
+        .label
+        .take()
+        .map_or_else(|| "failed here, in library code".to_owned(), String::from);
+    for label in &mut error.labels {
+        label.input.get_or_insert(from);
+    }
+    error.labels.insert(
+        0,
+        Label {
+            span: error.span,
+            text,
+            input: Some(from),
+        },
+    );
+    error.suggestion = None;
+    error.span = span;
+    error.input = input;
+    error.foreign = false;
+    error
 }

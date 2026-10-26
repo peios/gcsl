@@ -126,7 +126,7 @@ use crate::lexer;
 use crate::names::{self, Name};
 use crate::source::Span;
 
-use super::parse::is_library_path;
+use super::parse::{is_foreign_path, is_library_path};
 use super::{
     Alias, BUILTINS, File, LIBRARIES, PRELUDE, STANDARD_DIR, Scan, Target, TypeImport, clashes,
 };
@@ -432,9 +432,7 @@ fn of_workspace(scan: &Scan, target: Target) -> bool {
         Target::File(file) => scan.files.get(file as usize).map(|file| file.path.as_str()),
         _ => None,
     };
-    path.is_some_and(|path| {
-        !is_library_path(path) && !path.starts_with(STANDARD_DIR) && path != BUILTINS
-    })
+    path.is_some_and(|path| !is_foreign_path(path))
 }
 
 /// What the module path `path` names, or the error that it names nothing

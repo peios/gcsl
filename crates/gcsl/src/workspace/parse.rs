@@ -119,8 +119,8 @@ use crate::names::{Name, Names};
 use crate::source::{SourceFile, Span};
 
 use super::{
-    BUILTINS, Dir, File, FileScope, LIBRARIES, Library, Node, PRELUDE, Placing, ROOT, Scan, count,
-    parent_path, standard_source,
+    BUILTINS, Dir, File, FileScope, LIBRARIES, Library, Node, PRELUDE, Placing, ROOT, STANDARD_DIR,
+    Scan, count, parent_path, standard_source,
 };
 
 /// A file parsed: its tree and the names it spells, with its lexical and
@@ -458,6 +458,18 @@ pub(super) fn parse(source: &SourceFile, names: &mut Names) -> Parsed {
 #[must_use]
 pub(crate) fn is_library_path(path: &str) -> bool {
     path == LIBRARIES || path.starts_with(&format!("{LIBRARIES}/"))
+}
+
+/// Whether `path`, a directory's or a file's, is foreign to the workspace:
+/// a library's, the standard library's or the built-in module's, none of
+/// the workspace's own code (see [Errors in a
+/// library](crate::eval::calls#errors-in-a-library)).
+#[must_use]
+pub(crate) fn is_foreign_path(path: &str) -> bool {
+    is_library_path(path)
+        || path == STANDARD_DIR
+        || path.starts_with(&format!("{STANDARD_DIR}/"))
+        || path == BUILTINS
 }
 
 /// The directory `path`, added with the directories above it if new; a
