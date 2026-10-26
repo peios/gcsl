@@ -92,8 +92,11 @@ def get<T>(kind: Variant<Toolchain, T>, ^toolchains, ^host_platform, ^platform) 
             return kind.payload(provides)
         }
     }
+    # Registering any replaces the default, the host's C toolchain, which is
+    # easy to miss when the toolchain wanted is that one.
     panic(
         "no toolchain of kind `{show(kind)}` runs on `{host_platform.arch}-{host_platform.os}` and \
-         builds for `{platform.arch}-{platform.os}`",
+         builds for `{platform.arch}-{platform.os}`: register one in `toolchains`, whose list \
+         replaces the default, `[Toolchain::C system_c]`, the host's own C compiler",
     )
 }

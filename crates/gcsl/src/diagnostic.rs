@@ -109,6 +109,11 @@ pub struct Diagnostic {
     /// What the evaluator knows of where a runtime error came from that its
     /// message does not say.
     pub(crate) mark: Mark,
+    /// Whether `input` is foreign to the workspace, a library's or the
+    /// standard library's, as the evaluator found it, whose error a call
+    /// from the workspace's own code reports at that call (see [Errors in a
+    /// library](crate::eval::calls#errors-in-a-library)).
+    pub(crate) foreign: bool,
 }
 
 /// What the evaluator knows of where a runtime error came from that its
@@ -184,6 +189,7 @@ impl Diagnostic {
             input: None,
             suggestion: None,
             mark: Mark::NONE,
+            foreign: false,
         }
     }
 

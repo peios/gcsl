@@ -1919,6 +1919,9 @@ pub struct Ir {
     /// The directory of the file the program was lowered from, by its index
     /// in its run's table of directories (see [`Ir::dir`]).
     dir: u32,
+    /// Whether the program is foreign to its workspace, a library's or the
+    /// standard library's (see [`Ir::is_foreign`]).
+    foreign: bool,
     /// Each top-level function named by a dotted path, `def
     /// dev.peios.hello`, which refers to itself by no name, with its path,
     /// which [`Ir::pretty`] shows where it shows another's name. For
@@ -2282,6 +2285,22 @@ impl Ir {
     #[must_use]
     pub fn dir(&self) -> u32 {
         self.dir
+    }
+
+    /// Whether the program is foreign to its workspace, a library's or the
+    /// standard library's, whose errors are reported at the workspace's
+    /// call into it (see [Errors in a
+    /// library](crate::eval::calls#errors-in-a-library)): false for a
+    /// program lowered with no workspace's context.
+    #[must_use]
+    pub fn is_foreign(&self) -> bool {
+        self.foreign
+    }
+
+    /// Marks the program foreign to its workspace, or not
+    /// ([`Ir::is_foreign`]).
+    pub(crate) fn set_foreign(&mut self, foreign: bool) {
+        self.foreign = foreign;
     }
 
     /// The kind of value node `id` produces: [`ValueKind::Deferred`] for a
@@ -2738,6 +2757,7 @@ impl IrBuilder {
             slot_names,
             input,
             dir,
+            foreign: false,
             paths: Vec::new(),
             metas: Vec::new(),
             references: Vec::new(),

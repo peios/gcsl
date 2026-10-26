@@ -294,6 +294,11 @@ pub struct Place {
     /// The absolute path of the workspace's root directory:
     /// `fileroot.workspace`.
     pub workspace: Rc<str>,
+    /// Whether the file is foreign to the workspace, a library's or the
+    /// standard library's, whose errors are reported at the workspace's
+    /// call into it (see [Errors in a
+    /// library](crate::eval::calls#errors-in-a-library)).
+    pub foreign: bool,
 }
 
 /// A parameter's constant default, as its `= DEFAULT` is once checked against

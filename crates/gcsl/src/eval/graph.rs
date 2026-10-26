@@ -69,6 +69,20 @@
 //! before the step does anything with it, so that a host can give the step
 //! the context's files then. A run that ends ran from the start, so its
 //! reads are the step's.
+//!
+//! # Errors in a library
+//!
+//! A step's failure, unlike a call's, leaves no frame of the code that made
+//! it running, which could move it as [Errors in a
+//! library](crate::eval::calls#errors-in-a-library) says. So a node made by
+//! foreign code records where it would be reported: the innermost call from
+//! the workspace's own code into foreign code running when it was made
+//! (`Evaluator::reported`), which every call that crosses keeps on a stack
+//! of the run's. A step's run starts that stack with where the step reports,
+//! so that a step its body makes reports there too. A step that fails with
+//! an error located in foreign code is reported there, the place it was
+//! raised kept as a label (`run_step_call`); one the workspace's own code
+//! made reports at its call, as before.
 
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
@@ -87,7 +101,7 @@ use std::time::Instant;
 use crate::CALL_LEVELS;
 
 use super::plain::{Plain, from_plain, to_plain};
-use super::calls::raised_in_tracked;
+use super::calls::{moved_to, raised_in_tracked};
 use super::{Caller, Evaluator, Flow, MemoTables, Shared, internal};
 
 /// A node of an action graph, by its number (see [Graph mode](#graph-mode)).
@@ -149,6 +163,13 @@ pub struct Node {
     site: IrNode,
     /// The code of the unit that made it.
     code: Rc<Ir>,
+    /// Where it reports its failure, if `code` is foreign to the workspace:
+    /// the innermost call from the workspace's own code into foreign code
+    /// running when it was made, its input and span (see [Errors in a
+    /// library](#errors-in-a-library)); `None` for one the workspace's own
+    /// code made, which reports at `site`, or for one made with none
+    /// running.
+    reported: Option<(u32, Span)>,
     /// The caller a deferred call gives its callee.
     caller: Caller,
     /// Where it is in its life.
@@ -691,6 +712,18 @@ impl Evaluator<'_> {
                 .is_some_and(|run| (run.defers)(&code.attributes))
     }
 
+    /// Where a node this frame makes reports a failure raised in foreign
+    /// code (see [Errors in a library](#errors-in-a-library)): `None` if this
+    /// frame is the workspace's own code, which reports at the node's call;
+    /// else the innermost call from the workspace's code into foreign code
+    /// running, if any is.
+    fn reported(&self) -> Option<(u32, Span)> {
+        if !self.ir.is_foreign() {
+            return None;
+        }
+        self.shared.sites.borrow().last().copied()
+    }
+
     /// The call `node` of `closure`, whose code is `code`, with the arguments
     /// `args` at depth `depth`, as a deferred call's node (see [Graph
     /// mode](#graph-mode)): its arguments evaluated as a call's are, then the
@@ -726,6 +759,7 @@ impl Evaluator<'_> {
         }
         encode_context(context.as_ref(), &mut key);
         let made = self.callee_caller();
+        let reported = self.reported();
         let id = run.meet(key.into(), node.span, |graph, after| {
             let mut data = Vec::new();
             graph.holes_into(&given, &mut data);
@@ -748,6 +782,7 @@ impl Evaluator<'_> {
                 unit: run.unit,
                 site: *node,
                 code: Rc::clone(self.ir),
+                reported,
                 caller: made,
                 state: NodeState::Waiting,
                 future: Some(Rc::new(future)),
@@ -791,6 +826,7 @@ impl Evaluator<'_> {
             encode(value, &mut key);
         }
         encode_context(context.as_ref(), &mut key);
+        let reported = self.reported();
         let id = run.meet(key.into(), node.span, |graph, after| {
             let mut data = Vec::new();
             graph.holes_into(given, &mut data);
@@ -804,6 +840,7 @@ impl Evaluator<'_> {
                 unit: run.unit,
                 site: *node,
                 code: Rc::clone(self.ir),
+                reported,
                 caller: self.caller,
                 state: NodeState::Waiting,
                 future: None,
@@ -924,6 +961,12 @@ pub(crate) struct StepCall {
     site: IrNode,
     /// The input of the code the call is in.
     made_in: u32,
+    /// Where it reports a failure raised in foreign code, if anywhere: its
+    /// node's, or the call that made it if the workspace's own code did
+    /// (see [Errors in a library](#errors-in-a-library)).
+    reported: Option<(u32, Span)>,
+    /// Whether the code the call is in is foreign to the workspace.
+    made_foreign: bool,
 }
 
 impl StepCall {
@@ -936,6 +979,10 @@ impl StepCall {
             caller: node.caller,
             site: node.site,
             made_in: node.code.input(),
+            reported: node
+                .reported
+                .or_else(|| (!node.code.is_foreign()).then(|| (node.code.input(), node.site.span))),
+            made_foreign: node.code.is_foreign(),
         })
     }
 
@@ -963,18 +1010,28 @@ pub(crate) fn run_step_call(
 ) -> Result<Value, Diagnostic> {
     let mut shared = Shared::new(extras.0, extras.1, extras.2);
     shared.graph = Some(run);
+    // A step its body makes reports where this one does.
+    shared.sites.borrow_mut().extend(call.reported);
     call_step(call, (stack, memo), &shared, false).map_err(|mut error| {
-        if error.mark == Mark::PENDING || error.input.is_some() {
+        if error.mark == Mark::PENDING {
             return error;
         }
-        if raised_in_tracked(&error, &call.closure) {
-            error.span = call.site.span;
-            error.labels.retain(|label| label.input.is_some());
-            error.input = Some(call.made_in);
-        } else {
-            error.input = Some(call.closure.code.input());
+        if error.input.is_none() {
+            if raised_in_tracked(&error, &call.closure) {
+                error.span = call.site.span;
+                error.labels.retain(|label| label.input.is_some());
+                error.input = Some(call.made_in);
+                error.foreign = call.made_foreign;
+            } else {
+                error.input = Some(call.closure.code.input());
+                error.foreign = call.closure.code.is_foreign();
+            }
         }
-        error
+        // No frame of its maker is left running to move it.
+        match (error.foreign, error.input, call.reported) {
+            (true, Some(from), Some((input, span))) => moved_to(error, from, (Some(input), span)),
+            _ => error,
+        }
     })
 }
 

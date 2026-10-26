@@ -369,6 +369,11 @@ struct Shared<'a> {
     /// Whether the failure unwinding to the innermost operation on secrets
     /// is one of its operands', not its own (see [Secrets](crate::eval::secrets#secrets)).
     operand_failed: Cell<bool>,
+    /// The calls from the workspace's own code into foreign code that are
+    /// running, innermost last, each its input and its span: where a step
+    /// that foreign code makes reports its failure (see [Errors in a
+    /// library](crate::eval::calls#errors-in-a-library)).
+    sites: RefCell<Vec<(u32, Span)>>,
 }
 
 impl<'a> Shared<'a> {
@@ -392,6 +397,7 @@ impl<'a> Shared<'a> {
             failures: RefCell::new(Vec::new()),
             identities: RefCell::new(Vec::new()),
             operand_failed: Cell::new(false),
+            sites: RefCell::new(Vec::new()),
         }
     }
 }

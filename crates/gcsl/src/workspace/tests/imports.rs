@@ -618,3 +618,93 @@ fn a_library_path_is_segments_separated_by_slashes() {
         ["github.com/x/greet", "github.com/y/z"]
     );
 }
+
+/// Where running `app.gcsl` of `files` fails: the file its error is in and
+/// the text it points at, and each label's.
+fn failure(files: &[(&'static str, String)]) -> Vec<(String, String)> {
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, text)| (*path, text.as_str()))
+        .collect();
+    let mut workspace = rooted(&borrowed).unwrap();
+    let app = workspace.file("app.gcsl").unwrap();
+    let error = workspace.run(app).unwrap_err().remove(0);
+    let at = |input: Option<u32>, span: Span| {
+        let input = input.unwrap_or(app);
+        let (path, text) = files
+            .iter()
+            .find(|(path, _)| workspace.file(path) == Some(input))
+            .unwrap();
+        let shown = text.get(span.start as usize..span.end as usize).unwrap();
+        ((*path).to_owned(), shown.to_owned())
+    };
+    let mut found = vec![at(error.input, error.span)];
+    found.extend(
+        error
+            .labels
+            .iter()
+            .map(|label| at(label.input.or(error.input), label.span)),
+    );
+    found
+}
+
+/// A workspace whose `app.gcsl` is `text`, beside a library
+/// `github.com/x/tools` of `library`, which imports `github.com/x/deep` of
+/// `deep`.
+fn failing(library: &str, deep: &str, text: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("workspace.gcsl", String::new()),
+        (
+            "<lib>/github.com/x/tools/tools.gcsl",
+            format!("import \"github.com/x/deep\"\n{library}"),
+        ),
+        ("<lib>/github.com/x/deep/deep.gcsl", deep.to_owned()),
+        ("app.gcsl", format!("import \"github.com/x/tools\"\n{text}")),
+    ]
+}
+
+#[test]
+fn an_error_in_a_library_is_reported_at_the_workspace_s_call() {
+    let lib = |path: &str| format!("<lib>/github.com/x/{path}");
+    let app = |text: &str| ("app.gcsl".to_owned(), text.to_owned());
+    // Raised in the library's own function, and in a parameter's default.
+    let files = failing(
+        "def fails() -> Int { panic(\"no\") }",
+        "",
+        "x = tools.fails()",
+    );
+    assert_eq!(
+        failure(&files),
+        [
+            app("tools.fails()"),
+            (lib("tools/tools.gcsl"), "panic(\"no\")".to_owned())
+        ]
+    );
+    let files = failing(
+        "def tool() -> Int { panic(\"no tool\") }\ndef make(t: Int = tool()) -> Int { t }",
+        "",
+        "x = tools.make()",
+    );
+    assert_eq!(failure(&files)[0], app("tools.make()"));
+    // Raised in another library it calls: at the workspace's call still.
+    let files = failing(
+        "def call() -> Int { deep.fails() }",
+        "def fails() -> Int { panic(\"deep\") }",
+        "x = tools.call()",
+    );
+    assert_eq!(
+        failure(&files),
+        [
+            app("tools.call()"),
+            (lib("deep/deep.gcsl"), "panic(\"deep\")".to_owned())
+        ]
+    );
+    // Raised in the workspace's own function, which the library calls back:
+    // there, the innermost of the workspace's code.
+    let files = failing(
+        "def apply(f: fn() -> Int) -> Int { f() }",
+        "",
+        "fn mine() -> Int { panic(\"mine\") }\nx = tools.apply(mine)",
+    );
+    assert_eq!(failure(&files)[0], app("panic(\"mine\")"));
+}

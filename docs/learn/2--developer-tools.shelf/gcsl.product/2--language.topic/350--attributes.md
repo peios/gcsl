@@ -102,6 +102,14 @@ and then on to the outer call. An error from a function it calls that
 isn't marked, or from a function value it was given, stays where it was
 raised. A `fn` written inside the marked body counts as part of it.
 
+You don't need the attribute for an error that leaves a library, or the
+standard library, into your own code: that is always reported at your
+call into it, with the line where it was raised shown beneath, marked
+"failed here, in library code". This holds however deep in libraries the
+error was raised, for a library's parameter defaults, and for a build
+step a library makes that fails later. A function of your own that a
+library calls back, and that fails, is reported where it failed.
+
 ## Attributes on a definition type
 
 Attributes on a definition type apply to every definition made with it.
