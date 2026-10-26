@@ -72,6 +72,7 @@ use crate::mentions::{self, Resolve};
 use crate::names::{self, Name, Names};
 use crate::source::{SourceFile, Span};
 
+use super::scan::Throughs;
 use super::{
     InheritedDefType, Alias, BUILTINS, Dir, File, FileScope, Inheriting, Library, ROOT,
     STANDARD_DIR, Scan, builtin_nodes, declare_types, define_types, find_needs, imports, merge,
@@ -204,6 +205,7 @@ pub(super) fn scan_into_with(
         nodes: Vec::new(),
         functions: Vec::new(),
         views: Vec::new(),
+        throughs: Throughs::default(),
         needs: Vec::new(),
         order: Vec::new(),
         names: mem::take(names),
@@ -495,6 +497,7 @@ pub(super) fn unscan(scan: &mut Scan, mark: TypeStoreMark, dropped: &[(u32, usiz
     scan.by_name.clear();
     scan.functions.clear();
     scan.views.clear();
+    scan.throughs = Throughs::default();
     scan.defs.clear();
     scan.part_base.clear();
     scan.types.clear();

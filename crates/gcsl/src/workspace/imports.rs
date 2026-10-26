@@ -91,6 +91,17 @@
 //! `import Toolchain * from PATH`, which would find none, and a variant
 //! written for a def-type that takes none.
 //!
+//! `import build hello from app` and `import Toolchain::C gcc from lib`
+//! import one definition: the namespace of each directory that defines it,
+//! seen through it alone ([`Target::Through`]), so that the file sees the
+//! definition and none of the namespace's others (`one_definition`). Each
+//! such node, and each on the way down to the definition, is numbered among
+//! the targets once the files' imports are resolved
+//! ([`Scan::register_through`]). One that no directory defines is
+//! "`Toolchain::C` has no definition `gcc` in \"lib\"", but for one
+//! imported without the variant its def-type's definitions are made with,
+//! which the checker reports.
+//!
 //! A reference that ends on a cell reads that cell's slot: a `def`'s is its
 //! function's slot, since the merged node of a `def` is never written. A
 //! record read whole (a directory, a file, a file's part of a shared node,
@@ -266,6 +277,7 @@ pub(super) fn imports(
             modules_named,
         ));
     }
+    register_throughs(scan, found.iter().flat_map(|(aliases, ..)| aliases));
     for (file, (aliases, types, (poisoned, blind, failed), modules_named)) in
         scan.files.iter_mut().zip(found)
     {
@@ -277,6 +289,17 @@ pub(super) fn imports(
             file.poison(name);
         }
         file.blind |= blind;
+    }
+}
+
+/// Registers each node seen through a leaf that one of `aliases` binds,
+/// what an import of one definition binds, so that it is numbered among the
+/// targets ([`Scan::register_through`]).
+fn register_throughs<'a>(scan: &mut Scan, aliases: impl Iterator<Item = &'a Alias>) {
+    for alias in aliases {
+        if let Target::Through { node, leaf } = alias.target {
+            scan.register_through(node, leaf);
+        }
     }
 }
 
@@ -868,6 +891,26 @@ fn def_type_import(
             return;
         }
     };
+    let definition = ast.path(ast.def_type(used).path);
+    if !definition.is_empty() {
+        let found = one_definition(scan, &targets, key, definition);
+        // A def-type whose definitions have variants, imported without one,
+        // is the checker's to report.
+        let unvaried = ast.def_type(used).variant.is_none() && has_variants(scan, &targets, key);
+        if found.is_empty() && !unvaried {
+            errors.push(no_definition(scan, (ast, used), path, written));
+        }
+        aliases.extend(found.into_iter().map(|target| Alias {
+            name: key,
+            span: written,
+            item: Some(item),
+            target,
+            whole: false,
+            implicit: false,
+            inherited: false,
+        }));
+        return;
+    }
     let of = scan.names.get(key);
     for target in targets {
         let keys = if every {
@@ -892,6 +935,94 @@ fn def_type_import(
             }
         }
     }
+}
+
+/// Whether any of `targets` has definitions made with a variant of the
+/// def-type whose namespace's key is `key`.
+fn has_variants(scan: &Scan, targets: &[Target], key: Name) -> bool {
+    let of = scan.names.get(key);
+    targets.iter().any(|&target| {
+        target_roots(scan, target)
+            .into_iter()
+            .any(|root| names::is_variant_key_of(scan.names.get(root), of))
+    })
+}
+
+/// "`Toolchain::C` has no definition `gcc` in \"lib\"", of `used`, an
+/// import of `ast` of one definition from `path`, written at `written`: a
+/// library's path as it is written, in quotes, any other in backticks. The
+/// scan has the names, not the tree.
+fn no_definition(
+    scan: &Scan,
+    (ast, used): (&Ast, DefTypeId),
+    path: &[PathSegment],
+    written: Span,
+) -> Diagnostic {
+    let shown = |segments: &[PathSegment], by: &str| {
+        let names: Vec<&str> = segments
+            .iter()
+            .filter_map(PathSegment::name)
+            .map(|name| scan.names.get(name))
+            .collect();
+        names.join(by)
+    };
+    let dt: Vec<&str> = ast
+        .def_type_names(used)
+        .into_iter()
+        .map(|name| scan.names.get(name))
+        .collect();
+    let variant = ast
+        .def_type(used)
+        .variant
+        .map_or_else(String::new, |(name, _)| {
+            format!("::{}", scan.names.get(name))
+        });
+    let from = shown(path, "/");
+    let from = from
+        .strip_prefix(&format!("{LIBRARIES}/"))
+        .map_or_else(|| format!("`{from}`"), |library| format!("\"{library}\""));
+    let definition = shown(ast.path(ast.def_type(used).path), ".");
+    let message = format!(
+        "`{}{variant}` has no definition `{definition}` in {from}",
+        dt.join(".")
+    );
+    Diagnostic::error(message, written)
+}
+
+/// The namespace of key `key` in each of `targets`, directories or a file,
+/// seen through its definition of path `definition` alone, of each that has
+/// one: its merged node seen through the definition's leaf, a definition a
+/// file's own if the target is that file.
+fn one_definition(
+    scan: &Scan,
+    targets: &[Target],
+    key: Name,
+    definition: &[PathSegment],
+) -> Vec<Target> {
+    targets
+        .iter()
+        .filter_map(|&target| {
+            let node = match scan.target_child(target, key)? {
+                Target::Node(node) => node,
+                Target::Part { file, node } => {
+                    *scan.files.get(file as usize)?.global.get(node as usize)?
+                }
+                _ => return None,
+            };
+            let mut at = Target::Node(node);
+            for segment in definition {
+                at = scan.target_child(at, segment.name()?)?;
+            }
+            let Target::Node(leaf) = at else {
+                return None;
+            };
+            let owner = scan.nodes.get(leaf as usize)?.leaf?;
+            match target {
+                Target::File(file) if file != owner => None,
+                _ => Some(Target::Through { node, leaf }),
+            }
+        })
+        .collect()
 }
 
 /// The suggestion for `name`, imported by member from `target`, which has
@@ -962,6 +1093,10 @@ pub(crate) fn target_roots(scan: &Scan, target: Target) -> Vec<Name> {
                 .filter_map(|&root| f.mentions.tree.nodes.get(root as usize).map(|n| n.name))
                 .collect()
         }),
-        Target::Part { .. } | Target::Node(_) | Target::View(_) | Target::Fileroot(_) => Vec::new(),
+        Target::Part { .. }
+        | Target::Node(_)
+        | Target::Through { .. }
+        | Target::View(_)
+        | Target::Fileroot(_) => Vec::new(),
     }
 }

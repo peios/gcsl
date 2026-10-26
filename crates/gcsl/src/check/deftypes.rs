@@ -141,9 +141,10 @@
 //! references alone.
 //!
 //! An import of its definitions names a variant, `import Toolchain::C *
-//! from PATH`, found as a definition's is, or every one, `import
-//! Toolchain::* from PATH`; one that names none would find none, and is
-//! "`Toolchain`'s definitions are made with a variant", and a variant, or
+//! from PATH` or `import Toolchain::C gcc from PATH`, found as a
+//! definition's is, or every one, `import Toolchain::* from PATH`; one that
+//! names none would find none, and is "`Toolchain`'s definitions are made
+//! with a variant", and a variant, or
 //! every one, imported of a def-type of the other shape is "`package` takes
 //! no variant" (`Checker::check_def_type_import`).
 //!
@@ -386,16 +387,24 @@ impl Checker<'_> {
                     self.variant_signature(&sig, at, variant, &shown);
                 }
             }
-            (Some(_), None, false) => self.errors.push(
-                Diagnostic::error(
-                    format!("`{shown}`'s definitions are made with a variant"),
-                    use_.span,
-                )
-                .with_note(format!(
-                    "import those of one, `import {shown}::V * from PATH`, or of every one, \
-                     `import {shown}::* from PATH`"
-                )),
-            ),
+            (Some(_), None, false) => {
+                let path = self.ast.show_def_type(def).1;
+                let note = if path.is_empty() {
+                    format!(
+                        "import those of one, `import {shown}::V * from PATH`, or of every one, \
+                         `import {shown}::* from PATH`"
+                    )
+                } else {
+                    format!("import it with its variant, `import {shown}::V {path} from PATH`")
+                };
+                self.errors.push(
+                    Diagnostic::error(
+                        format!("`{shown}`'s definitions are made with a variant"),
+                        use_.span,
+                    )
+                    .with_note(note),
+                );
+            }
             (None, Some((_, at)), _) => self.errors.push(
                 Diagnostic::error(format!("`{shown}` takes no variant"), at).with_note(format!(
                     "its definitions are imported `import {shown} * from PATH`"

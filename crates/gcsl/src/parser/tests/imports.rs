@@ -276,6 +276,9 @@ fn an_import_of_a_def_type_s_definitions_prints_as_written() {
         "import pekit.package * from pkgs/dev.peios/*",
         "import Toolchain::C * from lib",
         "import Toolchain::* from lib/*",
+        "import build hello from lib",
+        "import Toolchain::C gcc from lib",
+        "import package dev.peios.gmp-c++ from pkgs/*",
     ] {
         assert_eq!(shape(text), text, "{text}");
     }
@@ -328,6 +331,22 @@ fn an_import_of_a_def_type_s_definitions_prints_as_written() {
         member("import Toolchain::* from lib"),
         (None, Span::new(7, 19), true)
     );
+    // One definition is the use's path, the member through it.
+    let ast = parse_text("import Toolchain::C dev.gcc from lib").unwrap();
+    let ItemKind::Import(id) = ast.item(ast.items(ast.root())[0]).kind else {
+        panic!("expected an import");
+    };
+    let ImportForm::Members(range) = ast.import_decl(id).form else {
+        panic!("expected members");
+    };
+    let [ImportMember::DefType { def, span, every }] = ast.import_members(range) else {
+        panic!("expected a def-type member");
+    };
+    assert_eq!((*span, *every), (Span::new(7, 27), false));
+    assert_eq!(
+        ast.show_def_type(*def),
+        ("Toolchain::C".to_owned(), "dev.gcc".to_owned())
+    );
 }
 
 #[test]
@@ -364,11 +383,15 @@ fn an_import_of_a_def_type_s_definitions_has_one_member_and_globs_have_it() {
         )
     );
     assert_eq!(
-        error("import Toolchain::C gcc from lib"),
+        error("import Toolchain::C ( from lib"),
         (
-            "expected `*` after the variant, found `gcc`".to_owned(),
-            Span::new(20, 23)
+            "expected `*` or a definition's name after the variant, found `(`".to_owned(),
+            Span::new(20, 21)
         )
+    );
+    assert_eq!(
+        message("import build hello world from lib"),
+        "expected `from`, found `world`"
     );
     assert_eq!(
         message("import Toolchain::* * from lib"),

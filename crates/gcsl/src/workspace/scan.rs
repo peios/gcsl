@@ -15,6 +15,16 @@ use super::{
     ViewPart, count, in_file, merge_files, target_roots,
 };
 
+/// The merged nodes seen through a leaf below them that a scan's imports
+/// bind or reach ([`Target::Through`]), each a node and its leaf.
+#[derive(Debug, Default)]
+pub(super) struct Throughs {
+    /// Each, by its number among them.
+    pub(super) list: Vec<(u32, u32)>,
+    /// The number of each.
+    pub(super) numbers: HashMap<(u32, u32), u32>,
+}
+
 /// The scanned workspace: what [`scan`](super::scan) finds before anything is checked.
 #[derive(Debug)]
 pub struct Scan {
@@ -30,6 +40,10 @@ pub struct Scan {
     /// The nodes of every file's view that several sources have, each
     /// file's together ([`File::view`]).
     pub views: Vec<ViewNode>,
+    /// Each merged node seen through one leaf below it that an import binds,
+    /// or that is on the way down from one to its leaf ([`Target::Through`]),
+    /// by its number among them, and the numbers by node and leaf.
+    pub(super) throughs: Throughs,
     /// For each file, the files it needs, each once, in index order.
     pub needs: Vec<Vec<u32>>,
     /// The files in the order they are checked and run.
@@ -426,7 +440,9 @@ impl Scan {
     /// The number of `target` among every target of the workspace: the
     /// directories, then the files, then the files' own nodes, then the
     /// merged nodes, then the views' nodes, then the `fileroot` module and
-    /// its members, in the order of [`Fileroot::ALL`].
+    /// its members, in the order of [`Fileroot::ALL`], then the merged
+    /// nodes seen through a leaf, in the order they were registered
+    /// ([`Scan::register_through`]).
     pub(super) fn target_number(&self, target: Target) -> u32 {
         let (dirs, files) = (count(self.dirs.len()), count(self.files.len()));
         let parts = self.parts();
@@ -447,6 +463,55 @@ impl Scan {
             Target::Fileroot(member) => self
                 .fileroot_number()
                 .saturating_add(member.map_or(0, |member| member.index() + 1)),
+            Target::Through { node, leaf } => self.through_base().saturating_add(
+                self.throughs
+                    .numbers
+                    .get(&(node, leaf))
+                    .copied()
+                    .unwrap_or(u32::MAX),
+            ),
+        }
+    }
+
+    /// The number of the first merged node seen through a leaf among every
+    /// target, after the `fileroot` module's members (see
+    /// [`Scan::target_number`]).
+    fn through_base(&self) -> u32 {
+        self.fileroot_number()
+            .saturating_add(1)
+            .saturating_add(count(Fileroot::ALL.len()))
+    }
+
+    /// Registers `node` seen through `leaf`, a leaf below it, and each node
+    /// on the way down from it to `leaf` so seen, for [`Scan::target_number`]
+    /// to number: what an import of one definition binds and reaches
+    /// ([`Target::Through`]).
+    pub(super) fn register_through(&mut self, node: u32, leaf: u32) {
+        let mut at = node;
+        while at != leaf {
+            let Throughs { list, numbers } = &mut self.throughs;
+            numbers.entry((at, leaf)).or_insert_with(|| {
+                list.push((at, leaf));
+                count(list.len() - 1)
+            });
+            let Some(next) = self.through_child(at, leaf) else {
+                return;
+            };
+            at = next;
+        }
+    }
+
+    /// The child of `node` on the way down to `leaf`, a node below it:
+    /// `leaf` itself, or the node above it that is `node`'s child. `None`
+    /// if `leaf` is not below `node`.
+    pub(super) fn through_child(&self, node: u32, leaf: u32) -> Option<u32> {
+        let mut at = leaf;
+        loop {
+            let parent = self.nodes.get(at as usize)?.parent?;
+            if parent == node {
+                return Some(at);
+            }
+            at = parent;
         }
     }
 
@@ -462,6 +527,10 @@ impl Scan {
 
     /// The target of number `number` (see [`Scan::target_number`]).
     pub(super) fn target_of(&self, number: u32) -> Option<Target> {
+        if let Some(at) = number.checked_sub(self.through_base()) {
+            let &(node, leaf) = self.throughs.list.get(at as usize)?;
+            return Some(Target::Through { node, leaf });
+        }
         if let Some(at) = number.checked_sub(self.fileroot_number()) {
             return match at.checked_sub(1) {
                 None => Some(Target::Fileroot(None)),
@@ -706,6 +775,14 @@ impl Scan {
                 .find(|&(_, named)| named == Some(name))
                 .map(|(member, _)| Target::Fileroot(Some(member))),
             Target::Fileroot(Some(_)) => None,
+            Target::Through { node, leaf } => {
+                let child = self.through_child(node, leaf)?;
+                (self.nodes.get(child as usize)?.name == name).then_some(if child == leaf {
+                    Target::Node(leaf)
+                } else {
+                    Target::Through { node: child, leaf }
+                })
+            }
         }
     }
 
@@ -765,6 +842,11 @@ impl Scan {
                 })
                 .unwrap_or_default(),
             Target::View(view) => self.view_names(view),
+            Target::Through { node, leaf } => self
+                .through_child(node, leaf)
+                .and_then(|child| self.nodes.get(child as usize))
+                .map(|child| vec![child.name])
+                .unwrap_or_default(),
             Target::Dir(_) | Target::File(_) | Target::Fileroot(_) => target_roots(self, target),
         }
     }
@@ -796,8 +878,9 @@ impl Scan {
 
     /// The files a reference through an import to `target` needs: every
     /// file of a directory, the file of a file or a part, a merged node's
-    /// leaf's file or its contributors, every owner of every part of a view
-    /// node; none for the `fileroot` module, which no file computes.
+    /// leaf's file or its contributors, the file of the leaf a node is seen
+    /// through, every owner of every part of a view node; none for the
+    /// `fileroot` module, which no file computes.
     #[must_use]
     pub fn target_files(&self, target: Target) -> Vec<u32> {
         match target {
@@ -812,6 +895,8 @@ impl Scan {
                 n.leaf
                     .map_or_else(|| n.contributors.clone(), |leaf| vec![leaf])
             }),
+            // Its leaf's file alone: nothing else below it is seen.
+            Target::Through { leaf, .. } => self.target_files(Target::Node(leaf)),
             Target::View(view) => {
                 let parts = self.views.get(view as usize).map_or(&[][..], |v| &v.parts);
                 let mut files: Vec<u32> = parts
@@ -845,7 +930,7 @@ impl Scan {
                 .get(file as usize)
                 .and_then(|f| f.global.get(node as usize))
                 .map_or_else(String::new, |&merged| self.show(merged)),
-            Target::Node(node) => self.show(node),
+            Target::Node(node) | Target::Through { node, .. } => self.show(node),
             Target::View(view) => self.show_view(view),
         }
     }

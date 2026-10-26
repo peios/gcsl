@@ -200,12 +200,9 @@ fn import_shape(ast: &Ast, import: ImportId, out: &mut String) {
                         name(n) + &as_alias(alias).unwrap_or_default()
                     }
                     ImportMember::All(_) => "*".to_owned(),
-                    ImportMember::DefType {
-                        def, every: true, ..
-                    } => {
-                        format!("{}::*", ast.show_def_type(def).0)
+                    ImportMember::DefType { def, every, .. } => {
+                        ast.show_def_type_member(def, every)
                     }
-                    ImportMember::DefType { def, .. } => format!("{} *", ast.show_def_type(def).0),
                 })
                 .collect();
             out.push_str(&members.join(", "));

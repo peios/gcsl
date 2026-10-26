@@ -247,7 +247,11 @@ impl Scan {
         match target {
             Target::Dir(dir) => self.dir_types.get(dir as usize).cloned(),
             Target::File(file) => self.files.get(file as usize).map(|f| f.types.clone()),
-            Target::Part { .. } | Target::Node(_) | Target::View(_) | Target::Fileroot(_) => None,
+            Target::Part { .. }
+            | Target::Node(_)
+            | Target::Through { .. }
+            | Target::View(_)
+            | Target::Fileroot(_) => None,
         }
         .unwrap_or_default()
     }

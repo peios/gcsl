@@ -410,6 +410,18 @@ pub enum Target {
     },
     /// A merged node, a cell of the workspace, reached through an import.
     Node(u32),
+    /// A merged node seen through one leaf below it alone: the node, and
+    /// the leaf, which an import of one definition binds, its def-type's
+    /// namespace with the definition alone in it (see [Imports of
+    /// definitions](crate::workspace::imports#imports-of-definitions)). Its
+    /// one child is the leaf, or the node on the way down to it, itself so
+    /// seen; never read whole, as no namespace is.
+    Through {
+        /// The node.
+        node: u32,
+        /// The leaf below it.
+        leaf: u32,
+    },
     /// A node of a file's view that several sources have and no leaf of
     /// the file is under, by its index in [`Scan::views`]: read whole, the
     /// record its file assembles of every source's children.

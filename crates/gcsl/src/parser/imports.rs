@@ -7,10 +7,11 @@
 //! ```text
 //! IMPORT  = "import" PATH ("as" NAME)?
 //!         | "import" MEMBER ("," MEMBER)* "from" PATH
-//!         | "import" DT ("::" NAME)? "*" "from" (PATH ("/" GLOB)? | GLOB)
+//!         | "import" DT ("::" NAME)? ("*" | DEFPATH) "from" (PATH ("/" GLOB)? | GLOB)
 //!         | "import" DT "::" "*" "from" (PATH ("/" GLOB)? | GLOB)
 //! MEMBER  = NAME ("as" NAME)? | "*"
 //! DT      = NAME ("." NAME)*
+//! DEFPATH = a definition's path, as a `def` writes it
 //! GLOB    = "*" | "**"                       (its stars glued to the path)
 //! PATH    = SEGMENT ("/" SEGMENT)*          (one run of glued tokens, below)
 //! SEGMENT = a run of ASCII letters, digits, `_`, `-`, `+` and `.`
@@ -82,9 +83,14 @@
 //! variant: `import Toolchain::C * from PATH` those made with `C`, the
 //! use's variant, and `import Toolchain::* from PATH` those made with any,
 //! [`ImportMember::DefType`]'s `every` (`Parser::parse_import_variant`).
+//! A definition's path in place of the `*`, `import build hello from app`
+//! or `import Toolchain::C gcc from lib`, imports that one definition: the
+//! use's path, read as a `def`'s is (`Parser::parse_def_type_path`). A name
+//! after an import's first path, `from` aside, starts one.
 //! After `::`, anything but a name or `*` is "expected a variant's name or
-//! `*` after `::`", and after the variant's name anything but `*` "expected
-//! `*` after the variant". A `DT` of anything but names joined by `.`
+//! `*` after `::`", and after the variant's name anything but `*` or a
+//! definition's path "expected `*` or a definition's name after the
+//! variant". A `DT` of anything but names joined by `.`
 //! is "a def-type is a name, or names joined by `.`"; another member with
 //! it, "a def-type's `*` is imported alone, as in `import package * from
 //! pkgs/*`"; a glob in any other import, "a glob imports the definitions of
@@ -112,11 +118,15 @@ const GLOB_NEEDS_DEF_TYPE: &str =
 
 /// What follows a def-type import's `DT` (`Parser::parse_import_variant`).
 struct ImportVariant {
-    /// The variant `V` of `DT::V *`, with where it is written.
+    /// The variant `V` of `DT::V *` or `DT::V NAME`, with where it is
+    /// written.
     variant: Option<(Name, Span)>,
     /// Whether it is `DT::*`, every variant.
     every: bool,
-    /// Where its last `*` is written.
+    /// The definition's path of `DT NAME` or `DT::V NAME`, the one
+    /// definition imported; empty for every one, `*`.
+    path: Vec<PathSegment>,
+    /// Where its `*` or its definition's path ends.
     end: Span,
 }
 
@@ -145,7 +155,10 @@ impl Parser<'_> {
             end = end.join(path_span);
             let alias = self.parse_import_alias(&mut end)?;
             let next = self.peek();
-            if alias.is_none() && matches!(next.kind, TokenKind::Star | TokenKind::ColonColon) {
+            let named = matches!(next.kind, TokenKind::Ident(_)) && !self.is_from(next);
+            if alias.is_none()
+                && (named || matches!(next.kind, TokenKind::Star | TokenKind::ColonColon))
+            {
                 return self.parse_def_type_import(keyword, base, path_span);
             }
             if next.kind != TokenKind::Comma && !self.is_from(next) {
@@ -278,6 +291,7 @@ impl Parser<'_> {
         let ImportVariant {
             variant,
             every,
+            path: definition,
             end,
         } = self.parse_import_variant()?;
         let written: Vec<PathSegment> = self.path[base..].to_vec();
@@ -317,13 +331,13 @@ impl Parser<'_> {
         }
         self.advance();
         let dt = self.path_expr(&segments)?;
-        let empty = self.builder.push_path(&[]);
+        let definition = self.builder.push_path(&definition);
         let span = dt_span.join(end);
         let def = self.builder.push_def_type(DefTypeUse {
             role: DefTypeRole::Import,
             dt,
             variant,
-            path: empty,
+            path: definition,
             read: None,
             key: None,
             meta: None,
@@ -345,49 +359,65 @@ impl Parser<'_> {
     }
 
     /// Reads what follows a def-type import's `DT`, the next token: `*`,
-    /// `::V *` or `::*` (see [Imports](#imports)). Anything else after `::`
-    /// is "expected a variant's name or `*` after `::`", and after `V`
-    /// "expected `*` after the variant".
+    /// a definition's path, `::V` and either, or `::*` (see
+    /// [Imports](#imports)). Anything else after `::` is "expected a
+    /// variant's name or `*` after `::`", and after `V` "expected `*` or a
+    /// definition's name after the variant".
     fn parse_import_variant(&mut self) -> ParseResult<ImportVariant> {
-        let first = self.peek();
-        self.advance();
-        if first.kind == TokenKind::Star {
-            return Ok(ImportVariant {
-                variant: None,
-                every: false,
-                end: first.span,
-            });
+        let mut variant = None;
+        if self.peek().kind == TokenKind::ColonColon {
+            self.advance();
+            let after = self.peek();
+            match after.kind {
+                TokenKind::Star => {
+                    self.advance();
+                    return Ok(ImportVariant {
+                        variant: None,
+                        every: true,
+                        path: Vec::new(),
+                        end: after.span,
+                    });
+                }
+                TokenKind::Ident(name) => {
+                    self.advance();
+                    variant = Some((name, after.span));
+                }
+                _ => {
+                    return Err(
+                        self.error("expected a variant's name or `*` after `::`", after.span)
+                    );
+                }
+            }
         }
-        let after = self.peek();
-        let variant = match after.kind {
+        let next = self.peek();
+        match next.kind {
             TokenKind::Star => {
                 self.advance();
-                return Ok(ImportVariant {
-                    variant: None,
-                    every: true,
-                    end: after.span,
-                });
+                Ok(ImportVariant {
+                    variant,
+                    every: false,
+                    path: Vec::new(),
+                    end: next.span,
+                })
             }
-            TokenKind::Ident(name) => (name, after.span),
+            TokenKind::Ident(_) if !self.is_from(next) => {
+                let path = self.parse_def_type_path(false)?;
+                let end = path.last().map_or(next.span, |segment| segment.span);
+                Ok(ImportVariant {
+                    variant,
+                    every: false,
+                    path,
+                    end,
+                })
+            }
             _ => {
-                return Err(self.error("expected a variant's name or `*` after `::`", after.span));
+                let found = self.describe(next);
+                Err(self.error(
+                    format!("expected `*` or a definition's name after the variant, found {found}"),
+                    next.span,
+                ))
             }
-        };
-        self.advance();
-        let star = self.peek();
-        if star.kind != TokenKind::Star {
-            let found = self.describe(star);
-            return Err(self.error(
-                format!("expected `*` after the variant, found {found}"),
-                star.span,
-            ));
         }
-        self.advance();
-        Ok(ImportVariant {
-            variant: Some(variant),
-            every: false,
-            end: star.span,
-        })
     }
 
     /// Whether the source written at `span` holds a `/`.

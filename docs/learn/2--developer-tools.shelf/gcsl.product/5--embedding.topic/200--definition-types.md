@@ -126,6 +126,20 @@ The first brings in only the `Tool::C` definitions, the second every
 `import Tool * from ...` would find nothing, so it's an error, as is a
 variant for a definition type that takes none.
 
+## Importing one definition
+
+Name a definition in place of the `*` to import it and nothing else:
+
+```text
+import build greet from app/greet
+import Tool::C gcc from "github.com/example/tools"
+```
+
+The file then sees `build greet` and `Tool::C gcc`, but no other
+definition of those types from there. A path that ends in a glob imports
+the definition from whichever directory defines it, and finding it in
+none is an error.
+
 ## Definitions of any result
 
 A definition type can be generic without a variant. Each definition's

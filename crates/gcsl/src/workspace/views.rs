@@ -294,6 +294,7 @@ impl Scan {
                     .get(file as usize)
                     .and_then(|f| f.mentions.tree.nodes.get(node as usize))
                     .map_or(0, |n| n.children.len()),
+                Target::Through { .. } => 1,
                 _ => 0,
             },
         }
@@ -444,6 +445,8 @@ impl Scan {
                 .views
                 .get(view as usize)
                 .is_some_and(|v| v.parts.iter().all(|&part| self.part_shadowable(part))),
+            // Its leaf is all that is seen of it.
+            Target::Through { leaf, .. } => self.target_shadowable(Target::Node(leaf)),
             Target::Dir(_) | Target::File(_) | Target::Fileroot(_) => false,
         }
     }
@@ -493,6 +496,8 @@ impl Scan {
                 (file, count(own))
             }
             Target::Part { file, node } => (file, node),
+            // Its leaf is the first and only one under it.
+            Target::Through { leaf, .. } => return self.part_spans(Target::Node(leaf)),
             _ => return None,
         };
         let (path, item) = first_leaf(self.files.get(file as usize)?, own)?;

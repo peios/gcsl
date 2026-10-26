@@ -295,8 +295,8 @@ impl Index {
                             self.scan.names.get(name.name).to_owned()
                         }
                         ImportMember::All(_) => "*".to_owned(),
-                        ImportMember::DefType { def, .. } => {
-                            format!("{} *", ast.show_def_type(def).0)
+                        ImportMember::DefType { def, every, .. } => {
+                            ast.show_def_type_member(def, every)
                         }
                     })
                     .collect();

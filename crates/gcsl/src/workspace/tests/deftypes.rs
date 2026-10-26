@@ -678,3 +678,70 @@ fn an_import_of_definitions_names_a_variant_if_and_only_if_they_have_one() {
         );
     }
 }
+
+#[test]
+fn one_definition_is_imported_alone() {
+    // It, and none of the namespace's others.
+    let files = variants(
+        "import Toolchain::C gcc from tools",
+        "let gcc = Toolchain::C gcc()\nv = gcc.arch",
+    );
+    assert_eq!(
+        value(&borrowed(&files), "app/main.gcsl"),
+        "{v = \"x86_64\"}"
+    );
+    let files = variants(
+        "import Toolchain::C gcc from tools",
+        "v = Toolchain::C clang()",
+    );
+    assert_eq!(
+        messages(&borrowed(&files), "app/main.gcsl"),
+        ["`Toolchain::C` has no definition `clang`"]
+    );
+    // Two of one namespace, and one beside the file's own definitions.
+    let files = variants(
+        "import Toolchain::C gcc from tools\nimport Toolchain::C clang from tools",
+        "let gcc = Toolchain::C gcc()\nlet clang = Toolchain::C clang()\nv = [gcc.arch, clang.arch]",
+    );
+    assert_eq!(
+        value(&borrowed(&files), "app/main.gcsl"),
+        "{v = [\"x86_64\", \"riscv64\"]}"
+    );
+    let own = "def Toolchain::C mine() {\n    arch = \"own\"\n    provides = { cc = \"cc\" }\n}\n\
+               let gcc = Toolchain::C gcc()\nlet mine = Toolchain::C mine()\n\
+               v = [gcc.arch, mine.arch]";
+    let files = variants("import Toolchain::C gcc from tools", own);
+    assert_eq!(
+        value(&borrowed(&files), "app/main.gcsl"),
+        "{v = [\"x86_64\", \"own\"]}"
+    );
+    // A def-type of no variant, from each directory a glob names.
+    let files = globbed("import build y from pkgs/*\nv = build y()");
+    assert_eq!(value(&borrowed(&files), "image/app.gcsl"), "{v = \"y: b\"}");
+    let files = globbed("import build y from pkgs/*\nv = build y2()");
+    assert_eq!(
+        messages(&borrowed(&files), "image/app.gcsl"),
+        ["`build` has no definition `y2`"]
+    );
+}
+
+#[test]
+fn an_import_of_one_definition_names_one_there_is() {
+    for (import, message) in [
+        (
+            "import Toolchain::C nope from tools",
+            "`Toolchain::C` has no definition `nope` in `tools`",
+        ),
+        (
+            "import Toolchain gcc from tools",
+            "`Toolchain`'s definitions are made with a variant",
+        ),
+    ] {
+        let files = variants(import, "v = 1");
+        assert_eq!(
+            messages(&borrowed(&files), "app/main.gcsl"),
+            [message],
+            "{import}"
+        );
+    }
+}

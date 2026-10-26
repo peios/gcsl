@@ -337,6 +337,8 @@ Imports reach other directories or files by root-relative paths:
     import package * from pkgs/*
     import Toolchain::C * from lib/tools
     import Toolchain::* from lib/tools
+    import build greet from app/greet
+    import Toolchain::C gcc from lib/tools
 .fi
 .PP
 A path separates directories with /, and names each directory or file as it is, dots included.
@@ -345,6 +347,7 @@ An imported directory exposes its own merged declarations, not an automatic recu
 import DT * from PATH imports every definition of the definition type DT, and nothing else, from what PATH names; PATH/* reads every directory directly in PATH, PATH/** every directory at any depth below it, and * or ** alone the workspace root's, skipping hidden directories and what is below them.
 Two of those directories defining one name is an error at the import; finding none is not.
 For a definition type whose definitions are made with a variant, import DT::V * from PATH imports those made with the variant V, and import DT::* from PATH those made with any; import DT * from PATH is then an error, as is a variant for a definition type that takes none.
+A definition's path in place of the *, as in import build greet from app/greet or import Toolchain::C gcc from lib/tools, imports that one definition and no other; finding it nowhere PATH names is an error.
 A file and directory with the same module name are ambiguous.
 A file outside any workspace can import standard modules only.
 Hidden names, symbolic-link directories, and nested workspace trees are excluded from workspace discovery.

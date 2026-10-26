@@ -835,7 +835,7 @@ impl Index {
     /// Adds the keys of `target`, `depth` views in, to `keys`.
     fn target_keys(&self, target: Target, depth: usize, keys: &mut Vec<Key>) {
         match target {
-            Target::Node(node) => keys.push(Key::Node(node)),
+            Target::Node(node) | Target::Through { node, .. } => keys.push(Key::Node(node)),
             Target::Part { file, node } => {
                 let global = self
                     .scan
@@ -1089,7 +1089,9 @@ impl Index {
                 format!("{}.{}", Fileroot::MODULE, member.name()),
                 "built-in".to_owned(),
             ),
-            Target::Node(_) | Target::View(_) => (String::new(), String::new()),
+            Target::Node(_) | Target::Through { .. } | Target::View(_) => {
+                (String::new(), String::new())
+            }
         };
         let ty = match target {
             Target::Fileroot(None) => None,
@@ -1395,7 +1397,7 @@ impl Index {
     /// start.
     fn module_sites(&self, target: Target) -> Vec<Location> {
         match target {
-            Target::Node(node) => self.node_sites(node),
+            Target::Node(node) | Target::Through { node, .. } => self.node_sites(node),
             Target::View(view) => self.view_sites(view),
             Target::Part { file, node } => {
                 let mut found = Vec::new();
@@ -1459,7 +1461,8 @@ impl Index {
             Target::Dir(_) | Target::File(_) => target_roots(&self.scan, target),
             Target::View(view) => self.scan.view_names(view),
             Target::Part { .. } => self.scan.child_names(target),
-            Target::Node(_) | Target::Fileroot(_) => return None,
+            // A namespace, which nothing reads whole.
+            Target::Node(_) | Target::Through { .. } | Target::Fileroot(_) => return None,
         };
         let mut fields = Vec::with_capacity(names.len());
         for name in names {

@@ -807,6 +807,22 @@ impl Ast {
         (shown, path)
     }
 
+    /// The def-type member `id` of an import as it is written, of every
+    /// variant if `every` (see the parser's
+    /// [Imports](crate::parser::imports#imports)): `DT *`, `DT::V *`,
+    /// `DT::*`, or the one definition `DT NAME` or `DT::V NAME`.
+    #[must_use]
+    pub fn show_def_type_member(&self, id: DefTypeId, every: bool) -> String {
+        let (dt, path) = self.show_def_type(id);
+        if every {
+            format!("{dt}::*")
+        } else if path.is_empty() {
+            format!("{dt} *")
+        } else {
+            format!("{dt} {path}")
+        }
+    }
+
     /// Gives the def-type definition, reference or meta `id` `key`, the key
     /// of its def-type's namespace, which the workspace found its `DT` names
     /// (see [Def-types](crate::ast#def-types)), and, for a definition or a meta,
