@@ -183,6 +183,28 @@ fs.set_executable(tool.path, true)
 share one mode: changing it through one name would change the file
 everywhere else too. That's why the example copies first.
 
+### From a git repository
+
+`fetch_git(url, commit)` gives the files of a git repository as one
+commit has them, as a directory:
+
+```text
+let authd = fetch_git(
+    "https://github.com/peios/authd.git",
+    "a014fa4c74f17ce4f67ba964eefce33a1a3dbdfa",
+)
+```
+
+The pin is the commit's whole name, 40 hexadecimal digits. A commit's
+name is a digest of its files, so it pins them as `sha256` pins a file. A
+branch or a tag can move, so `fetch_git` refuses one. The directory holds
+the repository's files without its `.git` directory, and without its
+submodules.
+
+Plain GCSL runs `git` to fetch, so it must be installed. A build tool such
+as pekit keeps the repositories it fetches, and fetches each commit only
+once.
+
 ## Unpacking archives
 
 The `archive` module's `unpack(archive, strip)` makes a directory of what

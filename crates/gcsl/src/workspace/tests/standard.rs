@@ -36,7 +36,7 @@ fn the_standard_summary_runs_in_a_workspace_and_alone() {
     assert_eq!(scan.dirs[scan.files[0].dir as usize].parent, None);
     assert_eq!(scan.order[0], 0);
     // The built-in functions' cells are the first.
-    let builtins: Vec<Option<Builtin>> = (0..55).map(|node| scan.builtin(node)).collect();
+    let builtins: Vec<Option<Builtin>> = (0..56).map(|node| scan.builtin(node)).collect();
     assert_eq!(
         builtins,
         [
@@ -76,6 +76,7 @@ fn the_standard_summary_runs_in_a_workspace_and_alone() {
             Some(Builtin::File),
             Some(Builtin::FileRead),
             Some(Builtin::Fetch),
+            Some(Builtin::FetchGit),
             Some(Builtin::ArchiveUnpack),
             Some(Builtin::Which),
             Some(Builtin::KeychainString),
@@ -279,6 +280,7 @@ fn a_file_s_own_names_shadow_the_prelude_s_silently() {
             "exec_secret",
             "file",
             "fetch",
+            "fetch_git",
             "dir",
             "build",
             "package",

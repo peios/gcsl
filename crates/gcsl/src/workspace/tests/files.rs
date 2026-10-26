@@ -600,6 +600,76 @@ fn a_fetch_that_is_not_what_was_pinned_fails_with_what_it_is() {
     );
 }
 
+/// A git repository of one commit, `a.txt` and `sub/b.txt`, in the scratch
+/// directory `name`: its URL and the commit's name; or `None` where `git`
+/// cannot run, which `fetch_git` needs.
+fn repository(name: &str) -> Option<(String, String)> {
+    let dir = fs_scratch(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(format!("{dir}/sub")).unwrap();
+    std::fs::write(format!("{dir}/a.txt"), "a\n").unwrap();
+    std::fs::write(format!("{dir}/sub/b.txt"), "b\n").unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    git(&["init", "--quiet"])?;
+    git(&["add", "."])?;
+    git(&["commit", "--quiet", "-m", "one"])?;
+    let commit = git(&["rev-parse", "HEAD"])?;
+    Some((format!("file://{dir}"), commit))
+}
+
+#[test]
+fn fetch_git_gives_a_repository_s_files_at_a_commit() {
+    let Some((url, commit)) = repository("fetch-git") else {
+        return;
+    };
+    let text = format!(
+        "let d = fetch_git(\"{url}\", \"{}\")\n\
+         = [d.file(\"a.txt\").read(), d.file(\"sub/b.txt\").read(), \
+         fs.exists(\"{{d.path}}/.git\")]",
+        commit.to_ascii_uppercase()
+    );
+    assert_eq!(
+        lone(&format!("import fs\n{text}")).unwrap(),
+        "[\"a\\n\", \"b\\n\", false]"
+    );
+    // A branch, which can move, is no pin.
+    let moving = lone_error(&format!("x = fetch_git(\"{url}\", \"main\")"));
+    assert_eq!(
+        moving.message,
+        format!(
+            "`fetch_git` of `{url}` is pinned by `main`, which is no commit's name: 40 \
+             hexadecimal digits, not a branch or a tag, which can move"
+        )
+    );
+    // A commit the repository lacks.
+    let absent = "0".repeat(40);
+    let missing = lone_error(&format!("x = fetch_git(\"{url}\", \"{absent}\")"));
+    assert!(
+        missing.message.starts_with(&format!(
+            "`fetch_git` could not fetch `{absent}` of `{url}`"
+        )),
+        "{}",
+        missing.message
+    );
+}
+
 #[test]
 fn a_fetched_file_is_named_by_its_url_s_last_segment() {
     use crate::eval::fetched_name;

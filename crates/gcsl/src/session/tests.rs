@@ -1447,9 +1447,9 @@ fn a_union_variable_is_used_by_later_inputs() {
 #[test]
 fn a_session_runs_exec_panic_and_sh() {
     let mut session = Session::new();
-    // The fifty-four built-in functions' cells are its first slots.
+    // The fifty-five built-in functions' cells are its first slots.
     assert_eq!(
-        &session.frame[..54],
+        &session.frame[..55],
         Builtin::ALL.map(Value::Builtin).as_slice()
     );
     // On the first input, and on later ones, through a variable.

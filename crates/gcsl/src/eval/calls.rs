@@ -313,7 +313,7 @@ use super::{
 use super::builtins::{enum_builtin, secret_builtin};
 use super::kinds::{as_function, float_to_int, into_callee, mixed};
 use super::elements::element_builtin;
-use super::files::{dir_files, fetch, inside, make_file, read_file, unpack, which};
+use super::files::{dir_files, fetch, fetch_git, inside, make_file, read_file, unpack, which};
 use super::keychain::keychain;
 use super::graph::effect_builtin;
 use super::sandbox::{sandbox_entry, sandbox_exec};
@@ -405,6 +405,9 @@ impl Evaluator<'_> {
             }
             (Builtin::Fetch, Value::Str(url), Some(Value::Str(sha256))) => {
                 fetch(&url, &sha256, self.shared.effects, node)
+            }
+            (Builtin::FetchGit, Value::Str(url), Some(Value::Str(commit))) => {
+                fetch_git(&url, &commit, self.shared.effects, node)
             }
             (Builtin::ArchiveUnpack, Value::File(archive), Some(Value::Int(strip))) => {
                 unpack(&archive, strip, self.shared.effects, node)

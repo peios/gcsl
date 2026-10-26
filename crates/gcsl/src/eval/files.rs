@@ -74,6 +74,19 @@
 //! pekit does, answers a call itself, from its store when it holds the
 //! digest, so that a pinned file is downloaded once.
 //!
+//! `fetch_git(url, commit)`, the built-in `fetch_git` (`fetch_git`), makes a
+//! new temporary directory of the run of the files of the git repository at
+//! `url` as the commit `commit` has them, its submodules left out and its
+//! own `.git` too: a repository's files at a commit are as fixed as a
+//! digest's bytes, the commit's name being a digest of them. The pin is the
+//! commit's whole name, 40 hex digits, any case; anything else, a branch or
+//! a tag, which can move, is an error before anything is fetched. It runs
+//! `git` through the run's [`Effects`]: a repository is made, the commit
+//! fetched into it alone, shallowly, or, if the server won't give a commit
+//! by its name, with everything else, checked out, checked to be the pin,
+//! and its `.git` removed. A host that keeps repositories, as pekit does,
+//! answers a call itself.
+//!
 //! # Unpacking
 //!
 //! `archive.unpack(a, strip)`, the built-in `archive_unpack` (`unpack`),
@@ -586,6 +599,81 @@ pub(super) fn fetch(url: &str, sha256: &str, effects: &dyn Effects, node: &IrNod
         .into());
     }
     Ok(entry(false, Rc::from(path)))
+}
+
+/// Applies `fetch_git`, for the call `node`, to `url` and `commit` (see
+/// [Fetching](#fetching)): a new directory of the repository's files at
+/// that commit.
+pub(super) fn fetch_git(
+    url: &str,
+    commit: &str,
+    effects: &dyn Effects,
+    node: &IrNode,
+) -> Flow<Value> {
+    let fail = |message: String| Err(Diagnostic::error(message, node.span).into());
+    let pin = commit.trim().to_ascii_lowercase();
+    if pin.len() != 40 || !pin.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return fail(format!(
+            "`fetch_git` of `{url}` is pinned by `{commit}`, which is no commit's name: 40 \
+             hexadecimal digits, not a branch or a tag, which can move"
+        ));
+    }
+    let Some(made) = effects.temp_dir() else {
+        return mistyped(node, "`fetch_git` called in a run without an owner");
+    };
+    let path = match made {
+        Ok(dir) => format!("{dir}/{}", fetched_name(url).trim_end_matches(".git")),
+        Err(reason) => {
+            return fail(format!(
+                "`fetch_git` could not create a temporary directory: {reason}"
+            ));
+        }
+    };
+    let host = match effects.host_path(&path) {
+        Ok(host) => host,
+        Err(reason) => return fail(format!("`fetch_git` cannot use `{path}`: {reason}")),
+    };
+    let git = |args: &[&str]| {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(&host).args(args);
+        run_through(effects, command)
+    };
+    let fetched = fs::create_dir_all(&host)
+        .map_err(|error| error.to_string())
+        .and_then(|()| git(&["init", "--quiet"]))
+        .and_then(|_| {
+            git(&["fetch", "--quiet", "--depth", "1", url, &pin])
+                .or_else(|_| git(&["fetch", "--quiet", url]))
+        })
+        .and_then(|_| {
+            git(&[
+                "-c",
+                "advice.detachedHead=false",
+                "checkout",
+                "--quiet",
+                &pin,
+            ])
+        })
+        .and_then(|_| git(&["rev-parse", "HEAD"]));
+    let head = match fetched {
+        Ok(head) => head.trim().to_owned(),
+        Err(reason) => {
+            return fail(format!(
+                "`fetch_git` could not fetch `{pin}` of `{url}`: {reason}"
+            ));
+        }
+    };
+    if head != pin {
+        return fail(format!(
+            "`fetch_git` of `{url}` checked out `{head}`, not `{pin}`"
+        ));
+    }
+    if let Err(error) = fs::remove_dir_all(host.join(".git")) {
+        return fail(format!(
+            "`fetch_git` could not remove the repository of `{url}`: {error}"
+        ));
+    }
+    Ok(entry(true, Rc::from(path)))
 }
 
 /// Applies `archive_unpack`, for the call `node`, to `archive` and `strip`

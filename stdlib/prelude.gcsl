@@ -201,6 +201,15 @@ file = builtins.file
 def fetch(url: String, sha256: String = "") -> File {
     builtins.fetch(url, sha256)
 }
+# `fetch_git(url, commit)` gives the files of the git repository at `url`
+# as the commit `commit` has them, without the repository's `.git` or its
+# submodules. `commit` is the commit's whole name, 40 hexadecimal digits,
+# which names its files as a digest does: a branch or a tag, which can move,
+# is an error. A build tool keeps repositories, and fetches each commit
+# once.
+def fetch_git(url: String, commit: String) -> Dir {
+    builtins.fetch_git(url, commit)
+}
 
 #[track_caller]
 def (f: File) read() -> String {
