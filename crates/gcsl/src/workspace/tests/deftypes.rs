@@ -745,3 +745,31 @@ fn an_import_of_one_definition_names_one_there_is() {
         );
     }
 }
+
+#[test]
+fn a_variant_declared_beside_its_definitions_is_seen_with_them() {
+    // As a library declares the variant of the toolchains it gives.
+    for import in [
+        "import Toolchain::Go gc from go",
+        "import Toolchain::Go * from go",
+        "import Toolchain::* from go",
+    ] {
+        let files = [
+            language::TOOLCHAIN,
+            (
+                "go/go.gcsl",
+                "enum Toolchain::Go<{go: String}>\n\
+                 def Toolchain::Go gc() {\n    arch = \"x86_64\"\n    provides = { go = \"go\" }\n}",
+            ),
+            (
+                "app/main.gcsl",
+                &format!("{import}\nlet gc = Toolchain::Go gc()\nv = gc.arch"),
+            ),
+        ];
+        assert_eq!(
+            value(&files, "app/main.gcsl"),
+            "{v = \"x86_64\"}",
+            "{import}"
+        );
+    }
+}

@@ -122,7 +122,9 @@ import Tool::* from "github.com/example/tools"
 ```
 
 The first brings in only the `Tool::C` definitions, the second every
-`Tool::C`, `Tool::Rust` and any other variant's. Without a variant,
+`Tool::C`, `Tool::Rust` and any other variant's. A variant the library
+declares itself, such as a `Tool::Go` of its own, comes with them, so
+you can write `Tool::Go gc` after importing it. Without a variant,
 `import Tool * from ...` would find nothing, so it's an error, as is a
 variant for a definition type that takes none.
 

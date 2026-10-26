@@ -87,7 +87,10 @@
 //! the key the use's variant gives it, and `import Toolchain::* from PATH`
 //! every variant's namespace each directory has, each a root of its tree
 //! whose key is a variant's of the def-type's ([`names::is_variant_key_of`]),
-//! so that a variant declared in any library is found. The checker reports
+//! so that a variant declared in any library is found. As any import's
+//! module's, the variants each module it reads declares are seen
+//! ([`File::method_modules`]), so a variant that a library declares beside
+//! its definitions names them. The checker reports
 //! `import Toolchain * from PATH`, which would find none, and a variant
 //! written for a def-type that takes none.
 //!
@@ -215,7 +218,8 @@ pub(super) fn imports(
                 let before = own_errors.len();
                 if let Some(member) = def_type_member(&file.ast, decl) {
                     let at = (file, item, decl);
-                    def_type_import(scan, &modules, at, member, aliases, &mut own_errors);
+                    let bound = (&mut *aliases, &mut modules_named);
+                    def_type_import(scan, &modules, at, member, bound, &mut own_errors);
                     if own_errors.len() > before {
                         failed_imports.push((item, None));
                         blind = true;
@@ -829,15 +833,17 @@ fn def_type_member(ast: &Ast, decl: &ImportDecl) -> Option<(DefTypeId, Span, boo
 /// definitions](#imports-of-definitions)): for each, the root of the
 /// def-type's namespace in it, or of its variant's, as an alias of its key,
 /// which the file's view merges; for `DT::*`, `every`, the root of each of
-/// its variants' namespaces. A def-type the file does not see is "`x` is no
-/// def-type"; a path that names nothing, the usual error; a glob on a
-/// file's path "a glob names directories, and `a/b` is a file".
+/// its variants' namespaces; and adds each module it reads to `read`, whose
+/// variants the file sees, so that a variant a library declares names its
+/// definitions. A def-type the file does not see is "`x` is no def-type"; a
+/// path that names nothing, the usual error; a glob on a file's path "a
+/// glob names directories, and `a/b` is a file".
 fn def_type_import(
     scan: &Scan,
     modules: &Modules,
     (file, item, decl): (&File, ItemId, &ImportDecl),
     (used, written, every): (DefTypeId, Span, bool),
-    aliases: &mut Vec<Alias>,
+    (aliases, read): (&mut Vec<Alias>, &mut Vec<Target>),
     errors: &mut Vec<Diagnostic>,
 ) {
     let ast = &file.ast;
@@ -891,6 +897,9 @@ fn def_type_import(
             return;
         }
     };
+    // Its modules' variants are seen, as any import's are: a variant a
+    // library declares names its definitions.
+    read.extend(targets.iter().copied());
     let definition = ast.path(ast.def_type(used).path);
     if !definition.is_empty() {
         let found = one_definition(scan, &targets, key, definition);
