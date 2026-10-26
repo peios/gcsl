@@ -722,8 +722,16 @@ impl Workspace {
             .into());
         };
         let context = (&mut self.frame, &mut self.memo);
-        let extras = (Some(&self.exec_result), &self.scan.dir_texts[..], effects);
-        run_node(node, context, extras).map_err(|mut error| {
+        let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
+        let extras = (
+            Some(&self.exec_result),
+            &self.scan.dir_texts[..],
+            effects,
+            Some(&names),
+        );
+        let ran = run_node(node, context, extras);
+        self.scan.names = names.into_inner();
+        ran.map_err(|mut error| {
             error.input.get_or_insert(node.unit());
             error
         })
@@ -744,6 +752,16 @@ impl Workspace {
     /// workspace's table (see [Plain values](crate::eval::plain#plain-values)).
     pub fn from_plain(&mut self, plain: &Plain) -> Value {
         from_plain(plain, &mut self.scan.names)
+    }
+
+    /// The text of each declared context's key, by the key: what a step's
+    /// run tells its host each read it makes by.
+    pub(crate) fn context_texts(&self) -> std::collections::HashMap<Name, Rc<str>> {
+        self.scan
+            .contexts
+            .iter()
+            .map(|context| (context.key, Rc::from(self.scan.names.get(context.key))))
+            .collect()
     }
 
     /// What a host needs of the node `id` of `graph` to key, stage and run
@@ -944,17 +962,20 @@ impl Workspace {
                 temp_dirs: Some(&self.temp_dirs),
             };
             let effects: &dyn Effects = graph.as_ref().map_or(&direct, |(_, host)| host.effects);
+            let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
             let context = (
                 &mut self.memo,
                 Some(&self.exec_result),
                 &self.scan.dir_texts[..],
                 effects,
+                Some(&names),
             );
             let run = graph
                 .as_mut()
                 .map(|(graph, host)| GraphRun::new(mem::take(*graph), at, host.defers));
             let outcome =
                 session::run_input_in(&ir, &mut self.frame, context, (None, run.as_ref()));
+            self.scan.names = names.into_inner();
             let paused = match (run, graph.as_mut()) {
                 (Some(run), Some((graph, _))) => {
                     let (left, paused) = run.finish();

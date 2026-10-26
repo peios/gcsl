@@ -810,6 +810,18 @@ pub enum IrKind {
         /// The kind of the narrowed type, and so of the node.
         kind: ValueKind,
     },
+    /// A call of `record`: the record of a field for each entry of the list
+    /// `entries`, named by its `key` and holding its `value`, those fields'
+    /// names (see [Records of any
+    /// names](crate::check::entries#records-of-any-names)).
+    RecordOf {
+        /// The entries.
+        entries: IrId,
+        /// The name `key`.
+        key: Name,
+        /// The name `value`.
+        value: Name,
+    },
     /// A call of `json.decode`: the JSON document `text`, a `String`,
     /// decoded by a plan the checker made (see [JSON
     /// decoding](crate::check::json#json-decoding)).
@@ -1364,6 +1376,7 @@ impl IrKind {
             | IrKind::Is { value: child, .. }
             | IrKind::As { value: child, .. }
             | IrKind::JsonDecode { text: child, .. }
+            | IrKind::RecordOf { entries: child, .. }
             | IrKind::Await { value: child, .. }
             | IrKind::Catch { body: child, .. }
             | IrKind::ContextBind { value: child, .. }
@@ -1512,6 +1525,7 @@ impl IrKind {
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
+            | IrKind::RecordOf { .. }
             | IrKind::UpdateField { .. }
             | IrKind::Assert { .. }
             | IrKind::Failure(_)
@@ -1586,6 +1600,7 @@ impl IrKind {
             | IrKind::Store(..)
             | IrKind::Block { .. }
             | IrKind::MakeRecord { .. }
+            | IrKind::RecordOf { .. }
             | IrKind::Field { .. }
             | IrKind::UpdateField { .. }
             | IrKind::Update { .. }
@@ -1647,6 +1662,7 @@ impl IrKind {
             IrKind::Is { .. } => "is",
             IrKind::As { .. } => "as",
             IrKind::JsonDecode { .. } => "json-decode",
+            IrKind::RecordOf { .. } => "record-of",
             IrKind::MakeList { .. } => "make-list",
             IrKind::Spread(_) => "spread",
             IrKind::Index { .. } => "index",
@@ -1657,25 +1673,10 @@ impl IrKind {
             IrKind::For { collect: true, .. } => "for",
             IrKind::For { collect: false, .. } => "for-each",
             IrKind::Loop {
-                collect: true,
-                test_first: true,
+                collect,
+                test_first,
                 ..
-            } => "loop",
-            IrKind::Loop {
-                collect: false,
-                test_first: true,
-                ..
-            } => "loop-each",
-            IrKind::Loop {
-                collect: true,
-                test_first: false,
-                ..
-            } => "do",
-            IrKind::Loop {
-                collect: false,
-                test_first: false,
-                ..
-            } => "do-each",
+            } => loop_name(collect, test_first),
             IrKind::Break { .. } => "break",
             IrKind::Continue { .. } => "continue",
             IrKind::Return { .. } => "return",
@@ -1729,6 +1730,18 @@ impl IrKind {
             IrKind::Await { .. } => "await",
             IrKind::Meta(_) => "meta",
         }
+    }
+}
+
+/// The name in [`Ir::pretty`] output of a loop that collects its results if
+/// `collect` and tests its condition before its first iteration if
+/// `test_first`: `loop`, `loop-each`, `do` or `do-each`.
+const fn loop_name(collect: bool, test_first: bool) -> &'static str {
+    match (test_first, collect) {
+        (true, true) => "loop",
+        (true, false) => "loop-each",
+        (false, true) => "do",
+        (false, false) => "do-each",
     }
 }
 
@@ -1807,6 +1820,7 @@ impl IrNode {
             | IrKind::Store(..)
             | IrKind::Block { .. }
             | IrKind::MakeRecord { .. }
+            | IrKind::RecordOf { .. }
             | IrKind::Field { .. }
             | IrKind::UpdateField { .. }
             | IrKind::Update { .. }

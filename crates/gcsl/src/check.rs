@@ -3171,6 +3171,7 @@ pub(crate) mod builtin;
 pub(crate) mod calls;
 pub(crate) mod context;
 pub(crate) mod deftypes;
+pub(crate) mod entries;
 pub(crate) mod enums;
 pub(crate) mod expect;
 pub(crate) mod failure;

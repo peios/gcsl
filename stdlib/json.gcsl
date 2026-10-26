@@ -10,7 +10,8 @@
 #   of its name, a missing key or `null` giving the field's default, and
 #   other keys left out. A union decodes as the member that takes the
 #   value's kind, so no two members may take the same kind, an `Int` and a
-#   `Float` apart. A record type with a rest-field cannot be decoded yet.
+#   `Float` apart. A record type with a rest-field takes each other key as
+#   a field of its name, decoded as the rest-field says, a `null` left out.
 #   It is pure. Text that is not JSON, or a document that does not fit the
 #   type, is a runtime error at the call, naming the path to what does not
 #   fit: `units[3].kind`.

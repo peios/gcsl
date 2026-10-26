@@ -31,12 +31,13 @@ use crate::types::{Decode, TyId, Undecodable};
 use super::{Builtin, Checker};
 
 /// What the checker knows of the calls of `json.decode` (see [JSON
-/// decoding](#json-decoding)).
+/// decoding](#json-decoding)) and of `record` (see [Records of any
+/// names](crate::check::entries#records-of-any-names)).
 #[derive(Default)]
 pub(super) struct Decoding {
     /// The type expected of each call being checked that may be one of
-    /// `json.decode`, by its id.
-    targets: HashMap<ExprId, TyId>,
+    /// `json.decode` or `record`, by its id.
+    pub(super) targets: HashMap<ExprId, TyId>,
     /// The plan of each call of `json.decode` checked, by its id: see
     /// [`Resolution::decode_of`](super::Resolution::decode_of).
     pub(super) plans: HashMap<ExprId, Decode>,

@@ -115,7 +115,7 @@ impl Evaluator<'_> {
         if let Some(run) = self.shared.graph
             && let Some(text) = run.note_read(key, context)
         {
-            self.shared.effects.context_read(text);
+            self.shared.effects.context_read(&text);
         }
     }
 
@@ -124,7 +124,7 @@ impl Evaluator<'_> {
     pub(super) fn note_step_reads_all(&self) {
         if let Some(run) = self.shared.graph {
             for text in run.note_all() {
-                self.shared.effects.context_read(text);
+                self.shared.effects.context_read(&text);
             }
         }
     }

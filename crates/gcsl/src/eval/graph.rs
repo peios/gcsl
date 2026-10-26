@@ -482,9 +482,9 @@ pub(crate) struct GraphRun<'g> {
     /// Of a step's unit's run, what it reads of the step's own context
     /// ([`StepReads`]); `None` for any other unit's.
     watch: RefCell<Option<Watch>>,
-    /// The names of the run's workspace, by which a read is told to the
+    /// The text of each context's key, by which a read is told to the
     /// host.
-    names: Option<&'g crate::names::Names>,
+    texts: HashMap<crate::names::Name, Rc<str>>,
 }
 
 /// What a run of a step's unit read of the context the step was made in
@@ -539,23 +539,24 @@ impl<'g> GraphRun<'g> {
             last: Cell::new(None),
             scopes: RefCell::new(vec![root]),
             watch: RefCell::new(None),
-            names: None,
+            texts: HashMap::new(),
         }
     }
 
     /// The run, watching what it reads of the context `context`, a step's,
-    /// each read told by its key's text in `names` ([`GraphRun::note_read`]).
+    /// each read told by its key's text in `texts`, the text of every
+    /// context's key ([`GraphRun::note_read`]).
     pub(crate) fn watching(
         mut self,
         context: Option<Rc<ContextFrame>>,
-        names: &'g crate::names::Names,
+        texts: HashMap<crate::names::Name, Rc<str>>,
     ) -> Self {
         self.watch = RefCell::new(Some(Watch {
             context,
             keys: Vec::new(),
             all: false,
         }));
-        self.names = Some(names);
+        self.texts = texts;
         self
     }
 
@@ -568,7 +569,7 @@ impl<'g> GraphRun<'g> {
         &self,
         key: crate::names::Name,
         context: Option<&Rc<ContextFrame>>,
-    ) -> Option<&'g str> {
+    ) -> Option<Rc<str>> {
         let mut watch = self.watch.borrow_mut();
         let watch = watch.as_mut()?;
         let read = ContextFrame::find(context, key).map(|(frame, _)| frame);
@@ -577,12 +578,12 @@ impl<'g> GraphRun<'g> {
             return None;
         }
         watch.keys.push((key, own.is_some()));
-        Some(self.names?.get(key))
+        self.texts.get(&key).cloned()
     }
 
     /// Notes that the run read every context its step's context binds, if it
     /// watches one: each's key's text that it had not read before.
-    pub(crate) fn note_all(&self) -> Vec<&'g str> {
+    pub(crate) fn note_all(&self) -> Vec<Rc<str>> {
         let mut watch = self.watch.borrow_mut();
         let Some(watch) = watch.as_mut() else {
             return Vec::new();
@@ -592,7 +593,7 @@ impl<'g> GraphRun<'g> {
         for (key, _) in ContextFrame::flattened(watch.context.as_ref()) {
             if !watch.keys.iter().any(|&(seen, _)| seen == key) {
                 watch.keys.push((key, true));
-                new.extend(self.names.map(|names| names.get(key)));
+                new.extend(self.texts.get(&key).cloned());
             }
         }
         new
@@ -605,12 +606,11 @@ impl<'g> GraphRun<'g> {
         let Some(watch) = watch.as_ref() else {
             return StepReads::default();
         };
-        let names = self.names;
         StepReads {
             keys: watch
                 .keys
                 .iter()
-                .filter_map(|&(key, bound)| Some((names?.get(key).to_owned(), bound)))
+                .filter_map(|&(key, bound)| Some((self.texts.get(&key)?.to_string(), bound)))
                 .collect(),
             all: watch.all,
         }
@@ -932,11 +932,13 @@ pub(crate) fn run_node(
     let span = node.site.span;
     match (node.kind, StepCall::of(node)) {
         (NodeKind::Deferred, Some(call)) => {
-            let shared = Shared::new(extras.0, extras.1, extras.2);
+            let mut shared = Shared::new(extras.0, extras.1, extras.2);
+            shared.names = extras.3;
             call_step(&call, (stack, memo), &shared, true)
         }
         (NodeKind::Effect(builtin), None) => {
-            let shared = Shared::new(extras.0, extras.1, extras.2);
+            let mut shared = Shared::new(extras.0, extras.1, extras.2);
+            shared.names = extras.3;
             shared.context.replace(node.context.clone());
             apply_effect(
                 builtin,
@@ -956,6 +958,7 @@ pub(crate) type RunExtras<'a> = (
     Option<&'a Rc<crate::value::Layout>>,
     &'a [Rc<str>],
     &'a dyn super::Effects,
+    Option<&'a RefCell<crate::names::Names>>,
 );
 
 /// A deferred node's call, apart from its graph, which a run takes (see
@@ -1022,6 +1025,7 @@ pub(crate) fn run_step_call(
     run: &GraphRun<'_>,
 ) -> Result<Value, Diagnostic> {
     let mut shared = Shared::new(extras.0, extras.1, extras.2);
+    shared.names = extras.3;
     shared.graph = Some(run);
     // A step its body makes reports where this one does.
     shared.sites.borrow_mut().extend(call.reported);

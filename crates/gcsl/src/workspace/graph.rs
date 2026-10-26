@@ -138,13 +138,16 @@ impl Workspace {
             STEP_UNITS.saturating_add(id.number()),
             host.defers,
         )
-        .watching(call.context(), &self.scan.names);
+        .watching(call.context(), self.context_texts());
+        let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
         let extras = (
             Some(&self.exec_result),
             &self.scan.dir_texts[..],
             host.effects,
+            Some(&names),
         );
         let outcome = run_step_call(&call, (&mut self.frame, &mut self.memo), extras, &run);
+        self.scan.names = names.into_inner();
         let reads = run.reads();
         let (left, paused) = run.finish();
         *graph = left;
@@ -365,14 +368,17 @@ impl Workspace {
                 }
             })
             .clone();
+        let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
         let context = (
             &mut self.memo,
             Some(&self.exec_result),
             &self.scan.dir_texts[..],
             host.effects,
+            Some(&names),
         );
         let run = GraphRun::new(mem::take(graph), call.unit, host.defers);
         let outcome = session::run_input_in(&call.ir, &mut self.frame, context, (root, Some(&run)));
+        self.scan.names = names.into_inner();
         let (left, paused) = run.finish();
         *graph = left;
         match outcome {

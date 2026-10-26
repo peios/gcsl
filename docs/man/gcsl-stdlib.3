@@ -31,6 +31,15 @@ NaN and infinities cannot be rendered as source.
 An empty list still needs an expected type when its rendered text is read back.
 The minimum Int value's rendered digits do not form an accepted positive integer literal before unary negation.
 .TP
+.B record(entries: List<Entry<T>>): {*: T}
+Make a record with a field for each entry, named by the entry's key and holding its value, its names known only as the program runs.
+type Entry<T> = {key: String, value: T}.
+The result has a rest-field alone, so no code reads its fields by name; give it to what takes a record of any names, such as exec's env.
+A {*: T} expected of the call gives the entries their type, so record([]) works where one is expected.
+Each field is named as the program names it, so the record equals one written with the same fields, whatever the entries' order.
+A key given twice is a runtime error.
+This operation has special typing and is not a general first-class polymorphic function.
+.TP
 .B int(x: Float): Int
 Truncate toward zero.
 NaN, infinity, and values outside the Int range fail.
@@ -195,7 +204,8 @@ A string decodes as a String; a number as an Int if it is written as an integer 
 Each field of a record comes from the key of its name; a missing key or null gives the field's default, and a field without a default must be present.
 Keys the type does not name are ignored.
 A union decodes as the member that takes the value's kind; no two members may take the same kind, except Int and Float, where an integer goes to the Int.
-Duration, Size, File, Dir, Sandbox, enums, secrets, functions, Partial, Never, and record types with a rest-field cannot be decoded; naming one is a checking error.
+A record type with a rest-field takes each key it does not name as a field of that name, decoded as the rest-field says; a null value is left out.
+Duration, Size, File, Dir, Sandbox, enums, secrets, functions, Partial, and Never cannot be decoded; naming one is a checking error.
 The parser follows RFC 8259 strictly and also rejects an object with a duplicate key.
 Text that is not JSON, or a document that does not fit the type, is a runtime error at the call that names the line and column, or the path to the value that does not fit, such as units[3].kind.
 This pure operation can be called from a pure function.

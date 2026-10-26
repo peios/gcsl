@@ -228,6 +228,12 @@ pub enum Builtin {
     /// stands, as an empty list's element type does (see [JSON
     /// decoding](crate::check::json#json-decoding)).
     JsonDecode,
+    /// `record<T>(entries: List<{key: String, value: T}>): {*: T}`: the
+    /// record of a field for each entry, by its key, whose value is the
+    /// entry's, a key twice a runtime error. Its typing is special: its
+    /// result's type has a rest-field alone, which no field is read by (see
+    /// [Records of any names](crate::check::entries#records-of-any-names)).
+    Record,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -251,7 +257,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 56] = [
+    pub const ALL: [Builtin; 57] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -308,6 +314,7 @@ impl Builtin {
         Builtin::ListUnique,
         Builtin::ListContains,
         Builtin::JsonDecode,
+        Builtin::Record,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -363,6 +370,7 @@ impl Builtin {
             Builtin::HostOs => "host_os",
             Builtin::Show => "show",
             Builtin::JsonDecode => "json_decode",
+            Builtin::Record => "record",
             Builtin::ExecLive => "exec_live",
             Builtin::VariantMatches => "variant_matches",
             Builtin::VariantPayload => "variant_payload",
@@ -431,6 +439,7 @@ impl Builtin {
             | Builtin::HostOs
             | Builtin::Show
             | Builtin::JsonDecode
+            | Builtin::Record
             | Builtin::ExecLive
             | Builtin::VariantMatches
             | Builtin::VariantPayload
@@ -509,7 +518,7 @@ impl Builtin {
             Builtin::Exec | Builtin::ExecLive | Builtin::ExecSecret => &["argv", "options"],
             Builtin::DirFiles => &["d"],
             Builtin::DirFile | Builtin::DirDir => &["d", "path"],
-            Builtin::FsComposeDir | Builtin::FsCompose => &["entries"],
+            Builtin::FsComposeDir | Builtin::FsCompose | Builtin::Record => &["entries"],
             Builtin::DirSandbox => &["d", "options"],
             Builtin::SandboxExec => &["s", "request"],
             Builtin::SandboxFile | Builtin::SandboxDir => &["s", "path"],
@@ -602,6 +611,7 @@ impl Builtin {
             | Builtin::HostOs
             | Builtin::Show
             | Builtin::JsonDecode
+            | Builtin::Record
             | Builtin::VariantMatches
             | Builtin::VariantPayload
             | Builtin::PartialMatches
@@ -622,7 +632,7 @@ impl Builtin {
     #[must_use]
     pub const fn typing(self) -> Typing {
         match self {
-            Builtin::Len | Builtin::Show | Builtin::JsonDecode => Typing::Special,
+            Builtin::Len | Builtin::Show | Builtin::JsonDecode | Builtin::Record => Typing::Special,
             Builtin::Int
             | Builtin::Float
             | Builtin::Exec
@@ -690,6 +700,7 @@ impl Builtin {
             Builtin::Len => "builtin len",
             Builtin::Show => "builtin show",
             Builtin::JsonDecode => "builtin json_decode",
+            Builtin::Record => "builtin record",
             Builtin::Int => "fn(x: Float): Int",
             Builtin::Float => "fn(x: Int): Float",
             Builtin::Exec | Builtin::ExecLive => {
@@ -833,7 +844,9 @@ impl Builtin {
             }
             // TEMPORARY (alias rule): the opaque type, until a polymorphic one (see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/)).
-            Builtin::Len | Builtin::Show | Builtin::JsonDecode => return types.builtin(self),
+            Builtin::Len | Builtin::Show | Builtin::JsonDecode | Builtin::Record => {
+                return types.builtin(self);
+            }
             Builtin::VariantMatches
             | Builtin::VariantPayload
             | Builtin::PartialMatches

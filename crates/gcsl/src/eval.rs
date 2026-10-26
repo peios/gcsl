@@ -177,9 +177,14 @@ pub fn eval_with(
     ir: &Rc<Ir>,
     stack: &mut Vec<Value>,
     memo: &mut MemoTables,
-    extras: (Option<&Rc<Layout>>, &[Rc<str>], &dyn Effects),
+    (exec_result, dirs, effects): (Option<&Rc<Layout>>, &[Rc<str>], &dyn Effects),
 ) -> Result<Value, Diagnostic> {
-    eval_rooted(ir, (stack, memo), extras, (None, None))
+    eval_rooted(
+        ir,
+        (stack, memo),
+        (exec_result, dirs, effects, None),
+        (None, None),
+    )
 }
 
 /// [`eval_with`], in the root context `context`, the frame of the contexts
@@ -191,7 +196,7 @@ pub fn eval_with(
 pub(crate) fn eval_rooted(
     ir: &Rc<Ir>,
     (stack, memo): (&mut Vec<Value>, &mut MemoTables),
-    (exec_result, dirs, effects): (Option<&Rc<Layout>>, &[Rc<str>], &dyn Effects),
+    (exec_result, dirs, effects, names): graph::RunExtras<'_>,
     (context, graph): (Option<Rc<ContextFrame>>, Option<&GraphRun<'_>>),
 ) -> Result<Value, Diagnostic> {
     let root = ir.root();
@@ -208,6 +213,7 @@ pub(crate) fn eval_rooted(
         origin: NO_ORIGIN,
     };
     let mut shared = Shared::new(exec_result, dirs, effects);
+    shared.names = names;
     shared.graph = graph;
     shared.context.replace(context);
     let result = Evaluator {
@@ -374,6 +380,11 @@ struct Shared<'a> {
     /// that foreign code makes reports its failure (see [Errors in a
     /// library](crate::eval::calls#errors-in-a-library)).
     sites: RefCell<Vec<(u32, Span)>>,
+    /// The names of the run's owner, which a record made with names known
+    /// only as the run goes adds to (see [Records of any
+    /// names](crate::eval::records#records-of-any-names)); `None` in a run
+    /// with no owner's names, where making one is an error.
+    names: Option<&'a RefCell<crate::names::Names>>,
 }
 
 impl<'a> Shared<'a> {
@@ -398,6 +409,7 @@ impl<'a> Shared<'a> {
             identities: RefCell::new(Vec::new()),
             operand_failed: Cell::new(false),
             sites: RefCell::new(Vec::new()),
+            names: None,
         }
     }
 }
@@ -472,6 +484,7 @@ impl Evaluator<'_> {
                 self.value(branch)
             }
             IrKind::MakeRecord { layout, values } => self.make_record(layout, values),
+            IrKind::RecordOf { .. } => self.record_of(node),
             IrKind::Field { record, name, .. } => self.field(record, name, node),
             IrKind::UpdateField { .. } => self.update_field(node),
             IrKind::Update { .. } => self.update(node),
@@ -1376,6 +1389,7 @@ fn mistyped<T>(node: &IrNode, message: &'static str) -> Flow<T> {
 pub(crate) mod builtins;
 pub mod effects;
 pub(crate) mod elements;
+pub(crate) mod entries;
 pub(crate) mod files;
 pub mod graph;
 pub(crate) mod keychain;

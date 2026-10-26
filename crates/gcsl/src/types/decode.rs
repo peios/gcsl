@@ -15,11 +15,13 @@
 //!   fraction or exponent, and as a `Float` whatever it is;
 //! - `true` and `false` as a `Bool`;
 //! - an array as a list;
-//! - an object as a record: each of the type's fields from the key of its
-//!   name, a key that is missing or `null` giving the field's default, and
-//!   every other key left out. A record type with a rest-field, `{*: T}`,
-//!   has no plan yet: its fields' names would come from the document, and
-//!   the evaluator cannot make new names.
+//! - an object as a record: each of the type's named fields from the key of
+//!   its name, a key that is missing or `null` giving the field's default,
+//!   and every other key as a field of its own name, by the rest-field's
+//!   plan, if the type has one, a `null` left out, or left out if it has
+//!   none. A rest-field's fields are named as the document names them, as
+//!   `record` names its fields (see [Records of any
+//!   names](crate::check::entries#records-of-any-names)).
 //!
 //! A union decodes as whichever of its members takes the JSON value's kind,
 //! so no two members may take the same kind, except that an `Int` and a
@@ -47,12 +49,22 @@ pub enum Decode {
     Bool,
     /// A JSON array, as a list each of whose elements decodes by the plan.
     List(Box<Decode>),
-    /// A JSON object, as a record of these fields, sorted by name.
-    Record(Box<[DecodeField]>),
+    /// A JSON object, as a record.
+    Record(Box<DecodeRecord>),
     /// A JSON value of any of the kinds the plans take, each plan taking
     /// kinds no other does, but an `Int` and a `Float`, which share
     /// numbers; at least two.
     Any(Box<[Decode]>),
+}
+
+/// How a JSON object is decoded as a record: see [`Decode::Record`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodeRecord {
+    /// Each named field of the record type, sorted by name.
+    pub fields: Box<[DecodeField]>,
+    /// How each key the fields do not name is decoded, as a field of its
+    /// name; `None` to leave them out.
+    pub rest: Option<Decode>,
 }
 
 /// A named field of a record decoded from a JSON object.
@@ -124,9 +136,6 @@ impl TypeTable {
             TyKind::Float => Ok(Decode::Float),
             TyKind::Bool => Ok(Decode::Bool),
             TyKind::List(element) => Ok(Decode::List(Box::new(self.decode_plan(element, names)?))),
-            TyKind::Record(record) if record.rest().is_some() => {
-                undecodable("a record type with a rest-field cannot be decoded yet")
-            }
             TyKind::Record(record) => {
                 let mut fields = Vec::with_capacity(record.fields.len());
                 for &(name, field) in &record.fields {
@@ -141,7 +150,14 @@ impl TypeTable {
                             .map(|(_, constant)| constant.clone()),
                     });
                 }
-                Ok(Decode::Record(fields.into_boxed_slice()))
+                let rest = match record.rest() {
+                    Some(rest) => Some(self.decode_plan(rest, names)?),
+                    None => None,
+                };
+                Ok(Decode::Record(Box::new(DecodeRecord {
+                    fields: fields.into_boxed_slice(),
+                    rest,
+                })))
             }
             TyKind::Union(members) => self.decode_union(ty, &members, names),
             TyKind::Quantity(_) => undecodable("a `Duration` or `Size` has no JSON form"),

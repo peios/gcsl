@@ -1216,15 +1216,19 @@ impl Workspace {
         let direct = Direct {
             temp_dirs: Some(&self.temp_dirs),
         };
+        let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
         let context = (
             &mut self.memo,
             Some(&self.exec_result),
             &self.scan.dir_texts[..],
             &direct as &dyn Effects,
+            Some(&names),
         );
         let mut warnings = self.warnings.clone();
         warnings.extend(own);
-        match session::run_input_in(&Rc::new(ir), &mut self.frame, context, (root, None)) {
+        let ran = session::run_input_in(&Rc::new(ir), &mut self.frame, context, (root, None));
+        self.scan.names = names.into_inner();
+        match ran {
             Ok(value) => Ok(Outcome { value, warnings }),
             Err(error) => {
                 let errors = invoked_here(vec![error], call, at);

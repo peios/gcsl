@@ -121,6 +121,21 @@ can't be read by name, and a record whose type has a rest-field can't be
 spread. Typed equality compares every field, and `is` and `as` test each
 field that the rest-field covers.
 
+When the names themselves are only known as the program runs, such as a
+program's environment built from a list, make the record with `record`.
+It takes a list of entries, each an `Entry<T>`, a `{key: String, value:
+T}`, and gives a `{*: T}` with a field for each:
+
+```gcsl
+let vars = [{key = "LANG"; value = "C"}, {key = "TZ"; value = "UTC"}]
+let env: {*: String} = record(vars)
+env == ({LANG = "C"; TZ = "UTC"}: {*: String})
+```
+
+Each field is named as the program names it, so the record equals one
+written with the same fields, in any order. A key given twice is an error
+when the program runs.
+
 ## Combining fields
 
 Dotted definitions construct nested records. Compatible dotted paths

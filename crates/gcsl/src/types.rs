@@ -3442,7 +3442,7 @@ mod display;
 mod needs;
 
 pub(crate) use display::write_constant;
-pub use decode::{Decode, DecodeField, Undecodable};
+pub use decode::{Decode, DecodeField, DecodeRecord, Undecodable};
 use display::Display;
 pub use needs::{Need, NeedsId, implies, met, through};
 

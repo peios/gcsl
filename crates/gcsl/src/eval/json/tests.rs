@@ -171,9 +171,21 @@ fn the_type_must_be_expected_and_decodable() {
         failure("let d: {a: Int} | {b: Int} = json.decode(\"1\")\n= d").0,
         "cannot decode JSON as a `{a: Int} | {b: Int}`"
     );
+}
+
+#[test]
+fn an_object_decodes_as_a_map_by_its_rest_field() {
+    // Each key a field of its name, a `null` left out, the named fields
+    // taken first.
+    let text = "let m: {name: String, *: List<Int>} = json.decode(\"{{\\\"name\\\": \\\"a\\\", \\\"b\\\": [1], \\\"c\\\": null, \\\"d\\\": []}}\")\n= m";
+    assert_eq!(decoded(text), "{name = \"a\"; b = [1]; d = []}");
+    // Named as the program names them: equal to a record written.
+    let text = "let m: {*: Int} = json.decode(\"{{\\\"b\\\": 2, \\\"a\\\": 1}}\")\n= m == ({a = 1; b = 2}: {*: Int})";
+    assert_eq!(decoded(text), "true");
+    // A value the rest-field's type does not take, by its path.
     assert_eq!(
-        failure("let d: {*: Int} = json.decode(\"1\")\n= d").0,
-        "cannot decode JSON as a `{*: Int}`"
+        failure("let m: {*: Int} = json.decode(\"{{\\\"b\\\": \\\"no\\\"}}\")\n= m").1,
+        Some("`b` is a string, not an integer".to_owned())
     );
 }
 

@@ -283,7 +283,10 @@ so no two of its members can be the same kind of JSON value. `Int` and
 
 Some types cannot be decoded, and naming one is an error when the file is
 checked: `Duration`, `Size`, `File`, `Dir`, enums, secrets, and functions.
-Records with a rest-field, such as `{*: Int}`, cannot be decoded yet.
+
+A record with a rest-field, such as `{*: Int}`, decodes every key it
+doesn't name as a field of that name, so a JSON object whose keys are
+data, a map, decodes as a `{*: T}`. A `null` value is left out.
 
 `decode` is pure. Text that is not JSON fails at the call, with the line
 and column where parsing stopped. A document that does not match the type

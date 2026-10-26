@@ -21,7 +21,8 @@ use std::rc::Rc;
 use crate::check::Constant;
 use crate::diagnostic::Diagnostic;
 use crate::ir::{Ir, IrKind, IrNode};
-use crate::types::{Decode, DecodeField};
+use crate::names::Name;
+use crate::types::{Decode, DecodeField, DecodeRecord};
 use crate::value::{Layout, List, Record, Value};
 
 use super::kinds::{mixed, of_kind};
@@ -78,6 +79,7 @@ impl Evaluator<'_> {
         })?;
         let mut decoder = Decoder {
             ir,
+            names: self.shared.names,
             layouts: HashMap::new(),
             path: String::new(),
         };
@@ -98,6 +100,9 @@ impl Evaluator<'_> {
 struct Decoder<'a> {
     /// The IR, for the texts of the field names of defaults.
     ir: &'a Ir,
+    /// The names of the run's owner, which a rest-field's fields are named
+    /// in; `None` in a run with none.
+    names: Option<&'a std::cell::RefCell<crate::names::Names>>,
     /// The layout of the records each record plan makes, by the address of
     /// its fields.
     layouts: HashMap<*const DecodeField, Rc<Layout>>,
@@ -133,7 +138,7 @@ impl Decoder<'_> {
                 }
                 Ok(Value::List(List::from_vec(values)))
             }
-            (Decode::Record(fields), Json::Object(members)) => self.record(fields, members),
+            (Decode::Record(record), Json::Object(members)) => self.record(record, members),
             (Decode::Any(plans), _) => {
                 let chosen = plans.iter().find(|each| takes(each, json));
                 match chosen {
@@ -145,15 +150,13 @@ impl Decoder<'_> {
         }
     }
 
-    /// The record of `fields` decoded from the object of `members`.
+    /// The record `record` says, decoded from the object of `members`.
     fn record(
         &mut self,
-        fields: &[DecodeField],
+        record: &DecodeRecord,
         members: &[(String, Json)],
     ) -> Result<Value, String> {
-        if fields.is_empty() {
-            return Ok(Value::Empty);
-        }
+        let fields = &record.fields;
         let length = self.path.len();
         let mut values = Vec::with_capacity(fields.len());
         for field in fields {
@@ -180,6 +183,40 @@ impl Decoder<'_> {
             };
             values.push(value);
         }
+        let mut names: Vec<Name> = Vec::new();
+        let mut texts: Vec<Box<str>> = Vec::new();
+        if let Some(rest) = &record.rest {
+            for (key, value) in members {
+                if *value == Json::Null || fields.iter().any(|field| *field.text == **key) {
+                    continue;
+                }
+                if !self.path.is_empty() {
+                    self.path.push('.');
+                }
+                self.path.push_str(key);
+                values.push(self.decode(rest, value)?);
+                self.path.truncate(length);
+                names.push(self.name_of(key)?);
+                texts.push(Box::from(key.as_str()));
+            }
+        }
+        if values.is_empty() {
+            return Ok(Value::Empty);
+        }
+        if !names.is_empty() {
+            let layout = Layout {
+                names: fields.iter().map(|field| field.name).chain(names).collect(),
+                texts: fields
+                    .iter()
+                    .map(|field| field.text.clone())
+                    .chain(texts)
+                    .collect(),
+            };
+            return Ok(Value::Record(Rc::new(Record {
+                layout: Rc::new(layout),
+                values: values.into_boxed_slice(),
+            })));
+        }
         let layout = self
             .layouts
             .entry(fields.as_ptr())
@@ -194,6 +231,20 @@ impl Decoder<'_> {
             layout,
             values: values.into_boxed_slice(),
         })))
+    }
+}
+
+impl Decoder<'_> {
+    /// The name of the key `key` in the names of the run's owner, interned
+    /// there if it is new.
+    fn name_of(&self, key: &str) -> Result<Name, String> {
+        let names = self
+            .names
+            .ok_or("is a map, which a run with no names to name its keys cannot decode")?;
+        let mut names = names
+            .try_borrow_mut()
+            .map_err(|_| "is a map, whose keys' names are already being made".to_owned())?;
+        Ok(names.intern(key))
     }
 }
 

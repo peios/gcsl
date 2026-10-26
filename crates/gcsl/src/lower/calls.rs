@@ -45,20 +45,12 @@ impl Lowerer<'_> {
                 message: "a call of `show` typed as something other than a String",
                 span,
             }),
-            Builtin::JsonDecode => {
-                let Some(plan) = self.resolution.decode_of(id) else {
-                    return Err(InternalError {
-                        message: "a call of `json.decode` has no plan",
-                        span,
-                    });
-                };
-                let plan = plan.clone();
-                self.name_default_fields(&plan);
-                let decode = self.builder.push_decode(plan);
-                let text = self.builtin_argument(args, 0, span)?;
-                let text = self.lower_operand(text, ValueKind::String)?;
-                Ok(IrKind::JsonDecode { text, decode, kind })
-            }
+            Builtin::Record if kind == ValueKind::Record => self.lower_record(args, span),
+            Builtin::Record => Err(InternalError {
+                message: "a call of `record` typed as something other than a record",
+                span,
+            }),
+            Builtin::JsonDecode => self.lower_json_decode(id, args, kind),
             // An ordinary built-in is called as any function value is.
             Builtin::Int
             | Builtin::Float
@@ -119,6 +111,52 @@ impl Lowerer<'_> {
         }
     }
 
+    /// Lowers the call spanning `span` of `record` with the arguments
+    /// `args`: a `RecordOf` of its entries, with the names of their fields
+    /// (see [Records of any names](crate::check::entries#records-of-any-names)).
+    fn lower_record(&mut self, args: ArgRange, span: Span) -> Result<IrKind, InternalError> {
+        let names = self.ast.names();
+        let (Some(key), Some(value)) = (names.lookup("key"), names.lookup("value")) else {
+            return Err(InternalError {
+                message: "a call of `record` whose entries name no `key` or `value`",
+                span,
+            });
+        };
+        self.builder.add_name_text(key, "key");
+        self.builder.add_name_text(value, "value");
+        let entries = self.builtin_argument(args, 0, span)?;
+        let entries = self.lower_operand(entries, ValueKind::List)?;
+        Ok(IrKind::RecordOf {
+            entries,
+            key,
+            value,
+        })
+    }
+
+    /// Lowers the call `id` of `json.decode` with the arguments `args`, of
+    /// kind `kind`: a `JsonDecode` of its text, with the plan the checker
+    /// made for it (see [JSON decoding](crate::check::json#json-decoding)).
+    fn lower_json_decode(
+        &mut self,
+        id: ExprId,
+        args: ArgRange,
+        kind: ValueKind,
+    ) -> Result<IrKind, InternalError> {
+        let span = self.ast.get(id).span;
+        let Some(plan) = self.resolution.decode_of(id) else {
+            return Err(InternalError {
+                message: "a call of `json.decode` has no plan",
+                span,
+            });
+        };
+        let plan = plan.clone();
+        self.name_default_fields(&plan);
+        let decode = self.builder.push_decode(plan);
+        let text = self.builtin_argument(args, 0, span)?;
+        let text = self.lower_operand(text, ValueKind::String)?;
+        Ok(IrKind::JsonDecode { text, decode, kind })
+    }
+
     /// Records the text of the name of every field of a record among the
     /// defaults `plan` gives, for the evaluator to make them (see [JSON
     /// decoding](crate::check::json#json-decoding)).
@@ -132,12 +170,15 @@ impl Lowerer<'_> {
                     self.name_default_fields(each);
                 }
             }
-            Decode::Record(fields) => {
-                for field in fields {
+            Decode::Record(record) => {
+                for field in &record.fields {
                     if let Some(default) = &field.default {
                         self.name_constant_fields(default);
                     }
                     self.name_default_fields(&field.plan);
+                }
+                if let Some(rest) = &record.rest {
+                    self.name_default_fields(rest);
                 }
             }
             Decode::Str | Decode::Int | Decode::Float | Decode::Bool => {}
