@@ -273,9 +273,9 @@ fn a_session_runs_the_standard_library_first() {
     // The standard files are its first inputs, and the built-in
     // functions' cells its first slots, written as the frame was laid
     // out.
-    assert_eq!(first(), 7);
+    assert_eq!(first(), 8);
     assert_eq!(
-        session.source(5).map(SourceFile::name),
+        session.source(6).map(SourceFile::name),
         Some("<stdlib>/prelude.gcsl")
     );
     assert!(session.source(first()).is_none());
@@ -339,8 +339,8 @@ fn a_conflict_with_the_prelude_names_its_file() {
     assert_eq!(error.message, "field `len` is defined in two files");
     assert_eq!(error.input, None);
     let inputs: Vec<Option<u32>> = error.labels.iter().map(|label| label.input).collect();
-    assert_eq!(inputs, [Some(5), None]);
-    let prelude = session.source(5).unwrap();
+    assert_eq!(inputs, [Some(6), None]);
+    let prelude = session.source(6).unwrap();
     assert_eq!(prelude.slice(error.labels[0].span), "len");
 }
 
@@ -1447,9 +1447,9 @@ fn a_union_variable_is_used_by_later_inputs() {
 #[test]
 fn a_session_runs_exec_panic_and_sh() {
     let mut session = Session::new();
-    // The fifty-five built-in functions' cells are its first slots.
+    // The fifty-six built-in functions' cells are its first slots.
     assert_eq!(
-        &session.frame[..55],
+        &session.frame[..56],
         Builtin::ALL.map(Value::Builtin).as_slice()
     );
     // On the first input, and on later ones, through a variable.
@@ -1518,7 +1518,7 @@ fn a_session_has_the_string_built_ins_and_path() {
     // Every standard module was loaded as it started, each a scope of
     // its own, in path order.
     assert_eq!(
-        session.source(4).map(SourceFile::name),
+        session.source(5).map(SourceFile::name),
         Some("<stdlib>/path.gcsl")
     );
     // `split` on the first input.

@@ -3437,10 +3437,12 @@ impl TypeTable {
     }
 }
 
+mod decode;
 mod display;
 mod needs;
 
 pub(crate) use display::write_constant;
+pub use decode::{Decode, DecodeField, Undecodable};
 use display::Display;
 pub use needs::{Need, NeedsId, implies, met, through};
 

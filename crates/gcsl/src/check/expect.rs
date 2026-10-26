@@ -522,7 +522,7 @@ impl Checker<'_> {
         // as ever.
         let found = match self.defaulted_record(expected) {
             Some(record) if self.reaches_result(id) => self.fill_result(id, record, (context, why)),
-            _ => self.check_expr(id),
+            _ => self.expecting_decode(id, expected, |checker| checker.check_expr(id)),
         };
         self.expect_at(id, found, expected, (context, why), (site, filling));
         found

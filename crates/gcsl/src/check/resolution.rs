@@ -8,7 +8,7 @@ use std::rc::Rc;
 use crate::ast::{ArgRange, ExprId, FnId, ForId, GenericOwner, ItemId, RecoverId};
 use crate::names::Name;
 use crate::source::Span;
-use crate::types::{AwaitKind, GenericId, Need, TyId, ValueTest};
+use crate::types::{AwaitKind, Decode, GenericId, Need, TyId, ValueTest};
 
 use super::{
     Attribute, Constant, FieldSchedule, ImportedRecord, ImportedRecords, MadeAt, ParamDefault,
@@ -456,6 +456,9 @@ pub struct Resolution {
     /// What was decided for each `is` and `as` expression, by its id; only
     /// a program that has one has entries.
     pub(super) tests: HashMap<ExprId, TestResolution>,
+    /// The decoding plan of each call of `json.decode`, by its id; only a
+    /// program that has one has entries.
+    pub(super) decodes: HashMap<ExprId, Decode>,
     /// Each field access that reads a function's meta, `func.versions`, by
     /// its id, with the meta's type and how the meta is awaited before its
     /// field is read (see [Metas](crate::check::attributes#metas)); only a program that reads one
@@ -860,6 +863,14 @@ impl Resolution {
         self.tests.get(&id)
     }
 
+    /// The decoding plan of the call `id` of `json.decode` (see [JSON
+    /// decoding](crate::check::json#json-decoding)); `None` for any other
+    /// expression.
+    #[must_use]
+    pub fn decode_of(&self, id: ExprId) -> Option<&Decode> {
+        self.decodes.get(&id)
+    }
+
     /// If the field access `id` reads a function's meta (see
     /// [Metas](crate::check::attributes#metas)): the meta's type, before any await, and how the
     /// meta is awaited before its field is read. `None` for any other
@@ -951,6 +962,7 @@ impl Resolution {
             returned_blocks: HashSet::new(),
             discarded: HashSet::new(),
             tests: HashMap::new(),
+            decodes: HashMap::new(),
             meta_reads: HashMap::new(),
             metas: Vec::new(),
             lowered: ForLowering::default(),

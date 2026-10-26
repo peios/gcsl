@@ -242,6 +242,56 @@ Plain GCSL runs `tar` to unpack, or `unzip` for a zip archive. A build
 tool such as pekit unpacks archives itself and keeps the result, so each
 archive is unpacked once.
 
+## Reading JSON
+
+The `json` module's `decode(text)` reads a JSON document as a value of a
+type you declare. The type comes from where the call stands, as an empty
+list's element type does, so declare it there:
+
+```gcsl
+import json
+
+type Dep = {index: Int, name: String}
+type Unit = {crate: String, platform: String = "", dependencies: List<Dep>}
+type Graph = {units: List<Unit>, roots: List<Int>}
+
+# `{{` and `}}` are a string's literal braces.
+let text = "{{\"units\": [{{\"crate\": \"app\", \"platform\": null, \"dependencies\": []}}], \"roots\": [0]}}"
+let graph: Graph = json.decode(text)
+= graph.units[0].platform == ""
+```
+
+A document usually comes from a file, as `json.decode(f.read())`, and
+`json.decode(text): Graph` says the same as the `let` above. Each JSON
+value becomes a value of the matching kind:
+
+| JSON | GCSL |
+|---|---|
+| string | `String` |
+| number | `Int` if written as an integer that fits, `Float` otherwise |
+| `true`, `false` | `Bool` |
+| array | a list |
+| object | a record |
+
+A record takes each of its fields from the key of the same name. A missing
+key, or `null`, gives the field's default, and is an error for a field
+without one. Keys the type does not name are ignored, so a type need only
+describe the parts of a document you use. A union, such as
+`String | List<String>`, takes whichever member matches the value's kind,
+so no two of its members can be the same kind of JSON value. `Int` and
+`Float` are the exception: an integer goes to the `Int`.
+
+Some types cannot be decoded, and naming one is an error when the file is
+checked: `Duration`, `Size`, `File`, `Dir`, enums, secrets, and functions.
+Records with a rest-field, such as `{*: Int}`, cannot be decoded yet.
+
+`decode` is pure. Text that is not JSON fails at the call, with the line
+and column where parsing stopped. A document that does not match the type
+fails with the path to the value that does not fit, such as
+`units[3].dependencies[0].index` is a string, not an integer. The parser
+follows RFC 8259 strictly, and rejects an object that has the same key
+twice.
+
 ## Directories
 
 A `Dir` is a tree of files: an unpacked archive, a toolchain, or what a

@@ -502,6 +502,7 @@ impl Evaluator<'_> {
             } => self.make_future(function, captures, reads_caller),
             IrKind::Await { .. } => self.await_node(node),
             IrKind::As { .. } => self.narrow_node(node),
+            IrKind::JsonDecode { .. } => self.decode_node(node),
             IrKind::Arg { .. } => mistyped(node, "an argument outside a call"),
             IrKind::MakeList { items, spreads } => self.make_list(items, spreads),
             IrKind::Range(inclusive, operands) => self.range(operands, inclusive, node),
@@ -793,6 +794,7 @@ impl Evaluator<'_> {
             IrKind::Index { list, index, .. } => self.index_as((list, index), node, taken.owned),
             IrKind::Await { .. } => self.await_as(node, taken.owned),
             IrKind::As { .. } => self.narrow_as(node, taken.owned),
+            IrKind::JsonDecode { .. } => self.decode_as(node, taken.owned),
             _ => mistyped(
                 node,
                 "a node a typed walker evaluates itself, given to it shared",
@@ -1390,6 +1392,7 @@ pub(crate) mod calls;
 pub(crate) mod context;
 pub(crate) mod failure;
 pub(crate) mod futures;
+pub(crate) mod json;
 pub(crate) mod lists;
 pub(crate) mod loops;
 pub(crate) mod memoised;

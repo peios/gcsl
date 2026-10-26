@@ -303,7 +303,7 @@ use crate::check::{Attribute, Slot};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::{FieldName, Quoted};
-use crate::types::ValueTest;
+use crate::types::{Decode, ValueTest};
 use crate::value::{Layout, Quantity, ValueKind};
 use std::time::Duration;
 
@@ -580,6 +580,17 @@ impl TestId {
     }
 }
 
+/// Index of the plan of a call of `json.decode` in its [`Ir`]'s table.
+/// Resolve it with [`Ir::decode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DecodeId(u32);
+
+impl DecodeId {
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// The test an [`IrKind::Is`] or [`IrKind::As`] runs, as the checker
 /// planned it, with what an `as` says when its test fails.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -797,6 +808,17 @@ pub enum IrKind {
         /// The test.
         test: TestId,
         /// The kind of the narrowed type, and so of the node.
+        kind: ValueKind,
+    },
+    /// A call of `json.decode`: the JSON document `text`, a `String`,
+    /// decoded by a plan the checker made (see [JSON
+    /// decoding](crate::check::json#json-decoding)).
+    JsonDecode {
+        /// The document's text.
+        text: IrId,
+        /// The plan.
+        decode: DecodeId,
+        /// The kind of the type decoded as, and so of the node.
         kind: ValueKind,
     },
     /// `Bool` conjunction, evaluating the right operand only if the left is
@@ -1341,6 +1363,7 @@ impl IrKind {
             | IrKind::Show(child)
             | IrKind::Is { value: child, .. }
             | IrKind::As { value: child, .. }
+            | IrKind::JsonDecode { text: child, .. }
             | IrKind::Await { value: child, .. }
             | IrKind::Catch { body: child, .. }
             | IrKind::ContextBind { value: child, .. }
@@ -1507,6 +1530,7 @@ impl IrKind {
             }
             | IrKind::Await { kind, .. }
             | IrKind::As { kind, .. }
+            | IrKind::JsonDecode { kind, .. }
             | IrKind::Catch { kind, .. }
             | IrKind::ContextRead { kind, .. }
             | IrKind::SecretValue { kind, .. }
@@ -1597,6 +1621,7 @@ impl IrKind {
             | IrKind::Catch { .. }
             | IrKind::Is { .. }
             | IrKind::As { .. }
+            | IrKind::JsonDecode { .. }
             | IrKind::FilePath(_)
             | IrKind::Meta(_) => None,
         }
@@ -1621,6 +1646,7 @@ impl IrKind {
             IrKind::ValueSame(_) | IrKind::ValueNotSame(_) => "value-same",
             IrKind::Is { .. } => "is",
             IrKind::As { .. } => "as",
+            IrKind::JsonDecode { .. } => "json-decode",
             IrKind::MakeList { .. } => "make-list",
             IrKind::Spread(_) => "spread",
             IrKind::Index { .. } => "index",
@@ -1805,6 +1831,7 @@ impl IrNode {
             | IrKind::Await { .. }
             | IrKind::Is { .. }
             | IrKind::As { .. }
+            | IrKind::JsonDecode { .. }
             | IrKind::FilePath(_)
             | IrKind::Meta(_) => return None,
         };
@@ -1898,6 +1925,8 @@ pub struct Ir {
     lazy_unions: Vec<Option<Box<[LazyShapeId]>>>,
     /// The test of every `is` and `as`, indexed by [`TestId`].
     tests: Vec<TestCode>,
+    /// The plan of every call of `json.decode`, indexed by [`DecodeId`].
+    decodes: Vec<Decode>,
     /// The text of the name of every [`IrKind::UpdateField`], and of every
     /// field an [`IrKind::Update`]'s path steps to, which may add it to a
     /// record's layout at runtime.
@@ -2127,6 +2156,13 @@ impl Ir {
     #[must_use]
     pub fn test(&self, id: TestId) -> Option<&TestCode> {
         self.tests.get(id.index())
+    }
+
+    /// The plan of a call of `json.decode`, `id`, or `None` for an id this
+    /// IR does not have.
+    #[must_use]
+    pub fn decode(&self, id: DecodeId) -> Option<&Decode> {
+        self.decodes.get(id.index())
     }
 
     /// The text of `name`, if it is the name of an [`IrKind::UpdateField`],
@@ -2438,6 +2474,7 @@ pub(crate) struct IrBuilder {
     lazy_lists: Vec<Option<LazyField>>,
     lazy_unions: Vec<Option<Box<[LazyShapeId]>>>,
     tests: Vec<TestCode>,
+    decodes: Vec<Decode>,
     name_texts: HashMap<Name, Box<str>>,
     update_steps: Vec<UpdateStep>,
     update_paths: Vec<StepRange>,
@@ -2456,6 +2493,7 @@ impl IrBuilder {
             lazy_lists: Vec::new(),
             lazy_unions: Vec::new(),
             tests: Vec::new(),
+            decodes: Vec::new(),
             name_texts: HashMap::new(),
             update_steps: Vec::new(),
             update_paths: Vec::new(),
@@ -2580,6 +2618,14 @@ impl IrBuilder {
     pub(crate) fn push_test(&mut self, test: TestCode) -> TestId {
         let id = TestId(u32::try_from(self.tests.len()).unwrap_or(u32::MAX));
         self.tests.push(test);
+        id
+    }
+
+    /// Adds the plan of a call of `json.decode` and returns its id. There
+    /// is one per such call, so ids never saturate either.
+    pub(crate) fn push_decode(&mut self, decode: Decode) -> DecodeId {
+        let id = DecodeId(u32::try_from(self.decodes.len()).unwrap_or(u32::MAX));
+        self.decodes.push(decode);
         id
     }
 
@@ -2748,6 +2794,7 @@ impl IrBuilder {
             lazy_lists: self.lazy_lists,
             lazy_unions: self.lazy_unions,
             tests: self.tests,
+            decodes: self.decodes,
             name_texts: self.name_texts,
             update_steps: self.update_steps,
             update_paths: self.update_paths,

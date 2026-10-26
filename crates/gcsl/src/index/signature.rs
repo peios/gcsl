@@ -193,6 +193,7 @@ impl Index {
         let mut shown = match self.types.kind(ty) {
             TyKind::Builtin(Builtin::Len) => generic("list", "List<T>", "Int"),
             TyKind::Builtin(Builtin::Show) => generic("value", "T", "String"),
+            TyKind::Builtin(Builtin::JsonDecode) => generic("text", "String", "T"),
             _ => {
                 let sig = self.types.fn_sig(self.types.strip(ty))?;
                 let written = self.written_params(symbol);

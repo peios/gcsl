@@ -2,7 +2,8 @@
 //! call.
 
 use crate::ast::{ArgKind, ArgRange, ExprId, ExprKind};
-use crate::check::{Builtin, ParamDefault};
+use crate::check::{Builtin, Constant, ParamDefault};
+use crate::types::Decode;
 use crate::diagnostic::InternalError;
 use crate::ir::{ArgValue, IrId, IrKind, IrRange};
 use crate::source::Span;
@@ -11,20 +12,22 @@ use crate::value::ValueKind;
 use super::{Lowerer, read};
 
 impl Lowerer<'_> {
-    /// TEMPORARY (alias rule): lowers the call spanning `span` of the built-in function `builtin`,
-    /// whose typing is special, with the arguments `args`, of kind `kind`, to the built-in's own
-    /// node: `len` to a `ListLen` of its list, and `show` to a `Show` of its value, of any kind,
-    /// awaited as the checker marked it. (With polymorphic types for them, see the [inference
+    /// TEMPORARY (alias rule): lowers the call `id` of the built-in function `builtin`, whose
+    /// typing is special, with the arguments `args`, of kind `kind`, to the built-in's own node:
+    /// `len` to a `ListLen` of its list, `show` to a `Show` of its value, of any kind, awaited as
+    /// the checker marked it, and `json.decode` to a `JsonDecode` of its text, with the plan the
+    /// checker made for it (see [JSON decoding](crate::check::json#json-decoding)). (With polymorphic types for them, see the [inference
     /// limits](https://learn.peios.org/gcsl/language/inference-limits/), a call of one is an
     /// ordinary call,
     /// or this stays as a specialisation of a known callee.)
     pub(super) fn lower_builtin(
         &mut self,
+        id: ExprId,
         builtin: Builtin,
         args: ArgRange,
         kind: ValueKind,
-        span: Span,
     ) -> Result<IrKind, InternalError> {
+        let span = self.ast.get(id).span;
         match builtin {
             Builtin::Len if kind == ValueKind::Int => {
                 let list = self.builtin_argument(args, 0, span)?;
@@ -42,6 +45,20 @@ impl Lowerer<'_> {
                 message: "a call of `show` typed as something other than a String",
                 span,
             }),
+            Builtin::JsonDecode => {
+                let Some(plan) = self.resolution.decode_of(id) else {
+                    return Err(InternalError {
+                        message: "a call of `json.decode` has no plan",
+                        span,
+                    });
+                };
+                let plan = plan.clone();
+                self.name_default_fields(&plan);
+                let decode = self.builder.push_decode(plan);
+                let text = self.builtin_argument(args, 0, span)?;
+                let text = self.lower_operand(text, ValueKind::String)?;
+                Ok(IrKind::JsonDecode { text, decode, kind })
+            }
             // An ordinary built-in is called as any function value is.
             Builtin::Int
             | Builtin::Float
@@ -99,6 +116,58 @@ impl Lowerer<'_> {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),
+        }
+    }
+
+    /// Records the text of the name of every field of a record among the
+    /// defaults `plan` gives, for the evaluator to make them (see [JSON
+    /// decoding](crate::check::json#json-decoding)).
+    ///
+    /// Recurses once per level of the plan and of its defaults.
+    fn name_default_fields(&mut self, plan: &Decode) {
+        match plan {
+            Decode::List(element) => self.name_default_fields(element),
+            Decode::Any(plans) => {
+                for each in plans {
+                    self.name_default_fields(each);
+                }
+            }
+            Decode::Record(fields) => {
+                for field in fields {
+                    if let Some(default) = &field.default {
+                        self.name_constant_fields(default);
+                    }
+                    self.name_default_fields(&field.plan);
+                }
+            }
+            Decode::Str | Decode::Int | Decode::Float | Decode::Bool => {}
+        }
+    }
+
+    /// Records the text of the name of every field of a record in
+    /// `constant`.
+    ///
+    /// Recurses once per level of list and record nesting.
+    fn name_constant_fields(&mut self, constant: &Constant) {
+        match constant {
+            Constant::List(elements) => {
+                for each in elements {
+                    self.name_constant_fields(each);
+                }
+            }
+            Constant::Record(fields) => {
+                for (name, value) in fields {
+                    self.builder
+                        .add_name_text(*name, self.ast.names().get(*name));
+                    self.name_constant_fields(value);
+                }
+            }
+            Constant::Int(_)
+            | Constant::Quantity(..)
+            | Constant::Float(_)
+            | Constant::Bool(_)
+            | Constant::Str(_)
+            | Constant::Empty => {}
         }
     }
 

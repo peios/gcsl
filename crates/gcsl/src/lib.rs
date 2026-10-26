@@ -285,9 +285,10 @@ pub struct Outcome {
 /// standard library"), named `<stdlib>/STEM.gcsl`
 /// ([`workspace::check_with_standard`]); a session loads them all
 /// ([`workspace::standard_sources`]).
-pub const STANDARD: [(&str, &str); 7] = [
+pub const STANDARD: [(&str, &str); 8] = [
     ("archive", include_str!("../../../stdlib/archive.gcsl")),
     ("fs", include_str!("../../../stdlib/fs.gcsl")),
+    ("json", include_str!("../../../stdlib/json.gcsl")),
     ("keychain", include_str!("../../../stdlib/keychain.gcsl")),
     ("packaging", include_str!("../../../stdlib/packaging.gcsl")),
     ("path", include_str!("../../../stdlib/path.gcsl")),

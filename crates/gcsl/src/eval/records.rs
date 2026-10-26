@@ -94,6 +94,7 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
+            | IrKind::JsonDecode { .. }
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::Assert { .. }

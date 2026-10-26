@@ -243,6 +243,9 @@ impl Checker<'_> {
             (Typing::Special, &[value]) if builtin == Builtin::Show && !erroneous => {
                 self.check_show(callee, value)
             }
+            (Typing::Special, &[text]) if builtin == Builtin::JsonDecode && !erroneous => {
+                self.check_json_decode(id, callee, text)
+            }
             _ => {
                 // Every argument is checked, whatever goes wrong.
                 for &arg in &bound {
@@ -497,10 +500,10 @@ impl Checker<'_> {
         }
         let name = builtin.name();
         // What the built-in's type is for, which no type can write yet.
-        let any = if builtin == Builtin::Show {
-            "value"
-        } else {
-            "list"
+        let any = match builtin {
+            Builtin::Show => "value",
+            Builtin::JsonDecode => "result",
+            _ => "list",
         };
         self.errors.push(
             Diagnostic::error(

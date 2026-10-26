@@ -1047,7 +1047,10 @@ impl Checker<'_> {
             if let Some(label) = label {
                 self.enter_block(body, label, returns);
             }
-            let mut found = self.check_body(items, expecting);
+            // A call of `json.decode` the body results in decodes as the
+            // return type.
+            let mut found =
+                self.expecting_decode(body, ret, |checker| checker.check_body(items, expecting));
             if label.is_some() {
                 found = self.leave_block(body, found, returns);
             }
