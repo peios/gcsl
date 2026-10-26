@@ -1367,3 +1367,25 @@ fn a_toolchain_is_the_first_registered_that_fits_the_platforms() {
         error.message
     );
 }
+
+#[test]
+fn a_toolchain_built_with_another_may_be_registered_before_it() {
+    // A tool's toolchain whose definition asks for a C toolchain, and so
+    // runs a `get` of it, registered first: a `get` of the C toolchain
+    // never runs it, so neither waits on itself.
+    let text = format!(
+        "{TOOLCHAINS}\
+         enum Toolchain::Tool<{{tool: File}}>\n\
+         def Toolchain::Tool built() {{\n\
+         \x20   host_platform = {{}}\n\
+         \x20   platform = {{}}\n\
+         \x20   provides = {{tool = file(\"{{cc()}}-made-tool\")}}\n\
+         }}\n\
+         let registered = [Toolchain::Tool built, Toolchain::C x86]\n\
+         let on = {{arch = \"x86_64\"; os = \"linux\"}}\n\
+         = with {{ toolchains = registered; host_platform = on; platform = on }} {{\n\
+         \x20   [toolchain.get(Toolchain::Tool).tool.path, cc()]\n\
+         }}"
+    );
+    assert_eq!(lone(&text).unwrap(), "[\"/x/cc-made-tool\", \"/x/cc\"]");
+}

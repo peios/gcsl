@@ -18,8 +18,12 @@
 #   and what it `provides`.
 # - `context toolchains`: the registered toolchains, each its definition,
 #   `Toolchain::C gcc`, in order, the first that matches winning; plain
-#   GCSL's are the host's own, `system_c`. A definition is run once, when
-#   `get` first comes to it: it is memoised.
+#   GCSL's are the host's own, `system_c`. A registered toolchain's kind is
+#   known before its definition runs, and its definition is run once, when
+#   a `get` of its kind first comes to it: it is memoised. So a toolchain
+#   built with another, a tool compiled with `Toolchain::Rust` say, is
+#   never run by a `get` of that other's kind, and can be registered in any
+#   order.
 # - `get(kind)`: the layout of the first registered toolchain of the kind
 #   `kind`, such as `Toolchain::C`, whose platforms match `^host_platform`
 #   and `^platform`; it fails, naming the kind and both platforms, if none
@@ -38,15 +42,20 @@ type ToolchainDef<T> = {host_platform: Partial<Platform>, platform: Partial<Plat
 
 type Registered = {host_platform: Partial<Platform>, platform: Partial<Platform>, provides: Toolchain}
 
+# A registered toolchain: the name of its kind, known before its definition
+# runs, and its definition, run when a `get` of its kind comes to it.
+type Entry = {kind_name: String, made: fn() ->> Registered}
+
 #[def_type]
-def Toolchain<T>(name: String, kind: Variant<Toolchain, T>, f: fn() -> ToolchainDef<T>) ->> Registered {
-    let made = f()
-    host_platform = made.host_platform
-    platform = made.platform
-    provides = kind(made.provides)
+def Toolchain<T>(name: String, kind: Variant<Toolchain, T>, f: fn() -> ToolchainDef<T>) ->> Entry {
+    kind_name = show(kind)
+    made = fn() ->> Registered {
+        let made = f()
+        = {host_platform = made.host_platform; platform = made.platform; provides = kind(made.provides)}
+    }
 }
 
-context toolchains: List<fn() ->> Registered> = [Toolchain::C system_c]
+context toolchains: List<fn() ->> Entry> = [Toolchain::C system_c]
 
 # The host's own C toolchain, found on `PATH`, for wherever GCSL runs: it
 # runs on the host and builds for it, never for another platform.
@@ -65,8 +74,15 @@ def Toolchain::C system_c() {
 
 #[track_caller]
 def get<T>(kind: Variant<Toolchain, T>, ^toolchains, ^host_platform, ^platform) -> T {
-    for entry in toolchains {
-        let registered = entry()
+    let wanted = show(kind)
+    for each in toolchains {
+        # Another kind's definition is never run, so it may be built with
+        # this kind's toolchain.
+        let entry = each()
+        if entry.kind_name != wanted {
+            continue
+        }
+        let registered = entry.made()
         let provides: Toolchain = registered.provides
         let runs_here = registered.host_platform.matches(host_platform)
         let builds_for = registered.platform.matches(platform)

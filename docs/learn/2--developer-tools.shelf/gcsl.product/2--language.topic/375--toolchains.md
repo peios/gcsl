@@ -74,5 +74,9 @@ registered for that platform. Set it with `with` to choose others:
 let app = build_app() with { toolchains = [Toolchain::C gcc_x86_64] }
 ```
 
-A registered toolchain's body runs once, when `get` first reaches it.
-When nothing fits, `get` fails, naming the kind and both platforms.
+A registered toolchain's body runs once, when a `get` of its kind first
+reaches it. A `get` of another kind passes over it without running it,
+so a toolchain built with another can be registered in any order: a
+tool compiled with the Rust toolchain doesn't make every `get` of the
+Rust toolchain wait on itself. When nothing fits, `get` fails, naming
+the kind and both platforms.
