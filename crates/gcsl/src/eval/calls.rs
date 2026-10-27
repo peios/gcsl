@@ -343,6 +343,10 @@ use super::sandbox::{sandbox_entry, sandbox_exec};
 use super::system::{exec, file_system, write_file};
 use super::text::{join, sort_versions, split, string_list, strip_prefix, strip_suffix, trim};
 
+/// The arguments of a call of a built-in, each with its span, by its
+/// parameter's index.
+pub(super) type BuiltinArguments = [Option<(Value, Span)>; Builtin::MAX_PARAMS];
+
 impl Evaluator<'_> {
     /// Evaluates the `Call` `node` of `callee` with the arguments `args`,
     /// at depth `depth` in this frame's body (see the module documentation),
@@ -700,23 +704,44 @@ impl Evaluator<'_> {
         node: &IrNode,
     ) -> Flow<Value> {
         // Each parameter's argument, with its span, by the parameter's index.
-        let mut arguments: [Option<(Value, Span)>; Builtin::MAX_PARAMS] = Default::default();
+        let mut arguments: BuiltinArguments = Default::default();
         for &arg in self.ir.items(args) {
-            let arg = self.ir.get(arg);
-            let IrKind::Arg {
-                param,
-                value: ArgValue::Node(value),
-            } = arg.kind
-            else {
-                return mistyped(arg, "a built-in's argument is not a node's value");
-            };
+            let (param, value) = self.builtin_argument(arg)?;
             let span = self.ir.get(value).span;
             let value = self.value(value)?;
             let Some(entry) = arguments.get_mut(param as usize) else {
-                return mistyped(arg, "an argument for a parameter the built-in lacks");
+                return mistyped(
+                    self.ir.get(arg),
+                    "an argument for a parameter the built-in lacks",
+                );
             };
             *entry = Some((value, span));
         }
+        self.apply_called(builtin, arguments, node)
+    }
+
+    /// The parameter and the value node of `arg`, an argument of a call of
+    /// a built-in.
+    pub(super) fn builtin_argument(&self, arg: IrId) -> Flow<(u32, IrId)> {
+        let node = self.ir.get(arg);
+        match node.kind {
+            IrKind::Arg {
+                param,
+                value: ArgValue::Node(value),
+            } => Ok((param, value)),
+            _ => mistyped(node, "a built-in's argument is not a node's value"),
+        }
+    }
+
+    /// The rest of [`Evaluator::call_builtin`], once the arguments are
+    /// evaluated: the call `node` of `builtin` with `arguments`, or, in
+    /// graph mode, the effect's node.
+    pub(super) fn apply_called(
+        &mut self,
+        builtin: Builtin,
+        mut arguments: BuiltinArguments,
+        node: &IrNode,
+    ) -> Flow<Value> {
         // A program's relative `cwd` is resolved here, where the code that
         // wrote it is running, before it can become a node, which runs apart
         // from it (see [Where a path is](crate::eval::files#where-a-path-is)).

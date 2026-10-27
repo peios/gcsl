@@ -47,17 +47,27 @@
 //! on its way out, a call's frame truncating the value stack and reporting
 //! the error as the call does.
 
+mod builtins;
+mod control;
+mod data;
+mod futures;
 mod loops;
 
 use std::rc::Rc;
 
 use crate::diagnostic::Mark as ErrorMark;
 use crate::ir::{ArgValue, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, Operands};
-use crate::value::{Caller, Closure, Value};
+use crate::names::Name;
+use crate::value::{Caller, Closure, ContextFrame, Value};
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
+use builtins::BuiltinCall;
+use control::{DefaultRun, WithState};
+use data::OperandsState;
+use futures::{AwaitState, FutureRun};
 use loops::{ForState, LoopAt, LoopState};
 
+use super::kinds::into_callee;
 use super::memo::{Mark, MemoBegin, MemoTables};
 use super::{
     Callee, Evaluator, Flow, GUARD_LEVELS, Shared, Unwind, mistyped, nested_too_deeply,
@@ -71,8 +81,12 @@ pub(super) struct Activation {
     ir: Rc<Ir>,
     /// Where its frame starts on the value stack.
     base: usize,
-    /// The closure running; `None` at the top level.
+    /// The closure running; `None` at the top level and in a `lazy`'s
+    /// body.
     callee: Option<Rc<Closure>>,
+    /// The captured values of the `lazy` whose body is running, taken out
+    /// of its future while it runs; `None` for any other frame.
+    owned: Option<Box<[Value]>>,
     /// Its caller, its helper flag and the caller's origin.
     caller: Caller,
     /// The levels of nesting the enclosing frames have consumed.
@@ -86,6 +100,7 @@ impl Activation {
             ir: Rc::clone(ir),
             base: 0,
             callee: None,
+            owned: None,
             caller,
             levels: 0,
         }
@@ -134,6 +149,29 @@ enum Frame {
     /// The body of a catch for the `return`s of this number, evaluated
     /// above.
     Catch(u32),
+    /// The value of an await, evaluated above.
+    Await(AwaitState),
+    /// The body of a `lazy`, run above for an await.
+    Future(Box<FutureRun>),
+    /// An argument of a call of a built-in, evaluated above.
+    BuiltinArgument(Box<BuiltinCall>),
+    /// The callee of the call node, evaluated above.
+    Callee(IrId),
+    /// An operand of a node the machine applies, evaluated above.
+    Operands(Box<OperandsState>),
+    /// The left operand of an `and`, if `false`, or an `or`, evaluated
+    /// above.
+    Logic(Operands, bool),
+    /// A binding of a `with`, of the key, evaluated above.
+    WithBinding(Box<WithState>, Name),
+    /// The body of a `with`, evaluated above, and the context to restore.
+    WithBody(Option<Rc<ContextFrame>>),
+    /// The body of a `recover` with this fallback, evaluated above.
+    Recover(IrId),
+    /// The fallback of a `recover`, evaluated above.
+    Fallback,
+    /// The default of a context read, run above as a call.
+    Default(Box<DefaultRun>),
 }
 
 /// A call of a closure that the machine runs.
@@ -266,10 +304,11 @@ impl<'r> Machine<'r> {
             ir: &activation.ir,
             stack: self.stack,
             base: activation.base,
-            captures: activation
-                .callee
-                .as_ref()
-                .map_or(&[][..], |closure| &closure.captures),
+            captures: match (&activation.owned, &activation.callee) {
+                (Some(owned), _) => owned,
+                (None, Some(closure)) => &closure.captures,
+                (None, None) => &[],
+            },
             callee: activation.callee.as_ref(),
             memo: self.memo,
             shared: self.shared,
@@ -332,6 +371,18 @@ impl<'r> Machine<'r> {
             IrKind::Catch {
                 body, id: catch, ..
             } => self.catch(body, catch.number()),
+            IrKind::Await { value, .. } => self.await_node(id, value),
+            IrKind::And(operands) => self.logic(operands, false),
+            IrKind::Or(operands) => self.logic(operands, true),
+            IrKind::With { parts, .. } => self.with(id, parts),
+            IrKind::Recover { body, fallback, .. } => self.recover(body, fallback),
+            IrKind::ContextRead {
+                key,
+                default,
+                depth,
+                ..
+            } => self.context_read(id, key, (default, depth)),
+            kind if Self::applies(kind) => self.operands(id),
             _ => give(self.walker(|walker| walker.value(id))),
         }
     }
@@ -376,6 +427,17 @@ impl<'r> Machine<'r> {
             Frame::Loop(state, at) => self.loop_resume(state, at, result),
             Frame::Leave(id) => self.left(id, result),
             Frame::Catch(catch) => Next::Give(loops::caught_return(catch, result)),
+            Frame::Await(state) => self.awaited(state, result),
+            Frame::Future(run) => self.future_done(*run, result),
+            Frame::BuiltinArgument(call) => self.builtin_argument(call, result),
+            Frame::Callee(id) => self.callee_done(id, result),
+            Frame::Operands(state) => self.operand(state, result),
+            Frame::Logic(operands, decisive) => self.logic_lhs(operands, decisive, result),
+            Frame::WithBinding(state, key) => self.with_binding(state, key, result),
+            Frame::WithBody(outer) => self.with_done(outer, result),
+            Frame::Recover(fallback) => self.recovered(fallback, result),
+            Frame::Fallback => self.fallback_done(result),
+            Frame::Default(run) => self.default_done(&run, result),
         }
     }
 
@@ -485,11 +547,33 @@ impl<'r> Machine<'r> {
     /// [`Evaluator::call_closure`] runs them; any other callee's call is a
     /// walker's ([`Evaluator::call_resolved`]).
     fn call(&mut self, id: IrId, (callee, args, depth): (IrId, IrRange, u16)) -> Next {
-        let callee = match self.walker(|walker| walker.function(callee)) {
-            Ok(callee) => callee,
-            Err(unwind) => return fail(unwind),
+        if !self.running().ir.is_simple(callee) {
+            self.frames.push(Frame::Callee(id));
+            return Next::Eval(callee);
+        }
+        match self.walker(|walker| walker.function(callee)) {
+            Ok(callee) => self.call_resolved(id, callee, (args, depth)),
+            Err(unwind) => fail(unwind),
+        }
+    }
+
+    /// Takes up the call node `id` with `result`, the value of its callee.
+    fn callee_done(&mut self, id: IrId, result: Outcome) -> Next {
+        let IrKind::Call { args, depth, .. } = self.running().ir.get(id).kind else {
+            return self.mistyped(id, "a callee of a node that is not a call");
         };
+        match result.map(into_callee) {
+            Ok(Some(callee)) => self.call_resolved(id, callee, (args, depth)),
+            Ok(None) => self.mistyped(id, "a node of another kind where a function was expected"),
+            Err(unwind) => Next::Give(Err(unwind)),
+        }
+    }
+
+    /// Goes on with the call node `id` of `callee`, evaluated already, with
+    /// the arguments `args`, at depth `depth`.
+    fn call_resolved(&mut self, id: IrId, callee: Callee, (args, depth): (IrRange, u16)) -> Next {
         let closure = match callee {
+            Callee::Builtin(builtin) => return self.builtin_call(id, builtin, args),
             Callee::Closure(closure) if !self.deferred(&closure) => closure,
             callee => {
                 return give(self.walker(|walker| {
@@ -702,6 +786,7 @@ impl<'r> Machine<'r> {
             ir: Rc::clone(&state.closure.code),
             base: state.base,
             callee: Some(Rc::clone(&state.closure)),
+            owned: None,
             caller,
             levels,
         });
