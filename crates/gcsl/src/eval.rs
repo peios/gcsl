@@ -217,18 +217,9 @@ pub(crate) fn eval_rooted(
     let mut shared = extras.shared();
     shared.graph = graph;
     shared.context.replace(context);
-    let result = Evaluator {
-        ir,
-        stack,
-        base: 0,
-        captures: &[],
-        callee: None,
-        memo,
-        shared: &shared,
-        caller,
-        levels: 0,
-    }
-    .value(root);
+    let result =
+        machine::Machine::new((stack, memo), &shared, machine::Activation::top(ir, caller))
+            .run(root);
     stack.truncate(frame_size);
     // The checker lets no `break` or `continue` out of the top level's
     // loops, so a stop arriving here is a bug.
@@ -1415,6 +1406,7 @@ pub(crate) mod futures;
 pub(crate) mod json;
 pub(crate) mod lists;
 pub(crate) mod loops;
+pub(crate) mod machine;
 pub(crate) mod memoised;
 pub(crate) mod metas;
 pub(crate) mod narrowing;

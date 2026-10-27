@@ -1,0 +1,609 @@
+//! The machine: evaluation whose place is held as data, not on Rust's
+//! call stack, so that it can stop where it waits and carry on later
+//! (pekit2's `design/suspension.md`).
+//!
+//! # Suspension
+//!
+//! The recursive walkers (see the module documentation of
+//! [`crate::eval`]) keep where evaluation is in Rust's own call stack, one
+//! Rust frame per node being evaluated. That stack cannot be set aside and
+//! taken up again, so a unit in graph mode that waits for a result can only
+//! give up and run again from its start. The machine keeps the same place
+//! as data instead: a stack of [`Frame`]s, each saying what to do with the
+//! value of the node evaluated above it, and a stack of [`Activation`]s,
+//! the calls running, each the code, the frame's base on the value stack,
+//! the closure and the caller a walker would hold.
+//!
+//! The machine evaluates control nodes, those that a simple subtree cannot
+//! hold ([`crate::ir::Ir::is_simple`]), with frames of its own. A simple
+//! node, which can wait for nothing, it hands to the walkers, which
+//! evaluate it by recursion as they always have, through an [`Evaluator`]
+//! made for the activation running ([`Machine::walker`]); so is, for now,
+//! every control node the machine does not evaluate itself, its
+//! subtree with it. Whatever a walker changes of its activation, the
+//! frame's caller, is written back when it returns.
+//!
+//! What the machine evaluates itself, so far:
+//!
+//! - a block, its items in order and then its result;
+//! - an `if`, its condition and then the branch it selects;
+//! - a store, its value and then the write to its slot;
+//! - `Int` arithmetic, `+`, `-`, `*`, `//` and `%`, its operands in order
+//!   and then the operator;
+//! - a call of a closure of a plain function, one neither memoised,
+//!   deferred, retried nor timed, in a run that is not profiled: its
+//!   callee, its arguments in order, each in the calling frame, and then
+//!   its body, in a frame of its own, exactly as
+//!   [`Evaluator::run_closure`] runs it. Any other call is handed to the
+//!   walkers once its callee is evaluated ([`Evaluator::call_resolved`]).
+//!
+//! Every error, stop and cleanup is the walkers': a frame that an
+//! unwinding passes through does what the Rust function it stands for does
+//! on its way out, a call's frame truncating the value stack and reporting
+//! the error as the call does.
+
+use std::rc::Rc;
+
+use crate::ir::{FnKind, Ir, IrId, IrKind, IrNode, IrRange, Operands};
+use crate::value::{Caller, Closure, Value};
+use crate::{CALL_LEVELS, MAX_DEPTH};
+
+use super::memo::MemoTables;
+use super::{Callee, Evaluator, Flow, Shared, Unwind, mistyped, nested_too_deeply};
+
+/// A call running in the machine: what an [`Evaluator`] of its frame
+/// holds, owned.
+pub(super) struct Activation {
+    /// The code running.
+    ir: Rc<Ir>,
+    /// Where its frame starts on the value stack.
+    base: usize,
+    /// The closure running; `None` at the top level.
+    callee: Option<Rc<Closure>>,
+    /// Its caller, its helper flag and the caller's origin.
+    caller: Caller,
+    /// The levels of nesting the enclosing frames have consumed.
+    levels: usize,
+}
+
+impl Activation {
+    /// The top level's activation, of `ir`, with the caller `caller`.
+    pub(super) fn top(ir: &Rc<Ir>, caller: Caller) -> Self {
+        Self {
+            ir: Rc::clone(ir),
+            base: 0,
+            callee: None,
+            caller,
+            levels: 0,
+        }
+    }
+}
+
+/// What to do with the value of the node evaluated above a frame.
+enum Frame {
+    /// The items of a block from `next` on, and then its result.
+    Items {
+        items: IrRange,
+        next: u32,
+        result: IrId,
+    },
+    /// The branches of the `if` `node`, its condition evaluated above.
+    Branch { node: IrId, then: IrId, else_: IrId },
+    /// The write of the value evaluated above to `slot`, for the `Store`
+    /// `node`.
+    Store {
+        slot: crate::check::Slot,
+        node: IrId,
+    },
+    /// An `Int` operator `node` of `operands`, the left one evaluated
+    /// above, or, with `lhs`, the right one.
+    Arithmetic {
+        node: IrId,
+        operands: Operands,
+        lhs: Option<i64>,
+    },
+    /// A call's arguments, from `next` on, the one before evaluated above.
+    Arguments(Box<CallState>),
+    /// A call's body, evaluated above in an activation of its own.
+    Body(Box<CallState>),
+}
+
+/// A call of a closure that the machine runs.
+struct CallState {
+    /// The closure called.
+    closure: Rc<Closure>,
+    /// The call node.
+    node: IrId,
+    /// Its arguments.
+    args: IrRange,
+    /// The argument evaluated next.
+    next: u32,
+    /// Its depth in the calling frame's body.
+    depth: u16,
+    /// Where the callee's frame starts on the value stack.
+    base: usize,
+    /// The levels of nesting at the callee's body.
+    entering: usize,
+    /// Whether the call goes from the workspace's own code into foreign
+    /// code, and so is on the run's list of sites.
+    crossing: bool,
+}
+
+/// What the machine does next.
+enum Next {
+    /// Evaluate a node in the activation running.
+    Eval(IrId),
+    /// Give the frame on top what the node above it came to.
+    Give(Flow<Value>),
+}
+
+/// A run of the machine over one value stack.
+pub(super) struct Machine<'r> {
+    /// The value stack, holding every frame.
+    stack: &'r mut Vec<Value>,
+    /// The memo tables of the execution context.
+    memo: &'r mut MemoTables,
+    /// What every frame of the run shares.
+    shared: &'r Shared<'r>,
+    /// The calls running, innermost last.
+    activations: Vec<Activation>,
+    /// The frames, innermost last.
+    frames: Vec<Frame>,
+}
+
+impl<'r> Machine<'r> {
+    /// A machine over `stack` and `memo`, sharing `shared`, running
+    /// `activation`.
+    pub(super) fn new(
+        (stack, memo): (&'r mut Vec<Value>, &'r mut MemoTables),
+        shared: &'r Shared<'r>,
+        activation: Activation,
+    ) -> Self {
+        Self {
+            stack,
+            memo,
+            shared,
+            activations: vec![activation],
+            frames: Vec::new(),
+        }
+    }
+
+    /// Evaluates `root` in the activation the machine was made with.
+    pub(super) fn run(&mut self, root: IrId) -> Flow<Value> {
+        let mut next = Next::Eval(root);
+        loop {
+            next = match next {
+                Next::Eval(id) => self.eval(id),
+                Next::Give(result) => match self.frames.pop() {
+                    Some(frame) => self.resume(frame, result),
+                    None => return result,
+                },
+            };
+        }
+    }
+
+    /// The activation running.
+    fn running(&self) -> &Activation {
+        // The machine is made with one, and only a call's body frame, which
+        // pops its own, ever pops one.
+        let at = self.activations.len().saturating_sub(1);
+        &self.activations[at]
+    }
+
+    /// Runs `walk` on a walker of the activation running, writing back
+    /// what it changes of the activation: its caller.
+    fn walker<T>(&mut self, walk: impl FnOnce(&mut Evaluator<'_>) -> T) -> T {
+        let at = self.activations.len().saturating_sub(1);
+        let activation = &mut self.activations[at];
+        let mut evaluator = Evaluator {
+            ir: &activation.ir,
+            stack: self.stack,
+            base: activation.base,
+            captures: activation
+                .callee
+                .as_ref()
+                .map_or(&[][..], |closure| &closure.captures),
+            callee: activation.callee.as_ref(),
+            memo: self.memo,
+            shared: self.shared,
+            caller: activation.caller,
+            levels: activation.levels,
+        };
+        let outcome = walk(&mut evaluator);
+        let caller = evaluator.caller;
+        activation.caller = caller;
+        outcome
+    }
+
+    /// Evaluates node `id` of the activation running: a simple node, or one
+    /// the machine does not evaluate itself, by a walker, and any other by
+    /// pushing the frame for it.
+    fn eval(&mut self, id: IrId) -> Next {
+        let ir = &self.running().ir;
+        let kind = ir.get(id).kind;
+        if ir.is_simple(id) {
+            return Next::Give(self.walker(|walker| walker.value(id)));
+        }
+        match kind {
+            IrKind::Block { items, result } => self.items(items, 0, result),
+            IrKind::If { cond, then, else_ } => self.branch(id, cond, (then, else_)),
+            IrKind::Store(slot, value) => {
+                self.frames.push(Frame::Store { slot, node: id });
+                Next::Eval(value)
+            }
+            IrKind::IntAdd(operands)
+            | IrKind::IntSub(operands)
+            | IrKind::IntMul(operands)
+            | IrKind::IntFloorDiv(operands)
+            | IrKind::IntRem(operands) => {
+                self.frames.push(Frame::Arithmetic {
+                    node: id,
+                    operands,
+                    lhs: None,
+                });
+                Next::Eval(operands.lhs)
+            }
+            IrKind::Call {
+                callee,
+                args,
+                depth,
+                ..
+            } => self.call(id, (callee, args, depth)),
+            _ => Next::Give(self.walker(|walker| walker.value(id))),
+        }
+    }
+
+    /// Takes up `frame` with `result`, what the node evaluated above it
+    /// came to.
+    fn resume(&mut self, frame: Frame, result: Flow<Value>) -> Next {
+        match frame {
+            Frame::Items {
+                items,
+                next,
+                result: last,
+            } => match result {
+                Ok(_) => self.items(items, next, last),
+                Err(unwind) => Next::Give(Err(unwind)),
+            },
+            Frame::Branch { node, then, else_ } => match result {
+                Ok(Value::Bool(cond)) => Next::Eval(if cond { then } else { else_ }),
+                Ok(_) => self.mistyped(node, "a condition that is not a Bool"),
+                Err(unwind) => Next::Give(Err(unwind)),
+            },
+            Frame::Store { slot, node } => match result {
+                Ok(value) => self.store(slot, value, node),
+                Err(unwind) => Next::Give(Err(unwind)),
+            },
+            Frame::Arithmetic {
+                node,
+                operands,
+                lhs,
+            } => self.arithmetic(node, operands, lhs, result),
+            Frame::Arguments(state) => self.argument_done(state, result),
+            Frame::Body(state) => self.body_done(&state, result),
+        }
+    }
+
+    /// Evaluates the items of a block from `next` on, the simple ones at
+    /// once, and then its result.
+    fn items(&mut self, items: IrRange, mut next: u32, result: IrId) -> Next {
+        loop {
+            let ir = &self.running().ir;
+            let Some(&item) = ir.items(items).get(next as usize) else {
+                return Next::Eval(result);
+            };
+            next += 1;
+            if !ir.is_simple(item) {
+                self.frames.push(Frame::Items {
+                    items,
+                    next,
+                    result,
+                });
+                return Next::Eval(item);
+            }
+            if let Err(unwind) = self.walker(|walker| walker.value(item)) {
+                return Next::Give(Err(unwind));
+            }
+        }
+    }
+
+    /// Evaluates an `if`: its condition, at once if it is simple, and then
+    /// the branch it selects.
+    fn branch(&mut self, node: IrId, cond: IrId, (then, else_): (IrId, IrId)) -> Next {
+        if self.running().ir.is_simple(cond) {
+            return match self.walker(|walker| walker.bool(cond)) {
+                Ok(cond) => Next::Eval(if cond { then } else { else_ }),
+                Err(unwind) => Next::Give(Err(unwind)),
+            };
+        }
+        self.frames.push(Frame::Branch { node, then, else_ });
+        Next::Eval(cond)
+    }
+
+    /// Writes `value` to `slot` of the running frame, for the `Store` node
+    /// `node`.
+    fn store(&mut self, slot: crate::check::Slot, value: Value, node: IrId) -> Next {
+        let at = self.running().base + slot.index();
+        if let Some(target) = self.stack.get_mut(at) {
+            *target = value;
+            return Next::Give(Ok(Value::Empty));
+        }
+        let span = self.running().ir.get(node).span;
+        Next::Give(Err(super::internal(
+            "store to a slot outside the frame",
+            span,
+        )
+        .into()))
+    }
+
+    /// Takes up the `Int` operator `node` of `operands` with `result`, the
+    /// value of its left operand, or, if `lhs` is that, of its right one.
+    fn arithmetic(
+        &mut self,
+        node: IrId,
+        operands: Operands,
+        lhs: Option<i64>,
+        result: Flow<Value>,
+    ) -> Next {
+        let value = match result {
+            Ok(Value::Int(value)) => value,
+            Ok(_) => return self.mistyped(node, "a non-Int operand of an Int operator"),
+            Err(unwind) => return Next::Give(Err(unwind)),
+        };
+        let Some(lhs) = lhs else {
+            self.frames.push(Frame::Arithmetic {
+                node,
+                operands,
+                lhs: Some(value),
+            });
+            return Next::Eval(operands.rhs);
+        };
+        let pair = (lhs, value);
+        Next::Give(
+            self.walker(|walker| {
+                let node = walker.ir.get(node);
+                match node.kind {
+                    IrKind::IntAdd(_) => {
+                        walker.int_arithmetic_of(node, operands, i64::checked_add, pair)
+                    }
+                    IrKind::IntSub(_) => {
+                        walker.int_arithmetic_of(node, operands, i64::checked_sub, pair)
+                    }
+                    IrKind::IntMul(_) => {
+                        walker.int_arithmetic_of(node, operands, i64::checked_mul, pair)
+                    }
+                    IrKind::IntFloorDiv(_) => {
+                        walker.int_division_of(node, operands, super::floor_div, pair)
+                    }
+                    IrKind::IntRem(_) => walker.int_division_of(
+                        node,
+                        operands,
+                        |lhs, rhs| Some(super::floor_mod(lhs, rhs)),
+                        pair,
+                    ),
+                    _ => mistyped(node, "a node that is not an Int operator"),
+                }
+            })
+            .map(Value::Int),
+        )
+    }
+
+    /// Evaluates the call node `id` of `callee` with the arguments `args`,
+    /// at depth `depth`: its callee, and then, for a closure the machine
+    /// runs itself ([`Machine::runs`]), its arguments and body, and for any
+    /// other callee the whole call by a walker.
+    fn call(&mut self, id: IrId, (callee, args, depth): (IrId, IrRange, u16)) -> Next {
+        let callee = match self.walker(|walker| walker.function(callee)) {
+            Ok(callee) => callee,
+            Err(unwind) => return Next::Give(Err(unwind)),
+        };
+        let closure = match callee {
+            Callee::Closure(closure) if self.runs(&closure) => closure,
+            callee => {
+                return Next::Give(self.walker(|walker| {
+                    let node = walker.ir.get(id);
+                    walker.call_resolved(callee, (args, depth), node)
+                }));
+            }
+        };
+        let Some(code) = closure.code.find_function(closure.function) else {
+            return self.mistyped(id, "a closure of a function its IR lacks");
+        };
+        let (height, frame_size) = (code.height as usize, code.frame_size as usize);
+        let running = self.running();
+        let crossing = closure.code.is_foreign() && !running.ir.is_foreign();
+        let entering = running.levels + usize::from(depth) + CALL_LEVELS;
+        let span = running.ir.get(id).span;
+        if crossing {
+            let input = running.ir.input();
+            self.shared.sites.borrow_mut().push((input, span));
+        }
+        let early = self.walker(|walker| {
+            let node = walker.ir.get(id);
+            if walker.past_deadline() {
+                walker.timed_out(node)
+            } else if entering + height > MAX_DEPTH {
+                Err(nested_too_deeply(node).into())
+            } else {
+                Ok(Value::Empty)
+            }
+        });
+        if let Err(unwind) = early {
+            self.leave_call(crossing);
+            return Next::Give(Err(unwind));
+        }
+        let base = self.stack.len();
+        self.stack.resize(base + frame_size, Value::Empty);
+        self.next_argument(Box::new(CallState {
+            closure,
+            node: id,
+            args,
+            next: 0,
+            depth,
+            base,
+            entering,
+            crossing,
+        }))
+    }
+
+    /// Whether the machine runs a call of `closure` itself: one of a
+    /// plain function, neither memoised, deferred, retried nor timed, in a
+    /// run that is not profiled.
+    fn runs(&mut self, closure: &Rc<Closure>) -> bool {
+        let Some(code) = closure.code.find_function(closure.function) else {
+            return false;
+        };
+        self.shared.profile.is_none()
+            && code.kind != FnKind::Memo
+            && code.retry == 0
+            && code.timeout.is_none()
+            && !self.walker(|walker| walker.defers(code))
+    }
+
+    /// Evaluates the call's arguments from `state.next` on, in the calling
+    /// frame, the simple ones and defaults at once, and then its body.
+    fn next_argument(&mut self, mut state: Box<CallState>) -> Next {
+        loop {
+            let ir = &self.running().ir;
+            let Some(&arg) = ir.items(state.args).get(state.next as usize) else {
+                return self.enter_body(state);
+            };
+            let IrKind::Arg { value, .. } = ir.get(arg).kind else {
+                return self.argument_failed(
+                    &state,
+                    self.mistyped_unwind(arg, "a call's argument is not an argument"),
+                );
+            };
+            match value {
+                crate::ir::ArgValue::Node(value) if !ir.is_simple(value) => {
+                    self.frames.push(Frame::Arguments(state));
+                    return Next::Eval(value);
+                }
+                _ => {
+                    let written = self.walker(|walker| {
+                        walker.argument(arg, state.base, (&state.closure, state.depth))
+                    });
+                    if let Err(unwind) = written {
+                        return self.argument_failed(&state, unwind);
+                    }
+                    state.next += 1;
+                }
+            }
+        }
+    }
+
+    /// Takes up a call's arguments with `result`, the value of argument
+    /// `state.next`.
+    fn argument_done(&mut self, mut state: Box<CallState>, result: Flow<Value>) -> Next {
+        let value = match result {
+            Ok(value) => value,
+            Err(unwind) => return self.argument_failed(&state, unwind),
+        };
+        let ir = &self.running().ir;
+        let param =
+            ir.items(state.args)
+                .get(state.next as usize)
+                .map(|&arg| match ir.get(arg).kind {
+                    IrKind::Arg { param, .. } => Some(param),
+                    _ => None,
+                });
+        let Some(Some(param)) = param else {
+            return self.argument_failed(
+                &state,
+                self.mistyped_unwind(state.node, "a call's argument is not an argument"),
+            );
+        };
+        let Some(slot) = self.stack.get_mut(state.base + param as usize) else {
+            return self.argument_failed(
+                &state,
+                self.mistyped_unwind(state.node, "an argument for a parameter outside the frame"),
+            );
+        };
+        *slot = value;
+        state.next += 1;
+        self.next_argument(state)
+    }
+
+    /// Ends a call whose argument failed or stopped with `unwind`: its frame
+    /// goes, and the call reports an error as
+    /// [`Evaluator::run_closure`] does.
+    fn argument_failed(&mut self, state: &CallState, unwind: Unwind) -> Next {
+        self.stack.truncate(state.base);
+        let unwind = self.walker(|walker| {
+            let node = walker.ir.get(state.node);
+            walker.argument_failed(unwind, node)
+        });
+        self.leave_call(state.crossing);
+        Next::Give(Err(unwind))
+    }
+
+    /// Runs the body of the call `state`, its arguments evaluated, in an
+    /// activation of its own.
+    fn enter_body(&mut self, state: Box<CallState>) -> Next {
+        let caller = self.walker(callee_caller);
+        let Some(code) = state.closure.code.find_function(state.closure.function) else {
+            return self.argument_failed(
+                &state,
+                self.mistyped_unwind(state.node, "a closure of a function its IR lacks"),
+            );
+        };
+        let body = code.body;
+        self.activations.push(Activation {
+            ir: Rc::clone(&state.closure.code),
+            base: state.base,
+            callee: Some(Rc::clone(&state.closure)),
+            caller,
+            levels: state.entering,
+        });
+        self.frames.push(Frame::Body(state));
+        Next::Eval(body)
+    }
+
+    /// Ends the call `state` with `result`, what its body came to, as
+    /// [`Evaluator::run_closure`] does: its frame and activation go, a
+    /// `return` for the function is its value, and an error is reported
+    /// as the calling frame reports it.
+    fn body_done(&mut self, state: &CallState, result: Flow<Value>) -> Next {
+        self.activations.pop();
+        self.stack.truncate(state.base);
+        let span = self.running().ir.get(state.node).span;
+        let outcome = result
+            .or_else(|unwind| unwind.returned(span))
+            .map_err(|error| {
+                self.walker(|walker| {
+                    let node = walker.ir.get(state.node);
+                    walker.call_error(error, &state.closure, node).into()
+                })
+            });
+        self.leave_call(state.crossing);
+        Next::Give(outcome)
+    }
+
+    /// Leaves a call, taking it off the run's list of sites if it is
+    /// `crossing` onto it.
+    fn leave_call(&self, crossing: bool) {
+        if crossing {
+            self.shared.sites.borrow_mut().pop();
+        }
+    }
+
+    /// The internal error of the mistyped node `id`, saying `what`.
+    fn mistyped(&self, id: IrId, what: &'static str) -> Next {
+        Next::Give(Err(self.mistyped_unwind(id, what)))
+    }
+
+    /// The internal error of the mistyped node `id`, saying `what`.
+    fn mistyped_unwind(&self, id: IrId, what: &'static str) -> Unwind {
+        let node: &IrNode = self.running().ir.get(id);
+        match mistyped::<()>(node, what) {
+            Err(unwind) => unwind,
+            Ok(()) => super::internal(what, node.span).into(),
+        }
+    }
+}
+
+/// The caller `walker`'s frame gives a callee: [`Evaluator::callee_caller`],
+/// as a function a walker of any lifetime can be given to.
+fn callee_caller(walker: &mut Evaluator<'_>) -> Caller {
+    walker.callee_caller()
+}

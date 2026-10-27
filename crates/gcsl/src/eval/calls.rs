@@ -353,7 +353,18 @@ impl Evaluator<'_> {
         (callee, args, depth): (IrId, IrRange, u16),
         node: &IrNode,
     ) -> Flow<Value> {
-        let closure = match self.function(callee)? {
+        let callee = self.function(callee)?;
+        self.call_resolved(callee, (args, depth), node)
+    }
+
+    /// [`Evaluator::call`] of `callee`, evaluated already.
+    pub(super) fn call_resolved(
+        &mut self,
+        callee: Callee,
+        (args, depth): (IrRange, u16),
+        node: &IrNode,
+    ) -> Flow<Value> {
+        let closure = match callee {
             Callee::Closure(closure) => closure,
             Callee::Builtin(builtin) => return self.call_builtin(builtin, args, node),
             Callee::Tag(tag) => return self.call_tag(tag, args, node),
@@ -603,7 +614,7 @@ impl Evaluator<'_> {
     /// reported at the call if this frame is the workspace's own code (see
     /// [Errors in a library](#errors-in-a-library)); an argument written
     /// here fails where it is.
-    fn argument_failed(&self, unwind: Unwind, node: &IrNode) -> Unwind {
+    pub(super) fn argument_failed(&self, unwind: Unwind, node: &IrNode) -> Unwind {
         match unwind {
             Unwind::Error(error) => Unwind::Error(self.reported_here(error, node)),
             stop @ Unwind::Stop(_) => stop,
@@ -841,22 +852,35 @@ impl Evaluator<'_> {
         (callee, depth): (&Rc<Closure>, u16),
     ) -> Flow<()> {
         for &arg in self.ir.items(args) {
-            let node = self.ir.get(arg);
-            let IrKind::Arg { param, value } = node.kind else {
-                return mistyped(node, "a call's argument is not an argument");
-            };
-            let value = match value {
-                ArgValue::Node(value) => self.value(value)?,
-                ArgValue::Default { capture, .. } => {
-                    let earlier = base..base + param as usize;
-                    self.default_arg((callee, capture), earlier, (depth, node))?
-                }
-            };
-            let Some(slot) = self.stack.get_mut(base + param as usize) else {
-                return mistyped(node, "an argument for a parameter outside the frame");
-            };
-            *slot = value;
+            self.argument(arg, base, (callee, depth))?;
         }
+        Ok(())
+    }
+
+    /// Evaluates the argument `arg` of a call of `callee` at depth `depth`,
+    /// writing it to its parameter's slot of the frame that starts at
+    /// `base`, as [`Evaluator::arguments`] evaluates each.
+    pub(super) fn argument(
+        &mut self,
+        arg: IrId,
+        base: usize,
+        (callee, depth): (&Rc<Closure>, u16),
+    ) -> Flow<()> {
+        let node = self.ir.get(arg);
+        let IrKind::Arg { param, value } = node.kind else {
+            return mistyped(node, "a call's argument is not an argument");
+        };
+        let value = match value {
+            ArgValue::Node(value) => self.value(value)?,
+            ArgValue::Default { capture, .. } => {
+                let earlier = base..base + param as usize;
+                self.default_arg((callee, capture), earlier, (depth, node))?
+            }
+        };
+        let Some(slot) = self.stack.get_mut(base + param as usize) else {
+            return mistyped(node, "an argument for a parameter outside the frame");
+        };
+        *slot = value;
         Ok(())
     }
 

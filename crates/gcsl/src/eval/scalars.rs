@@ -188,6 +188,18 @@ impl Evaluator<'_> {
         // arithmetic chain, so it saves that frame.
         let lhs = self.int(operands.lhs)?;
         let rhs = self.int(operands.rhs)?;
+        self.int_arithmetic_of(node, operands, op, (lhs, rhs))
+    }
+
+    /// The `+`, `-` or `*` `node`, which `op` computes, of its operands'
+    /// values `lhs` and `rhs`, evaluated already.
+    pub(super) fn int_arithmetic_of(
+        &self,
+        node: &IrNode,
+        operands: Operands,
+        op: fn(i64, i64) -> Option<i64>,
+        (lhs, rhs): (i64, i64),
+    ) -> Flow<i64> {
         op(lhs, rhs).ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs).into())
     }
 
@@ -201,6 +213,18 @@ impl Evaluator<'_> {
     ) -> Flow<i64> {
         let lhs = self.int(operands.lhs)?;
         let rhs = self.int(operands.rhs)?;
+        self.int_division_of(node, operands, op, (lhs, rhs))
+    }
+
+    /// The `//` or `%` `node`, which `op` computes, of its operands' values
+    /// `lhs` and `rhs`, evaluated already.
+    pub(super) fn int_division_of(
+        &self,
+        node: &IrNode,
+        operands: Operands,
+        op: fn(i64, NonZeroI64) -> Option<i64>,
+        (lhs, rhs): (i64, i64),
+    ) -> Flow<i64> {
         let Some(divisor) = NonZeroI64::new(rhs) else {
             return Err(self
                 .binary_error(node, operands, DIVISION_BY_ZERO, lhs, rhs)

@@ -1294,6 +1294,30 @@ const _: () = assert!(
 );
 
 impl IrKind {
+    /// Whether this is a *control* node, one that a subtree of simple nodes
+    /// may not hold (see [`Ir::is_simple`]): a call, a loop, an await, a
+    /// context read or `with`, a `recover`, a `break`, `continue` or
+    /// `return` and what catches one, and a call's argument.
+    #[must_use]
+    pub(crate) const fn is_control(self) -> bool {
+        matches!(
+            self,
+            IrKind::Call { .. }
+                | IrKind::Arg { .. }
+                | IrKind::For { .. }
+                | IrKind::Loop { .. }
+                | IrKind::Await { .. }
+                | IrKind::ContextRead { .. }
+                | IrKind::ContextBind { .. }
+                | IrKind::With { .. }
+                | IrKind::Recover { .. }
+                | IrKind::Break { .. }
+                | IrKind::Continue { .. }
+                | IrKind::Return { .. }
+                | IrKind::Catch { .. }
+        )
+    }
+
     /// The children of a node of this kind, in order, which are the nodes
     /// in `pool`, the item pool, of any list it has: an operator's operands,
     /// an `if`'s condition and branches, a block's items and then its
@@ -1980,6 +2004,8 @@ pub struct Ir {
     /// closures capture the def-type and the definition (see
     /// [`Ir::is_reference`]); usually empty.
     references: Vec<FnId>,
+    /// For each node, whether it is simple (see [`Ir::is_simple`]).
+    simple: Vec<bool>,
 }
 
 /// Where the meta of a function's closures is, for a function that has one
@@ -2034,6 +2060,17 @@ impl Ir {
     /// Panics if `id` does not belong to this IR.
     pub(crate) fn children(&self, id: IrId) -> impl DoubleEndedIterator<Item = IrId> + '_ {
         self.get(id).kind.children(&self.item_lists)
+    }
+
+    /// Whether node `id` is *simple*: whether its subtree runs nothing but
+    /// operators, constants, reads, literals, `if`s and blocks, and so
+    /// calls, loops, awaits, reads no context, sets none, recovers from no
+    /// failure and stops nothing ([`IrKind::is_control`]). A simple subtree
+    /// can never wait for anything, so the evaluator runs it by recursion,
+    /// with no frame of its own (see [Suspension](crate::eval::machine)).
+    #[must_use]
+    pub(crate) fn is_simple(&self, id: IrId) -> bool {
+        self.simple.get(id.index()).copied().unwrap_or(false)
     }
 
     /// Every call in the frame whose body is `body`, with its depth and
@@ -2813,7 +2850,9 @@ impl IrBuilder {
         functions: Vec<FnCode>,
         (input, dir): (u32, u32),
     ) -> Ir {
+        let simple = simple_nodes(&self.nodes, &self.item_lists);
         Ir {
+            simple,
             nodes: self.nodes,
             item_lists: self.item_lists,
             strings: self.strings,
@@ -2841,6 +2880,23 @@ impl IrBuilder {
             references: Vec::new(),
         }
     }
+}
+
+/// For each of `nodes`, whose lists are in `pool`, whether it is simple
+/// (see [`Ir::is_simple`]): a node that is no control node, and all of
+/// whose children are simple. A builder adds a node after its children, so
+/// one pass in order finds every child's answer before its parent's.
+fn simple_nodes(nodes: &[IrNode], pool: &[IrId]) -> Vec<bool> {
+    let mut simple = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let answer = !node.kind.is_control()
+            && node
+                .kind
+                .children(pool)
+                .all(|child| simple.get(child.index()).copied().unwrap_or(false));
+        simple.push(answer);
+    }
+    simple
 }
 
 struct Pretty<'a> {
