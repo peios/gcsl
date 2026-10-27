@@ -77,6 +77,9 @@ impl Error for SourceError {}
 pub struct SourceFile {
     name: String,
     text: String,
+    /// Where the host found the file's directory, for a library's file
+    /// ([`SourceFile::with_dir`]); `None` otherwise.
+    dir: Option<String>,
     /// Byte offset at which each line starts. Always non-empty: line 1 starts
     /// at offset 0, and every `\n` starts a new line after it.
     line_starts: Vec<u32>,
@@ -113,6 +116,7 @@ impl SourceFile {
             name: name.into(),
             text,
             line_starts,
+            dir: None,
         })
     }
 
@@ -120,6 +124,24 @@ impl SourceFile {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The file, its directory being at `dir`, an absolute path as GCSL code
+    /// names paths: where its host found a library, so that a relative path
+    /// in the library is in its own directory (see [Where a path
+    /// is](crate::eval::files#where-a-path-is)). A workspace's files need
+    /// none, being under its root.
+    #[must_use]
+    pub fn with_dir(mut self, dir: impl Into<String>) -> Self {
+        self.dir = Some(dir.into());
+        self
+    }
+
+    /// Where the host found the file's directory, if it said
+    /// ([`SourceFile::with_dir`]).
+    #[must_use]
+    pub fn dir(&self) -> Option<&str> {
+        self.dir.as_deref()
     }
 
     /// The full source text.

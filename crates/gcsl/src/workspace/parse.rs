@@ -234,6 +234,14 @@ pub(super) fn place_dirs(
 ) -> (HashMap<String, u32>, Vec<u32>) {
     let mut dirs: HashMap<String, u32> = HashMap::new();
     intern_dir(&mut scan.dirs, &mut dirs, "");
+    for source in sorted {
+        if let Some(found) = source.dir() {
+            scan.located.insert(
+                parent_path(source.name()).to_owned(),
+                std::rc::Rc::from(found),
+            );
+        }
+    }
     let user_dirs: Vec<u32> = sorted
         .iter()
         .map(|source| match placing {

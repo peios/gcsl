@@ -55,6 +55,18 @@ libraries it imports: never anything of the workspace that uses it. So a
 library means the same in every workspace, and a name it uses can't be
 picked up from yours by accident.
 
+A library can keep other files beside its `.gcsl` files, sources to build
+or tools to run. A relative path in a library is relative to its own
+directory, so `file("tools/gen.py")` names the library's tool wherever
+it's used.
+
+GCSL doesn't pin the libraries a workspace imports; a host such as pekit
+does. `import libraries` gives the context `pinned_libraries`, a
+`Pinned` for each library the host pinned: its path, its git repository,
+the directory in the repository that holds it, and the commit. A library
+that takes what one of those repositories gives another way, such as a
+crate from the same repository, can check that both are at one commit.
+
 ## Boundaries and evaluation order
 
 Hidden names and nested directories containing their own `workspace.gcsl`

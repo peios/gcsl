@@ -221,6 +221,7 @@ pub(super) fn scan_into_with(
         lone: matches!(placing, Placing::Lone(..)),
         relocation: None,
         dir_texts: Vec::new(),
+        located: HashMap::new(),
         file_dirs: Vec::new(),
         types: Vec::new(),
         dir_types: Vec::new(),

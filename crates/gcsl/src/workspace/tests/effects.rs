@@ -97,6 +97,7 @@ fn every_effect_goes_through_the_host_s_context() {
                   fs.read(\"/d/x.txt\"),\n\
                   \"{fs.exists(\"/d/x.txt\")}\",\n\
                   file(\"rel\").path,\n\
+                  working_dir().path,\n\
                   \"{exec([\"true\"]).status}\",\n\
                   dir(\"/d\").files()[0].path,\n\
                   composed.path,\n\
@@ -104,10 +105,12 @@ fn every_effect_goes_through_the_host_s_context() {
                   fs.temp_dir(),\n\
                 ]";
     let value = run_through(text, &effects).unwrap();
-    // GCSL's values hold paths as its code names them.
+    // GCSL's values hold paths as its code names them: a relative one in
+    // its file's directory, the root, and the working directory the
+    // host's.
     assert_eq!(
         value.to_string(),
-        "[\"hi\", \"true\", \"/work/rel\", \"0\", \"/d/x.txt\", \"/tmp/0\", \"hi\", \"/tmp/1\"]"
+        "[\"hi\", \"true\", \"/rel\", \"/work\", \"0\", \"/d/x.txt\", \"/tmp/0\", \"hi\", \"/tmp/1\"]"
     );
     // What it did to the file system is under the host's root.
     assert_eq!(std::fs::read_to_string(root.join("d/x.txt")).unwrap(), "hi");

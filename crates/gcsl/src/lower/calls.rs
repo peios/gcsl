@@ -93,6 +93,7 @@ impl Lowerer<'_> {
             | Builtin::KeychainFile
             | Builtin::ExecSecret
             | Builtin::Dir
+            | Builtin::WorkingDir
             | Builtin::DirFiles
             | Builtin::DirFile
             | Builtin::DirDir

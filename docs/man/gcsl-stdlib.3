@@ -143,7 +143,7 @@ Run as sh does with live output copying.
 A failure message omits standard error already copied to the terminal.
 .TP
 .B file(path: String) -> File
-Return the file at path, a relative path resolved against the working directory exec uses by default, then normalised lexically: . segments and repeated slashes dropped and each .. removing the segment before it, never above /, with no symbolic link resolved.
+Return the file at path, a relative path resolved against the directory of the file the call is written in (the caller's, for the standard library's own code), then normalised lexically: . segments and repeated slashes dropped and each .. removing the segment before it, never above /, with no symbolic link resolved.
 Nothing is read, so a missing file is found when it is read.
 An empty path is a runtime error.
 f.path is its absolute path; under plain GCSL two files are equal when their paths are.
@@ -163,6 +163,10 @@ A FileSet is a list of loose files; a tree of files is a Dir.
 .TP
 .B dir(path: String) -> Dir
 Return the directory at path, resolved and normalised as file resolves a file's; nothing is read.
+.TP
+.B working_dir() -> Dir
+Return the run's working directory: where a program given no cwd runs, and under pekit a step's own directory, where it writes the files it makes.
+Relative paths are never resolved against it.
 d.path is its absolute path; under plain GCSL two directories are equal when their paths are.
 .TP
 .B Dir.file(path: String): File, Dir.dir(path: String): Dir
@@ -281,8 +285,18 @@ Absolute source directory of the running function's caller.
 .TP
 .B fileroot.helper()
 Make the running function pass its caller's source directory through to functions it calls.
-This supports helpers whose effects should be relative to the original calling source.
+This supports helpers that name paths with fileroot.caller; a relative path given to file, dir, or a cwd is always relative to the file it is written in.
 Memoized functions account for a caller path when they read it.
+.SH LIBRARIES MODULE
+import libraries.
+These say what a host pinned of the libraries a workspace imports; GCSL itself pins none.
+.TP
+.B type Pinned = {path: String, git: String, dir: String, commit: String}
+A library pinned: its import path, the URL of its git repository, the directory in the repository that holds it (empty for the root), and the whole name of the commit.
+.TP
+.B context pinned_libraries: List<Pinned> = []
+Each library the workspace imports that its host pinned, as pekit pins them in pekit.lock; empty under plain GCSL.
+Read it as ^pinned_libraries.
 .SH SECURITY
 Process and filesystem operations use the embedding process's authority.
 Lexical path normalization is not a filesystem containment check.

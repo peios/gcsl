@@ -691,10 +691,9 @@ impl Evaluator<'_> {
             };
             *entry = Some((value, span));
         }
-        // A program's working directory is its definition's, resolved here,
-        // where its context is, before it can become a node, which runs
-        // apart from it (see [The working
-        // directory](crate::eval::files#the-working-directory)).
+        // A program's relative `cwd` is resolved here, where the code that
+        // wrote it is running, before it can become a node, which runs apart
+        // from it (see [Where a path is](crate::eval::files#where-a-path-is)).
         if matches!(
             builtin,
             Builtin::Exec | Builtin::ExecLive | Builtin::ExecSecret
@@ -779,6 +778,7 @@ impl Evaluator<'_> {
                 write_file(&p, &contents, self.shared.effects, node)
             }
             (Builtin::FsTempDir, None, None) => self.temp_dir(node),
+            (Builtin::WorkingDir, None, None) => self.working_dir_value(node),
             (_, Some((first, _)), second) if builtin.is_of_elements() => {
                 element_builtin(builtin, &first, second.as_ref(), node)
             }

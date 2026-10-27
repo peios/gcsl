@@ -36,7 +36,7 @@ fn the_standard_summary_runs_in_a_workspace_and_alone() {
     assert_eq!(scan.dirs[scan.files[0].dir as usize].parent, None);
     assert_eq!(scan.order[0], 0);
     // The built-in functions' cells are the first.
-    let builtins: Vec<Option<Builtin>> = (0..58).map(|node| scan.builtin(node)).collect();
+    let builtins: Vec<Option<Builtin>> = (0..59).map(|node| scan.builtin(node)).collect();
     assert_eq!(
         builtins,
         [
@@ -97,6 +97,7 @@ fn the_standard_summary_runs_in_a_workspace_and_alone() {
             Some(Builtin::ListContains),
             Some(Builtin::JsonDecode),
             Some(Builtin::Record),
+            Some(Builtin::WorkingDir),
             None
         ]
     );
@@ -285,6 +286,7 @@ fn a_file_s_own_names_shadow_the_prelude_s_silently() {
             "fetch",
             "fetch_git",
             "dir",
+            "working_dir",
             "build",
             "package",
             "test",
@@ -423,4 +425,26 @@ fn the_table_of_standard_files_is_the_stdlib_directory() {
         .map(|(stem, _)| format!("<stdlib>/{stem}.gcsl"))
         .collect();
     assert_eq!(names, expected);
+}
+
+#[test]
+fn the_libraries_module_says_what_its_host_pinned() {
+    // Plain GCSL pins nothing; a host binds what it pinned, which code
+    // takes as a context.
+    assert_eq!(
+        lone(
+            "import libraries\n\
+             fn pins(^pinned_libraries) -> Int { = len(pinned_libraries) }\n\
+             = pins()"
+        ),
+        Ok("0".to_owned())
+    );
+    assert_eq!(
+        lone(
+            "import libraries\n\
+             fn first(^pinned_libraries) -> String { = pinned_libraries[0].commit }\n\
+             = first() with {pinned_libraries = [{path = \"x.org/a/b\"; git = \"https://x.org/a/b\"; dir = \"\"; commit = \"c\"}]}"
+        ),
+        Ok("c".to_owned())
+    );
 }

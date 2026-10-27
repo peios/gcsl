@@ -390,14 +390,16 @@ fn fileroot_is_a_reserved_name() {
     }
 }
 
-/// A def-type, `build`, of definitions giving a `String`, and `named`, a
-/// memoised function giving the path of the file a relative path names.
+/// A def-type, `build`, of definitions giving a `String`; `named`, a
+/// memoised function giving the path of the file a relative path names;
+/// and `given`, one giving the path of a file it is given.
 const BUILDS: &str = "#[def_type]\n\
         def build(name: String, f: fn() -> String) -> String { f() }\n\
-        def named(p: String) -> String { file(p).path }";
+        def named(p: String) -> String { file(p).path }\n\
+        def given(f: File) -> String { f.path }";
 
 #[test]
-fn a_definition_s_relative_paths_are_its_own_directory_s_whoever_calls_it() {
+fn a_relative_path_is_against_the_directory_of_the_file_it_is_written_in() {
     let files = [
         ("workspace.gcsl", ""),
         ("_lib/builds.gcsl", BUILDS),
@@ -412,27 +414,31 @@ fn a_definition_s_relative_paths_are_its_own_directory_s_whoever_calls_it() {
         (
             "app/app.gcsl",
             "import build from _lib/builds\n\
-                 import named from _lib/builds\n\
+                 import named, given from _lib/builds\n\
                  def build app() { build lib() }\n\
                  def build app_named() { named(\"lib.txt\") }\n\
+                 def build app_given() { given(file(\"lib.txt\")) }\n\
                  through = build app()\n\
-                 memo = [build lib_named(), build app_named()]",
+                 memo = [build lib_named(), build app_named()]\n\
+                 passed = build app_given()",
         ),
     ];
     assert_eq!(
         rooted_text(&files, "lib.gcsl"),
         "{alone = \"<root>/lib.txt\"}"
     );
-    // Built for `app`, `lib` is in its own directory still; a memoised
-    // function called in two definitions' bodies is in each one's.
+    // Built for `app`, `lib` is in its own directory still; a function's
+    // relative path is in its own file's, whoever calls it; a file its
+    // caller makes is in the caller's.
     assert_eq!(
         rooted_text(&files, "app/app.gcsl"),
-        "{through = \"<root>/lib.txt\"; memo = [\"<root>/lib.txt\", \"<root>/app/lib.txt\"]}"
+        "{through = \"<root>/lib.txt\"; memo = [\"<root>/_lib/lib.txt\", \"<root>/_lib/lib.txt\"]; \
+         passed = \"<root>/app/lib.txt\"}"
     );
 }
 
 #[test]
-fn a_definition_s_relative_cwd_is_against_its_directory() {
+fn a_relative_cwd_is_against_its_file_s_directory() {
     let root = crate::workspace::tests::fs::fs_scratch("definition-cwd");
     std::fs::create_dir_all(format!("{root}/app/sub")).unwrap();
     let files = [
@@ -464,4 +470,57 @@ fn a_definition_s_relative_cwd_is_against_its_directory() {
         ran,
         format!("{{ran = \"{root}\\n{root}/app/sub\\n/\\n{host}\\n\"}}")
     );
+}
+
+#[test]
+fn a_library_s_relative_paths_are_where_its_host_found_it() {
+    let sources = [
+        SourceFile::new("workspace.gcsl", "").unwrap(),
+        SourceFile::new(
+            "app.gcsl",
+            "import \"example.org/o/sdk\"\nimport fileroot\n\
+             = [sdk.own(), sdk.given(file(\"a.txt\")), sdk.this]",
+        )
+        .unwrap(),
+        SourceFile::new(
+            "<lib>/example.org/o/sdk/sdk.gcsl",
+            "import fileroot\n\
+             def own() -> String { file(\"src/a.txt\").path }\n\
+             def given(f: File) -> String { f.path }\n\
+             this = fileroot.this",
+        )
+        .unwrap()
+        .with_dir("/found/sdk"),
+    ];
+    let mut workspace = check_with_standard(&sources, &[], SCRATCH)
+        .1
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    let index = workspace.file("app.gcsl").unwrap();
+    let value = workspace.run(index).unwrap().value.to_string();
+    // Its own files are in its own directory, wherever it is used; what it
+    // is given, in its caller's.
+    assert_eq!(
+        value.replace(SCRATCH, "<root>"),
+        "[\"/found/sdk/src/a.txt\", \"<root>/a.txt\", \"/found/sdk\"]"
+    );
+}
+
+#[test]
+fn the_standard_library_s_relative_paths_are_its_caller_s() {
+    let root = crate::workspace::tests::fs::fs_scratch("standard-caller");
+    std::fs::create_dir_all(format!("{root}/app")).unwrap();
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "app/app.gcsl",
+            "= [exec([\"pwd\"], cwd = \".\").stdout, dir(\".\").exec(\"pwd\").stdout]",
+        ),
+    ];
+    let mut workspace = rooted_at(&files, &root).unwrap_or_else(|errors| panic!("{errors:?}"));
+    let index = workspace.file("app/app.gcsl").unwrap();
+    let ran = workspace.run(index).unwrap().value.to_string();
+    std::fs::remove_dir_all(&root).unwrap();
+    // The prelude's `exec` and `d.exec` hand the built-in a `cwd` of their
+    // caller's, which is the caller's directory, not the prelude's.
+    assert_eq!(ran, format!("[\"{root}/app\\n\", \"{root}/app\\n\"]"));
 }
