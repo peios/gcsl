@@ -39,10 +39,11 @@ The host keeps a `Graph` for the whole evaluation and drives it:
 
 1. Run a unit, a file with `Workspace::run_graph` or a target with
    `Workspace::prepare_call` and `Workspace::run_prepared`. You get
-   `Progress::Paused(node)` if the unit needs a result it doesn't have
-   yet, `Progress::Waiting(unit)` if it needs a result that another
-   unit is computing (see [Units that share work](#units-that-share-work)),
-   or `Progress::Done(value)` once it finishes.
+   `Progress::Paused(nodes)` if the unit needs results it doesn't have
+   yet (see [Loops that wait](#loops-that-wait)),
+   `Progress::Waiting(unit)` if it needs a result that another unit is
+   computing (see [Units that share work](#units-that-share-work)), or
+   `Progress::Done(value)` once it finishes.
 2. Find what to run. `graph.holes(&value)` lists the results a finished
    value still waits for, `graph.needed(&demands)` adds every step they
    depend on, and `graph.ready(&needed)` keeps those whose own inputs are
@@ -61,6 +62,30 @@ how a host runs code of its own over a target without calling a function
 value itself: pekit packs a package as `packaging.pack(package NAME())`.
 Several prepared calls are units of their own, and can be driven together
 against one graph, sharing the steps they both reach.
+
+## Loops that wait
+
+When an iteration of a `for` loop in a function stops to wait, the rest
+of the loop doesn't wait with it: the iteration is set aside, and the
+next one runs. So a loop that fetches a hundred files stops once, with
+all hundred fetches in `Progress::Paused(nodes)`, rather than a hundred
+times. The loop's value is the same as if its iterations had run in
+order, and if several fail, the earliest iteration's failure is the one
+reported.
+
+A loop is only split like this if its iterations are independent: none
+assigns a variable declared outside the loop with `:=`, and none leaves
+it with `break` or `return`. Any other loop runs its iterations in
+order.
+
+An iteration set aside can still reach effects that must happen in
+program order, such as programs that write files the next one reads.
+Your `Effects` says which effects it isolates, through
+`Effects::isolates`: an effect you don't isolate is only made once
+nothing earlier in the program is still waiting, so you still see such
+effects one at a time, in program order. By default nothing is
+isolated. Isolate an effect only if its order can't matter, such as a
+fetch pinned by its digest.
 
 ## Units that share work
 

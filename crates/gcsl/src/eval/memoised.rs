@@ -38,6 +38,14 @@ impl Evaluator<'_> {
                     self.stack.truncate(base);
                     return self.wait_for_unit(owner, node);
                 }
+                // Only a machine runs tasks, and a walker never runs in one
+                // that has others.
+                MemoBegin::Sibling => {
+                    self.stack.truncate(base);
+                    let error =
+                        super::internal("a walker met another task's memoised call", node.span);
+                    return Err(error.into());
+                }
             };
         // Its body is a scope of its own, in graph mode, keyed by the call's
         // callee and arguments (see [Graph mode](crate::eval::graph#graph-mode)).
@@ -163,6 +171,7 @@ impl Evaluator<'_> {
                 // The frame is left as it is, the arguments in it, for a
                 // machine to look them up again once the unit has run.
                 Lookup::Elsewhere(owner) => return Ok(MemoBegin::Elsewhere(owner)),
+                Lookup::Sibling => return Ok(MemoBegin::Sibling),
             };
         let entering = self.levels + usize::from(depth) + CALL_LEVELS;
         if entering + code.height as usize > MAX_DEPTH {

@@ -53,6 +53,7 @@ mod data;
 mod futures;
 mod loops;
 mod suspend;
+mod tasks;
 
 use std::rc::Rc;
 
@@ -67,6 +68,7 @@ pub(super) use suspend::{Entry, run_machine};
 
 use builtins::BuiltinCall;
 use suspend::Resume;
+use tasks::{Join, Meta, Status, Task};
 use control::{AssertState, DefaultRun, WithState};
 use data::OperandsState;
 use futures::{AwaitState, FutureRun};
@@ -74,6 +76,7 @@ use loops::{ForState, LoopAt, LoopState};
 
 use super::kinds::into_callee;
 use super::memo::{Mark, MemoBegin, MemoTables};
+use super::profile;
 use super::graph::{StepCall, Wait};
 use super::{
     Callee, Evaluator, Flow, GUARD_LEVELS, Shared, Unwind, mistyped, nested_too_deeply,
@@ -82,6 +85,7 @@ use super::{
 
 /// A call running in the machine: what an [`Evaluator`] of its frame
 /// holds, owned.
+#[derive(Clone)]
 pub(super) struct Activation {
     /// The code running.
     ir: Rc<Ir>,
@@ -190,6 +194,11 @@ enum Frame {
     /// The body of a step run as a unit of its own, its frame at the base,
     /// reported at the span, evaluated above.
     Step(usize, crate::source::Span),
+    /// The bottom of a task split off: what it came to goes to the join, as
+    /// the child of the number (see [Tasks](tasks#tasks)).
+    Deliver(Rc<std::cell::RefCell<Join>>, usize),
+    /// A `for` waiting for the iterations split off from it.
+    ForJoin(Box<ForState>),
     /// The value of a secret, read deeply if `true`, evaluated above.
     SecretValue(bool),
     /// The operation of the `SecretWrap` node, of the operation node and
@@ -272,15 +281,20 @@ enum Next {
     /// Stop for `Wait`, to take up where it stopped, doing `Resume`, once
     /// what it waits for is there (see [Suspension](#suspension)).
     Block(Wait, Resume),
+    /// Set the task running aside with the status, and run another (see
+    /// [Tasks](tasks#tasks)).
+    Park(Box<Status>),
+    /// Stop: every task of the unit waits.
+    Stop,
 }
 
 /// How a run of the machine ends.
 pub(super) enum Ran {
     /// With what the root came to.
     Done(Flow<Value>),
-    /// Stopped for something it waits for, its frames kept, to take up
-    /// doing `Resume` (see [Suspension](#suspension)).
-    Blocked(Wait, Resume),
+    /// Stopped, every task waiting, for what the tasks wait for, its frames
+    /// and tasks kept (see [Suspension](#suspension)).
+    Blocked(Vec<Wait>),
 }
 
 /// What a machine that stopped keeps of itself: its frames, activations
@@ -293,6 +307,11 @@ pub(super) struct Parked {
     frames: Vec<Frame>,
     /// The calls the machine runs, innermost last.
     calls: Vec<CallState>,
+    /// The other tasks of the unit, and the running one's place and
+    /// status (see [Tasks](tasks#tasks)).
+    tasks: (Vec<Task>, Meta, Option<Status>),
+    /// The number of the next task split off.
+    next_task: u32,
 }
 
 /// Gives the frame on top `flow`, a walker's result.
@@ -321,6 +340,17 @@ pub(super) struct Machine<'r> {
     /// evaluated, innermost last: one for each [`Frame::Arguments`] and
     /// [`Frame::Body`], kept here so that a call allocates nothing.
     calls: Vec<CallState>,
+    /// The place of the task running (see [Tasks](tasks#tasks)).
+    meta: Meta,
+    /// What the task running waits for, once every task waits.
+    status: Option<Status>,
+    /// The unit's other tasks, set aside.
+    tasks: Vec<Task>,
+    /// The number of the next task split off.
+    next_task: u32,
+    /// How many profiled calls were running when the run began, below
+    /// which none is a task's.
+    profiled_base: usize,
 }
 
 impl<'r> Machine<'r> {
@@ -331,6 +361,7 @@ impl<'r> Machine<'r> {
         shared: &'r Shared<'r>,
         activation: Activation,
     ) -> Self {
+        let profiled_base = shared.profile.map_or(0, profile::Profile::running);
         Self {
             stack,
             memo,
@@ -338,6 +369,11 @@ impl<'r> Machine<'r> {
             activations: vec![activation],
             frames: Vec::new(),
             calls: Vec::new(),
+            meta: Meta::default(),
+            status: None,
+            tasks: Vec::new(),
+            next_task: 1,
+            profiled_base,
         }
     }
 
@@ -348,6 +384,8 @@ impl<'r> Machine<'r> {
         shared: &'r Shared<'r>,
         parked: Parked,
     ) -> Self {
+        let profiled_base = shared.profile.map_or(0, profile::Profile::running);
+        let (tasks, meta, status) = parked.tasks;
         Self {
             stack,
             memo,
@@ -355,6 +393,11 @@ impl<'r> Machine<'r> {
             activations: parked.activations,
             frames: parked.frames,
             calls: parked.calls,
+            meta,
+            status,
+            tasks,
+            next_task: parked.next_task,
+            profiled_base,
         }
     }
 
@@ -364,6 +407,8 @@ impl<'r> Machine<'r> {
             activations: self.activations,
             frames: self.frames,
             calls: self.calls,
+            tasks: (self.tasks, self.meta, self.status),
+            next_task: self.next_task,
         }
     }
 
@@ -422,9 +467,33 @@ impl<'r> Machine<'r> {
                     Some(frame) => self.resume(frame, result),
                     None => return Ran::Done(result.map_err(|unwind| *unwind)),
                 },
-                Next::Block(wait, resume) => return Ran::Blocked(wait, resume),
+                Next::Block(wait, resume) => match self.fork_for(wait, resume) {
+                    Ok(next) => next,
+                    Err((wait, resume)) => self
+                        .park(Status::Blocked(wait, resume))
+                        .unwrap_or(Next::Stop),
+                },
+                Next::Park(status) => self.park(*status).unwrap_or(Next::Stop),
+                Next::Stop => return self.stopped(),
             };
         }
+    }
+
+    /// How the run ends once every task waits: the root running, what the
+    /// unit's tasks wait for; or, if none waits for a node or a unit, the
+    /// tasks wait for each other, which is an internal error.
+    fn stopped(&mut self) -> Ran {
+        self.root_running();
+        let waits = self.waits();
+        if waits.is_empty() {
+            let span = self.running().ir.get(self.running().ir.root()).span;
+            return Ran::Done(Err(super::internal(
+                "the tasks of a unit wait for each other",
+                span,
+            )
+            .into()));
+        }
+        Ran::Blocked(waits)
     }
 
     /// The activation running.
@@ -499,6 +568,7 @@ impl<'r> Machine<'r> {
                 slot,
                 parts,
                 collect,
+                ..
             } => self.for_loop(id, (slot, parts, collect)),
             IrKind::Loop {
                 parts,
@@ -595,6 +665,8 @@ impl<'r> Machine<'r> {
             Frame::Recover(fallback) => self.recovered(fallback, result),
             Frame::Fallback => self.fallback_done(result),
             Frame::Default(run) => self.default_done(&run, result),
+            Frame::Deliver(join, at) => self.deliver(&join, at, result).unwrap_or(Next::Stop),
+            Frame::ForJoin(state) => self.joined(*state, result),
             Frame::Step(base, span) => {
                 self.walker(|walker| walker.profile_end());
                 self.stack.truncate(base);
@@ -1026,6 +1098,10 @@ impl<'r> Machine<'r> {
                 Ok(MemoBegin::Elsewhere(owner)) => {
                     self.calls.push(state);
                     return Next::Block(Wait::Unit(owner), Resume::Lookup);
+                }
+                Ok(MemoBegin::Sibling) => {
+                    self.calls.push(state);
+                    return Next::Park(Box::new(Status::Waiting(Resume::Lookup)));
                 }
                 Ok(MemoBegin::Started(mark)) => {
                     let scoped = self.memo_scope(&state);

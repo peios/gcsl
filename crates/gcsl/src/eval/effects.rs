@@ -127,6 +127,17 @@ pub trait Effects: std::fmt::Debug {
     /// with what is in it when the run's owner is done; `None` for a run
     /// that has no owner to remove it, which no checked program calls for.
     fn temp_dir(&self) -> Option<Result<String, String>>;
+
+    /// Whether the host isolates the effect of `builtin`, in graph mode, so
+    /// that it may happen out of program order: an effect it does not
+    /// isolate is made, as a node, only once nothing earlier in program
+    /// order is still running (see [Graph
+    /// mode](crate::eval::graph#graph-mode)). By default none is, and every
+    /// effect is made in program order.
+    fn isolates(&self, builtin: crate::check::Builtin) -> bool {
+        let _ = builtin;
+        false
+    }
 }
 
 /// A secret a keychain gives, as a host is asked of it (see

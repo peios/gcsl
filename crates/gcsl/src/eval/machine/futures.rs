@@ -14,6 +14,7 @@ use crate::value::{Begin, Future, FutureState, Value};
 use super::super::graph::{NodeId, Wait};
 use super::super::kinds::of_kind;
 use super::super::{depends_on_itself, nested_too_deeply};
+use super::tasks::Status;
 use super::{Activation, Frame, Machine, Next, Outcome, Resume, fail, give};
 
 /// An await running in the machine: of an `Await` node, or of a step of an
@@ -163,6 +164,19 @@ impl Machine<'_> {
         let unit = self.walker(|walker| walker.unit());
         let captures = match future.begin(unit) {
             Some(Begin::Done(value)) => return Ok(value),
+            Some(Begin::Running)
+                if !self
+                    .shared
+                    .futures
+                    .borrow()
+                    .iter()
+                    .any(|running| Rc::ptr_eq(running, &future)) =>
+            {
+                // Another task of the unit runs it: waited for, and awaited
+                // again.
+                let waiting = Status::Waiting(resumed(state, future, then));
+                return Err(Next::Park(Box::new(waiting)));
+            }
             Some(Begin::Running) => return Err(fail(depends_on_itself(&site))),
             Some(Begin::Pending(captures)) => captures,
             // Awaited again once what it waits for is there.
@@ -178,6 +192,7 @@ impl Machine<'_> {
         };
         let base = self.stack.len();
         self.stack.resize(base + frame_size, Value::Empty);
+        self.shared.futures.borrow_mut().push(Rc::clone(&future));
         let outer = self.shared.context.replace(future.context.clone());
         let scoped = self.walker(|walker| {
             let scoped = walker.enter_scope_of(&future.code, future.function, &captures);
@@ -224,6 +239,7 @@ impl Machine<'_> {
             walker.profile_end();
             walker.leave_scope(scoped);
         });
+        self.shared.futures.borrow_mut().pop();
         self.shared.context.replace(outer);
         self.stack.truncate(base);
         match result.or_else(|unwind| unwind.returned(state.span)) {

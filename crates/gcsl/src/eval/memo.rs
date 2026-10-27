@@ -526,6 +526,13 @@ impl MemoTables {
             } if Some(*owner) != unit => {
                 return Lookup::Elsewhere(*owner);
             }
+            // Running, but not on this task's line of control: another task
+            // of the unit runs it (see [Tasks](crate::eval::machine::tasks#tasks)).
+            EntryState::Running { .. }
+                if !self.running.iter().any(|running| running.entry == entry.id) =>
+            {
+                return Lookup::Sibling;
+            }
             EntryState::Running { reentered, .. } => {
                 *reentered = true;
                 return Lookup::Running;
@@ -765,6 +772,9 @@ pub(super) enum Lookup {
     /// unit, this one, in graph mode, which has stopped: the call waits for
     /// it (see [Graph mode](crate::eval::graph#graph-mode)).
     Elsewhere(u32),
+    /// The closure is running with equal arguments in another task of this
+    /// unit, which has stopped: the call waits for it.
+    Sibling,
     /// No entry: the arguments' hash, for recording them.
     Missing(u64),
 }
@@ -783,6 +793,10 @@ pub(super) enum MemoBegin {
     /// the arguments, for the call to wait for that unit and look them up
     /// again.
     Elsewhere(u32),
+    /// The call is running with equal arguments in another task of the
+    /// unit: its frame is on the stack, with the arguments, for the call to
+    /// wait for that task and look them up again.
+    Sibling,
 }
 
 /// A running memoised call, as [`MemoTables::start`] recorded it.

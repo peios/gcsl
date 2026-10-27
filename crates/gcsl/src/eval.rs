@@ -403,6 +403,11 @@ struct Shared<'a> {
     profile: Option<&'a profile::Profile>,
     /// A machine's deep await through a walker (see [`Ahead`]).
     ahead: Ahead,
+    /// The `lazy`s whose bodies the machine's task running, or a task it
+    /// was split off from, is running: one it meets running that is not
+    /// among them another task runs (see
+    /// [Tasks](crate::eval::machine::tasks#tasks)).
+    futures: RefCell<Vec<Rc<crate::value::Future>>>,
 }
 
 /// A machine's deep await through a walker, which leaves the futures it
@@ -455,13 +460,14 @@ impl<'a> Shared<'a> {
             names: None,
             profile: None,
             ahead: Ahead::default(),
+            futures: RefCell::new(Vec::new()),
         }
     }
 }
 
 /// The deadline of a running call of a function with `#[timeout]` (see
 /// [Retry and timeout](crate::eval::retry#retry-and-timeout)).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Deadline {
     /// Its number, unique in the run: what the error of its passing is
     /// marked with ([`ErrorMark::deadline`](crate::diagnostic::Mark::deadline)).

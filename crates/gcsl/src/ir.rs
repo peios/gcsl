@@ -1015,6 +1015,12 @@ pub enum IrKind {
         /// them and yields `{}`, a statement whose value nothing would
         /// hold, and is of kind [`ValueKind::Record`].
         collect: bool,
+        /// Whether its iterations are independent of one another, so that
+        /// one may wait while the next runs (see
+        /// [Suspension](crate::eval::machine#suspension)): its guard and
+        /// body assign no variable declared outside them, and no `break`
+        /// or `return` leaves it. Lowering finds it.
+        forkable: bool,
     },
     /// A condition loop or a `do` loop: of `parts`, the condition, a `Bool`
     /// node, the body, a node of any kind, and the items after the
@@ -2060,6 +2066,19 @@ impl Ir {
     /// Panics if `id` does not belong to this IR.
     pub(crate) fn children(&self, id: IrId) -> impl DoubleEndedIterator<Item = IrId> + '_ {
         self.get(id).kind.children(&self.item_lists)
+    }
+
+    /// Whether each `For` of the program is forkable, in the order its
+    /// nodes were built, an inner loop's before an outer one's, for tests.
+    #[cfg(test)]
+    pub(crate) fn forkable_fors(&self) -> Vec<bool> {
+        self.nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                IrKind::For { forkable, .. } => Some(forkable),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Whether node `id` is *simple*: whether its subtree runs nothing but

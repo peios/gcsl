@@ -121,19 +121,60 @@ impl Lowerer<'_> {
         let base = self.item_stack.len();
         let iterable = self.lower_operand(iterable, ValueKind::List)?;
         self.item_stack.push(iterable);
-        if let Some(guard) = guard {
-            let guard = self.lower_operand(guard, ValueKind::Bool)?;
-            self.item_stack.push(guard);
-        }
-        let body = self.lower_loop_body(for_id, body)?;
-        self.item_stack.push(body);
+        self.forks.push((for_id, slot, true));
+        let lowered = self.lower_each_parts(for_id, guard, body);
+        let forkable = self.forks.pop().is_some_and(|(_, _, forkable)| forkable);
+        lowered?;
         let parts = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
         Ok(IrKind::For {
             slot,
             parts,
             collect,
+            forkable,
         })
+    }
+
+    /// Lowers the guard, if any, and the body of the iteration `for_id`
+    /// onto [`Lowerer::item_stack`], the iteration on
+    /// [`Lowerer::forks`].
+    fn lower_each_parts(
+        &mut self,
+        for_id: ForId,
+        guard: Option<ExprId>,
+        body: ExprId,
+    ) -> Result<(), InternalError> {
+        if let Some(guard) = guard {
+            let guard = self.lower_operand(guard, ValueKind::Bool)?;
+            self.item_stack.push(guard);
+        }
+        let body = self.lower_loop_body(for_id, body)?;
+        self.item_stack.push(body);
+        Ok(())
+    }
+
+    /// Notes that what is being lowered assigns the variable in `slot`:
+    /// every iteration around it that the variable was declared outside of
+    /// is not forkable.
+    pub(super) fn assigns(&mut self, slot: Slot) {
+        for (_, floor, forkable) in &mut self.forks {
+            if slot.index() < floor.index() {
+                *forkable = false;
+            }
+        }
+    }
+
+    /// Notes that what is being lowered leaves the loops after the
+    /// `at`th on [`Lowerer::loops`], and the `at`th itself if it ends it,
+    /// `ends`: none of them is forkable.
+    pub(super) fn leaves(&mut self, at: usize, ends: bool) {
+        let first = if ends { at } else { at + 1 };
+        let left: Vec<ForId> = self.loops.get(first..).unwrap_or_default().to_vec();
+        for (for_id, _, forkable) in &mut self.forks {
+            if left.contains(for_id) {
+                *forkable = false;
+            }
+        }
     }
 
     /// Lowers `body`, the body of the loop `for_id`, as it is used, with

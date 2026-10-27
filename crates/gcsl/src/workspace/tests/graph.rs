@@ -81,14 +81,14 @@ fn a_unit_that_needs_a_result_stops_and_runs_again_once_it_is_given() {
     let mut graph = Graph::new();
     assert_eq!(
         workspace.run_graph(file, &mut graph, every()).unwrap(),
-        Progress::Paused(NodeId::of(0))
+        Progress::Paused(vec![NodeId::of(0)])
     );
     // Both were found before the first was needed.
     assert_eq!(graph.len(), 2);
     assert!(graph.resolve(NodeId::of(0), Ok(text("a.o"))));
     assert_eq!(
         workspace.run_graph(file, &mut graph, every()).unwrap(),
-        Progress::Paused(NodeId::of(1))
+        Progress::Paused(vec![NodeId::of(1)])
     );
     assert!(graph.resolve(NodeId::of(1), Ok(text("b.o"))));
     // The attempts found the same nodes again, and made no others.
@@ -103,9 +103,10 @@ fn a_unit_that_needs_a_result_stops_and_runs_again_once_it_is_given() {
 fn an_effect_is_a_step_needed_at_once() {
     let (mut workspace, file) = lone_workspace("import fs\n= \"read {fs.read(\"/x\")}\"");
     let mut graph = Graph::new();
-    let Progress::Paused(read) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
+    let Progress::Paused(reads) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
         panic!("not paused");
     };
+    let read = reads[0];
     let node = graph.node(read).unwrap();
     assert_eq!(node.kind(), NodeKind::Effect(crate::check::Builtin::FsRead));
     assert_eq!(node.args(), [Value::Str(Rc::from("/x"))]);
@@ -128,7 +129,7 @@ fn a_step_s_failure_is_raised_where_its_result_is_needed() {
     let mut graph = Graph::new();
     assert_eq!(
         workspace.run_graph(file, &mut graph, every()).unwrap(),
-        Progress::Paused(NodeId::of(0))
+        Progress::Paused(vec![NodeId::of(0)])
     );
     let failure = Diagnostic::error("cc exited with 1", Span::new(0, 0));
     assert!(graph.resolve(NodeId::of(0), Err(failure)));
@@ -152,7 +153,7 @@ fn a_def_type_s_deferring_attribute_makes_its_definitions_steps_and_not_itself()
     let mut graph = Graph::new();
     assert_eq!(
         workspace.run_graph(file, &mut graph, every()).unwrap(),
-        Progress::Paused(NodeId::of(0))
+        Progress::Paused(vec![NodeId::of(0)])
     );
     assert_eq!(graph.len(), 1);
     let failure = Diagnostic::error("assertion failed", Span::new(0, 0));
@@ -183,7 +184,7 @@ fn a_definition_s_own_parameters_are_its_step_s_arguments() {
     let mut graph = Graph::new();
     assert_eq!(
         workspace.run_graph(file, &mut graph, every()).unwrap(),
-        Progress::Paused(NodeId::of(1))
+        Progress::Paused(vec![NodeId::of(1)])
     );
     assert_eq!(graph.len(), 2);
     assert!(graph.resolve(NodeId::of(0), Ok(text("w.o"))));
@@ -233,13 +234,15 @@ fn a_memoised_call_that_finds_its_entry_shifts_no_other_effect() {
          = \"{x} {y}\"",
     );
     let mut graph = Graph::new();
-    let Progress::Paused(inner) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
+    let Progress::Paused(inners) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
         panic!("not paused");
     };
+    let inner = inners[0];
     assert!(graph.resolve(inner, Ok(text("inner"))));
-    let Progress::Paused(outer) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
+    let Progress::Paused(outers) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
         panic!("not paused");
     };
+    let outer = outers[0];
     assert_ne!(inner, outer);
     assert!(graph.resolve(outer, Ok(text("outer"))));
     // `m`'s entry is found now, its body skipped.
@@ -272,7 +275,7 @@ fn a_unit_waiting_for_a_step_is_never_retried() {
     let mut graph = Graph::new();
     assert_eq!(
         workspace.run_graph(file, &mut graph, every()).unwrap(),
-        Progress::Paused(NodeId::of(0))
+        Progress::Paused(vec![NodeId::of(0)])
     );
     assert_eq!(graph.len(), 1);
     assert!(graph.resolve(NodeId::of(0), Ok(text("x.o"))));
@@ -291,7 +294,7 @@ fn a_step_given_another_s_result_keys_the_same_once_it_is_given() {
     let mut graph = Graph::new();
     assert_eq!(
         workspace.run_graph(file, &mut graph, every()).unwrap(),
-        Progress::Paused(NodeId::of(1))
+        Progress::Paused(vec![NodeId::of(1)])
     );
     assert!(graph.resolve(NodeId::of(0), Ok(text("a.o"))));
     assert!(graph.resolve(NodeId::of(1), Ok(text("app"))));
@@ -309,7 +312,7 @@ fn a_step_whose_key_changes_between_attempts_is_an_error_not_a_loop() {
     let mut graph = Graph::new();
     assert_eq!(
         workspace.run_graph(file, &mut graph, every()).unwrap(),
-        Progress::Paused(NodeId::of(0))
+        Progress::Paused(vec![NodeId::of(0)])
     );
     assert!(graph.resolve(NodeId::of(0), Ok(text("a.o"))));
     // A copy of the file's code, which no closure of the first attempt
@@ -339,7 +342,7 @@ pub(super) fn drive(workspace: &mut Workspace, file: u32) -> (Value, Graph) {
     let direct = crate::eval::Direct { temp_dirs: None };
     loop {
         let demands = match workspace.run_graph(file, &mut graph, every()).unwrap() {
-            Progress::Paused(node) => vec![node],
+            Progress::Paused(nodes) => nodes,
             Progress::Waiting(unit) => panic!("one file's units wait for unit {unit}"),
             Progress::Done(value) => {
                 let holes = graph.holes(&value);
@@ -672,7 +675,8 @@ fn a_step_runs_as_a_unit_whose_effects_are_jobs_on_any_thread() {
     let mut jobs = 0;
     let result = loop {
         match workspace.run_step(&mut graph, step, inline).unwrap().0 {
-            Progress::Paused(effect) => {
+            Progress::Paused(effects) => {
+                let effect = effects[0];
                 let node = graph.node(effect).unwrap();
                 assert_eq!(node.unit(), crate::eval::graph::STEP_UNITS + step.number());
                 let job = workspace.effect_job(&graph, effect).unwrap();
@@ -765,17 +769,19 @@ fn a_step_s_unit_forgotten_runs_afresh_with_new_effects() {
         defers: &|_: &[crate::check::Attribute]| false,
         effects: &crate::eval::Direct { temp_dirs: None },
     };
-    let Progress::Paused(first) = workspace.run_step(&mut graph, step, inline).unwrap().0 else {
+    let Progress::Paused(firsts) = workspace.run_step(&mut graph, step, inline).unwrap().0 else {
         panic!("not paused");
     };
+    let first = firsts[0];
     let failure = Diagnostic::error("echo crashed", Span::new(0, 0));
     assert!(graph.resolve(first, Err(failure)));
     assert!(workspace.run_step(&mut graph, step, inline).is_err());
     // Retried afresh: a new effect, not the failed one.
     graph.forget_unit(crate::eval::graph::STEP_UNITS + step.number());
-    let Progress::Paused(second) = workspace.run_step(&mut graph, step, inline).unwrap().0 else {
+    let Progress::Paused(seconds) = workspace.run_step(&mut graph, step, inline).unwrap().0 else {
         panic!("not paused");
     };
+    let second = seconds[0];
     assert_ne!(first, second);
 }
 
@@ -1238,7 +1244,8 @@ fn a_lazy_made_in_a_memoised_call_and_awaited_after_converges() {
     let mut graph = Graph::new();
     let result = loop {
         match workspace.run_graph(file, &mut graph, every()).unwrap() {
-            Progress::Paused(effect) => {
+            Progress::Paused(effects) => {
+                let effect = effects[0];
                 let job = workspace.effect_job(&graph, effect).unwrap();
                 let plain = on_a_thread(job, None).unwrap();
                 let value = workspace.from_plain(&plain);
@@ -1265,7 +1272,8 @@ fn a_registered_toolchain_s_definition_converges_in_graph_mode() {
         attempts += 1;
         assert!(attempts < 10);
         match workspace.run_graph(file, &mut graph, every()) {
-            Ok(Progress::Paused(effect)) => {
+            Ok(Progress::Paused(effects)) => {
+                let effect = effects[0];
                 let job = workspace.effect_job(&graph, effect).unwrap();
                 let plain = on_a_thread(job, None).unwrap();
                 let value = workspace.from_plain(&plain);

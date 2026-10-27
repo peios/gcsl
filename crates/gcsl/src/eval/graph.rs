@@ -476,7 +476,7 @@ pub fn effect_builtin(builtin: Builtin) -> bool {
 }
 
 /// The scope a node is met in (see [Graph mode](#graph-mode)).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Scope {
     /// Its path: a hash of its parent's, its key and its number among its
     /// parent's scopes of that key.
@@ -497,8 +497,9 @@ pub(crate) struct GraphRun<'g> {
     /// Whether the host takes a call of a function with these attributes, a
     /// deferring attribute among them, as a step.
     defers: Defers<'g>,
-    /// What the run stopped for, once it has.
-    paused: Cell<Option<Wait>>,
+    /// What the run stopped for, once it has: every node and unit its
+    /// tasks wait for.
+    paused: RefCell<Vec<Wait>>,
     /// The node met last, in program order.
     last: Cell<Option<NodeId>>,
     /// The scopes being run, innermost last.
@@ -561,7 +562,7 @@ impl std::fmt::Debug for GraphRun<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GraphRun")
             .field("unit", &self.unit)
-            .field("paused", &self.paused.get())
+            .field("paused", &self.paused.borrow())
             .finish_non_exhaustive()
     }
 }
@@ -579,7 +580,7 @@ impl<'g> GraphRun<'g> {
             graph: RefCell::new(graph),
             unit,
             defers,
-            paused: Cell::new(None),
+            paused: RefCell::new(Vec::new()),
             last: Cell::new(None),
             scopes: RefCell::new(vec![root]),
             watch: RefCell::new(None),
@@ -601,9 +602,9 @@ impl<'g> GraphRun<'g> {
         self.own
     }
 
-    /// Notes that the run stopped for `wait`.
+    /// Notes that the run stopped for `wait`, among what it waits for.
     pub(crate) fn stopped(&self, wait: Wait) {
-        self.paused.set(Some(wait));
+        self.paused.borrow_mut().push(wait);
     }
 
     /// Gives the run the unit's evaluation to take up, suspended where an
@@ -632,6 +633,39 @@ impl<'g> GraphRun<'g> {
             last: self.last.get(),
             watch: self.watch.borrow_mut().take(),
         }
+    }
+
+    /// Whether the node `id` waits for the host to give its result.
+    pub(crate) fn is_waiting(&self, id: NodeId) -> bool {
+        self.graph
+            .borrow()
+            .node(id)
+            .is_some_and(|node| node.state == NodeState::Waiting)
+    }
+
+    /// How many scopes are being run.
+    pub(crate) fn scope_depth(&self) -> usize {
+        self.scopes.borrow().len()
+    }
+
+    /// The node met last.
+    pub(crate) fn last_met(&self) -> Option<NodeId> {
+        self.last.get()
+    }
+
+    /// What the run keeps of itself, for a task split off now, which keeps
+    /// it all; the task running is cut back to its first `kept` scopes and
+    /// `last` (see [Tasks](crate::eval::machine::tasks#tasks)).
+    pub(crate) fn fork_state(&self, kept: usize, last: Option<NodeId>) -> RunState {
+        let mut scopes = self.scopes.borrow_mut();
+        let state = RunState {
+            scopes: scopes.clone(),
+            last: self.last.get(),
+            watch: None,
+        };
+        scopes.truncate(kept);
+        self.last.set(last);
+        state
     }
 
     /// Takes up `state`, what an earlier run of the unit kept of itself.
@@ -718,8 +752,8 @@ impl<'g> GraphRun<'g> {
 
     /// The graph, as the run left it, and the node the run stopped for, if
     /// it did.
-    pub(crate) fn finish(self) -> (Graph, Option<Wait>) {
-        (self.graph.into_inner(), self.paused.get())
+    pub(crate) fn finish(self) -> (Graph, Vec<Wait>) {
+        (self.graph.into_inner(), self.paused.into_inner())
     }
 
     /// The position of the next node met, in the innermost scope.

@@ -159,8 +159,8 @@ impl Workspace {
         *graph = left;
         match outcome {
             Ok(value) => Ok((Progress::Done(value), reads)),
-            Err(error) if error.mark == Mark::PENDING => match paused {
-                Some(wait) => Ok((Progress::stopped(wait), reads)),
+            Err(error) if error.mark == Mark::PENDING => match Progress::stopped(&paused) {
+                Some(progress) => Ok((progress, reads)),
                 None => Err(internal("a step stopped for no step")),
             },
             Err(error) => Err(error),
@@ -351,11 +351,11 @@ impl Workspace {
         host: GraphHost<'_>,
     ) -> Result<Progress, InvokeError> {
         for &file in &call.files {
-            if let Some(wait) = self
+            if let Some(progress) = self
                 .run_files(file, Some((&mut *graph, host)))
                 .map_err(InvokeError::Diagnostics)?
             {
-                return Ok(Progress::stopped(wait));
+                return Ok(progress);
             }
         }
         // Its root context, its definition bound as a reference's call binds
@@ -400,8 +400,8 @@ impl Workspace {
         *graph = left;
         match outcome {
             Ok(value) => Ok(Progress::Done(value)),
-            Err(error) if error.mark == Mark::PENDING => match paused {
-                Some(wait) => Ok(Progress::stopped(wait)),
+            Err(error) if error.mark == Mark::PENDING => match Progress::stopped(&paused) {
+                Some(progress) => Ok(progress),
                 None => Err(InvokeError::Diagnostics(vec![
                     crate::diagnostic::InternalError {
                         message: "a call stopped for no step",

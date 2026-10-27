@@ -46,6 +46,9 @@ pub(in crate::eval) enum Resume {
     /// The await `state` of `future`, again: the future has run, or the
     /// node it stands for has its result, or not yet.
     Await(AwaitState, Rc<Future>),
+    /// The application of a built-in, its arguments evaluated, again: its
+    /// turn to make an effect may have come.
+    Builtin(Box<super::builtins::BuiltinCall>),
     /// The deep await `state` of the value, again: a future of one of its
     /// fields has run, or the node it stands for has its result, or not
     /// yet.
@@ -65,10 +68,9 @@ pub(in crate::eval) enum Resume {
 /// A unit's evaluation, stopped where it waits (see the module
 /// documentation).
 pub(crate) struct Suspended {
-    /// The machine's frames, activations and calls.
+    /// The machine's frames, activations and calls, and the unit's other
+    /// tasks.
     parked: Parked,
-    /// What it does first when it takes up again.
-    resume: Resume,
     /// The value stack from where the unit's own slots begin.
     segment: Vec<Value>,
     /// Where on the stack `segment` began.
@@ -111,6 +113,8 @@ struct Task {
     operand_failed: bool,
     /// Its calls from the workspace's own code into foreign code.
     sites: Vec<(u32, Span)>,
+    /// The `lazy`s it is running.
+    futures: Vec<Rc<crate::value::Future>>,
 }
 
 /// Where a run of the machine started: the stack's length from which the
@@ -154,9 +158,9 @@ pub(in crate::eval) fn run_machine(
     let graph = shared.graph;
     let resumed = graph.and_then(GraphRun::take_suspended);
     let (start, ran, parked) = if let Some(suspended) = resumed {
-        let (start, parked, resume) = take_up(suspended, (stack, memo), shared, own);
+        let (start, parked) = take_up(suspended, (stack, memo), shared, own);
         let mut machine = Machine::parked((stack, memo), shared, parked);
-        let next = machine.resume_next(resume);
+        let next = machine.take_up_tasks();
         let ran = machine.run_from(next);
         (start, ran, machine.into_parked())
     } else {
@@ -186,10 +190,12 @@ pub(in crate::eval) fn run_machine(
             super::super::internal("a unit stopped where the machine could not", error.span).into(),
         ),
         (Ran::Done(flow), _) => flow,
-        (Ran::Blocked(wait, resume), Some(run)) => {
-            let suspended = set_aside((parked, resume), start, (stack, memo), shared);
+        (Ran::Blocked(waits), Some(run)) => {
+            let suspended = set_aside(parked, start, (stack, memo), shared);
             run.suspend(suspended);
-            run.stopped(wait);
+            for wait in waits {
+                run.stopped(wait);
+            }
             Err(pending(span).into())
         }
         (Ran::Blocked(..), None) => {
@@ -201,7 +207,7 @@ pub(in crate::eval) fn run_machine(
 /// Takes what the machine stopped with out of `stack`, `memo` and `shared`
 /// into the unit's [`Suspended`], `start` being where its run started.
 fn set_aside(
-    (parked, resume): (Parked, Resume),
+    parked: Parked,
     start: Start,
     (stack, memo): (&mut Vec<Value>, &mut MemoTables),
     shared: &Shared<'_>,
@@ -219,6 +225,7 @@ fn set_aside(
         identities: shared.identities.take(),
         operand_failed: shared.operand_failed.get(),
         sites: shared.sites.take(),
+        futures: shared.futures.take(),
     };
     shared.earliest.set(None);
     let run = shared
@@ -226,7 +233,6 @@ fn set_aside(
         .map_or_else(RunState::default, GraphRun::take_state);
     Suspended {
         parked,
-        resume,
         segment,
         base: start.base,
         task,
@@ -239,17 +245,16 @@ fn set_aside(
 
 /// Puts `suspended` back into `stack`, `memo` and `shared`, its frames
 /// rebased if its slots begin elsewhere now, and returns where this run
-/// started, its machine's parts and what it does first. `own` is where the
+/// started and its machine's parts. `own` is where the
 /// unit's own top-level slots begin, if it is a prepared call.
 fn take_up(
     suspended: Suspended,
     (stack, memo): (&mut Vec<Value>, &mut MemoTables),
     shared: &Shared<'_>,
     own: Option<usize>,
-) -> (Start, Parked, Resume) {
+) -> (Start, Parked) {
     let Suspended {
         mut parked,
-        resume,
         segment,
         base,
         task,
@@ -287,7 +292,7 @@ fn take_up(
     if let Some(graph) = shared.graph {
         graph.restore_state(run);
     }
-    (start, parked, resume)
+    (start, parked)
 }
 
 /// Puts `task` back into `shared`, its deadlines moved on by `blocked`,
@@ -311,6 +316,7 @@ fn restore_task(task: Task, shared: &Shared<'_>, blocked: Duration) {
     shared.identities.replace(task.identities);
     shared.operand_failed.set(task.operand_failed);
     shared.sites.replace(task.sites);
+    shared.futures.replace(task.futures);
 }
 
 impl Parked {
@@ -343,6 +349,7 @@ impl Machine<'_> {
         match resume {
             Resume::Await(state, future) => self.await_fully(state, Value::Future(future)),
             Resume::Deep(state, value) => self.await_deep(state, value),
+            Resume::Builtin(call) => self.builtin_apply(call),
             Resume::Apply(operands) => self.apply_again(operands),
             Resume::Effect(node, id) => {
                 let outcome = self.walker(|walker| walker.node_outcome(id, walker.ir.get(node)));

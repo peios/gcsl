@@ -474,8 +474,9 @@ pub enum Progress {
     /// It finished with this value, which may hold results the host has yet
     /// to give.
     Done(Value),
-    /// It stopped for the result of this node, which it needs.
-    Paused(NodeId),
+    /// It stopped for the results of these nodes, which its tasks need,
+    /// none of them given yet (see [Tasks](crate::eval::machine::tasks#tasks)).
+    Paused(Vec<NodeId>),
     /// It stopped for the run of this unit, which computes a memoised
     /// call's value or a `lazy`'s that it needs, and has stopped itself: run
     /// it again once that unit has run (see [Graph
@@ -484,12 +485,24 @@ pub enum Progress {
 }
 
 impl Progress {
-    /// What a run that stopped for `wait` is.
-    pub(crate) const fn stopped(wait: Wait) -> Self {
-        match wait {
-            Wait::Node(id) => Progress::Paused(id),
-            Wait::Unit(unit) => Progress::Waiting(unit),
+    /// What a run that stopped for `waits` is: the nodes it waits for, or,
+    /// if it waits for none, the first unit it waits for. `None` if it
+    /// waits for nothing.
+    pub(crate) fn stopped(waits: &[Wait]) -> Option<Self> {
+        let nodes: Vec<NodeId> = waits
+            .iter()
+            .filter_map(|wait| match *wait {
+                Wait::Node(id) => Some(id),
+                Wait::Unit(_) => None,
+            })
+            .collect();
+        if !nodes.is_empty() {
+            return Some(Progress::Paused(nodes));
         }
+        waits.iter().find_map(|wait| match *wait {
+            Wait::Unit(unit) => Some(Progress::Waiting(unit)),
+            Wait::Node(_) => None,
+        })
     }
 }
 
@@ -726,8 +739,8 @@ impl Workspace {
         graph: &mut Graph,
         host: GraphHost<'_>,
     ) -> Result<Progress, Vec<Diagnostic>> {
-        if let Some(wait) = self.run_files(index, Some((graph, host)))? {
-            return Ok(Progress::stopped(wait));
+        if let Some(progress) = self.run_files(index, Some((graph, host)))? {
+            return Ok(progress);
         }
         Ok(Progress::Done(
             self.values
@@ -979,7 +992,7 @@ impl Workspace {
         &mut self,
         index: u32,
         mut graph: Option<(&mut Graph, GraphHost<'_>)>,
-    ) -> Result<Option<Wait>, Vec<Diagnostic>> {
+    ) -> Result<Option<Progress>, Vec<Diagnostic>> {
         for at in self.scan.needed(index) {
             let Some(state) = self.runs.get_mut(at as usize) else {
                 continue;
@@ -1030,7 +1043,7 @@ impl Workspace {
                     **graph = left;
                     paused
                 }
-                _ => None,
+                _ => Vec::new(),
             };
             let Some(state) = self.runs.get_mut(at as usize) else {
                 continue;
@@ -1045,8 +1058,8 @@ impl Workspace {
                 // once the host has given it.
                 Err(error) if error.mark == Mark::PENDING => {
                     *state = FileRun::Paused(ir);
-                    return match paused {
-                        Some(wait) => Ok(Some(wait)),
+                    return match Progress::stopped(&paused) {
+                        Some(progress) => Ok(Some(progress)),
                         None => Err(vec![
                             InternalError {
                                 message: "a unit stopped for no step",

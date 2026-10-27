@@ -4,9 +4,17 @@
 
 use crate::check::Slot;
 use crate::ir::{IrId, IrKind, IrRange, Operands};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::diagnostic::Mark as ErrorMark;
 use crate::value::{List, Value};
 
+use super::super::graph::Wait;
+
 use super::super::{Elements, FOR_RESERVE, Flow, Stop, StopKind, Unwind, caught};
+use super::suspend::Resume;
+use super::tasks::{Join, Marks, Status, path_of};
 use super::{Frame, Machine, Next, Outcome, fail, give};
 
 /// A `for` running in the machine.
@@ -23,8 +31,31 @@ pub(super) struct ForState {
     collect: bool,
     /// The elements left; none until its iterable is evaluated.
     elements: Option<Elements>,
-    /// The values collected so far.
+    /// The values collected so far, each split-off iteration's place held
+    /// by `{}` until it delivers.
     values: Vec<Value>,
+    /// How many elements it has taken: the iteration running is the last.
+    index: usize,
+    /// Whether its iterations may be split off (see
+    /// [Tasks](super::tasks#tasks)): its node is forkable, in graph mode,
+    /// in a function's body.
+    forkable: bool,
+    /// Where the iteration running began, if it may be split off.
+    marks: Option<Box<Marks>>,
+    /// Its iterations split off, once one is.
+    join: Option<Rc<RefCell<Join>>>,
+    /// Its own failure, once iterations are split off, by its iteration.
+    failure: Option<(usize, Box<Unwind>)>,
+}
+
+impl ForState {
+    /// The iteration it is at, as part of a task's path, if it has split
+    /// iterations off (see [Tasks](super::tasks#tasks)).
+    pub(super) fn split_at(&self) -> Option<u32> {
+        self.join
+            .as_ref()
+            .map(|_| u32::try_from(self.index.saturating_sub(1)).unwrap_or(u32::MAX))
+    }
 }
 
 /// A condition loop running in the machine.
@@ -68,6 +99,10 @@ impl Machine<'_> {
             [iterable, guard, body] => (iterable, Some(guard), body),
             _ => return self.mistyped(id, "a `for` without its iterable and body"),
         };
+        let running = self.running();
+        let forkable = matches!(ir.get(id).kind, IrKind::For { forkable: true, .. })
+            && self.shared.graph.is_some()
+            && (running.callee.is_some() || running.owned.is_some());
         let mut state = Box::new(ForState {
             node: id,
             slot,
@@ -76,6 +111,11 @@ impl Machine<'_> {
             collect,
             elements: None,
             values: Vec::new(),
+            index: 0,
+            forkable,
+            marks: None,
+            join: None,
+            failure: None,
         });
         if let IrKind::Range(inclusive, operands) = ir.get(iterable).kind
             && !ir.is_simple(iterable)
@@ -156,9 +196,18 @@ impl Machine<'_> {
             if let Err(unwind) = deadline {
                 return fail(unwind);
             }
+            // Once an iteration split off has failed, no later one runs.
+            if state
+                .join
+                .as_ref()
+                .is_some_and(|join| join.borrow().failed.is_some())
+            {
+                return self.for_end(state);
+            }
             let Some(element) = state.elements.as_mut().and_then(Iterator::next) else {
-                return Next::Give(Ok(loop_result(state.collect, state.values)));
+                return self.for_end(state);
             };
+            state.index += 1;
             let at = self.running().base + state.slot.index();
             let Some(variable) = self.stack.get_mut(at) else {
                 let span = self.running().ir.get(state.node).span;
@@ -179,15 +228,17 @@ impl Machine<'_> {
                 }
             }
             if !self.running().ir.is_simple(state.body) {
-                let body = state.body;
-                self.frames.push(Frame::ForBody(state));
-                return Next::Eval(body);
+                return self.for_body_begin(state);
             }
             let body = state.body;
             let result = self.walker(|walker| walker.value(body)).map_err(Box::new);
             match collected(&mut state, result) {
-                Ok(true) => return Next::Give(Ok(loop_result(state.collect, state.values))),
+                Ok(true) => return self.for_end(state),
                 Ok(false) => {}
+                Err(unwind) if state.join.is_some() => {
+                    state.failure = Some((state.index.saturating_sub(1), Box::new(unwind)));
+                    return self.for_end(state);
+                }
                 Err(unwind) => return fail(unwind),
             }
         }
@@ -196,11 +247,7 @@ impl Machine<'_> {
     /// Takes up the `for` `state` with `result`, the value of its guard.
     pub(super) fn for_guard(&mut self, state: Box<ForState>, result: Outcome) -> Next {
         match result {
-            Ok(Value::Bool(true)) => {
-                let body = state.body;
-                self.frames.push(Frame::ForBody(state));
-                Next::Eval(body)
-            }
+            Ok(Value::Bool(true)) => self.for_body_begin(state),
             Ok(Value::Bool(false)) => self.for_next(state),
             Ok(_) => self.mistyped(state.node, "a guard that is not a Bool"),
             Err(unwind) => Next::Give(Err(unwind)),
@@ -209,10 +256,182 @@ impl Machine<'_> {
 
     /// Takes up the `for` `state` with `result`, what its body came to.
     pub(super) fn for_body(&mut self, mut state: Box<ForState>, result: Outcome) -> Next {
+        if state.marks.take().is_some() {
+            self.walker(|walker| walker.leave_scope(true));
+        }
         match collected(&mut state, result) {
-            Ok(true) => Next::Give(Ok(loop_result(state.collect, state.values))),
+            Ok(true) => self.for_end(state),
             Ok(false) => self.for_next(state),
+            Err(unwind) if state.join.is_some() => {
+                state.failure = Some((state.index.saturating_sub(1), Box::new(unwind)));
+                self.for_end(state)
+            }
             Err(unwind) => fail(unwind),
+        }
+    }
+
+    /// Begins the body of the iteration running of `state`: if its
+    /// iterations may be split off, where it began is marked, and it runs
+    /// in a graph-mode scope of its own, by its number.
+    fn for_body_begin(&mut self, state: Box<ForState>) -> Next {
+        let body = state.body;
+        if !state.forkable {
+            self.frames.push(Frame::ForBody(state));
+            return Next::Eval(body);
+        }
+        let key = (
+            Value::Int(i64::from(self.running().ir.get(state.node).span.start)),
+            Value::Int(i64::try_from(state.index).unwrap_or(i64::MAX)),
+        );
+        self.frames.push(Frame::ForBody(state));
+        let marks = self.marks();
+        self.walker(|walker| walker.enter_scope(&[&key.0, &key.1]));
+        if let Some(Frame::ForBody(state)) = self.frames.last_mut() {
+            state.marks = Some(Box::new(marks));
+        }
+        Next::Eval(body)
+    }
+
+    /// Ends `state`, its elements taken: its value, or, if iterations were
+    /// split off, once they have all delivered, theirs and its own in
+    /// iteration order (see [Tasks](super::tasks#tasks)).
+    fn for_end(&mut self, state: Box<ForState>) -> Next {
+        let Some(join) = state.join.clone() else {
+            return Next::Give(Ok(loop_result(state.collect, state.values)));
+        };
+        if let Some((failed, _)) = &state.failure {
+            let later: Vec<u32> = join
+                .borrow()
+                .children
+                .iter()
+                .filter(|child| child.0 > *failed && child.3.is_none())
+                .map(|child| child.2)
+                .collect();
+            self.cancel(&later);
+        }
+        if join.borrow().live > 0 {
+            self.frames.push(Frame::ForJoin(state));
+            return Next::Park(Box::new(Status::Joining));
+        }
+        Self::join_result(*state)
+    }
+
+    /// Takes up `state`, waiting for its children, with `result`: they have
+    /// all delivered, or the task is being cancelled, which cancels them.
+    pub(super) fn joined(&mut self, state: ForState, result: Outcome) -> Next {
+        match result {
+            Ok(_) => Self::join_result(state),
+            Err(unwind) => {
+                let live: Vec<u32> = state
+                    .join
+                    .as_ref()
+                    .map(|join| {
+                        join.borrow()
+                            .children
+                            .iter()
+                            .filter(|child| child.3.is_none())
+                            .map(|child| child.2)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.cancel(&live);
+                Next::Give(Err(unwind))
+            }
+        }
+    }
+
+    /// The value of `state`, its children all delivered: the first failure
+    /// in iteration order, its own or a child's, or else its values, each
+    /// child's in its place, as a loop run in order would give them.
+    fn join_result(mut state: ForState) -> Next {
+        let children = state
+            .join
+            .take()
+            .map(|join| std::mem::take(&mut join.borrow_mut().children))
+            .unwrap_or_default();
+        let mut first = state.failure.take();
+        let mut dropped = Vec::new();
+        for (iteration, position, _, outcome) in children {
+            match outcome.map(|outcome| outcome.map_err(|unwind| *unwind)) {
+                Some(Ok(value)) => {
+                    if let Some(place) = state.values.get_mut(position) {
+                        *place = value;
+                    }
+                }
+                Some(Err(Unwind::Stop(Stop {
+                    to: 0,
+                    kind: StopKind::Continue,
+                    value,
+                }))) => match (value, state.values.get_mut(position)) {
+                    (Some(value), Some(place)) => *place = value,
+                    _ => dropped.push(position),
+                },
+                Some(Err(Unwind::Error(error))) if error.mark == ErrorMark::CANCELLED => {}
+                Some(Err(unwind)) => {
+                    if first.as_ref().is_none_or(|(at, _)| iteration < *at) {
+                        first = Some((iteration, Box::new(unwind)));
+                    }
+                }
+                None => dropped.push(position),
+            }
+        }
+        if let Some((_, unwind)) = first {
+            return Next::Give(Err(unwind));
+        }
+        if state.collect {
+            dropped.sort_unstable();
+            for position in dropped.into_iter().rev() {
+                if position < state.values.len() {
+                    state.values.remove(position);
+                }
+            }
+        }
+        Next::Give(Ok(loop_result(state.collect, state.values)))
+    }
+
+    /// Splits the innermost iteration on the task's frames that may be
+    /// split off, which stops for `wait`, to take up after `resume`, into a
+    /// child, and goes on with its loop's next iteration; or, if there is
+    /// none, gives `wait` and `resume` back (see [Tasks](super::tasks#tasks)).
+    pub(super) fn fork_for(&mut self, wait: Wait, resume: Resume) -> Result<Next, (Wait, Resume)> {
+        let Some(at) = self
+            .frames
+            .iter()
+            .rposition(|frame| matches!(frame, Frame::ForBody(state) if state.marks.is_some()))
+        else {
+            return Err((wait, resume));
+        };
+        let (parent, child) = (self.meta.id, self.next_task);
+        let Some(Frame::ForBody(state)) = self.frames.get_mut(at) else {
+            return Err((wait, resume));
+        };
+        let join = Rc::clone(
+            state
+                .join
+                .get_or_insert_with(|| Rc::new(RefCell::new(Join::new(parent)))),
+        );
+        let position = if state.collect {
+            state.values.push(Value::Empty);
+            state.values.len() - 1
+        } else {
+            0
+        };
+        let number = {
+            let mut joined = join.borrow_mut();
+            joined
+                .children
+                .push((state.index.saturating_sub(1), position, child, None));
+            joined.live += 1;
+            joined.children.len() - 1
+        };
+        let Some(marks) = state.marks.take() else {
+            return Err((wait, resume));
+        };
+        let base = path_of(&self.meta, self.frames.get(..=at).unwrap_or_default());
+        self.split(&marks, (join, number), (wait, resume), base);
+        match self.frames.pop() {
+            Some(Frame::ForBody(state)) => Ok(self.for_next(state)),
+            _ => Ok(self.lost_call()),
         }
     }
 

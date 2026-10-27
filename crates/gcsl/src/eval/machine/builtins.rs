@@ -7,11 +7,12 @@ use crate::check::Builtin;
 use crate::ir::{ArgValue, IrId, IrKind, IrRange};
 
 use super::super::calls::{Applied, BuiltinArguments};
-use super::super::graph::Wait;
+use super::super::graph::{Wait, effect_builtin};
+use super::tasks::Status;
 use super::{Frame, Machine, Next, Outcome, Resume, fail, give};
 
 /// A call of a built-in running in the machine.
-pub(super) struct BuiltinCall {
+pub(in crate::eval) struct BuiltinCall {
     /// The built-in.
     builtin: Builtin,
     /// The call node.
@@ -43,22 +44,7 @@ impl Machine<'_> {
         loop {
             let ir = &self.running().ir;
             let Some(&arg) = ir.items(call.args).get(call.next as usize) else {
-                let BuiltinCall {
-                    builtin,
-                    node,
-                    arguments,
-                    ..
-                } = *call;
-                let applied = self
-                    .walker(|walker| walker.apply_or_meet(builtin, arguments, walker.ir.get(node)));
-                return match applied {
-                    Ok(Applied::Value(value)) => Next::Give(Ok(value)),
-                    // Its outcome is read once the host gives it.
-                    Ok(Applied::Waiting(id)) => {
-                        Next::Block(Wait::Node(id), Resume::Effect(node, id))
-                    }
-                    Err(unwind) => fail(unwind),
-                };
+                return self.builtin_apply(call);
             };
             let IrKind::Arg {
                 value: ArgValue::Node(value),
@@ -83,6 +69,34 @@ impl Machine<'_> {
                 }
                 Err(unwind) => return fail(unwind),
             }
+        }
+    }
+
+    /// Applies the built-in of `call`, its arguments evaluated: its value,
+    /// or, in graph mode, its effect's node, which it waits for. An effect
+    /// the host does not isolate waits first until nothing earlier in
+    /// program order is running (see [Tasks](super::tasks#tasks)).
+    pub(super) fn builtin_apply(&mut self, call: Box<BuiltinCall>) -> Next {
+        if self.shared.graph.is_some()
+            && effect_builtin(call.builtin)
+            && !self.shared.effects.isolates(call.builtin)
+            && self.earlier_live()
+        {
+            return Next::Park(Box::new(Status::Waiting(Resume::Builtin(call))));
+        }
+        let BuiltinCall {
+            builtin,
+            node,
+            arguments,
+            ..
+        } = *call;
+        let applied =
+            self.walker(|walker| walker.apply_or_meet(builtin, arguments, walker.ir.get(node)));
+        match applied {
+            Ok(Applied::Value(value)) => Next::Give(Ok(value)),
+            // Its outcome is read once the host gives it.
+            Ok(Applied::Waiting(id)) => Next::Block(Wait::Node(id), Resume::Effect(node, id)),
+            Err(unwind) => fail(unwind),
         }
     }
 
