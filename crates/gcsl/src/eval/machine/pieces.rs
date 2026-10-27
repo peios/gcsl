@@ -50,12 +50,6 @@ pub(in crate::eval) struct Pieces {
 }
 
 impl Pieces {
-    /// The piece running, as part of a task's path, if pieces were split
-    /// off (see [Tasks](super::tasks#tasks)).
-    pub(super) fn split_at(&self) -> Option<u32> {
-        self.join.as_ref().map(|_| self.at)
-    }
-
     /// Whether a piece split off has failed, so that what the task does
     /// after it would not be done in program order.
     pub(super) fn failed(&self) -> bool {
@@ -169,6 +163,20 @@ impl Frame {
             Self::Items { split, .. } => split.as_mut().map(|state| &mut state.pieces),
             _ => None,
         }
+    }
+
+    /// The piece of the node, call or block of this frame running, marked
+    /// or not, as part of a task's path (see [Tasks](super::tasks#tasks)),
+    /// `call` the call it takes, if it takes one.
+    pub(super) fn piece_running(&self, call: Option<&CallState>) -> Option<u32> {
+        let at = match self {
+            Self::Operands(state) => u32::try_from(state.values.len()).unwrap_or(u32::MAX),
+            Self::Arguments => call?.next,
+            Self::BuiltinArgument(call) => call.next,
+            Self::Items { next, .. } => next.saturating_sub(1),
+            _ => return None,
+        };
+        Some(at)
     }
 
     /// Whether the iteration or piece of this frame running may be split
@@ -300,11 +308,6 @@ impl Machine<'_> {
             return self.fork_for(at, status);
         }
         let parent = self.meta.id;
-        let base = path_of(
-            &self.meta,
-            self.frames.get(..=at).unwrap_or_default(),
-            &self.calls,
-        );
         let pieces = match call {
             Some(call) => self.calls.get_mut(call).map(|call| &mut call.pieces),
             None => self.frames.get_mut(at).and_then(Frame::pieces_mut),
@@ -322,6 +325,12 @@ impl Machine<'_> {
                 .get_or_insert_with(|| Rc::new(RefCell::new(Join::new(parent)))),
         );
         let number = join.borrow().children.len();
+        // Its path, the construct's join made, has the piece's number.
+        let base = path_of(
+            &self.meta,
+            self.frames.get(..=at).unwrap_or_default(),
+            &self.calls,
+        );
         self.split(&marks, (Rc::clone(&join), number), status, base);
         Ok(self.split_off(piece, &join))
     }

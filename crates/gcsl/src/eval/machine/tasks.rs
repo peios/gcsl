@@ -38,8 +38,11 @@
 //!
 //! **Program order.** A task's *path* is where its work is in the program:
 //! its base, the path its parent was at when it split it off, and then the
-//! iteration or piece each split loop, node or call on its frames is at,
-//! one waiting for its children past every iteration or piece. An effect
+//! iteration or piece that each loop whose iterations may be split off,
+//! and each list, interpolation, call and block, on its frames is at,
+//! whether or not anything was split off from it, so that paths taken at
+//! different times compare as the program orders them; one waiting for
+//! its children is past every iteration or piece. An effect
 //! the host does not isolate ([`crate::eval::Effects::isolates`]) is made
 //! only when no live task's path is earlier, so that such effects reach the
 //! host in program order; and never once an iteration or piece split off
@@ -549,7 +552,7 @@ impl Machine<'_> {
         drop(joined);
         self.cancel(&later);
         if let Some(parent) = woken {
-            self.wake(parent);
+            self.wake(parent, join);
         }
         self.finished()
     }
@@ -606,16 +609,24 @@ impl Machine<'_> {
         }
     }
 
-    /// Wakes the loop of the task `id`, which waits for its children.
-    fn wake(&mut self, id: u32) {
+    /// Wakes the task `id` if it waits for the children of `join`: its
+    /// innermost frame waits for them. A task may hold other joins further
+    /// down its frames, whose children end while it waits for this one.
+    fn wake(&mut self, id: u32, join: &Rc<RefCell<Join>>) {
+        let waits = |frames: &[Frame]| {
+            frames
+                .last()
+                .and_then(Frame::join)
+                .is_some_and(|waited| Rc::ptr_eq(waited, join))
+        };
         if self.meta.id == id {
-            if matches!(self.status, Some(Status::Joining)) {
+            if matches!(self.status, Some(Status::Joining)) && waits(&self.frames) {
                 self.status = Some(Status::Ready(Next::Give(Ok(Value::Empty))));
             }
             return;
         }
         for task in &mut self.tasks {
-            if task.meta.id == id && matches!(task.status, Status::Joining) {
+            if task.meta.id == id && matches!(task.status, Status::Joining) && waits(&task.frames) {
                 task.status = Status::Ready(Next::Give(Ok(Value::Empty)));
             }
         }
@@ -767,7 +778,7 @@ pub(super) fn path_of(meta: &Meta, frames: &[Frame], calls: &[CallState]) -> Vec
         if let Some(at) = match frame {
             Frame::ForBody(state) => ForState::split_at(state),
             Frame::ForJoin(_) | Frame::PiecesJoin(_) => Some(u32::MAX),
-            frame => frame.pieces(call).and_then(super::pieces::Pieces::split_at),
+            frame => frame.piece_running(call),
         } {
             path.push(at);
         }

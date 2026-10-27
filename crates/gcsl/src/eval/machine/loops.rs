@@ -47,12 +47,12 @@ pub(super) struct ForState {
 }
 
 impl ForState {
-    /// The iteration it is at, as part of a task's path, if it has split
-    /// iterations off (see [Tasks](super::tasks#tasks)).
+    /// The iteration it is at, as part of a task's path, if its iterations
+    /// may be split off, whether or not any has been (see
+    /// [Tasks](super::tasks#tasks)).
     pub(super) fn split_at(&self) -> Option<u32> {
-        self.join
-            .as_ref()
-            .map(|_| u32::try_from(self.index.saturating_sub(1)).unwrap_or(u32::MAX))
+        self.forkable
+            .then(|| u32::try_from(self.index.saturating_sub(1)).unwrap_or(u32::MAX))
     }
 
     /// Whether the iteration running may be split off: where it began is

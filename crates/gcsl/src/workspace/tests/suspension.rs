@@ -639,3 +639,78 @@ fn an_earlier_task_runs_a_lazy_a_later_one_began_and_waits_in() {
     assert_eq!(value, texts(&["As", "s"]));
     assert_eq!(graph.len(), 2);
 }
+
+#[test]
+fn a_task_on_a_piece_after_one_split_off_is_later_than_it_in_program_order() {
+    // The first element is split off at its read; the task goes on with
+    // the second, which is never marked, being the last. Its write is
+    // after the first element's in program order, so it waits.
+    let (mut workspace, file) = super::graph::lone_workspace(
+        "import fs\n\
+         fn f() -> List<{}> {\n\
+         \x20   = [{ let t = fs.read(\"/a\")\n = fs.write(\"/one\", t) }, fs.write(\"/two\", \"y\")]\n\
+         }\n\
+         = f()",
+    );
+    let host = crate::eval::graph::GraphHost {
+        defers: &|_: &[crate::check::Attribute]| true,
+        effects: &ReadsIsolated,
+    };
+    let mut graph = Graph::new();
+    let mut seen = Vec::new();
+    loop {
+        match workspace.run_graph(file, &mut graph, host).unwrap() {
+            Progress::Paused(nodes) => {
+                for node in nodes {
+                    let first = graph.node(node).unwrap().args()[0].clone();
+                    seen.push(first.clone());
+                    let given = if first == text("/a") {
+                        text("A")
+                    } else {
+                        Value::Empty
+                    };
+                    assert!(graph.resolve(node, Ok(given)));
+                }
+            }
+            Progress::Waiting(unit) => panic!("waits for unit {unit}"),
+            Progress::Done(_) => break,
+        }
+    }
+    assert_eq!(seen, [text("/a"), text("/one"), text("/two")]);
+}
+
+#[test]
+fn what_is_split_off_inside_a_piece_before_the_piece_is_keeps_its_place() {
+    // The first statement is split off at its read. The inner list's
+    // third element then waits its turn and is split off while the outer
+    // list has nothing split off; then the outer list's first element is.
+    // Every write keeps program order.
+    let (mut workspace, file) = super::graph::lone_workspace(
+        "import fs\n\
+         fn f() -> List<List<{}>> {\n\
+         \x20   let t = fs.read(\"/r\")\n\
+         \x20   let l = [[{}, {}, fs.write(\"/a1\", \"x\"), fs.write(\"/a2\", \"x\")], [fs.write(\"/b\", \"x\")]]\n\
+         \x20   = l\n\
+         }\n\
+         = f()",
+    );
+    let host = crate::eval::graph::GraphHost {
+        defers: &|_: &[crate::check::Attribute]| true,
+        effects: &ReadsIsolated,
+    };
+    let mut graph = Graph::new();
+    let mut seen = Vec::new();
+    loop {
+        match workspace.run_graph(file, &mut graph, host).unwrap() {
+            Progress::Paused(nodes) => {
+                for node in nodes {
+                    seen.push(graph.node(node).unwrap().args()[0].clone());
+                    assert!(graph.resolve(node, Ok(Value::Empty)));
+                }
+            }
+            Progress::Waiting(unit) => panic!("waits for unit {unit}"),
+            Progress::Done(_) => break,
+        }
+    }
+    assert_eq!(seen, [text("/r"), text("/a1"), text("/a2"), text("/b")]);
+}
