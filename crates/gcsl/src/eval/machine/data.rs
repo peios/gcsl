@@ -11,13 +11,18 @@ use crate::check::Builtin;
 use crate::ir::{IrId, IrKind, Operands};
 use crate::value::{List, Record, Value, int_to_float};
 
-use super::super::kinds::of_kind;
-use super::super::{Evaluator, Flow, INTERPOLATED_VALUE_ESTIMATE, internal, mistyped, out_of_range};
+use super::super::kinds::{into_callee, of_kind};
+use super::super::{
+    Callee, Evaluator, Flow, INTERPOLATED_VALUE_ESTIMATE, internal, mistyped, out_of_range,
+    source_of,
+};
+use super::futures::{AwaitState, Then};
 use super::{Frame, Machine, Next, Outcome, fail, give};
 
 /// A node whose operands the machine evaluates, in order, before applying
 /// it.
-pub(super) struct OperandsState {
+#[derive(Clone)]
+pub(in crate::eval) struct OperandsState {
     /// The node.
     node: IrId,
     /// Its operands, in order.
@@ -63,6 +68,15 @@ impl Machine<'_> {
                 | IrKind::FloatDiv(_)
                 | IrKind::FloatNeg(_)
                 | IrKind::IntToFloat(_)
+                | IrKind::Is { .. }
+                | IrKind::As { .. }
+                | IrKind::RecordOf { .. }
+                | IrKind::IntNeg(_)
+                | IrKind::Quantity(..)
+                | IrKind::Show(_)
+                | IrKind::Range(..)
+                | IrKind::FilePath(_)
+                | IrKind::Meta(_)
         )
     }
 
@@ -97,8 +111,7 @@ impl Machine<'_> {
     fn next_operand(&mut self, mut state: Box<OperandsState>) -> Next {
         loop {
             let Some(&operand) = state.operands.get(state.values.len()) else {
-                let OperandsState { node, values, .. } = *state;
-                return give(self.walker(|walker| apply(walker, node, values)));
+                return self.apply_again(state);
             };
             if !self.running().ir.is_simple(operand) {
                 self.frames.push(Frame::Operands(state));
@@ -111,14 +124,58 @@ impl Machine<'_> {
         }
     }
 
-    /// Takes up `state` with `result`, the value of its next operand.
+    /// Takes up `state` with `result`, the value of its next operand: a
+    /// quantity's overflow in its amount's own operator says what
+    /// overflowed, as
+    /// [`Evaluator::quantity_amount`](super::Evaluator::quantity_amount)
+    /// says it.
     pub(super) fn operand(&mut self, mut state: Box<OperandsState>, result: Outcome) -> Next {
         match result {
             Ok(value) => {
                 state.values.push(value);
                 self.next_operand(state)
             }
-            Err(unwind) => Next::Give(Err(unwind)),
+            Err(unwind) => match self.running().ir.get(state.node).kind {
+                IrKind::Quantity(quantity, amount) => {
+                    fail(self.walker(|walker| walker.quantity_overflow(quantity, amount, *unwind)))
+                }
+                _ => Next::Give(Err(unwind)),
+            },
+        }
+    }
+
+    /// Applies the node of `state` to its operands' values. An update's walk
+    /// down its path leaves the first future it meets that has not run to
+    /// the machine, as a deep await does, which runs it, its body here, and
+    /// then applies the update again.
+    pub(super) fn apply_again(&mut self, state: Box<OperandsState>) -> Next {
+        let node = state.node;
+        if !matches!(self.running().ir.get(node).kind, IrKind::Update { .. }) {
+            let OperandsState { values, .. } = *state;
+            return give(self.walker(|walker| apply(walker, node, values)));
+        }
+        let values = state.values.clone();
+        self.shared.ahead.awaiting.set(true);
+        let applied = self.walker(|walker| apply(walker, node, values));
+        self.shared.ahead.awaiting.set(false);
+        match (applied, self.shared.ahead.met.take()) {
+            (
+                Err(_),
+                Some(super::super::Met {
+                    future,
+                    depth,
+                    level,
+                    span,
+                }),
+            ) => {
+                let site = AwaitState::at(node, (depth, span));
+                match self.begin_future(site, future, (level, Then::Apply(state.clone()))) {
+                    // It had run after all: the walk goes on past it.
+                    Ok(_) => self.apply_again(state),
+                    Err(next) => next,
+                }
+            }
+            (applied, _) => give(applied),
         }
     }
 
@@ -192,6 +249,53 @@ fn apply(walker: &mut Evaluator<'_>, id: IrId, values: Vec<Value>) -> Flow<Value
         (IrKind::JsonDecode { decode, kind, .. }, [Value::Str(text)]) => {
             decoded(walker, text, (decode, kind), node)
         }
+        (IrKind::Is { .. } | IrKind::As { .. } | IrKind::RecordOf { .. } | IrKind::Meta(_), _) => {
+            narrowed(walker, node, values)
+        }
+        (IrKind::IntNeg(operand), [Value::Int(value)]) => {
+            walker.int_neg_of(node, operand, *value).map(Value::Int)
+        }
+        (IrKind::Quantity(quantity, _), [Value::Int(amount)]) => {
+            Ok(Value::Quantity(quantity, *amount))
+        }
+        (IrKind::Show(_), [value]) => {
+            let value = value.clone();
+            walker
+                .profiled_builtin(Builtin::Show, |_| source_of(&value, node))
+                .map(Value::Str)
+        }
+        (IrKind::Range(inclusive, _), [Value::Int(start), Value::Int(end)]) => {
+            Evaluator::range_of((*start, *end), inclusive, node)
+        }
+        (IrKind::FilePath(_), [Value::File(file) | Value::Dir(file)]) => {
+            Ok(Value::Str(Rc::clone(&file.path)))
+        }
+        (
+            IrKind::IntCmp(..)
+            | IrKind::FloatCmp(..)
+            | IrKind::StrCmp(..)
+            | IrKind::BoolEq(..)
+            | IrKind::RecordEq(_)
+            | IrKind::RecordNe(_)
+            | IrKind::RecordSame(_)
+            | IrKind::RecordNotSame(_)
+            | IrKind::ListEq(_)
+            | IrKind::ListNe(_)
+            | IrKind::ListSame(_)
+            | IrKind::ListNotSame(_)
+            | IrKind::ValueSame(_)
+            | IrKind::ValueNotSame(_),
+            [lhs, rhs],
+        ) => walker.compared(node, (lhs, rhs)).map(Value::Bool),
+        _ => operator(walker, node, &values),
+    }
+}
+
+/// Applies the operator `node` of `walker`'s code to `values`, its
+/// operands' values, in order, as the walker of its kind would: what
+/// [`apply`] leaves.
+fn operator(walker: &Evaluator<'_>, node: &crate::ir::IrNode, values: &[Value]) -> Flow<Value> {
+    match (node.kind, values) {
         (IrKind::Field { name, .. }, [record]) => match record {
             Value::Record(fields) => match fields.get(name) {
                 Some(value) => Ok(value.clone()),
@@ -212,7 +316,7 @@ fn apply(walker: &mut Evaluator<'_>, id: IrId, values: Vec<Value>) -> Flow<Value
             Ok(Value::Int(i64::try_from(list.len()).unwrap_or(i64::MAX)))
         }
         (IrKind::Interp(items), _) => {
-            interpolated(walker, walker.ir.items(items), &values, node.span)
+            interpolated(walker, walker.ir.items(items), values, node.span)
         }
         (IrKind::StrConcat(_), [Value::Str(lhs), Value::Str(rhs)]) => {
             let mut text = String::with_capacity(lhs.len() + rhs.len());
@@ -235,24 +339,48 @@ fn apply(walker: &mut Evaluator<'_>, id: IrId, values: Vec<Value>) -> Flow<Value
         }
         (IrKind::FloatNeg(_), [Value::Float(operand)]) => Ok(Value::Float(-operand)),
         (IrKind::IntToFloat(_), [Value::Int(operand)]) => Ok(Value::Float(int_to_float(*operand))),
-        (
-            IrKind::IntCmp(..)
-            | IrKind::FloatCmp(..)
-            | IrKind::StrCmp(..)
-            | IrKind::BoolEq(..)
-            | IrKind::RecordEq(_)
-            | IrKind::RecordNe(_)
-            | IrKind::RecordSame(_)
-            | IrKind::RecordNotSame(_)
-            | IrKind::ListEq(_)
-            | IrKind::ListNe(_)
-            | IrKind::ListSame(_)
-            | IrKind::ListNotSame(_)
-            | IrKind::ValueSame(_)
-            | IrKind::ValueNotSame(_),
-            [lhs, rhs],
-        ) => walker.compared(node, (lhs, rhs)).map(Value::Bool),
         _ => mistyped(node, "operands of another kind than their node's"),
+    }
+}
+
+/// What the `Is`, `As`, `RecordOf` or `Meta` `node` comes to of `values`,
+/// its one operand's, as the walkers' helpers for them make it.
+fn narrowed(
+    walker: &mut Evaluator<'_>,
+    node: &crate::ir::IrNode,
+    values: Vec<Value>,
+) -> Flow<Value> {
+    let Some(value) = values.into_iter().next() else {
+        return mistyped(node, "a node without its operand");
+    };
+    match node.kind {
+        IrKind::Is { .. } => walker.is_test_of(node, value).map(Value::Bool),
+        IrKind::As { kind, .. } => {
+            let value = walker.narrowed_of(node, value)?;
+            if of_kind(&value, kind) {
+                Ok(value)
+            } else {
+                mistyped(
+                    node,
+                    "an `as` produced a value of another kind than its node",
+                )
+            }
+        }
+        IrKind::RecordOf {
+            key, value: named, ..
+        } => match value {
+            Value::List(entries) => walker.record_of_entries(node, &entries, (key, named)),
+            _ => mistyped(node, "a `record` of entries that are no list"),
+        },
+        IrKind::Meta(_) => match into_callee(value) {
+            Some(callee) => match walker.meta_of(callee, node)? {
+                Callee::Closure(closure) => Ok(Value::Fn(closure)),
+                Callee::Builtin(builtin) => Ok(Value::Builtin(builtin)),
+                Callee::Tag(tag) => Ok(Value::Tag(tag)),
+            },
+            None => mistyped(node, "the meta of a value that is no function"),
+        },
+        _ => mistyped(node, "a node that is not narrowed narrowed"),
     }
 }
 

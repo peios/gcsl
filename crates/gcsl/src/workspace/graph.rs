@@ -3,8 +3,8 @@
 //! # Prepared calls
 //!
 //! A host evaluates a target, an invocation of a definition, in graph mode
-//! as a unit that runs again from its start until it is done (see [Graph
-//! mode](crate::eval::graph#graph-mode)). Its call is lowered once
+//! as a unit that runs, stopping where it waits and taking up there, until
+//! it is done (see [Graph mode](crate::eval::graph#graph-mode)). Its call is lowered once
 //! ([`Workspace::prepare_call`]), as [`Workspace::invoke_with`] lowers it,
 //! checked and placed alike, so that every attempt runs the same code,
 //! whose closures' keys are then the same; and it is numbered, after every
@@ -116,10 +116,10 @@ impl Workspace {
     /// runs ([`Workspace::effect_job`]), deferred calls in it as `host`
     /// says, and its own `#[retry]` and `#[timeout]` not applied, which are
     /// the host's. [`Progress::Paused`] if it needs a result the host has yet
-    /// to give, to run again from its start once it is given. With it, what
+    /// to give, to take up where it stopped once it is given. With it, what
     /// the run read of the context the step was made in ([`StepReads`]): a
-    /// run that ends has made every read the step makes, since it ran from
-    /// the start, so a host keys the step by those; each first read is told
+    /// run that ends gives every read the step made, across its runs, so a
+    /// host keys the step by those; each first read is told
     /// to `host`'s effects as it is made ([`Effects::context_read`](crate::eval::Effects::context_read)).
     ///
     /// # Errors
@@ -137,12 +137,10 @@ impl Workspace {
         let Some(call) = call else {
             return Err(internal("a step that is no deferred call's"));
         };
-        let run = GraphRun::new(
-            mem::take(graph),
-            STEP_UNITS.saturating_add(id.number()),
-            host.defers,
-        )
-        .watching(call.context(), self.context_texts());
+        let unit = STEP_UNITS.saturating_add(id.number());
+        let run = GraphRun::new(mem::take(graph), unit, host.defers)
+            .watching(call.context(), self.context_texts())
+            .resuming(self.suspended.remove(&unit));
         let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
         let extras = RunExtras {
             exec_result: Some(&self.exec_result),
@@ -153,6 +151,9 @@ impl Workspace {
         };
         let outcome = run_step_call(&call, (&mut self.frame, &mut self.memo), extras, &run);
         self.scan.names = names.into_inner();
+        if let Some(suspended) = run.take_suspended() {
+            self.suspended.insert(unit, suspended);
+        }
         let reads = run.reads();
         let (left, paused) = run.finish();
         *graph = left;

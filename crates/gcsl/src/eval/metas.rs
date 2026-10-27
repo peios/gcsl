@@ -43,7 +43,14 @@ impl Evaluator<'_> {
     /// an internal error. Out of line: only a meta's read pays for it.
     #[inline(never)]
     pub(super) fn meta(&mut self, function: IrId, node: &IrNode) -> Flow<Callee> {
-        let Callee::Closure(mut closure) = self.function(function)? else {
+        let callee = self.function(function)?;
+        self.meta_of(callee, node)
+    }
+
+    /// The meta of `callee`, the function of the `Meta` `node`, evaluated
+    /// already, as [`Evaluator::meta`] finds it.
+    pub(super) fn meta_of(&self, callee: Callee, node: &IrNode) -> Flow<Callee> {
+        let Callee::Closure(mut closure) = callee else {
             return Err(internal("the meta of a built-in function read", node.span).into());
         };
         loop {

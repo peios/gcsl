@@ -63,18 +63,18 @@ use crate::value::{Caller, Closure, ContextFrame, Value};
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
 pub(crate) use suspend::Suspended;
-pub(super) use suspend::run_machine;
+pub(super) use suspend::{Entry, run_machine};
 
 use builtins::BuiltinCall;
 use suspend::Resume;
-use control::{DefaultRun, WithState};
+use control::{AssertState, DefaultRun, WithState};
 use data::OperandsState;
 use futures::{AwaitState, FutureRun};
 use loops::{ForState, LoopAt, LoopState};
 
 use super::kinds::into_callee;
 use super::memo::{Mark, MemoBegin, MemoTables};
-use super::graph::Wait;
+use super::graph::{StepCall, Wait};
 use super::{
     Callee, Evaluator, Flow, GUARD_LEVELS, Shared, Unwind, mistyped, nested_too_deeply,
     shown_duration,
@@ -144,6 +144,12 @@ enum Frame {
     Body,
     /// A `for`'s iterable, evaluated above.
     ForIterable(Box<ForState>),
+    /// A bound of the range a `for` counts, included if `true`, of the
+    /// operands, the left one evaluated above, or, with the start, the
+    /// right one.
+    ForRange(Box<ForState>, bool, Operands, Option<i64>),
+    /// The argument of a call of a variant, of the tag, evaluated above.
+    Variant(Rc<crate::value::Tag>),
     /// A `for`'s guard, evaluated above.
     ForGuard(Box<ForState>),
     /// A `for`'s body, evaluated above.
@@ -163,6 +169,9 @@ enum Frame {
     BuiltinArgument(Box<BuiltinCall>),
     /// The callee of the call node, evaluated above.
     Callee(IrId),
+    /// The default of a parameter of the innermost of the machine's calls,
+    /// run above as a call of its default function.
+    ArgDefault(Box<ArgDefault>),
     /// An operand of a node the machine applies, evaluated above.
     Operands(Box<OperandsState>),
     /// The left operand of an `and`, if `false`, or an `or`, evaluated
@@ -178,6 +187,19 @@ enum Frame {
     Fallback,
     /// The default of a context read, run above as a call.
     Default(Box<DefaultRun>),
+    /// The body of a step run as a unit of its own, its frame at the base,
+    /// reported at the span, evaluated above.
+    Step(usize, crate::source::Span),
+    /// The value of a secret, read deeply if `true`, evaluated above.
+    SecretValue(bool),
+    /// The operation of the `SecretWrap` node, of the operation node and
+    /// whether it is revealed, evaluated above, the identities recorded
+    /// before it this many.
+    SecretWrap(IrId, (IrId, bool), usize),
+    /// An operand of an assertion's condition, evaluated above.
+    Assert(Box<AssertState>),
+    /// The message of a failed assertion, evaluated above.
+    AssertMessage(Box<AssertState>),
 }
 
 /// A call of a closure that the machine runs.
@@ -208,6 +230,19 @@ struct CallState {
     /// Whether the host takes the call as a step, in graph mode: its
     /// arguments are evaluated, and it becomes a node.
     deferred: bool,
+}
+
+/// A parameter's default running in the machine, as a call of its
+/// default function on the caller's side of its call.
+struct ArgDefault {
+    /// The argument node.
+    arg: IrId,
+    /// The parameter, by its index.
+    param: u32,
+    /// The default function's closure.
+    default: Rc<Closure>,
+    /// Where the default function's frame starts on the value stack.
+    base: usize,
 }
 
 /// The attempts of a call whose function has `#[retry]` or `#[timeout]`,
@@ -250,6 +285,7 @@ pub(super) enum Ran {
 
 /// What a machine that stopped keeps of itself: its frames, activations
 /// and calls (see [Suspension](#suspension)).
+#[derive(Default)]
 pub(super) struct Parked {
     /// The calls running, innermost last.
     activations: Vec<Activation>,
@@ -329,6 +365,45 @@ impl<'r> Machine<'r> {
             frames: self.frames,
             calls: self.calls,
         }
+    }
+
+    /// Runs the body of the step `call` as a unit of its own on a machine
+    /// over `stack` and `memo`, sharing `shared`, as
+    /// [`call_step`](super::graph) runs it unguarded: its arguments in a
+    /// frame of its own, in the context it was made in, its `#[retry]` and
+    /// `#[timeout]` the host's. Returns how the run ended and what the
+    /// machine keeps.
+    pub(super) fn run_step(
+        call: &StepCall,
+        (stack, memo): (&'r mut Vec<Value>, &'r mut MemoTables),
+        shared: &'r Shared<'r>,
+    ) -> (Ran, Parked) {
+        let closure = call.closure();
+        let span = call.span();
+        let Some(code) = closure.code.find_function(closure.function) else {
+            let error = super::internal("a step's callee is no function of its code", span);
+            return (Ran::Done(Err(error.into())), Parked::default());
+        };
+        shared.context.replace(call.context());
+        let base = stack.len();
+        stack.resize(base + code.frame_size as usize, Value::Empty);
+        for (slot, value) in stack.iter_mut().skip(base).zip(call.args()) {
+            *slot = value.clone();
+        }
+        let activation = Activation {
+            ir: Rc::clone(&closure.code),
+            base,
+            callee: Some(Rc::clone(closure)),
+            owned: None,
+            caller: call.caller(),
+            levels: CALL_LEVELS,
+        };
+        let mut machine = Machine::new((stack, memo), shared, activation);
+        machine
+            .walker(|walker| walker.profile_begin((&closure.code, closure.function, code), true));
+        machine.frames.push(Frame::Step(base, span));
+        let ran = machine.run_from(Next::Eval(code.body));
+        (ran, machine.into_parked())
     }
 
     /// Evaluates `root` in the activation the machine was made with.
@@ -447,6 +522,9 @@ impl<'r> Machine<'r> {
                 depth,
                 ..
             } => self.context_read(id, key, (default, depth)),
+            IrKind::SecretValue { value, deep, .. } => self.secret_value(value, deep),
+            IrKind::SecretWrap(computed, revealed) => self.secret_wrap(id, computed, revealed),
+            IrKind::Assert { cond, message } => self.assert(id, (cond, message)),
             kind if Self::applies(kind) => self.operands(id),
             _ => give(self.walker(|walker| walker.value(id))),
         }
@@ -487,6 +565,16 @@ impl<'r> Machine<'r> {
                 None => self.lost_call(),
             },
             Frame::ForIterable(state) => self.for_iterable(state, result),
+            Frame::ForRange(state, inclusive, operands, start) => {
+                self.for_range(state, (inclusive, operands, start), result)
+            }
+            Frame::Variant(tag) => match result {
+                Ok(payload) => Next::Give(Ok(Value::Variant(Rc::new(crate::value::Variant {
+                    tag,
+                    payload,
+                })))),
+                Err(unwind) => Next::Give(Err(unwind)),
+            },
             Frame::ForGuard(state) => self.for_guard(state, result),
             Frame::ForBody(state) => self.for_body(state, result),
             Frame::Loop(state, at) => self.loop_resume(state, at, result),
@@ -496,6 +584,10 @@ impl<'r> Machine<'r> {
             Frame::Future(run) => self.future_done(*run, result),
             Frame::BuiltinArgument(call) => self.builtin_argument(call, result),
             Frame::Callee(id) => self.callee_done(id, result),
+            Frame::ArgDefault(run) => match self.calls.pop() {
+                Some(state) => self.default_argument_done(state, &run, result),
+                None => self.lost_call(),
+            },
             Frame::Operands(state) => self.operand(state, result),
             Frame::Logic(operands, decisive) => self.logic_lhs(operands, decisive, result),
             Frame::WithBinding(state, key) => self.with_binding(state, key, result),
@@ -503,6 +595,21 @@ impl<'r> Machine<'r> {
             Frame::Recover(fallback) => self.recovered(fallback, result),
             Frame::Fallback => self.fallback_done(result),
             Frame::Default(run) => self.default_done(&run, result),
+            Frame::Step(base, span) => {
+                self.walker(|walker| walker.profile_end());
+                self.stack.truncate(base);
+                give(
+                    result
+                        .or_else(|unwind| unwind.returned(span))
+                        .map_err(Unwind::from),
+                )
+            }
+            Frame::SecretValue(deep) => self.secret_value_done(deep, result),
+            Frame::SecretWrap(id, wrapped, depth) => {
+                self.secret_wrap_done(id, (wrapped, depth), result)
+            }
+            Frame::Assert(state) => self.assert_operand(state, result),
+            Frame::AssertMessage(state) => self.assert_failed(&state, result),
         }
     }
 
@@ -640,12 +747,7 @@ impl<'r> Machine<'r> {
         let closure = match callee {
             Callee::Builtin(builtin) => return self.builtin_call(id, builtin, args),
             Callee::Closure(closure) => closure,
-            callee @ Callee::Tag(_) => {
-                return give(self.walker(|walker| {
-                    let node = walker.ir.get(id);
-                    walker.call_resolved(callee, (args, depth), node)
-                }));
-            }
+            Callee::Tag(tag) => return self.variant(id, tag, args),
         };
         let Some(code) = closure.code.find_function(closure.function) else {
             return self.mistyped(id, "a closure of a function its IR lacks");
@@ -696,6 +798,26 @@ impl<'r> Machine<'r> {
         })
     }
 
+    /// Evaluates the call node `id` of the variant `tag`, of its one
+    /// argument among `args`, as
+    /// [`Evaluator::call_tag`](super::Evaluator::call_tag) does: its value,
+    /// here unless it is simple, made the variant's payload.
+    fn variant(&mut self, id: IrId, tag: Rc<crate::value::Tag>, args: IrRange) -> Next {
+        let ir = &self.running().ir;
+        let value = match ir.items(args) {
+            &[arg] => match ir.get(arg).kind {
+                IrKind::Arg {
+                    value: ArgValue::Node(value),
+                    ..
+                } => value,
+                _ => return self.mistyped(id, "a variant's argument is not a node's value"),
+            },
+            _ => return self.mistyped(id, "a variant called with other than one argument"),
+        };
+        self.frames.push(Frame::Variant(tag));
+        Next::Eval(value)
+    }
+
     /// Whether the host takes a call of `closure` as a step, in graph mode.
     fn deferred(&mut self, closure: &Rc<Closure>) -> bool {
         let Some(code) = closure.code.find_function(closure.function) else {
@@ -712,15 +834,20 @@ impl<'r> Machine<'r> {
             let Some(&arg) = ir.items(state.args).get(state.next as usize) else {
                 return self.enter_body(state);
             };
-            if let IrKind::Arg {
-                value: ArgValue::Node(value),
-                ..
-            } = ir.get(arg).kind
-                && !ir.is_simple(value)
-            {
-                self.calls.push(state);
-                self.frames.push(Frame::Arguments);
-                return Next::Eval(value);
+            match ir.get(arg).kind {
+                IrKind::Arg {
+                    value: ArgValue::Node(value),
+                    ..
+                } if !ir.is_simple(value) => {
+                    self.calls.push(state);
+                    self.frames.push(Frame::Arguments);
+                    return Next::Eval(value);
+                }
+                IrKind::Arg {
+                    param,
+                    value: ArgValue::Default { capture, .. },
+                } => return self.default_argument(state, arg, (param, capture)),
+                _ => {}
             }
             let written = self
                 .walker(|walker| walker.argument(arg, state.base, (&state.closure, state.depth)));
@@ -729,6 +856,101 @@ impl<'r> Machine<'r> {
             }
             state.next += 1;
         }
+    }
+
+    /// Runs the default of the parameter `param` of the call `state`, the
+    /// argument node `arg`, the default function the callee keeps at its
+    /// capture `capture`, as [`Evaluator::default_arg`] runs it: called with
+    /// the values of the parameters before it, copied up from the callee's
+    /// frame, on the caller's side of the call.
+    fn default_argument(
+        &mut self,
+        state: CallState,
+        arg: IrId,
+        (param, capture): (u32, u32),
+    ) -> Next {
+        let Some(Value::Fn(default)) = state.closure.captures.get(capture as usize) else {
+            let unwind =
+                self.mistyped_unwind(arg, "a default that its callee keeps no function for");
+            return self.argument_failed(&state, unwind);
+        };
+        let default = Rc::clone(default);
+        let Some(code) = default.code.find_function(default.function) else {
+            let unwind = self.mistyped_unwind(arg, "a closure of a function its IR lacks");
+            return self.argument_failed(&state, unwind);
+        };
+        let (height, frame_size, body) =
+            (code.height as usize, code.frame_size as usize, code.body);
+        let entering = self.running().levels + usize::from(state.depth) + CALL_LEVELS;
+        if entering + height > MAX_DEPTH {
+            let error = nested_too_deeply(self.running().ir.get(arg));
+            return self.argument_failed(&state, error.into());
+        }
+        let earlier = state.base..state.base + param as usize;
+        if earlier.end > self.stack.len() {
+            let unwind =
+                self.mistyped_unwind(arg, "a default's parameters lie outside its call's frame");
+            return self.argument_failed(&state, unwind);
+        }
+        let base = self.stack.len();
+        self.stack.resize(base + frame_size, Value::Empty);
+        for (at, from) in earlier.enumerate() {
+            let value = self.stack.get(from).cloned().unwrap_or(Value::Empty);
+            if let Some(slot) = self.stack.get_mut(base + at) {
+                *slot = value;
+            }
+        }
+        let caller = self.walker(|walker| {
+            let passed = walker.callee_caller();
+            walker.profile_begin((&default.code, default.function, code), true);
+            passed
+        });
+        self.activations.push(Activation {
+            ir: Rc::clone(&default.code),
+            base,
+            callee: Some(Rc::clone(&default)),
+            owned: None,
+            caller,
+            levels: entering,
+        });
+        self.calls.push(state);
+        self.frames.push(Frame::ArgDefault(Box::new(ArgDefault {
+            arg,
+            param,
+            default,
+            base,
+        })));
+        Next::Eval(body)
+    }
+
+    /// Takes up the call `state` with `result`, what the default `run` of
+    /// one of its parameters came to: the default's frame goes, its error
+    /// is reported at the call, and its value is the parameter's.
+    fn default_argument_done(
+        &mut self,
+        mut state: CallState,
+        run: &ArgDefault,
+        result: Outcome,
+    ) -> Next {
+        self.activations.pop();
+        self.walker(|walker| walker.profile_end());
+        self.stack.truncate(run.base);
+        let span = self.running().ir.get(run.arg).span;
+        let value = match result.or_else(|unwind| unwind.returned(span)) {
+            Ok(value) => value,
+            Err(error) => {
+                let unwind = self.walker(|walker| walker.marked(error, &run.default.code).into());
+                return self.argument_failed(&state, unwind);
+            }
+        };
+        let Some(slot) = self.stack.get_mut(state.base + run.param as usize) else {
+            let unwind =
+                self.mistyped_unwind(run.arg, "an argument for a parameter outside the frame");
+            return self.argument_failed(&state, unwind);
+        };
+        *slot = value;
+        state.next += 1;
+        self.next_argument(state)
     }
 
     /// Takes up a call's arguments with `result`, the value of argument

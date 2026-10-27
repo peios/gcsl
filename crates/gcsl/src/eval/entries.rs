@@ -16,7 +16,7 @@ use std::rc::Rc;
 use crate::diagnostic::Diagnostic;
 use crate::ir::{IrKind, IrNode};
 use crate::names::Name;
-use crate::value::{Layout, Record, Value};
+use crate::value::{Layout, Record, Value, List};
 
 use super::{Evaluator, Flow, internal, mistyped};
 
@@ -32,6 +32,18 @@ impl Evaluator<'_> {
             return mistyped(node, "a node that is not a `record` made a record");
         };
         let entries = self.list(entries)?;
+        self.record_of_entries(node, &entries, (key, value))
+    }
+
+    /// The `RecordOf` `node` of `entries`, its list's, evaluated already,
+    /// each entry's fields `key` and `value`, as [`Evaluator::record_of`]
+    /// makes it.
+    pub(super) fn record_of_entries(
+        &self,
+        node: &IrNode,
+        entries: &List,
+        (key, value): (Name, Name),
+    ) -> Flow<Value> {
         let mut names: Vec<Name> = Vec::with_capacity(entries.values().len());
         let mut texts: Vec<Box<str>> = Vec::with_capacity(names.capacity());
         let mut values: Vec<Value> = Vec::with_capacity(names.capacity());

@@ -601,7 +601,7 @@ impl Evaluator<'_> {
     /// `error`, out of a frame of the program `callee`, marked with its
     /// input and whether it is foreign if it was raised in another input than
     /// this frame's and no inner call has marked it.
-    fn marked(&self, mut error: Diagnostic, callee: &Ir) -> Diagnostic {
+    pub(super) fn marked(&self, mut error: Diagnostic, callee: &Ir) -> Diagnostic {
         if error.input.is_none() && callee.input() != self.ir.input() {
             error.input = Some(callee.input());
             error.foreign = callee.is_foreign();

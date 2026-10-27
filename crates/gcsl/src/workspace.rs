@@ -497,7 +497,7 @@ impl Progress {
 /// later request that needs it, without repeating any of its earlier effects.
 /// Boxing keeps this state table compact after the large IR is released. A
 /// file whose run in graph mode stopped for a step's result keeps its IR,
-/// shared, to run again from its start, its closures' code the same (see
+/// shared, to take up where it stopped, its closures' code the same (see
 /// [Graph mode](crate::eval::graph#graph-mode)).
 #[derive(Debug)]
 enum FileRun {
@@ -969,8 +969,8 @@ impl Workspace {
     /// [`Workspace::run_needed`] does, each in graph mode, as unit number its
     /// file's, if `graph` is given, the graph and which deferring calls the
     /// host takes as steps (see [Graph mode](crate::eval::graph#graph-mode)).
-    /// Returns the node the run stopped for, if it stopped, the file that
-    /// stopped kept to run again from its start.
+    /// Returns what the run stopped for, if it stopped, the file that
+    /// stopped kept to take up where it stopped.
     ///
     /// # Errors
     ///
@@ -1041,7 +1041,7 @@ impl Workspace {
                         *entry = value;
                     }
                 }
-                // Stopped for a step's result: run again, from its start,
+                // Stopped for a step's result: taken up where it stopped
                 // once the host has given it.
                 Err(error) if error.mark == Mark::PENDING => {
                     *state = FileRun::Paused(ir);

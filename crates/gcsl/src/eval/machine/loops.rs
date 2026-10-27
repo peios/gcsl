@@ -3,7 +3,7 @@
 //! (see [Stops](crate::eval::loops#stops)).
 
 use crate::check::Slot;
-use crate::ir::{IrId, IrKind, IrRange};
+use crate::ir::{IrId, IrKind, IrRange, Operands};
 use crate::value::{List, Value};
 
 use super::super::{Elements, FOR_RESERVE, Flow, Stop, StopKind, Unwind, caught};
@@ -77,8 +77,15 @@ impl Machine<'_> {
             elements: None,
             values: Vec::new(),
         });
-        let counted = matches!(ir.get(iterable).kind, IrKind::Range(..));
-        if counted || ir.is_simple(iterable) {
+        if let IrKind::Range(inclusive, operands) = ir.get(iterable).kind
+            && !ir.is_simple(iterable)
+        {
+            // Counted, not built, as the walker counts it, its bounds here.
+            self.frames
+                .push(Frame::ForRange(state, inclusive, operands, None));
+            return Next::Eval(operands.lhs);
+        }
+        if ir.is_simple(iterable) {
             return match self.walker(|walker| walker.elements(iterable)) {
                 Ok(elements) => self.for_begin(state, elements),
                 Err(unwind) => fail(unwind),
@@ -87,6 +94,30 @@ impl Machine<'_> {
         state.elements = None;
         self.frames.push(Frame::ForIterable(state));
         Next::Eval(iterable)
+    }
+
+    /// Takes up the `for` `state` over a range, included if `inclusive`, of
+    /// `operands`, with `result`, the value of its left bound, or, if
+    /// `start` is that, of its right one.
+    pub(super) fn for_range(
+        &mut self,
+        state: Box<ForState>,
+        (inclusive, operands, start): (bool, Operands, Option<i64>),
+        result: Outcome,
+    ) -> Next {
+        let bound = match result {
+            Ok(Value::Int(bound)) => bound,
+            Ok(_) => return self.mistyped(state.node, "a range's bound that is not an Int"),
+            Err(unwind) => return Next::Give(Err(unwind)),
+        };
+        match start {
+            None => {
+                self.frames
+                    .push(Frame::ForRange(state, inclusive, operands, Some(bound)));
+                Next::Eval(operands.rhs)
+            }
+            Some(start) => self.for_begin(state, Elements::range(start, bound, inclusive)),
+        }
     }
 
     /// Takes up the `for` `state` with `result`, its iterable's value.

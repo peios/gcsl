@@ -221,7 +221,12 @@ pub(crate) fn eval_rooted(
     // plain evaluation never waits, so the walkers run it, faster.
     let result = if graph.is_some() || cfg!(feature = "machine-everywhere") {
         let own = graph.and_then(GraphRun::own);
-        machine::run_machine(ir, (stack, memo), &shared, (caller, own))
+        machine::run_machine(
+            machine::Entry::Root(ir, caller),
+            (stack, memo),
+            &shared,
+            own,
+        )
     } else {
         Evaluator {
             ir,
@@ -407,9 +412,22 @@ struct Shared<'a> {
 struct Ahead {
     /// Whether one is awaiting so.
     awaiting: Cell<bool>,
-    /// The future the walker met that has not run, and the level of
-    /// nesting it is at.
-    met: RefCell<Option<(Rc<crate::value::Future>, usize)>>,
+    /// The future the walker met that has not run, and where it met it.
+    met: RefCell<Option<Met>>,
+}
+
+/// A future a walker met awaiting ahead for a machine, which has not run
+/// (see [`Ahead`]).
+#[derive(Debug)]
+struct Met {
+    /// The future.
+    future: Rc<crate::value::Future>,
+    /// The depth of what awaits it in its frame's body.
+    depth: u16,
+    /// Its level of record and list nesting below that.
+    level: usize,
+    /// Where its errors are reported.
+    span: Span,
 }
 
 impl<'a> Shared<'a> {

@@ -133,7 +133,17 @@ impl Evaluator<'_> {
         inclusive: bool,
         node: &IrNode,
     ) -> Flow<Value> {
-        let (start, end) = self.ints(operands)?;
+        let bounds = self.ints(operands)?;
+        Self::range_of(bounds, inclusive, node)
+    }
+
+    /// The range `node` from `start` to `end`, included if `inclusive`, its
+    /// bounds evaluated already, as [`Evaluator::range`] makes it.
+    pub(super) fn range_of(
+        (start, end): (i64, i64),
+        inclusive: bool,
+        node: &IrNode,
+    ) -> Flow<Value> {
         let len = range_len(start, end, inclusive);
         let Some(len) = usize::try_from(len).ok().filter(|&len| len <= MAX_LIST_LEN) else {
             return Err(range_too_large(node, len).into());

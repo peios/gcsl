@@ -33,10 +33,11 @@ use crate::ir::{Ir, IrId};
 use crate::source::Span;
 use crate::value::{Caller, ContextFrame, Future, Value};
 
-use super::super::graph::{GraphRun, NodeId, RunState, Wait, pending};
+use super::super::graph::{GraphRun, NodeId, RunState, StepCall, Wait, pending};
 use super::super::memo::{MemoTables, Running};
 use super::super::profile;
-use super::super::{Deadline, Flow, Shared};
+use super::super::{Deadline, Flow, Shared, Unwind};
+use crate::diagnostic::Mark;
 use super::futures::AwaitState;
 use super::{Activation, Frame, Machine, Next, Parked, Ran, fail};
 
@@ -49,6 +50,10 @@ pub(in crate::eval) enum Resume {
     /// fields has run, or the node it stands for has its result, or not
     /// yet.
     Deep(AwaitState, Value),
+    /// The application of a node to its operands, again: a future met on
+    /// its update's path has run, or the node it stands for has its result,
+    /// or not yet.
+    Apply(Box<super::data::OperandsState>),
     /// The outcome of the effect node `NodeId`, made by the call node
     /// `IrId`.
     Effect(IrId, NodeId),
@@ -121,7 +126,18 @@ struct Start {
     profiled: usize,
 }
 
-/// Evaluates `ir`, the root's caller `caller`, on the machine, over `stack`
+/// What a run of the machine starts from, when it takes up nothing
+/// suspended.
+#[derive(Clone, Copy)]
+pub(in crate::eval) enum Entry<'a> {
+    /// The root of the code, run with this caller.
+    Root(&'a Rc<Ir>, Caller),
+    /// The body of a step, run as a unit of its own (see
+    /// [`run_step_call`](super::super::graph::run_step_call)).
+    Step(&'a StepCall),
+}
+
+/// Evaluates `entry`, the root of code or a step's body, on the machine, over `stack`
 /// and `memo`, sharing `shared`, as [`crate::eval::eval_rooted`] does in
 /// graph mode: taking up the unit's suspended evaluation, if its run has
 /// one, or else from the root; and suspending it, and stopping with the
@@ -130,10 +146,10 @@ struct Start {
 /// top-level slots begin, for a prepared call's, whose slots others share;
 /// a file's own slots are its cells, which no other run writes.
 pub(in crate::eval) fn run_machine(
-    ir: &Rc<Ir>,
+    entry: Entry<'_>,
     (stack, memo): (&mut Vec<Value>, &mut MemoTables),
     shared: &Shared<'_>,
-    (caller, own): (Caller, Option<usize>),
+    own: Option<usize>,
 ) -> Flow<Value> {
     let graph = shared.graph;
     let resumed = graph.and_then(GraphRun::take_suspended);
@@ -149,23 +165,36 @@ pub(in crate::eval) fn run_machine(
             memo: memo.running.len(),
             profiled: shared.profile.map_or(0, profile::Profile::running),
         };
-        let mut machine = Machine::new((stack, memo), shared, Activation::top(ir, caller));
-        let ran = machine.run(ir.root());
-        (start, ran, machine.into_parked())
+        let (ran, parked) = match entry {
+            Entry::Root(ir, caller) => {
+                let mut machine = Machine::new((stack, memo), shared, Activation::top(ir, caller));
+                let ran = machine.run(ir.root());
+                (ran, machine.into_parked())
+            }
+            Entry::Step(call) => Machine::run_step(call, (stack, memo), shared),
+        };
+        (start, ran, parked)
+    };
+    let span = match entry {
+        Entry::Root(ir, _) => ir.get(ir.root()).span,
+        Entry::Step(call) => call.span(),
     };
     match (ran, graph) {
+        // Graph mode stops only on the machine, never in a walker, which
+        // could only restart the unit.
+        (Ran::Done(Err(Unwind::Error(error))), Some(_)) if error.mark == Mark::PENDING => Err(
+            super::super::internal("a unit stopped where the machine could not", error.span).into(),
+        ),
         (Ran::Done(flow), _) => flow,
         (Ran::Blocked(wait, resume), Some(run)) => {
             let suspended = set_aside((parked, resume), start, (stack, memo), shared);
             run.suspend(suspended);
             run.stopped(wait);
-            Err(pending(ir.get(ir.root()).span).into())
+            Err(pending(span).into())
         }
-        (Ran::Blocked(..), None) => Err(super::super::internal(
-            "a plain run stopped to wait",
-            ir.get(ir.root()).span,
-        )
-        .into()),
+        (Ran::Blocked(..), None) => {
+            Err(super::super::internal("a plain run stopped to wait", span).into())
+        }
     }
 }
 
@@ -243,7 +272,7 @@ fn take_up(
     stack.resize(at, Value::Empty);
     stack.extend(segment);
     if at != base {
-        parked.rebase(at.wrapping_sub(base));
+        parked.rebase(base, at.wrapping_sub(base));
     }
     let start = Start {
         base: at,
@@ -285,11 +314,14 @@ fn restore_task(task: Task, shared: &Shared<'_>, blocked: Duration) {
 }
 
 impl Parked {
-    /// Moves every frame above the top level's by `delta` slots up the
-    /// stack, wrapping, so that a negative move is a wrapped subtraction.
-    fn rebase(&mut self, delta: usize) {
-        for activation in self.activations.iter_mut().skip(1) {
-            activation.base = activation.base.wrapping_add(delta);
+    /// Moves every frame from `from` on, those set aside with the unit, by
+    /// `delta` slots up the stack, wrapping, so that a negative move is a
+    /// wrapped subtraction; the top level's frame, below, stays.
+    fn rebase(&mut self, from: usize, delta: usize) {
+        for activation in &mut self.activations {
+            if activation.base >= from {
+                activation.base = activation.base.wrapping_add(delta);
+            }
         }
         for call in &mut self.calls {
             call.base = call.base.wrapping_add(delta);
@@ -298,6 +330,7 @@ impl Parked {
             match frame {
                 Frame::Future(run) => run.rebase(delta),
                 Frame::Default(run) => run.rebase(delta),
+                Frame::ArgDefault(run) => run.base = run.base.wrapping_add(delta),
                 _ => {}
             }
         }
@@ -310,6 +343,7 @@ impl Machine<'_> {
         match resume {
             Resume::Await(state, future) => self.await_fully(state, Value::Future(future)),
             Resume::Deep(state, value) => self.await_deep(state, value),
+            Resume::Apply(operands) => self.apply_again(operands),
             Resume::Effect(node, id) => {
                 let outcome = self.walker(|walker| walker.node_outcome(id, walker.ir.get(node)));
                 match outcome {

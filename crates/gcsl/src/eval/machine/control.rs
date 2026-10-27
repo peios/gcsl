@@ -231,3 +231,146 @@ impl Machine<'_> {
         }))
     }
 }
+
+/// An assertion running in the machine.
+pub(super) struct AssertState {
+    /// The `Assert` node.
+    node: IrId,
+    /// Its condition.
+    cond: IrId,
+    /// Its message.
+    message: IrId,
+    /// Its condition's operands, if it is a comparison, or else the
+    /// condition itself.
+    operands: Vec<IrId>,
+    /// Their values so far.
+    values: Vec<Value>,
+}
+
+impl Machine<'_> {
+    /// Evaluates the `SecretValue` node `id` of `value`, read deeply if
+    /// `deep`, as [`Evaluator::secret_value`](super::Evaluator::secret_value)
+    /// does: its value, here, and then its identity recorded.
+    pub(super) fn secret_value(&mut self, value: IrId, deep: bool) -> Next {
+        self.frames.push(Frame::SecretValue(deep));
+        Next::Eval(value)
+    }
+
+    /// Takes up a `SecretValue`, read deeply if `deep`, with `result`.
+    pub(super) fn secret_value_done(&mut self, deep: bool, result: Outcome) -> Next {
+        let result = result.map_err(|unwind| *unwind);
+        give(self.walker(|walker| walker.secret_value_of(result, deep)))
+    }
+
+    /// Evaluates the `SecretWrap` node `id` of `computed`, revealed if
+    /// `revealed`, as [`Evaluator::secret_wrap`](super::Evaluator::secret_wrap)
+    /// does: `computed`, here, its operands' identities recorded as it
+    /// goes, and then the secret it is.
+    pub(super) fn secret_wrap(&mut self, id: IrId, computed: IrId, revealed: bool) -> Next {
+        let depth = self.shared.identities.borrow().len();
+        self.frames
+            .push(Frame::SecretWrap(id, (computed, revealed), depth));
+        Next::Eval(computed)
+    }
+
+    /// Takes up the `SecretWrap` node `id` with `result`, what its operation
+    /// came to.
+    pub(super) fn secret_wrap_done(
+        &mut self,
+        id: IrId,
+        (wrapped, depth): ((IrId, bool), usize),
+        result: Outcome,
+    ) -> Next {
+        let result = result.map_err(|unwind| *unwind);
+        give(self.walker(|walker| walker.secret_wrap_of(wrapped, depth, result, walker.ir.get(id))))
+    }
+
+    /// Evaluates the `Assert` node `id` of `cond`, with the message
+    /// `message`, as [`Evaluator::assert`](super::Evaluator::assert) does:
+    /// its condition, or a comparison's operands, here, and then, if it
+    /// fails, its message.
+    pub(super) fn assert(&mut self, id: IrId, (cond, message): (IrId, IrId)) -> Next {
+        let operands = match super::super::comparison_operands(self.running().ir.get(cond).kind) {
+            Some((lhs, rhs)) => vec![lhs, rhs],
+            None => vec![cond],
+        };
+        self.assert_next(Box::new(AssertState {
+            node: id,
+            cond,
+            message,
+            operands,
+            values: Vec::new(),
+        }))
+    }
+
+    /// Evaluates the operands of `state` from the next on, and then decides
+    /// it.
+    fn assert_next(&mut self, mut state: Box<AssertState>) -> Next {
+        loop {
+            let Some(&operand) = state.operands.get(state.values.len()) else {
+                return self.assert_decide(state);
+            };
+            if !self.running().ir.is_simple(operand) {
+                self.frames.push(Frame::Assert(state));
+                return Next::Eval(operand);
+            }
+            match self.walker(|walker| walker.value(operand)) {
+                Ok(value) => state.values.push(value),
+                Err(unwind) => return fail(unwind),
+            }
+        }
+    }
+
+    /// Takes up `state` with `result`, the value of its next operand.
+    pub(super) fn assert_operand(&mut self, mut state: Box<AssertState>, result: Outcome) -> Next {
+        match result {
+            Ok(value) => {
+                state.values.push(value);
+                self.assert_next(state)
+            }
+            Err(unwind) => Next::Give(Err(unwind)),
+        }
+    }
+
+    /// Decides `state`, its operands evaluated: `{}` if it holds, and its
+    /// failure, with its message, otherwise.
+    fn assert_decide(&mut self, state: Box<AssertState>) -> Next {
+        let decided = self.walker(|walker| {
+            let condition = walker.ir.get(state.cond);
+            match &state.values[..] {
+                [lhs, rhs] => walker.compared(condition, (lhs, rhs)),
+                [Value::Bool(holds)] => Ok(*holds),
+                _ => {
+                    super::super::mistyped(condition, "an assertion's condition that is not a Bool")
+                }
+            }
+        });
+        match decided {
+            Ok(true) => Next::Give(Ok(Value::Empty)),
+            Ok(false) => {
+                let message = state.message;
+                self.frames.push(Frame::AssertMessage(state));
+                Next::Eval(message)
+            }
+            Err(unwind) => fail(unwind),
+        }
+    }
+
+    /// Ends the failed assertion `state` with `result`, its message.
+    pub(super) fn assert_failed(&mut self, state: &AssertState, result: Outcome) -> Next {
+        let message = match result {
+            Ok(Value::Str(message)) => message,
+            Ok(_) => {
+                return self.mistyped(state.node, "an assertion's message that is not a String");
+            }
+            Err(unwind) => return Next::Give(Err(unwind)),
+        };
+        let shown = match (&state.operands[..], &state.values[..]) {
+            (&[lhs, rhs], [left, right]) => Some([(lhs, left.clone()), (rhs, right.clone())]),
+            _ => None,
+        };
+        fail(self.walker(|walker| {
+            walker.assertion_failed((state.cond, message), shown, walker.ir.get(state.node))
+        }))
+    }
+}

@@ -21,16 +21,18 @@
 //!   `file` and `dir`, which only read the working directory, fixed for an
 //!   evaluation, are computed as ever.
 //!
-//! So a unit performs no effect of its own. A node whose result is not
-//! given yet stops the unit where the result is needed (`Evaluator::pause`):
-//! an await of a deferred call's future, or an effect's call. The stop is an
-//! error marked [`Mark::PENDING`], which nothing but the unit's root
-//! catches, `recover` and `#[retry]` included, and which unwinds by every
-//! path an error unwinds by; the node it waits on is the run's `paused`.
-//! Once the host gives that node's result ([`Graph::resolve`]), the unit
-//! runs again from its start: everything before the stop computes again to
-//! the same values, the calls that made nodes find them, and the stop is
-//! passed. A node's failure is raised where its result is needed, as any
+//! So a unit performs no effect of its own. A unit runs on the machine
+//! (see [Suspension](crate::eval::machine#suspension)), and a node whose
+//! result is not given yet stops it where the result is needed: an await
+//! of a deferred call's future, or an effect's call. The machine sets the
+//! unit's evaluation aside, the run's `paused` the node it waits on, and
+//! the run ends with an error marked [`Mark::PENDING`]. Once the host gives
+//! that node's result ([`Graph::resolve`]), the unit's next run takes up
+//! where it stopped: nothing before the stop runs again. A unit that needs
+//! a memoised call or a `lazy` another unit is running stops for that
+//! unit's run instead ([`Wait::Unit`]). A walker, which could only stop by
+//! unwinding, never stops in graph mode: one that would is an internal
+//! error. A node's failure is raised where its result is needed, as any
 //! failure there, so `recover` around it catches it; a `#[retry]` around an
 //! await raises it again, never running the step again.
 //!
@@ -67,8 +69,9 @@
 //! every context the step's binds. The first such read of a run is told to
 //! the host's effects at once ([`crate::eval::Effects::context_read`]),
 //! before the step does anything with it, so that a host can give the step
-//! the context's files then. A run that ends ran from the start, so its
-//! reads are the step's.
+//! the context's files then. A step's unit keeps what it read while it is
+//! stopped, so the reads a run that ends gives are every read the step
+//! made.
 //!
 //! # Errors in a library
 //!
@@ -516,13 +519,16 @@ pub(crate) struct GraphRun<'g> {
 }
 
 /// What a run of a unit in graph mode keeps of itself while the unit is
-/// suspended: where in its scopes it is, and the node it met last.
+/// suspended: where in its scopes it is, the node it met last, and, of a
+/// step's unit, what it has read of the step's context.
 #[derive(Debug, Default)]
 pub(crate) struct RunState {
     /// The scopes being run, innermost last.
     scopes: Vec<Scope>,
     /// The node met last, in program order.
     last: Option<NodeId>,
+    /// What a step's unit has read of the step's context.
+    watch: Option<Watch>,
 }
 
 /// What a run of a step's unit read of the context the step was made in
@@ -624,6 +630,7 @@ impl<'g> GraphRun<'g> {
         RunState {
             scopes: std::mem::take(&mut *self.scopes.borrow_mut()),
             last: self.last.get(),
+            watch: self.watch.borrow_mut().take(),
         }
     }
 
@@ -631,6 +638,9 @@ impl<'g> GraphRun<'g> {
     pub(crate) fn restore_state(&self, state: RunState) {
         self.scopes.replace(state.scopes);
         self.last.set(state.last);
+        if state.watch.is_some() {
+            self.watch.replace(state.watch);
+        }
     }
 
     /// The run, watching what it reads of the context `context`, a step's,
@@ -1148,6 +1158,26 @@ impl StepCall {
     }
 
     /// The context it was made in, which its run reads.
+    /// Its callee, the closure of the step's function.
+    pub(super) const fn closure(&self) -> &Rc<Closure> {
+        &self.closure
+    }
+
+    /// Its arguments, in parameter order.
+    pub(super) fn args(&self) -> &[Value] {
+        &self.args
+    }
+
+    /// The caller its body runs with.
+    pub(super) const fn caller(&self) -> Caller {
+        self.caller
+    }
+
+    /// Where it was made, which its errors are reported at.
+    pub(super) const fn span(&self) -> Span {
+        self.site.span
+    }
+
     pub(crate) fn context(&self) -> Option<Rc<ContextFrame>> {
         self.context.clone()
     }
@@ -1173,7 +1203,10 @@ pub(crate) fn run_step_call(
     shared.graph = Some(run);
     // A step its body makes reports where this one does.
     shared.sites.borrow_mut().extend(call.reported);
-    call_step(call, (stack, memo), &shared, false).map_err(|mut error| {
+    let entry = super::machine::Entry::Step(call);
+    let outcome = super::machine::run_machine(entry, (stack, memo), &shared, None)
+        .map_err(|unwind| unwind.into_error(call.site.span));
+    outcome.map_err(|mut error| {
         if error.mark == Mark::PENDING {
             return error;
         }

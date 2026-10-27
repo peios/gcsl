@@ -157,7 +157,12 @@ impl Evaluator<'_> {
             match value {
                 // Left to the machine awaiting deeply, which runs it.
                 Value::Future(future) if self.shared.ahead.awaiting.get() && !future.is_done() => {
-                    self.shared.ahead.met.replace(Some((future, level)));
+                    self.shared.ahead.met.replace(Some(super::Met {
+                        future,
+                        depth,
+                        level,
+                        span: node.span,
+                    }));
                     return Err(super::graph::pending(node.span).into());
                 }
                 Value::Future(future) => value = self.run_future(&future, depth, level, node)?,

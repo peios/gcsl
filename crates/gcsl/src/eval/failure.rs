@@ -48,13 +48,26 @@ impl Evaluator<'_> {
             return Ok(Value::Empty);
         }
         let message = self.string(message)?;
+        Err(self.assertion_failed((cond, message), shown, node).into())
+    }
+
+    /// The failure of the assertion `node` whose condition `cond` did not
+    /// hold, with the message `message`, its condition's operands' values
+    /// `shown` if it is a comparison, as [`Evaluator::assert`] reports it.
+    pub(super) fn assertion_failed(
+        &self,
+        (cond, message): (IrId, Rc<str>),
+        shown: Option<[(IrId, Value); 2]>,
+        node: &IrNode,
+    ) -> Diagnostic {
+        let condition = self.ir.get(cond);
         let mut error = Diagnostic::error(format!("assertion failed: {message}"), condition.span);
         for (operand, value) in shown.into_iter().flatten() {
             let text =
                 source_of(&value, node).map_or_else(|_| value.to_string(), |text| text.to_string());
             error = error.with_context(self.ir.get(operand).span, format!("this is `{text}`"));
         }
-        Err(error.into())
+        error
     }
 
     /// Whether the comparison `node` holds of `lhs` and `rhs`, its operands'
