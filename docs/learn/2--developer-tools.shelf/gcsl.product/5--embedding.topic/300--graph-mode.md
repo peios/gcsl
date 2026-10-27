@@ -40,15 +40,17 @@ The host keeps a `Graph` for the whole evaluation and drives it:
 1. Run a unit, a file with `Workspace::run_graph` or a target with
    `Workspace::prepare_call` and `Workspace::run_prepared`. You get
    `Progress::Paused(node)` if the unit needs a result it doesn't have
-   yet, or `Progress::Done(value)` once it finishes.
+   yet, `Progress::Waiting(unit)` if it needs a result that another
+   unit is computing (see [Units that share work](#units-that-share-work)),
+   or `Progress::Done(value)` once it finishes.
 2. Find what to run. `graph.holes(&value)` lists the results a finished
    value still waits for, `graph.needed(&demands)` adds every step they
    depend on, and `graph.ready(&needed)` keeps those whose own inputs are
    all known. Steps that nothing needs never run.
 3. For each ready step, either give its result from your cache, or run it
    with `Workspace::evaluate`, then pass the outcome to `graph.resolve`.
-4. Run the unit again. It starts from the beginning, finds the steps it
-   made before, and continues past the point where it stopped.
+4. Run the unit again. It carries on from the point where it stopped:
+   nothing it did before runs again.
 
 A target's call can set root contexts as it starts, from values you give
 or from a top-level field of a file, `Workspace::prepare_call_with`. With
@@ -59,6 +61,22 @@ how a host runs code of its own over a target without calling a function
 value itself: pekit packs a package as `packaging.pack(package NAME())`.
 Several prepared calls are units of their own, and can be driven together
 against one graph, sharing the steps they both reach.
+
+## Units that share work
+
+A unit that stops keeps everything it was doing, including the memoised
+calls it is in the middle of. If another unit makes the same memoised
+call with the same arguments, or awaits the same `lazy` value, it
+doesn't compute it again. It stops with `Progress::Waiting(unit)`,
+naming the unit that is computing it. Run that unit, or anything else
+that can make progress, and then run the waiting unit again. It looks
+the call up again, and finds the result once the other unit has
+finished it.
+
+A unit that waits on another never makes a node of its own for the
+shared work, so the work is done once, by whichever unit reached it
+first. If every unit you have is waiting on another, they are waiting
+on each other: report that as an error rather than running them again.
 
 A step's failure is raised where its result is used, so a `recover`
 around that use catches it, as with any failure. A finished value can
@@ -85,7 +103,8 @@ into an `EffectJob`, plain data you can send to a worker thread, where
 one. Give the result back with `Workspace::from_plain` and
 `graph.resolve`, and run the step again; it carries on to its next
 effect. One GCSL thread can drive as many running programs as you have
-workers. A step's own `#[retry]` and `#[timeout]` are left to you, since
+workers. A step's `exec`s run in the order its code makes them. A
+step's own `#[retry]` and `#[timeout]` are left to you, since
 you see every attempt: read them from its attributes with
 `check::retry_of` and `check::timeout_of`, as GCSL itself does. To run a
 failed step again from its start, call `graph.forget_unit` with its unit
@@ -196,9 +215,9 @@ difference is the time spent at the top level of the files, outside any
 function. A profiled run costs a little more than one that isn't, and
 nothing changes for a workspace that never starts profiling.
 
-Remember that a unit runs again from its start after each pause. Code a
-unit runs before it reaches its steps and effects runs once for every
-pause, so a profile counts it that many times. When the same expensive
-work, such as parsing a lock file, shows up thousands of times, memoise
-the function that does it with `->>`. Later runs then find its entry
-instead of doing the work again.
+A target's unit carries on from where it stopped after each pause, so a
+profile counts each call it makes once, however often it stops. Time a
+unit spends stopped isn't counted. When the same expensive work, such as
+parsing a lock file, shows up thousands of times, it's being done by
+that many calls: memoise the function that does it with `->>`, and
+later calls find its entry instead of doing the work again.

@@ -6,8 +6,9 @@
 use crate::check::Builtin;
 use crate::ir::{ArgValue, IrId, IrKind, IrRange};
 
-use super::super::calls::BuiltinArguments;
-use super::{Frame, Machine, Next, Outcome, fail, give};
+use super::super::calls::{Applied, BuiltinArguments};
+use super::super::graph::Wait;
+use super::{Frame, Machine, Next, Outcome, Resume, fail, give};
 
 /// A call of a built-in running in the machine.
 pub(super) struct BuiltinCall {
@@ -48,9 +49,16 @@ impl Machine<'_> {
                     arguments,
                     ..
                 } = *call;
-                return give(self.walker(|walker| {
-                    walker.apply_called(builtin, arguments, walker.ir.get(node))
-                }));
+                let applied = self
+                    .walker(|walker| walker.apply_or_meet(builtin, arguments, walker.ir.get(node)));
+                return match applied {
+                    Ok(Applied::Value(value)) => Next::Give(Ok(value)),
+                    // Its outcome is read once the host gives it.
+                    Ok(Applied::Waiting(id)) => {
+                        Next::Block(Wait::Node(id), Resume::Effect(node, id))
+                    }
+                    Err(unwind) => fail(unwind),
+                };
             };
             let IrKind::Arg {
                 value: ArgValue::Node(value),

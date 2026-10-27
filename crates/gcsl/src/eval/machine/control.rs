@@ -34,6 +34,14 @@ pub(super) struct DefaultRun {
     base: usize,
 }
 
+impl DefaultRun {
+    /// Moves its frame `delta` slots up the stack, wrapping (see
+    /// [Suspension](crate::eval::machine#suspension)).
+    pub(super) fn rebase(&mut self, delta: usize) {
+        self.base = self.base.wrapping_add(delta);
+    }
+}
+
 impl Machine<'_> {
     /// Evaluates the `With` node `id` of `parts`, as
     /// [`Evaluator::with`](super::Evaluator::with) does: each binding's

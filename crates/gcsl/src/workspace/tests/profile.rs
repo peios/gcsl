@@ -106,7 +106,7 @@ fn a_workspace_not_profiled_has_no_profile() {
 }
 
 #[test]
-fn a_profile_of_graph_mode_counts_every_run_of_a_unit_and_each_step() {
+fn a_profile_of_graph_mode_counts_each_call_once_however_often_its_unit_stops() {
     let (mut workspace, file) = super::graph::lone_workspace(
         "fn plan(n: Int) ->> String {\n\
              let a = exec([\"echo\", \"a\"]).stdout.trim()\n\
@@ -118,10 +118,10 @@ fn a_profile_of_graph_mode_counts_every_run_of_a_unit_and_each_step() {
     workspace.start_profiling();
     super::graph::drive(&mut workspace, file);
     let report = workspace.profile_report().unwrap();
-    // `plan`'s body stops at each `exec`, a node, ending without an entry,
-    // until the third run of the unit, whose second call finds the entry
-    // its first made.
-    assert_eq!(function_row(&report, "plan"), (4, 1, FnKind::Memo));
+    // `plan`'s body stops at each `exec`, a node, and takes up where it
+    // stopped once the node's result is given, never running again: one
+    // call that ran, and the second, which finds the entry it made.
+    assert_eq!(function_row(&report, "plan"), (2, 1, FnKind::Memo));
     // Each effect's node runs its built-in once, as the host asks.
     let exec: Vec<u64> = report
         .rows

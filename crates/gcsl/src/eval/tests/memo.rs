@@ -452,7 +452,7 @@ pub(super) fn start_reading(
     dir: u32,
 ) -> Mark {
     let hash = key_hash(&[]);
-    let entry = memo.start(closure, hash, &[]);
+    let entry = memo.start(closure, (hash, &[]), None);
     memo.running.push(Running {
         closure: Rc::as_ptr(closure),
         hash,
@@ -486,9 +486,9 @@ pub(super) fn found(
         helper: false,
         origin: NO_ORIGIN,
     };
-    match memo.lookup(closure, &[], (caller, false), None) {
+    match memo.lookup(closure, &[], (caller, false), (None, None)) {
         Lookup::Done(value, _) => Ok(Some(value)),
-        Lookup::Running => Ok(None),
+        Lookup::Running | Lookup::Elsewhere(_) => Ok(None),
         Lookup::Missing(_) => Err("missing"),
     }
 }

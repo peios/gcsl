@@ -78,7 +78,7 @@ impl Evaluator<'_> {
 
     /// Parses `text` and decodes it by the plan `decode`, for the
     /// `JsonDecode` `node`.
-    fn decode_text(&self, text: &str, decode: DecodeId, node: &IrNode) -> Flow<Value> {
+    pub(super) fn decode_text(&self, text: &str, decode: DecodeId, node: &IrNode) -> Flow<Value> {
         let ir = self.ir;
         let Some(plan) = ir.decode(decode) else {
             return mistyped(node, "a decode of a plan its IR lacks");

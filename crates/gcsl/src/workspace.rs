@@ -246,7 +246,7 @@ use crate::Outcome;
 use crate::check::ViewRecord;
 use crate::check::{Attribute, Builtin, KnownParams, Slot, Types};
 use crate::diagnostic::{Diagnostic, InternalError, Mark};
-use crate::eval::graph::{Graph, GraphHost, GraphRun, NodeId, NodeKind, RunExtras, run_node};
+use crate::eval::graph::{Graph, GraphHost, GraphRun, NodeId, NodeKind, RunExtras, Wait, run_node};
 use crate::eval::plain::{Plain, from_plain, to_identity_plain, to_key_plain, to_plain};
 
 /// A way to make a value plain data: [`to_plain`], [`to_key_plain`] or
@@ -476,6 +476,21 @@ pub enum Progress {
     Done(Value),
     /// It stopped for the result of this node, which it needs.
     Paused(NodeId),
+    /// It stopped for the run of this unit, which computes a memoised
+    /// call's value or a `lazy`'s that it needs, and has stopped itself: run
+    /// it again once that unit has run (see [Graph
+    /// mode](crate::eval::graph#graph-mode)).
+    Waiting(u32),
+}
+
+impl Progress {
+    /// What a run that stopped for `wait` is.
+    pub(crate) const fn stopped(wait: Wait) -> Self {
+        match wait {
+            Wait::Node(id) => Progress::Paused(id),
+            Wait::Unit(unit) => Progress::Waiting(unit),
+        }
+    }
 }
 
 /// A file runs at most once. A failed attempt must remain a failure for every
@@ -527,6 +542,10 @@ pub struct Workspace {
     /// numbered after every file (see [Prepared
     /// calls](crate::workspace::graph#prepared-calls)).
     calls_prepared: u32,
+    /// The evaluation of each unit in graph mode that stopped where it
+    /// waits, by its number, for its next run to take up (see
+    /// [Suspension](crate::eval::machine#suspension)).
+    suspended: std::collections::HashMap<u32, crate::eval::machine::Suspended>,
     /// The profile being taken of its runs, if they are profiled
     /// ([`Workspace::start_profiling`]).
     profile: Option<Profile>,
@@ -707,8 +726,8 @@ impl Workspace {
         graph: &mut Graph,
         host: GraphHost<'_>,
     ) -> Result<Progress, Vec<Diagnostic>> {
-        if let Some(node) = self.run_files(index, Some((graph, host)))? {
-            return Ok(Progress::Paused(node));
+        if let Some(wait) = self.run_files(index, Some((graph, host)))? {
+            return Ok(Progress::stopped(wait));
         }
         Ok(Progress::Done(
             self.values
@@ -960,7 +979,7 @@ impl Workspace {
         &mut self,
         index: u32,
         mut graph: Option<(&mut Graph, GraphHost<'_>)>,
-    ) -> Result<Option<NodeId>, Vec<Diagnostic>> {
+    ) -> Result<Option<Wait>, Vec<Diagnostic>> {
         for at in self.scan.needed(index) {
             let Some(state) = self.runs.get_mut(at as usize) else {
                 continue;
@@ -995,14 +1014,18 @@ impl Workspace {
                     profile: self.profile.as_ref(),
                 },
             );
-            let run = graph
-                .as_mut()
-                .map(|(graph, host)| GraphRun::new(mem::take(*graph), at, host.defers));
+            let suspended = self.suspended.remove(&at);
+            let run = graph.as_mut().map(|(graph, host)| {
+                GraphRun::new(mem::take(*graph), at, host.defers).resuming(suspended)
+            });
             let outcome =
                 session::run_input_in(&ir, &mut self.frame, context, (None, run.as_ref()));
             self.scan.names = names.into_inner();
             let paused = match (run, graph.as_mut()) {
                 (Some(run), Some((graph, _))) => {
+                    if let Some(suspended) = run.take_suspended() {
+                        self.suspended.insert(at, suspended);
+                    }
                     let (left, paused) = run.finish();
                     **graph = left;
                     paused
@@ -1023,7 +1046,7 @@ impl Workspace {
                 Err(error) if error.mark == Mark::PENDING => {
                     *state = FileRun::Paused(ir);
                     return match paused {
-                        Some(node) => Ok(Some(node)),
+                        Some(wait) => Ok(Some(wait)),
                         None => Err(vec![
                             InternalError {
                                 message: "a unit stopped for no step",

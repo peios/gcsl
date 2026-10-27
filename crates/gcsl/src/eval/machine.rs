@@ -52,6 +52,7 @@ mod control;
 mod data;
 mod futures;
 mod loops;
+mod suspend;
 
 use std::rc::Rc;
 
@@ -61,7 +62,11 @@ use crate::names::Name;
 use crate::value::{Caller, Closure, ContextFrame, Value};
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
+pub(crate) use suspend::Suspended;
+pub(super) use suspend::run_machine;
+
 use builtins::BuiltinCall;
+use suspend::Resume;
 use control::{DefaultRun, WithState};
 use data::OperandsState;
 use futures::{AwaitState, FutureRun};
@@ -69,6 +74,7 @@ use loops::{ForState, LoopAt, LoopState};
 
 use super::kinds::into_callee;
 use super::memo::{Mark, MemoBegin, MemoTables};
+use super::graph::Wait;
 use super::{
     Callee, Evaluator, Flow, GUARD_LEVELS, Shared, Unwind, mistyped, nested_too_deeply,
     shown_duration,
@@ -199,6 +205,9 @@ struct CallState {
     /// For a call of a function with `#[retry]` or `#[timeout]`, its
     /// attempts, once its body runs.
     guard: Option<Guard>,
+    /// Whether the host takes the call as a step, in graph mode: its
+    /// arguments are evaluated, and it becomes a node.
+    deferred: bool,
 }
 
 /// The attempts of a call whose function has `#[retry]` or `#[timeout]`,
@@ -225,6 +234,29 @@ enum Next {
     Eval(IrId),
     /// Give the frame on top what the node above it came to.
     Give(Outcome),
+    /// Stop for `Wait`, to take up where it stopped, doing `Resume`, once
+    /// what it waits for is there (see [Suspension](#suspension)).
+    Block(Wait, Resume),
+}
+
+/// How a run of the machine ends.
+pub(super) enum Ran {
+    /// With what the root came to.
+    Done(Flow<Value>),
+    /// Stopped for something it waits for, its frames kept, to take up
+    /// doing `Resume` (see [Suspension](#suspension)).
+    Blocked(Wait, Resume),
+}
+
+/// What a machine that stopped keeps of itself: its frames, activations
+/// and calls (see [Suspension](#suspension)).
+pub(super) struct Parked {
+    /// The calls running, innermost last.
+    activations: Vec<Activation>,
+    /// The frames, innermost last.
+    frames: Vec<Frame>,
+    /// The calls the machine runs, innermost last.
+    calls: Vec<CallState>,
 }
 
 /// Gives the frame on top `flow`, a walker's result.
@@ -273,16 +305,49 @@ impl<'r> Machine<'r> {
         }
     }
 
+    /// A machine over `stack` and `memo`, sharing `shared`, taking up
+    /// `parked`, where an earlier one stopped.
+    pub(super) fn parked(
+        (stack, memo): (&'r mut Vec<Value>, &'r mut MemoTables),
+        shared: &'r Shared<'r>,
+        parked: Parked,
+    ) -> Self {
+        Self {
+            stack,
+            memo,
+            shared,
+            activations: parked.activations,
+            frames: parked.frames,
+            calls: parked.calls,
+        }
+    }
+
+    /// What the machine keeps of itself once it has stopped.
+    pub(super) fn into_parked(self) -> Parked {
+        Parked {
+            activations: self.activations,
+            frames: self.frames,
+            calls: self.calls,
+        }
+    }
+
     /// Evaluates `root` in the activation the machine was made with.
-    pub(super) fn run(&mut self, root: IrId) -> Flow<Value> {
-        let mut next = Next::Eval(root);
+    pub(super) fn run(&mut self, root: IrId) -> Ran {
+        self.run_from(Next::Eval(root))
+    }
+
+    /// Runs from `next` on, until the root is evaluated or the machine
+    /// stops.
+    fn run_from(&mut self, next: Next) -> Ran {
+        let mut next = next;
         loop {
             next = match next {
                 Next::Eval(id) => self.eval(id),
                 Next::Give(result) => match self.frames.pop() {
                     Some(frame) => self.resume(frame, result),
-                    None => return result.map_err(|unwind| *unwind),
+                    None => return Ran::Done(result.map_err(|unwind| *unwind)),
                 },
+                Next::Block(wait, resume) => return Ran::Blocked(wait, resume),
             };
         }
     }
@@ -574,8 +639,8 @@ impl<'r> Machine<'r> {
     fn call_resolved(&mut self, id: IrId, callee: Callee, (args, depth): (IrRange, u16)) -> Next {
         let closure = match callee {
             Callee::Builtin(builtin) => return self.builtin_call(id, builtin, args),
-            Callee::Closure(closure) if !self.deferred(&closure) => closure,
-            callee => {
+            Callee::Closure(closure) => closure,
+            callee @ Callee::Tag(_) => {
                 return give(self.walker(|walker| {
                     let node = walker.ir.get(id);
                     walker.call_resolved(callee, (args, depth), node)
@@ -585,7 +650,8 @@ impl<'r> Machine<'r> {
         let Some(code) = closure.code.find_function(closure.function) else {
             return self.mistyped(id, "a closure of a function its IR lacks");
         };
-        let memo = code.kind == FnKind::Memo;
+        let deferred = self.deferred(&closure);
+        let memo = code.kind == FnKind::Memo && !deferred;
         let height = code.height as usize;
         let running = self.running();
         let crossing = closure.code.is_foreign() && !running.ir.is_foreign();
@@ -597,6 +663,10 @@ impl<'r> Machine<'r> {
         if let Err(unwind) = self.walker(|walker| {
             if walker.past_deadline() {
                 return walker.timed_out(walker.ir.get(id));
+            }
+            // A step's call is not profiled, and runs no body here.
+            if deferred {
+                return Ok(());
             }
             walker.profile_begin((&closure.code, closure.function, code), false);
             if !memo && entering + height > MAX_DEPTH {
@@ -622,6 +692,7 @@ impl<'r> Machine<'r> {
             crossing,
             memo: memo.then_some((None, false)),
             guard: None,
+            deferred,
         })
     }
 
@@ -692,7 +763,9 @@ impl<'r> Machine<'r> {
     fn argument_failed(&mut self, state: &CallState, unwind: Unwind) -> Next {
         self.stack.truncate(state.base);
         let unwind = self.walker(|walker| {
-            walker.profile_end();
+            if !state.deferred {
+                walker.profile_end();
+            }
             walker.argument_failed(unwind, walker.ir.get(state.node))
         });
         self.leave_call(state.crossing);
@@ -706,6 +779,18 @@ impl<'r> Machine<'r> {
             let unwind = self.mistyped_unwind(state.node, "a closure of a function its IR lacks");
             return self.argument_failed(&state, unwind);
         };
+        // A step's call becomes its node, and gives the future of its
+        // result; its frame goes.
+        if state.deferred {
+            let made = self.walker(|walker| {
+                let node = walker.ir.get(state.node);
+                walker
+                    .defer_made((&state.closure, code), state.base, node)
+                    .map_err(|unwind| walker.argument_failed(unwind, node))
+            });
+            self.leave_call(state.crossing);
+            return give(made);
+        }
         let (caller, levels) = if state.memo.is_some() {
             let begun = self.walker(|walker| {
                 let node = walker.ir.get(state.node);
@@ -714,6 +799,12 @@ impl<'r> Machine<'r> {
             match begun {
                 Err(unwind) => return self.argument_failed(&state, unwind),
                 Ok(MemoBegin::Found(value)) => return self.found(&state, value),
+                // Looked up again, its arguments still in its frame, once the
+                // unit that runs it has run.
+                Ok(MemoBegin::Elsewhere(owner)) => {
+                    self.calls.push(state);
+                    return Next::Block(Wait::Unit(owner), Resume::Lookup);
+                }
                 Ok(MemoBegin::Started(mark)) => {
                     let scoped = self.memo_scope(&state);
                     state.memo = Some((Some(mark), scoped));

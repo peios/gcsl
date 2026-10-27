@@ -338,7 +338,7 @@ use super::kinds::{as_function, float_to_int, into_callee, mixed};
 use super::elements::element_builtin;
 use super::files::{dir_files, fetch, fetch_git, inside, read_file, unpack, which};
 use super::keychain::keychain;
-use super::graph::effect_builtin;
+use super::graph::{NodeId, effect_builtin};
 use super::sandbox::{sandbox_entry, sandbox_exec};
 use super::system::{exec, file_system, write_file};
 use super::text::{join, sort_versions, split, string_list, strip_prefix, strip_suffix, trim};
@@ -346,6 +346,14 @@ use super::text::{join, sort_versions, split, string_list, strip_prefix, strip_s
 /// The arguments of a call of a built-in, each with its span, by its
 /// parameter's index.
 pub(super) type BuiltinArguments = [Option<(Value, Span)>; Builtin::MAX_PARAMS];
+
+/// What applying a built-in gives ([`Evaluator::apply_or_meet`]).
+pub(super) enum Applied {
+    /// Its value.
+    Value(Value),
+    /// In graph mode, an effect's node, whose result is not given yet.
+    Waiting(NodeId),
+}
 
 impl Evaluator<'_> {
     /// Evaluates the `Call` `node` of `callee` with the arguments `args`,
@@ -739,9 +747,24 @@ impl Evaluator<'_> {
     pub(super) fn apply_called(
         &mut self,
         builtin: Builtin,
-        mut arguments: BuiltinArguments,
+        arguments: BuiltinArguments,
         node: &IrNode,
     ) -> Flow<Value> {
+        match self.apply_or_meet(builtin, arguments, node)? {
+            Applied::Value(value) => Ok(value),
+            Applied::Waiting(id) => self.pause(id, node),
+        }
+    }
+
+    /// [`Evaluator::apply_called`], but for an effect, in graph mode, whose
+    /// node's result is not given yet, that node, rather than the stop for
+    /// it, for a machine to wait for.
+    pub(super) fn apply_or_meet(
+        &mut self,
+        builtin: Builtin,
+        mut arguments: BuiltinArguments,
+        node: &IrNode,
+    ) -> Flow<Applied> {
         // A program's relative `cwd` is resolved here, where the code that
         // wrote it is running, before it can become a node, which runs apart
         // from it (see [Where a path is](crate::eval::files#where-a-path-is)).
@@ -756,9 +779,14 @@ impl Evaluator<'_> {
         // An effect is a node, in graph mode (see [Graph
         // mode](crate::eval::graph#graph-mode)).
         if self.shared.graph.is_some() && effect_builtin(builtin) {
-            return self.effect_node(builtin, &arguments, node);
+            let id = self.meet_effect(builtin, &arguments, node)?;
+            return Ok(match self.node_outcome(id, node)? {
+                Some(value) => Applied::Value(value),
+                None => Applied::Waiting(id),
+            });
         }
         self.profiled_builtin(builtin, |this| this.apply_builtin(builtin, arguments, node))
+            .map(Applied::Value)
     }
 
     /// Applies the built-in `builtin`, for its call `node`, to `arguments`,

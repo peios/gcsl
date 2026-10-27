@@ -7,9 +7,11 @@
 use std::fmt::Write as _;
 use std::rc::Rc;
 
+use crate::check::Builtin;
 use crate::ir::{IrId, IrKind, Operands};
 use crate::value::{List, Record, Value, int_to_float};
 
+use super::super::kinds::of_kind;
 use super::super::{Evaluator, Flow, INTERPOLATED_VALUE_ESTIMATE, internal, mistyped, out_of_range};
 use super::{Frame, Machine, Next, Outcome, fail, give};
 
@@ -31,7 +33,10 @@ impl Machine<'_> {
         matches!(
             kind,
             IrKind::MakeRecord { .. }
-                | IrKind::MakeList { spreads: false, .. }
+                | IrKind::MakeList { .. }
+                | IrKind::UpdateField { .. }
+                | IrKind::Update { .. }
+                | IrKind::JsonDecode { .. }
                 | IrKind::Field { .. }
                 | IrKind::Index { .. }
                 | IrKind::ListLen(_)
@@ -64,7 +69,22 @@ impl Machine<'_> {
     /// Evaluates node `id`, one the machine applies itself: its operands,
     /// in order, the simple ones at once, and then the node.
     pub(super) fn operands(&mut self, id: IrId) -> Next {
-        let operands = self.running().ir.children(id).collect();
+        let ir = &self.running().ir;
+        let operands = match ir.get(id).kind {
+            // Its value and the record or list it updates: the positions
+            // of its path are evaluated as its walk reaches them.
+            IrKind::Update { parts, .. } => ir.items(parts).iter().copied().take(2).collect(),
+            // A spread's list stands for it.
+            IrKind::MakeList { items, .. } => ir
+                .items(items)
+                .iter()
+                .map(|&item| match ir.get(item).kind {
+                    IrKind::Spread(list) => list,
+                    _ => item,
+                })
+                .collect(),
+            _ => ir.children(id).collect(),
+        };
         self.next_operand(Box::new(OperandsState {
             node: id,
             operands,
@@ -146,7 +166,32 @@ fn apply(walker: &mut Evaluator<'_>, id: IrId, values: Vec<Value>) -> Flow<Value
             layout: Rc::clone(walker.ir.layout(layout)),
             values: values.into_boxed_slice(),
         }))),
-        (IrKind::MakeList { .. }, _) => Ok(Value::List(List::from_vec(values))),
+        (IrKind::MakeList { spreads: false, .. }, _) => Ok(Value::List(List::from_vec(values))),
+        (IrKind::MakeList { items, .. }, _) => {
+            spread_list(walker, walker.ir.items(items), values, node)
+        }
+        (IrKind::UpdateField { name, .. }, [record, _]) => {
+            let record = record.clone();
+            let value = values.into_iter().nth(1).unwrap_or(Value::Empty);
+            walker.with_field(record, name, value, node)
+        }
+        (
+            IrKind::Update {
+                parts, path, depth, ..
+            },
+            [_, _],
+        ) => {
+            let mut values = values.into_iter();
+            let (value, root) = (
+                values.next().unwrap_or(Value::Empty),
+                values.next().unwrap_or(Value::Empty),
+            );
+            let positions = walker.ir.items(parts).get(2..).unwrap_or_default();
+            walker.walk_update((root, value), (positions, path, depth), node)
+        }
+        (IrKind::JsonDecode { decode, kind, .. }, [Value::Str(text)]) => {
+            decoded(walker, text, (decode, kind), node)
+        }
         (IrKind::Field { name, .. }, [record]) => match record {
             Value::Record(fields) => match fields.get(name) {
                 Some(value) => Ok(value.clone()),
@@ -209,6 +254,60 @@ fn apply(walker: &mut Evaluator<'_>, id: IrId, values: Vec<Value>) -> Flow<Value
         ) => walker.compared(node, (lhs, rhs)).map(Value::Bool),
         _ => mistyped(node, "operands of another kind than their node's"),
     }
+}
+
+/// The decode of `text` by the plan `decode` for the `JsonDecode` `node`,
+/// of the kind `kind`, as
+/// [`Evaluator::decode_node`](super::Evaluator::decode_node) decodes it.
+fn decoded(
+    walker: &mut Evaluator<'_>,
+    text: &str,
+    (decode, kind): (crate::ir::DecodeId, crate::value::ValueKind),
+    node: &crate::ir::IrNode,
+) -> Flow<Value> {
+    let value = walker.profiled_builtin(Builtin::JsonDecode, |this| {
+        this.decode_text(text, decode, node)
+    })?;
+    if of_kind(&value, kind) {
+        Ok(value)
+    } else {
+        mistyped(
+            node,
+            "a decode produced a value of another kind than its node",
+        )
+    }
+}
+
+/// The list of `items`, some of them spreads, whose values are `values`, a
+/// spread's that of its list, as
+/// [`Evaluator::make_spread_list`](super::Evaluator::make_spread_list)
+/// builds it: each run of elements a leaf, and each spread list joined in
+/// as it is.
+fn spread_list(
+    walker: &Evaluator<'_>,
+    items: &[IrId],
+    values: Vec<Value>,
+    node: &crate::ir::IrNode,
+) -> Flow<Value> {
+    let mut list = List::EMPTY;
+    let mut run = Vec::new();
+    for (&item, value) in items.iter().zip(values) {
+        if let IrKind::Spread(_) = walker.ir.get(item).kind {
+            let Value::List(spread) = value else {
+                return mistyped(node, "a spread of a value that is not a list");
+            };
+            if !run.is_empty() {
+                list = list.concat(&List::from_vec(std::mem::take(&mut run)));
+            }
+            list = list.concat(&spread);
+        } else {
+            run.push(value);
+        }
+    }
+    if !run.is_empty() {
+        list = list.concat(&List::from_vec(run));
+    }
+    Ok(Value::List(list))
 }
 
 /// The text of an interpolation spanning `span` of `items`, whose values

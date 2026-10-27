@@ -155,6 +155,11 @@ impl Evaluator<'_> {
         let mut value = value;
         loop {
             match value {
+                // Left to the machine awaiting deeply, which runs it.
+                Value::Future(future) if self.shared.ahead.awaiting.get() && !future.is_done() => {
+                    self.shared.ahead.met.replace(Some((future, level)));
+                    return Err(super::graph::pending(node.span).into());
+                }
                 Value::Future(future) => value = self.run_future(&future, depth, level, node)?,
                 present => return Ok(present),
             }
@@ -332,9 +337,10 @@ impl Evaluator<'_> {
         if entering + code.height as usize > MAX_DEPTH {
             return Err(nested_too_deeply(node).into());
         }
-        let captures = match future.begin() {
+        let captures = match future.begin(self.unit()) {
             Some(Begin::Done(value)) => return Ok(value),
             Some(Begin::Running) => return Err(depends_on_itself(node).into()),
+            Some(Begin::Elsewhere(owner)) => return self.wait_for_unit(owner, node),
             Some(Begin::Pending(captures)) => captures,
             // A step's result the host has yet to give, or its failure (see
             // [Graph mode](crate::eval::graph#graph-mode)).

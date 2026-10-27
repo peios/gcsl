@@ -71,6 +71,14 @@ pub struct Profile {
     tallies: RefCell<Tallies>,
 }
 
+/// The calls a suspended evaluation had running, taken off a profile's
+/// running calls while it waits (see [`Profile::suspend`]).
+#[derive(Debug, Default)]
+pub(crate) struct Suspended {
+    /// The calls, outermost first.
+    open: Vec<Open>,
+}
+
 /// What a [`Profile`] holds.
 #[derive(Debug, Default)]
 struct Tallies {
@@ -122,6 +130,34 @@ impl Profile {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How many calls are running, by which an evaluation that suspends
+    /// later finds its own ([`Profile::suspend`]).
+    pub(crate) fn running(&self) -> usize {
+        self.tallies.borrow().open.len()
+    }
+
+    /// Takes the calls running from the `from`th on off the running calls:
+    /// those of an evaluation that is suspending, which
+    /// [`Profile::resume`] puts back.
+    pub(crate) fn suspend(&self, from: usize) -> Suspended {
+        let mut tallies = self.tallies.borrow_mut();
+        let from = from.min(tallies.open.len());
+        Suspended {
+            open: tallies.open.split_off(from),
+        }
+    }
+
+    /// Puts the calls of `suspended` back as running, as if they had
+    /// begun `blocked` later: the time their evaluation was suspended is
+    /// none of theirs.
+    pub(crate) fn resume(&self, suspended: Suspended, blocked: Duration) {
+        let mut tallies = self.tallies.borrow_mut();
+        for mut open in suspended.open {
+            open.began = open.began.checked_add(blocked).unwrap_or(open.began);
+            tallies.open.push(open);
+        }
     }
 
     /// Begins a call of `site`, a function whose code is `code`, or a

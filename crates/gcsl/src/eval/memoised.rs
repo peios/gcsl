@@ -34,6 +34,10 @@ impl Evaluator<'_> {
                 MemoBegin::Found(value) => return Ok(value),
                 MemoBegin::Started(mark) => (Some(mark), mark.entering, mark.caller),
                 MemoBegin::Unkeyed(entering, caller) => (None, entering, caller),
+                MemoBegin::Elsewhere(owner) => {
+                    self.stack.truncate(base);
+                    return self.wait_for_unit(owner, node);
+                }
             };
         // Its body is a scope of its own, in graph mode, keyed by the call's
         // callee and arguments (see [Graph mode](crate::eval::graph#graph-mode)).
@@ -132,29 +136,34 @@ impl Evaluator<'_> {
         // in it would.
         let inherited = self.caller.helper;
         let context = self.shared.context.borrow().clone();
-        let hash = match self
-            .memo
-            .lookup(closure, key, (caller, inherited), context.as_ref())
-        {
-            Lookup::Missing(hash) => hash,
-            Lookup::Done(value, replayed) => {
-                self.stack.truncate(base);
-                // As reads here, of the step whose unit is running.
-                let context = self.shared.context.borrow().clone();
-                for read in replayed {
-                    match read {
-                        Replayed::Context(key) => self.note_step_read(key, context.as_ref()),
-                        Replayed::All => self.note_step_reads_all(),
+        let unit = self.unit();
+        let hash =
+            match self
+                .memo
+                .lookup(closure, key, (caller, inherited), (context.as_ref(), unit))
+            {
+                Lookup::Missing(hash) => hash,
+                Lookup::Done(value, replayed) => {
+                    self.stack.truncate(base);
+                    // As reads here, of the step whose unit is running.
+                    let context = self.shared.context.borrow().clone();
+                    for read in replayed {
+                        match read {
+                            Replayed::Context(key) => self.note_step_read(key, context.as_ref()),
+                            Replayed::All => self.note_step_reads_all(),
+                        }
                     }
+                    self.memo_found();
+                    return Ok(MemoBegin::Found(value));
                 }
-                self.memo_found();
-                return Ok(MemoBegin::Found(value));
-            }
-            Lookup::Running => {
-                self.stack.truncate(base);
-                return Err(depends_on_own_result(node).into());
-            }
-        };
+                Lookup::Running => {
+                    self.stack.truncate(base);
+                    return Err(depends_on_own_result(node).into());
+                }
+                // The frame is left as it is, the arguments in it, for a
+                // machine to look them up again once the unit has run.
+                Lookup::Elsewhere(owner) => return Ok(MemoBegin::Elsewhere(owner)),
+            };
         let entering = self.levels + usize::from(depth) + CALL_LEVELS;
         if entering + code.height as usize > MAX_DEPTH {
             self.stack.truncate(base);
@@ -176,7 +185,7 @@ impl Evaluator<'_> {
         } else {
             caller
         };
-        let entry = self.memo.start(closure, hash, key);
+        let entry = self.memo.start(closure, (hash, key), unit);
         let context = self.shared.context.borrow().clone();
         self.memo.running.push(Running {
             closure: Rc::as_ptr(closure),

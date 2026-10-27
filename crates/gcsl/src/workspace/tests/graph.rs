@@ -26,7 +26,7 @@ fn every_call(_: &[crate::check::Attribute]) -> bool {
 
 /// A host that takes every deferring call as a step, its other effects
 /// plain GCSL's.
-fn every() -> GraphHost<'static> {
+pub(super) fn every() -> GraphHost<'static> {
     GraphHost {
         defers: &every_call,
         effects: &crate::eval::Direct { temp_dirs: None },
@@ -319,6 +319,9 @@ fn a_step_whose_key_changes_between_attempts_is_an_error_not_a_loop() {
         panic!("not paused");
     };
     workspace.runs[file as usize] = FileRun::Paused(Rc::new((*ir).clone()));
+    // A unit that stopped on the machine takes up where it stopped; one a
+    // walker stopped runs again from its start, which this one is made to.
+    assert!(workspace.suspended.remove(&file).is_some());
     let errors = workspace.run_graph(file, &mut graph, every()).unwrap_err();
     assert!(
         errors[0]
@@ -337,6 +340,7 @@ pub(super) fn drive(workspace: &mut Workspace, file: u32) -> (Value, Graph) {
     loop {
         let demands = match workspace.run_graph(file, &mut graph, every()).unwrap() {
             Progress::Paused(node) => vec![node],
+            Progress::Waiting(unit) => panic!("one file's units wait for unit {unit}"),
             Progress::Done(value) => {
                 let holes = graph.holes(&value);
                 if holes.is_empty() {
@@ -634,7 +638,7 @@ impl crate::eval::Effects for Shareable {
 }
 
 /// Runs `job` on a thread of its own, as a host's pool would.
-fn on_a_thread(
+pub(super) fn on_a_thread(
     job: crate::eval::graph::EffectJob,
     deadline: Option<std::time::Instant>,
 ) -> Result<crate::eval::plain::Plain, Diagnostic> {
@@ -678,6 +682,7 @@ fn a_step_runs_as_a_unit_whose_effects_are_jobs_on_any_thread() {
                 assert!(graph.resolve(effect, Ok(value)));
                 jobs += 1;
             }
+            Progress::Waiting(unit) => panic!("a lone step waits for unit {unit}"),
             Progress::Done(value) => break value,
         }
     };
@@ -1239,6 +1244,7 @@ fn a_lazy_made_in_a_memoised_call_and_awaited_after_converges() {
                 let value = workspace.from_plain(&plain);
                 assert!(graph.resolve(effect, Ok(value)));
             }
+            Progress::Waiting(unit) => panic!("one file waits for unit {unit}"),
             Progress::Done(value) => break value,
         }
     };
@@ -1265,6 +1271,7 @@ fn a_registered_toolchain_s_definition_converges_in_graph_mode() {
                 let value = workspace.from_plain(&plain);
                 assert!(graph.resolve(effect, Ok(value)));
             }
+            Ok(Progress::Waiting(unit)) => panic!("one file waits for unit {unit}"),
             Ok(Progress::Done(value)) => break value,
             Err(errors) => panic!("{errors:?}"),
         }

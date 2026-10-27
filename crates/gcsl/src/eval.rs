@@ -220,8 +220,8 @@ pub(crate) fn eval_rooted(
     // Graph mode runs on the machine, which can stop where it waits;
     // plain evaluation never waits, so the walkers run it, faster.
     let result = if graph.is_some() || cfg!(feature = "machine-everywhere") {
-        machine::Machine::new((stack, memo), &shared, machine::Activation::top(ir, caller))
-            .run(root)
+        let own = graph.and_then(GraphRun::own);
+        machine::run_machine(ir, (stack, memo), &shared, (caller, own))
     } else {
         Evaluator {
             ir,
@@ -396,6 +396,20 @@ struct Shared<'a> {
     /// The profile being taken of the run, if it is profiled (see
     /// [Profiling](crate::eval::profile#profiling)).
     profile: Option<&'a profile::Profile>,
+    /// A machine's deep await through a walker (see [`Ahead`]).
+    ahead: Ahead,
+}
+
+/// A machine's deep await through a walker, which leaves the futures it
+/// meets that have not run to the machine (see
+/// [Suspension](crate::eval::machine#suspension)).
+#[derive(Debug, Default)]
+struct Ahead {
+    /// Whether one is awaiting so.
+    awaiting: Cell<bool>,
+    /// The future the walker met that has not run, and the level of
+    /// nesting it is at.
+    met: RefCell<Option<(Rc<crate::value::Future>, usize)>>,
 }
 
 impl<'a> Shared<'a> {
@@ -422,6 +436,7 @@ impl<'a> Shared<'a> {
             sites: RefCell::new(Vec::new()),
             names: None,
             profile: None,
+            ahead: Ahead::default(),
         }
     }
 }

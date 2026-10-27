@@ -76,6 +76,10 @@ pub struct PreparedCall {
     files: Vec<u32>,
     /// Its number as a unit, after every file's.
     unit: u32,
+    /// Where its own top-level slots begin: after every file's, at the
+    /// same place as every other prepared call's, which is why a suspended
+    /// run keeps them (see [Suspension](crate::eval::machine#suspension)).
+    own: usize,
     /// The slot of its definition's cell, whose closure it binds to the
     /// context of [`DEFINITION_CONTEXT`](crate::lower::DEFINITION_CONTEXT)
     /// around its call, as a reference's call does.
@@ -155,7 +159,7 @@ impl Workspace {
         match outcome {
             Ok(value) => Ok((Progress::Done(value), reads)),
             Err(error) if error.mark == Mark::PENDING => match paused {
-                Some(node) => Ok((Progress::Paused(node), reads)),
+                Some(wait) => Ok((Progress::stopped(wait), reads)),
                 None => Err(internal("a step stopped for no step")),
             },
             Err(error) => Err(error),
@@ -319,6 +323,9 @@ impl Workspace {
             root,
             files,
             unit,
+            // Checked in a scope of every slot the workspace has named, its
+            // own come after them.
+            own: self.slot_names.len(),
             definition: resolved.definition_cell.0,
             running: std::cell::OnceCell::new(),
         })
@@ -343,11 +350,11 @@ impl Workspace {
         host: GraphHost<'_>,
     ) -> Result<Progress, InvokeError> {
         for &file in &call.files {
-            if let Some(node) = self
+            if let Some(wait) = self
                 .run_files(file, Some((&mut *graph, host)))
                 .map_err(InvokeError::Diagnostics)?
             {
-                return Ok(Progress::Paused(node));
+                return Ok(Progress::stopped(wait));
             }
         }
         // Its root context, its definition bound as a reference's call binds
@@ -380,15 +387,20 @@ impl Workspace {
                 profile: self.profile.as_ref(),
             },
         );
-        let run = GraphRun::new(mem::take(graph), call.unit, host.defers);
+        let run = GraphRun::new(mem::take(graph), call.unit, host.defers)
+            .owning(call.own)
+            .resuming(self.suspended.remove(&call.unit));
         let outcome = session::run_input_in(&call.ir, &mut self.frame, context, (root, Some(&run)));
         self.scan.names = names.into_inner();
+        if let Some(suspended) = run.take_suspended() {
+            self.suspended.insert(call.unit, suspended);
+        }
         let (left, paused) = run.finish();
         *graph = left;
         match outcome {
             Ok(value) => Ok(Progress::Done(value)),
             Err(error) if error.mark == Mark::PENDING => match paused {
-                Some(node) => Ok(Progress::Paused(node)),
+                Some(wait) => Ok(Progress::stopped(wait)),
                 None => Err(InvokeError::Diagnostics(vec![
                     crate::diagnostic::InternalError {
                         message: "a call stopped for no step",

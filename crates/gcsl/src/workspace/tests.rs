@@ -300,6 +300,7 @@ mod files;
 mod fs;
 mod graph;
 mod imports;
+mod suspension;
 
 mod invoke;
 mod keychain;

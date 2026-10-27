@@ -10,16 +10,32 @@ use crate::MAX_DEPTH;
 use crate::ir::{IrId, IrKind, LazyShapeId};
 use crate::value::{Begin, Future, FutureState, Value};
 
-use super::super::graph::NodeId;
+use super::super::graph::{NodeId, Wait};
 use super::super::kinds::of_kind;
 use super::super::{depends_on_itself, nested_too_deeply};
-use super::{Activation, Frame, Machine, Next, Outcome, fail, give};
+use super::{Activation, Frame, Machine, Next, Outcome, Resume, fail, give};
 
 /// An await running in the machine.
 #[derive(Clone, Copy)]
-pub(super) struct AwaitState {
+pub(in crate::eval) struct AwaitState {
     /// The `Await` node.
     node: IrId,
+}
+
+impl FutureRun {
+    /// Moves its frame `delta` slots up the stack, wrapping (see
+    /// [Suspension](crate::eval::machine#suspension)).
+    pub(super) fn rebase(&mut self, delta: usize) {
+        self.base = self.base.wrapping_add(delta);
+    }
+}
+
+/// What an await does once a future it began running has run.
+pub(in crate::eval) enum Then {
+    /// Awaits what it yields fully, as the future was the value awaited.
+    Await,
+    /// Awaits this value deeply again, the future one of its fields'.
+    Deep(Value),
 }
 
 /// A `lazy`'s body running in the machine for an await.
@@ -35,6 +51,8 @@ pub(super) struct FutureRun {
     outer: Option<Rc<crate::value::ContextFrame>>,
     /// Whether the body is a graph-mode scope of its own.
     scoped: bool,
+    /// What the await does once the future has run.
+    then: Then,
 }
 
 impl Machine<'_> {
@@ -64,14 +82,14 @@ impl Machine<'_> {
     /// [`Evaluator::await_fully`](super::Evaluator::await_fully) does:
     /// while it is a future, runs it, the body here; and then awaits the
     /// result deeply, if the await has a lazy shape, by a walker.
-    fn await_fully(&mut self, state: AwaitState, value: Value) -> Next {
+    pub(super) fn await_fully(&mut self, state: AwaitState, value: Value) -> Next {
         let mut value = value;
         loop {
             let future = match value {
                 Value::Future(future) => future,
                 present => return self.await_deep(state, present),
             };
-            match self.begin_future(state, future) {
+            match self.begin_future(state, future, (0, Then::Await)) {
                 Ok(present) => value = present,
                 Err(next) => return next,
             }
@@ -84,28 +102,39 @@ impl Machine<'_> {
     /// activation of its own; or the error of an await of a running future,
     /// a step's failure, or the stop for a step's result not given yet,
     /// each as what the machine does next.
-    fn begin_future(&mut self, state: AwaitState, future: Rc<Future>) -> Result<Value, Next> {
+    /// `level` is how many levels of record and list nesting below the
+    /// value awaited the future is, and `then` what the await does once it
+    /// has run.
+    fn begin_future(
+        &mut self,
+        state: AwaitState,
+        future: Rc<Future>,
+        (level, then): (usize, Then),
+    ) -> Result<Value, Next> {
         let Some(code) = future.code.find_function(future.function) else {
             return Err(self.mistyped(state.node, "a future of a function its IR lacks"));
         };
         let (height, frame_size, body) =
             (code.height as usize, code.frame_size as usize, code.body);
         let depth = self.await_depth(state.node);
-        let entering = self.running().levels + usize::from(depth) + CALL_LEVELS;
+        let entering = self.running().levels + usize::from(depth) + level + CALL_LEVELS;
         if entering + height > MAX_DEPTH {
             return Err(fail(nested_too_deeply(self.running().ir.get(state.node))));
         }
-        let captures = match future.begin() {
+        let unit = self.walker(|walker| walker.unit());
+        let captures = match future.begin(unit) {
             Some(Begin::Done(value)) => return Ok(value),
             Some(Begin::Running) => {
                 return Err(fail(depends_on_itself(self.running().ir.get(state.node))));
             }
             Some(Begin::Pending(captures)) => captures,
+            // Awaited again once what it waits for is there.
+            Some(Begin::Elsewhere(owner)) => {
+                return Err(Next::Block(Wait::Unit(owner), resumed(state, future, then)));
+            }
             Some(Begin::Host(waiting)) => {
-                let node = state.node;
-                return Err(give(self.walker(|walker| {
-                    walker.pause(NodeId::of(waiting), walker.ir.get(node))
-                })));
+                let wait = Wait::Node(NodeId::of(waiting));
+                return Err(Next::Block(wait, resumed(state, future, then)));
             }
             Some(Begin::Failed(error)) => return Err(fail(error)),
             None => return Err(self.mistyped(state.node, "a future's state is in use")),
@@ -132,6 +161,7 @@ impl Machine<'_> {
             base,
             outer,
             scoped,
+            then,
         })));
         Err(Next::Eval(body))
     }
@@ -151,6 +181,7 @@ impl Machine<'_> {
             base,
             outer,
             scoped,
+            then,
         } = run;
         self.walker(|walker| {
             walker.profile_end();
@@ -164,7 +195,10 @@ impl Machine<'_> {
                 // The captures are dropped: a future that has run holds
                 // only its value.
                 if future.finish(FutureState::Done(value.clone())) {
-                    self.await_fully(state, value)
+                    match then {
+                        Then::Await => self.await_fully(state, value),
+                        Then::Deep(awaited) => self.await_deep(state, awaited),
+                    }
                 } else {
                     self.mistyped(state.node, "a future's state is in use")
                 }
@@ -186,12 +220,18 @@ impl Machine<'_> {
     }
 
     /// Ends the await `state` of `value`, awaited fully: awaited deeply,
-    /// by a walker, if the await has a lazy shape, and checked to be of the
-    /// kind the node states, as
+    /// if the await has a lazy shape, and checked to be of the kind the
+    /// node states, as
     /// [`Evaluator::await_node`](super::Evaluator::await_node) checks it.
-    fn await_deep(&mut self, state: AwaitState, value: Value) -> Next {
+    /// A walker walks the value as
+    /// [`Evaluator::await_deep`](super::Evaluator::await_deep) does, but
+    /// leaves the first future it meets that has not run to the machine,
+    /// which runs it, its body here, and then walks the value again: the
+    /// futures that have run are passed over, and the walk goes further.
+    pub(super) fn await_deep(&mut self, state: AwaitState, value: Value) -> Next {
         let node = state.node;
-        give(self.walker(|walker| {
+        self.shared.ahead.awaiting.set(true);
+        let walked = self.walker(|walker| {
             let node = walker.ir.get(node);
             let IrKind::Await {
                 shape, depth, kind, ..
@@ -199,20 +239,31 @@ impl Machine<'_> {
             else {
                 return super::super::mistyped(node, "a node that is not an await awaited");
             };
-            let value = if shape == LazyShapeId::NONE {
-                value
+            let awaited = if shape == LazyShapeId::NONE {
+                value.clone()
             } else {
-                walker.await_deep(value, shape, (depth, 1, false), node)?
+                walker.await_deep(value.clone(), shape, (depth, 1, false), node)?
             };
-            if of_kind(&value, kind) {
-                Ok(value)
+            if of_kind(&awaited, kind) {
+                Ok(awaited)
             } else {
                 super::super::mistyped(
                     node,
                     "an await produced a value of another kind than its node",
                 )
             }
-        }))
+        });
+        self.shared.ahead.awaiting.set(false);
+        match (walked, self.shared.ahead.met.take()) {
+            (Err(_), Some((future, level))) => {
+                match self.begin_future(state, future, (level, Then::Deep(value.clone()))) {
+                    // It had run after all: the walk goes on past it.
+                    Ok(_) => self.await_deep(state, value),
+                    Err(next) => next,
+                }
+            }
+            (walked, _) => give(walked),
+        }
     }
 
     /// The depth of the await node `id` in its frame's body.
@@ -221,5 +272,15 @@ impl Machine<'_> {
             IrKind::Await { depth, .. } => depth,
             _ => 0,
         }
+    }
+}
+
+/// What a machine that stopped for `future`, which the await `state` began
+/// running, does when it takes up: awaits it again, or, if it was a field's,
+/// walks the value awaited deeply again.
+fn resumed(state: AwaitState, future: Rc<Future>, then: Then) -> Resume {
+    match then {
+        Then::Await => Resume::Await(state, future),
+        Then::Deep(value) => Resume::Deep(state, value),
     }
 }
