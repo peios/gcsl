@@ -285,8 +285,18 @@ Absolute source directory of the running function's caller.
 .TP
 .B fileroot.helper()
 Make the running function pass its caller's source directory through to functions it calls.
-This supports helpers whose effects should be relative to the original calling source.
+This supports helpers that name paths with fileroot.caller; a relative path given to file, dir, or a cwd is always relative to the file it is written in.
 Memoized functions account for a caller path when they read it.
+.SH LIBRARIES MODULE
+import libraries.
+These say what a host pinned of the libraries a workspace imports; GCSL itself pins none.
+.TP
+.B type Pinned = {path: String, git: String, dir: String, commit: String}
+A library pinned: its import path, the URL of its git repository, the directory in the repository that holds it (empty for the root), and the whole name of the commit.
+.TP
+.B context pinned_libraries: List<Pinned> = []
+Each library the workspace imports that its host pinned, as pekit pins them in pekit.lock; empty under plain GCSL.
+Read it as ^pinned_libraries.
 .SH SECURITY
 Process and filesystem operations use the embedding process's authority.
 Lexical path normalization is not a filesystem containment check.

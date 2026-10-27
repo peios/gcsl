@@ -426,3 +426,25 @@ fn the_table_of_standard_files_is_the_stdlib_directory() {
         .collect();
     assert_eq!(names, expected);
 }
+
+#[test]
+fn the_libraries_module_says_what_its_host_pinned() {
+    // Plain GCSL pins nothing; a host binds what it pinned, which code
+    // takes as a context.
+    assert_eq!(
+        lone(
+            "import libraries\n\
+             fn pins(^pinned_libraries) -> Int { = len(pinned_libraries) }\n\
+             = pins()"
+        ),
+        Ok("0".to_owned())
+    );
+    assert_eq!(
+        lone(
+            "import libraries\n\
+             fn first(^pinned_libraries) -> String { = pinned_libraries[0].commit }\n\
+             = first() with {pinned_libraries = [{path = \"x.org/a/b\"; git = \"https://x.org/a/b\"; dir = \"\"; commit = \"c\"}]}"
+        ),
+        Ok("c".to_owned())
+    );
+}

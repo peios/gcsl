@@ -1,0 +1,16 @@
+# The libraries module: a module of GCSL's standard library, compiled into
+# every build and loaded by a run that imports it (`import libraries`). It
+# says what a host pinned of the libraries a workspace imports; GCSL itself
+# pins none.
+#
+# - `Pinned`: a library pinned: its import `path`, `github.com/gcslib/gcc`;
+#   `git`, the URL of the git repository it comes from; `dir`, the
+#   directory in the repository that holds it, empty for the root; and
+#   `commit`, the whole name of the commit pinned.
+# - `context pinned_libraries`: each library the workspace imports that its
+#   host pinned, as pekit pins them in `pekit.lock`; none under plain GCSL.
+#   A library that takes what one of these repositories gives another way,
+#   a git crate say, can check that the two are the same commit.
+type Pinned = {path: String, git: String, dir: String, commit: String}
+
+context pinned_libraries: List<Pinned> = []
