@@ -212,9 +212,10 @@ pub(in crate::eval) struct Join {
     pub(super) parent: u32,
     /// The first iteration that failed, if one has.
     pub(super) failed: Option<usize>,
-    /// For each child that is a block's item, by its number, the slots of
-    /// the value stack it declares, whose values it comes to (see
-    /// [Pieces](super::pieces#pieces)).
+    /// For each child that is a block's item, by its number, the slots it
+    /// declares, of the frame the block runs in, whose values it comes to
+    /// (see [Pieces](super::pieces#pieces)): by their indices in that
+    /// frame, so that they hold however its unit's frames are moved.
     pub(super) slots: Vec<(usize, Vec<usize>)>,
 }
 
@@ -520,7 +521,10 @@ impl Machine<'_> {
             Some((_, slots)) if result.is_ok() => Ok(Value::List(List::from_vec(
                 slots
                     .iter()
-                    .map(|&slot| self.stack.get(slot).cloned().unwrap_or(Value::Empty))
+                    .map(|&slot| {
+                        let at = self.running().base + slot;
+                        self.stack.get(at).cloned().unwrap_or(Value::Empty)
+                    })
                     .collect(),
             ))),
             _ => result,
@@ -540,7 +544,8 @@ impl Machine<'_> {
         }
         joined.live = joined.live.saturating_sub(1);
         let failed = joined.failed;
-        let woken = (joined.live == 0).then_some(joined.parent);
+        let parent = joined.parent;
+        let woken = (joined.live == 0).then_some(parent);
         let later: Vec<u32> = failed.map_or_else(Vec::new, |failed| {
             joined
                 .children
@@ -551,6 +556,12 @@ impl Machine<'_> {
         });
         drop(joined);
         self.cancel(&later);
+        // What the task that split it off does now is after the failure:
+        // it is cancelled as far as the loop, node or call, which then
+        // reports the failure.
+        if failed.is_some() {
+            self.halt(parent, join);
+        }
         if let Some(parent) = woken {
             self.wake(parent, join);
         }
@@ -582,6 +593,26 @@ impl Machine<'_> {
             {
                 task.meta.wound = Some((target, wounder));
                 task.status = Status::Cancel(looks_up(&task.status));
+            }
+        }
+    }
+
+    /// Cancels the task `id`, set aside, unless it waits for the children
+    /// of `join`, whose last child to end wakes it: one of its children
+    /// failed, and what it does now comes after the failure in program
+    /// order. Its cancellation stops at the loop, node or call that `join`
+    /// is of, which waits for its children and reports the failure.
+    fn halt(&mut self, id: u32, join: &Rc<RefCell<Join>>) {
+        for task in &mut self.tasks {
+            let waits = matches!(task.status, Status::Joining)
+                && task
+                    .frames
+                    .last()
+                    .and_then(Frame::join)
+                    .is_some_and(|waited| Rc::ptr_eq(waited, join));
+            if task.meta.id == id && !waits && !matches!(task.status, Status::Cancel(_)) {
+                task.status = Status::Cancel(looks_up(&task.status));
+                task.meta.wound = None;
             }
         }
     }

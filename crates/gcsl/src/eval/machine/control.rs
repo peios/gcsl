@@ -164,7 +164,7 @@ impl Machine<'_> {
         // A step's run hands the host what it reads of its context, which
         // the host then gives the step: the read keeps program order as an
         // effect the host does not isolate does.
-        if !self.tasks.is_empty() && self.shared.graph.is_some_and(GraphRun::is_watching) {
+        if self.shared.graph.is_some_and(GraphRun::is_watching) {
             if self.doomed() {
                 return fail(super::tasks::cancelled(self.running().ir.get(id).span));
             }

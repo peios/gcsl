@@ -714,3 +714,49 @@ fn what_is_split_off_inside_a_piece_before_the_piece_is_keeps_its_place() {
     }
     assert_eq!(seen, [text("/r"), text("/a1"), text("/a2"), text("/b")]);
 }
+
+#[test]
+fn a_task_cancelled_by_an_earlier_failure_releases_the_memoised_call_it_ran() {
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "app.gcsl",
+            "import fs\n\
+             #[def_type]\n\
+             def build(name: String, f: fn() -> List<String>) -> List<String> { f() }\n\
+             fn shared() ->> String { = fs.read(\"/s\") }\n\
+             def build first() { = [fs.read(\"/x\"), shared(), fs.read(\"/y\")] }\n\
+             def build second() { = [shared()] }",
+        ),
+    ];
+    let mut workspace = rooted(&files).unwrap();
+    let first = workspace
+        .prepare_call(("build", "first"), &[], &[])
+        .unwrap();
+    let second = workspace
+        .prepare_call(("build", "second"), &[], &[])
+        .unwrap();
+    let mut graph = Graph::new();
+    let Progress::Paused(nodes) = workspace
+        .run_prepared(&first, &mut graph, isolating())
+        .unwrap()
+    else {
+        panic!("the first target did not stop for its reads");
+    };
+    // Each element waits apart, `shared`'s run in a task of its own.
+    assert_eq!(nodes.len(), 3, "{nodes:?}");
+    let failure = Diagnostic::error("unreadable", crate::source::Span::new(0, 0));
+    assert!(graph.resolve(nodes[0], Err(failure)));
+    let Err(crate::workspace::InvokeError::Diagnostics(errors)) =
+        workspace.run_prepared(&first, &mut graph, isolating())
+    else {
+        panic!("the first target did not fail");
+    };
+    assert_eq!(errors[0].message, "unreadable", "{errors:?}");
+    // The cancelled task's entry went with it: the second target runs
+    // `shared` itself, rather than waiting for the first.
+    assert!(matches!(
+        workspace.run_prepared(&second, &mut graph, isolating()),
+        Ok(Progress::Paused(_))
+    ));
+}

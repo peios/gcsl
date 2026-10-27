@@ -390,12 +390,9 @@ impl Machine<'_> {
                     IrKind::Store(slot, _) => Some(slot),
                     _ => None,
                 });
-                let base = self.running().base;
                 held(
                     0,
-                    declared
-                        .map(|slot| vec![base + slot.index()])
-                        .unwrap_or_default(),
+                    declared.map(|slot| vec![slot.index()]).unwrap_or_default(),
                 );
                 if let (Some(slot), Some(state)) = (declared, split.as_mut()) {
                     state.pending.push(slot);
@@ -507,12 +504,13 @@ impl Machine<'_> {
     ) -> Next {
         match what {
             Joining::Items(items, next, result, mut split) => {
+                let base = self.running().base;
                 for (number, slots) in slots {
                     let Some((_, _, Value::List(list))) = values.get(number) else {
                         continue;
                     };
                     for (&slot, value) in slots.iter().zip(list.values()) {
-                        if let Some(place) = self.stack.get_mut(slot) {
+                        if let Some(place) = self.stack.get_mut(base + slot) {
                             *place = value.clone();
                         }
                     }

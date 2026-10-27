@@ -1382,6 +1382,16 @@ impl<'r> Machine<'r> {
         self.walker(|walker| walker.leave_scope(scoped));
         self.memo.running.pop();
         self.memo.finish(&state.closure, &mark, None);
+        // Its frame is as a call's whose body has yet to run, as a retried
+        // call's is.
+        if let Some(code) = state.closure.code.find_function(state.closure.function) {
+            let locals =
+                state.base + code.param_count as usize..state.base + code.frame_size as usize;
+            self.stack.truncate(locals.end);
+            for slot in self.stack.get_mut(locals).into_iter().flatten() {
+                *slot = Value::Empty;
+            }
+        }
         self.meta.wound = None;
         state.memo = Some((None, false));
         state.guard = None;
