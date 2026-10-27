@@ -246,7 +246,11 @@ use crate::check::ViewRecord;
 use crate::check::{Attribute, Builtin, KnownParams, Slot, Types};
 use crate::diagnostic::{Diagnostic, InternalError, Mark};
 use crate::eval::graph::{Graph, GraphHost, GraphRun, NodeId, NodeKind, run_node};
-use crate::eval::plain::{Plain, from_plain, to_key_plain, to_plain};
+use crate::eval::plain::{Plain, from_plain, to_identity_plain, to_key_plain, to_plain};
+
+/// A way to make a value plain data: [`to_plain`], [`to_key_plain`] or
+/// [`to_identity_plain`].
+type MakePlain = fn(&Value, &crate::names::Names) -> Result<Plain, String>;
 use crate::eval::{Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::names::{Name, Names};
@@ -440,6 +444,10 @@ pub(crate) fn exec_layout(names: &mut Names) -> Rc<Layout> {
 pub struct StepInputs {
     /// What the step is.
     pub kind: NodeKind,
+    /// Its callee, as a closure's plain form: its code's input, its function's
+    /// number and its captures; none for an effect. What it calls, which a
+    /// host names its step by, apart from its code's contents.
+    pub callee: Option<Plain>,
     /// Its arguments, in parameter order.
     pub args: Vec<Plain>,
     /// Its callee's captures, which its code reads; none for an effect.
@@ -714,8 +722,16 @@ impl Workspace {
             .into());
         };
         let context = (&mut self.frame, &mut self.memo);
-        let extras = (Some(&self.exec_result), &self.scan.dir_texts[..], effects);
-        run_node(node, context, extras).map_err(|mut error| {
+        let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
+        let extras = (
+            Some(&self.exec_result),
+            &self.scan.dir_texts[..],
+            effects,
+            Some(&names),
+        );
+        let ran = run_node(node, context, extras);
+        self.scan.names = names.into_inner();
+        ran.map_err(|mut error| {
             error.input.get_or_insert(node.unit());
             error
         })
@@ -738,6 +754,16 @@ impl Workspace {
         from_plain(plain, &mut self.scan.names)
     }
 
+    /// The text of each declared context's key, by the key: what a step's
+    /// run tells its host each read it makes by.
+    pub(crate) fn context_texts(&self) -> std::collections::HashMap<Name, Rc<str>> {
+        self.scan
+            .contexts
+            .iter()
+            .map(|context| (context.key, Rc::from(self.scan.names.get(context.key))))
+            .collect()
+    }
+
     /// What a host needs of the node `id` of `graph` to key, stage and run
     /// it as a step, once its data edges are given (see [Graph
     /// mode](crate::eval::graph#graph-mode)): its arguments as plain data,
@@ -753,10 +779,33 @@ impl Workspace {
     ///
     /// What of it is no data, or that `graph` has no node `id`.
     pub fn step_inputs(&self, graph: &Graph, id: NodeId) -> Result<StepInputs, String> {
+        self.inputs_of(graph, id, (to_plain, to_key_plain))
+    }
+
+    /// What a host names the node `id` of `graph` by, a step, before its
+    /// data edges are given: [`Workspace::step_inputs`], but each step's
+    /// result it is given and that has not been given yet as
+    /// [`Plain::Step`], by its node ([`to_identity_plain`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Workspace::step_inputs`].
+    pub fn step_identity(&self, graph: &Graph, id: NodeId) -> Result<StepInputs, String> {
+        self.inputs_of(graph, id, (to_identity_plain, to_identity_plain))
+    }
+
+    /// [`Workspace::step_inputs`], its arguments made plain by `plain` and
+    /// its callee, captures and context by `key`.
+    fn inputs_of(
+        &self,
+        graph: &Graph,
+        id: NodeId,
+        (plain, key): (MakePlain, MakePlain),
+    ) -> Result<StepInputs, String> {
         let names = &self.scan.names;
         let node = graph.node(id).ok_or("a step the graph lacks")?;
         let plain_all = |values: &[Value]| -> Result<Vec<Plain>, String> {
-            values.iter().map(|value| to_plain(value, names)).collect()
+            values.iter().map(|value| plain(value, names)).collect()
         };
         // What it can read, functions among them, which are keyed by their
         // code. A context with no default that its callee does not need is
@@ -789,7 +838,7 @@ impl Workspace {
             .context()
             .iter()
             .filter(|(key, _)| readable(*key))
-            .map(|(key, value)| Ok((names.get(*key).to_owned(), to_key_plain(value, names)?)))
+            .map(|(name, value)| Ok((names.get(*name).to_owned(), key(value, names)?)))
             .collect::<Result<Vec<_>, String>>()?;
         let (captures, attributes, code_files) = match node.closure() {
             Some(closure) => {
@@ -797,7 +846,7 @@ impl Workspace {
                 let captures = closure
                     .captures
                     .iter()
-                    .map(|value| to_key_plain(value, names))
+                    .map(|value| key(value, names))
                     .collect::<Result<Vec<_>, String>>()?;
                 (
                     captures,
@@ -807,8 +856,13 @@ impl Workspace {
             }
             None => (Vec::new(), Vec::new(), Vec::new()),
         };
+        let callee = node
+            .closure()
+            .map(|closure| key(&Value::Fn(Rc::clone(closure)), names))
+            .transpose()?;
         Ok(StepInputs {
             kind: node.kind(),
+            callee,
             args: plain_all(node.args())?,
             captures,
             context,
@@ -908,17 +962,20 @@ impl Workspace {
                 temp_dirs: Some(&self.temp_dirs),
             };
             let effects: &dyn Effects = graph.as_ref().map_or(&direct, |(_, host)| host.effects);
+            let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
             let context = (
                 &mut self.memo,
                 Some(&self.exec_result),
                 &self.scan.dir_texts[..],
                 effects,
+                Some(&names),
             );
             let run = graph
                 .as_mut()
                 .map(|(graph, host)| GraphRun::new(mem::take(*graph), at, host.defers));
             let outcome =
                 session::run_input_in(&ir, &mut self.frame, context, (None, run.as_ref()));
+            self.scan.names = names.into_inner();
             let paused = match (run, graph.as_mut()) {
                 (Some(run), Some((graph, _))) => {
                     let (left, paused) = run.finish();

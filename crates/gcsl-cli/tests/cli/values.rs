@@ -52,11 +52,11 @@ fn dump_ir_shows_strings_and_ifs() {
     assert_eq!(
         stdout(&output),
         "(block @0..36\n\
-         \x20 (store who#132 @0..17\n\
+         \x20 (store who#135 @0..17\n\
          \x20   (str \"world\" @10..17))\n\
          \x20 (interp @18..36\n\
          \x20   (str \"hello,\\t\" @18..36)\n\
-         \x20   (load who#132 @28..31)\n\
+         \x20   (load who#135 @28..31)\n\
          \x20   (str \"!\\n\" @18..36)))\n"
     );
     assert_eq!(output.status.code(), Some(0));
@@ -95,25 +95,25 @@ fn dump_ir_shows_updates() {
     assert_eq!(
         stdout(&output),
         "(block @39..122\n\
-         \x20 (store host#87 @39..64\n\
+         \x20 (store host#90 @39..64\n\
          \x20   (str \"localhost\" @53..64))\n\
-         \x20 (store port#88 @65..83\n\
+         \x20 (store port#91 @65..83\n\
          \x20   (int 8080 @79..83))\n\
-         \x20 (store name#89 @84..96\n\
+         \x20 (store name#92 @84..96\n\
          \x20   (str \"api\" @91..96))\n\
-         \x20 (store enabled#91 @97..122\n\
+         \x20 (store enabled#94 @97..122\n\
          \x20   (bool true @118..122))\n\
-         \x20 (store tls#90 @97..122\n\
+         \x20 (store tls#93 @97..122\n\
          \x20   (make-record [enabled] @97..122\n\
-         \x20     (load enabled#91 @97..122)))\n\
-         \x20 (store server#86 @39..64\n\
+         \x20     (load enabled#94 @97..122)))\n\
+         \x20 (store server#89 @39..64\n\
          \x20   (make-record [host port tls] @39..64\n\
-         \x20     (load host#87 @39..64)\n\
-         \x20     (load port#88 @65..83)\n\
-         \x20     (load tls#90 @97..122)))\n\
+         \x20     (load host#90 @39..64)\n\
+         \x20     (load port#91 @65..83)\n\
+         \x20     (load tls#93 @97..122)))\n\
          \x20 (make-record [server name] @39..122\n\
-         \x20   (load server#86 @39..45)\n\
-         \x20   (load name#89 @84..88)))\n"
+         \x20   (load server#89 @39..45)\n\
+         \x20   (load name#92 @84..88)))\n"
     );
     assert_eq!(output.status.code(), Some(0));
 }
@@ -162,9 +162,9 @@ fn dumps_show_functions_and_calls() {
     let ir = stdout(&output);
     assert!(
         ir.contains(
-            "  (store at#137 @254..301\n\
+            "  (store at#140 @254..301\n\
              \x20   (make-closure #2 @263..301\n\
-             \x20     (load base#136 @263..301)))\n"
+             \x20     (load base#139 @263..301)))\n"
         ),
         "{ir}"
     );

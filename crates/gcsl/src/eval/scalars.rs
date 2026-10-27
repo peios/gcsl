@@ -31,6 +31,7 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
+            | IrKind::JsonDecode { .. }
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::Assert { .. }
@@ -91,6 +92,7 @@ impl Evaluator<'_> {
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
+            | IrKind::RecordOf { .. }
             | IrKind::UpdateField { .. }
             | IrKind::Helper => mistyped(node, "record node where an Int was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where an Int was expected"),
@@ -221,6 +223,7 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
+            | IrKind::JsonDecode { .. }
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::Assert { .. }
@@ -280,6 +283,7 @@ impl Evaluator<'_> {
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
+            | IrKind::RecordOf { .. }
             | IrKind::UpdateField { .. }
             | IrKind::Helper => mistyped(node, "record node where a Float was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where a Float was expected"),
@@ -331,6 +335,7 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
+            | IrKind::JsonDecode { .. }
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::Assert { .. }
@@ -390,6 +395,7 @@ impl Evaluator<'_> {
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
+            | IrKind::RecordOf { .. }
             | IrKind::UpdateField { .. }
             | IrKind::Helper => mistyped(node, "record node where a Bool was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where a Bool was expected"),
@@ -468,6 +474,7 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
+            | IrKind::JsonDecode { .. }
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::Assert { .. }
@@ -525,6 +532,7 @@ impl Evaluator<'_> {
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
+            | IrKind::RecordOf { .. }
             | IrKind::UpdateField { .. }
             | IrKind::Helper => mistyped(node, "record node where a String was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where a String was expected"),

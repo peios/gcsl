@@ -511,6 +511,73 @@ const TARGETS: [(&str, &str); 2] = [
 ];
 
 #[test]
+fn one_call_two_targets_make_is_one_node_met_where_each_made_it() {
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "app.gcsl",
+            "#[attribute] #[defers] type step = {}\n\
+             #[step] fn compile(src: String) -> String { \"{src}.o\" }\n\
+             #[def_type]\n\
+             def build(name: String, f: fn() -> String) -> String { f() }\n\
+             def build first() { = compile(\"w\") }\n\
+             def build second() {\n\
+             \x20   = compile(\"w\")\n\
+             }",
+        ),
+    ];
+    let mut workspace = rooted(&files).unwrap();
+    let first = workspace
+        .prepare_call(("build", "first"), &[], &[])
+        .unwrap();
+    let second = workspace
+        .prepare_call(("build", "second"), &[], &[])
+        .unwrap();
+    let mut graph = Graph::new();
+    for call in [&first, &second] {
+        let progress = workspace.run_prepared(call, &mut graph, every()).unwrap();
+        assert!(matches!(progress, Progress::Done(_)), "{progress:?}");
+    }
+    // The definition each is made in is no part of the call: one node.
+    assert_eq!(graph.len(), 1);
+    let node = NodeId::of(0);
+    let (input, at_first) = graph.met_at(first.unit(), node).unwrap();
+    let (other, at_second) = graph.met_at(second.unit(), node).unwrap();
+    assert_eq!(input, other);
+    assert_ne!(at_first, at_second);
+    assert_eq!(graph.node(node).unwrap().span(), at_first);
+    assert_eq!(graph.met_at(first.unit() + 7, node), None);
+    // Named for a host before it runs, by itself, whoever is given it.
+    let inputs = workspace.step_identity(&graph, node).unwrap();
+    assert!(
+        matches!(inputs.callee, Some(Plain::Closure { .. })),
+        "{:?}",
+        inputs.callee
+    );
+    assert_eq!(inputs.args, [Plain::Str("w".to_owned())]);
+}
+
+#[test]
+fn a_step_s_result_names_the_steps_given_it_by_its_node() {
+    let (mut workspace, file) = lone_workspace("let o = compile(\"w\")\nresult = link([o])");
+    let mut graph = Graph::new();
+    let progress = workspace.run_graph(file, &mut graph, every()).unwrap();
+    assert!(matches!(progress, Progress::Done(_)), "{progress:?}");
+    assert_eq!(graph.len(), 2);
+    let link = NodeId::of(1);
+    let named = |graph: &Graph| workspace.step_identity(graph, link).unwrap().args;
+    assert_eq!(named(&graph), [Plain::List(vec![Plain::Step(0)])]);
+    // Its inputs wait for it; its identity is the same once it is given.
+    assert!(workspace.step_inputs(&graph, link).is_err());
+    assert!(graph.resolve(NodeId::of(0), Ok(text("w.o"))));
+    assert_eq!(named(&graph), [Plain::List(vec![Plain::Step(0)])]);
+    assert_eq!(
+        workspace.step_inputs(&graph, link).unwrap().args,
+        [Plain::List(vec![Plain::Str("w.o".to_owned())])]
+    );
+}
+
+#[test]
 fn a_prepared_invocation_is_a_unit_that_runs_until_it_is_done() {
     let mut workspace = rooted(&TARGETS).unwrap();
     let call = workspace.prepare_call(("build", "main"), &[], &[]).unwrap();
@@ -1015,10 +1082,10 @@ fn a_step_knows_the_definition_whose_call_made_it() {
         found
     };
     // `lib`'s, made in the call of `build lib`, wherever it is called from;
-    // and the prepared calls' own, each its own, though they make the same
-    // call: a step is its definition's, whatever else is built with it.
+    // and the prepared calls' own one call, which they share, the first's
+    // that made it: the definition is no part of a call.
     assert_eq!(of("lib"), ["app/lib"]);
-    assert_eq!(of("main"), ["app/app", "app/other"]);
+    assert_eq!(of("main"), ["app/app"]);
     // Nor does the definition key the step.
     let (id, _) = graph
         .nodes()

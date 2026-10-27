@@ -1,0 +1,24 @@
+# The json module: a module of GCSL's standard library, compiled into every
+# build and loaded by a run that imports it (`import json`).
+#
+# - `decode(text)`: the JSON document `text` decoded as a value of the type
+#   expected of the call where it stands, which must be one:
+#   `let graph: Graph = json.decode(text)`, or `json.decode(text): Graph`.
+#   A string decodes as a `String`, a number as an `Int`, if it is an
+#   integer an `Int` holds, or a `Float`, `true` and `false` as a `Bool`,
+#   an array as a list, and an object as a record: each field from the key
+#   of its name, a missing key or `null` giving the field's default, and
+#   other keys left out. A union decodes as the member that takes the
+#   value's kind, so no two members may take the same kind, an `Int` and a
+#   `Float` apart. A record type with a rest-field takes each other key as
+#   a field of its name, decoded as the rest-field says, a `null` left out.
+#   It is pure. Text that is not JSON, or a document that does not fit the
+#   type, is a runtime error at the call, naming the path to what does not
+#   fit: `units[3].kind`.
+#
+# Its binding is the ALIAS RULE's, as `show`'s is: `decode` has no type a
+# GCSL type can write, so a name bound directly to it is the built-in,
+# called by the checker's rule.
+import builtins
+
+decode = builtins.json_decode

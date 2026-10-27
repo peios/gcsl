@@ -409,6 +409,10 @@ impl Checker<'_> {
             return self.check_defmeta(id, function, def);
         }
         let (callee, decl, forced_ret) = self.fn_as_checked(function);
+        // The body of a definition of a generic def-type, with parameters of
+        // its own, gives its own result, as the definition does (see
+        // [Generic results](crate::check::deftypes#generic-results)).
+        let gives_own = forced_ret == Some(TyId::ERROR);
         let pure = decl.effect == Effect::Pure;
         let (params_mode, ret_mode) = bareness_of(decl.effect);
         let params = self.ast.params(decl.params);
@@ -465,6 +469,11 @@ impl Checker<'_> {
         let errors = self.errors.len();
         let callbacks = (self.callbacks.len(), self.callback_positions.len());
         self.check_fn_body(&decl, base, (callee, ty, span), ret);
+        if gives_own && self.errors.len() == errors {
+            let found = self.expr_types[decl.body.index()];
+            ty = self.function_type(function, base, (found, decl.effect));
+            self.expr_types[id.index()] = ty;
+        }
         let returns = self
             .functions
             .last_mut()
@@ -1047,7 +1056,10 @@ impl Checker<'_> {
             if let Some(label) = label {
                 self.enter_block(body, label, returns);
             }
-            let mut found = self.check_body(items, expecting);
+            // A call of `json.decode` the body results in decodes as the
+            // return type.
+            let mut found =
+                self.expecting_decode(body, ret, |checker| checker.check_body(items, expecting));
             if label.is_some() {
                 found = self.leave_block(body, found, returns);
             }

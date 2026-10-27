@@ -20,6 +20,14 @@ import builtins
 # back as an equal value: `show("a")` is "\"a\"", `show({n = 1})` "{n = 1}".
 len = builtins.len
 show = builtins.show
+# `record(entries)` is the record of a field for each entry, an `Entry`,
+# named by its key, the names known only as the program runs: a `{*: T}`,
+# whose fields no code reads by name, given to what takes a record of any
+# names, a program's environment say. A key twice is an error.
+record = builtins.record
+
+# An entry of a record `record` makes: a field's name and its value.
+type Entry<T> = {key: String, value: T}
 int = builtins.int
 float = builtins.float
 def half(n: Int): Float { float(n) / 2.0 }

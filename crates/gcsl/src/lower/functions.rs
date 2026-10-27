@@ -38,7 +38,7 @@ impl Lowerer<'_> {
                 span: expr.span,
             }),
             (ExprKind::Call { callee, args }, _) => match self.resolution.expr_var(callee) {
-                VarRef::Builtin(builtin) => self.lower_builtin(builtin, args, kind, expr.span),
+                VarRef::Builtin(builtin) => self.lower_builtin(id, builtin, args, kind),
                 // `fileroot.helper()`, which takes no argument, is its own
                 // node, never reading its callee; the calls after it pass on
                 // the caller the body runs with.

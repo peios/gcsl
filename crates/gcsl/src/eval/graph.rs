@@ -254,6 +254,9 @@ pub struct Graph {
     /// Every node met, by its unit and position, with the key it was met
     /// with there.
     positions: HashMap<Position, (Box<[u8]>, NodeId)>,
+    /// Where each unit first met each node it met: the input and span of
+    /// the call, which another unit's node it is need not be.
+    met: HashMap<(u32, NodeId), (u32, Span)>,
 }
 
 /// Where a node is met: its unit, and a hash of its scope's path and its
@@ -350,6 +353,15 @@ impl Graph {
     /// whatever already holds them.
     pub fn forget_unit(&mut self, unit: u32) {
         self.positions.retain(|&(met_in, _), _| met_in != unit);
+        self.met.retain(|&(met_in, _), _| met_in != unit);
+    }
+
+    /// Where the unit `unit` first met the node `id`, if it met it: the
+    /// input and span of its call, which are the node's own only if the unit
+    /// made it, since a deferred call two units make is one node.
+    #[must_use]
+    pub fn met_at(&self, unit: u32, id: NodeId) -> Option<(u32, Span)> {
+        self.met.get(&(unit, id)).copied()
     }
 
     /// The nodes whose results `value` holds and that are waiting: its holes,
@@ -470,9 +482,9 @@ pub(crate) struct GraphRun<'g> {
     /// Of a step's unit's run, what it reads of the step's own context
     /// ([`StepReads`]); `None` for any other unit's.
     watch: RefCell<Option<Watch>>,
-    /// The names of the run's workspace, by which a read is told to the
+    /// The text of each context's key, by which a read is told to the
     /// host.
-    names: Option<&'g crate::names::Names>,
+    texts: HashMap<crate::names::Name, Rc<str>>,
 }
 
 /// What a run of a step's unit read of the context the step was made in
@@ -527,23 +539,24 @@ impl<'g> GraphRun<'g> {
             last: Cell::new(None),
             scopes: RefCell::new(vec![root]),
             watch: RefCell::new(None),
-            names: None,
+            texts: HashMap::new(),
         }
     }
 
     /// The run, watching what it reads of the context `context`, a step's,
-    /// each read told by its key's text in `names` ([`GraphRun::note_read`]).
+    /// each read told by its key's text in `texts`, the text of every
+    /// context's key ([`GraphRun::note_read`]).
     pub(crate) fn watching(
         mut self,
         context: Option<Rc<ContextFrame>>,
-        names: &'g crate::names::Names,
+        texts: HashMap<crate::names::Name, Rc<str>>,
     ) -> Self {
         self.watch = RefCell::new(Some(Watch {
             context,
             keys: Vec::new(),
             all: false,
         }));
-        self.names = Some(names);
+        self.texts = texts;
         self
     }
 
@@ -556,7 +569,7 @@ impl<'g> GraphRun<'g> {
         &self,
         key: crate::names::Name,
         context: Option<&Rc<ContextFrame>>,
-    ) -> Option<&'g str> {
+    ) -> Option<Rc<str>> {
         let mut watch = self.watch.borrow_mut();
         let watch = watch.as_mut()?;
         let read = ContextFrame::find(context, key).map(|(frame, _)| frame);
@@ -565,12 +578,12 @@ impl<'g> GraphRun<'g> {
             return None;
         }
         watch.keys.push((key, own.is_some()));
-        Some(self.names?.get(key))
+        self.texts.get(&key).cloned()
     }
 
     /// Notes that the run read every context its step's context binds, if it
     /// watches one: each's key's text that it had not read before.
-    pub(crate) fn note_all(&self) -> Vec<&'g str> {
+    pub(crate) fn note_all(&self) -> Vec<Rc<str>> {
         let mut watch = self.watch.borrow_mut();
         let Some(watch) = watch.as_mut() else {
             return Vec::new();
@@ -580,7 +593,7 @@ impl<'g> GraphRun<'g> {
         for (key, _) in ContextFrame::flattened(watch.context.as_ref()) {
             if !watch.keys.iter().any(|&(seen, _)| seen == key) {
                 watch.keys.push((key, true));
-                new.extend(self.names.map(|names| names.get(key)));
+                new.extend(self.texts.get(&key).cloned());
             }
         }
         new
@@ -593,12 +606,11 @@ impl<'g> GraphRun<'g> {
         let Some(watch) = watch.as_ref() else {
             return StepReads::default();
         };
-        let names = self.names;
         StepReads {
             keys: watch
                 .keys
                 .iter()
-                .filter_map(|&(key, bound)| Some((names?.get(key).to_owned(), bound)))
+                .filter_map(|&(key, bound)| Some((self.texts.get(&key)?.to_string(), bound)))
                 .collect(),
             all: watch.all,
         }
@@ -649,7 +661,7 @@ impl<'g> GraphRun<'g> {
     fn meet(
         &self,
         key: Box<[u8]>,
-        span: Span,
+        (input, span): (u32, Span),
         new_node: impl FnOnce(&Graph, Option<NodeId>) -> Node,
     ) -> Result<NodeId, Diagnostic> {
         let position = (self.unit, self.next_position());
@@ -682,6 +694,7 @@ impl<'g> GraphRun<'g> {
                 id
             });
             graph.positions.insert(position, (key, id));
+            graph.met.entry((self.unit, id)).or_insert((input, span));
             id
         };
         self.last.set(Some(id));
@@ -757,10 +770,10 @@ impl Evaluator<'_> {
         for value in &given {
             encode(value, &mut key);
         }
-        encode_context(context.as_ref(), &mut key);
+        encode_context(context.as_ref(), true, &mut key);
         let made = self.callee_caller();
         let reported = self.reported();
-        let id = run.meet(key.into(), node.span, |graph, after| {
+        let id = run.meet(key.into(), (self.ir.input(), node.span), |graph, after| {
             let mut data = Vec::new();
             graph.holes_into(&given, &mut data);
             graph.holes_into(&closure.captures, &mut data);
@@ -825,9 +838,9 @@ impl Evaluator<'_> {
         for value in given {
             encode(value, &mut key);
         }
-        encode_context(context.as_ref(), &mut key);
+        encode_context(context.as_ref(), false, &mut key);
         let reported = self.reported();
-        let id = run.meet(key.into(), node.span, |graph, after| {
+        let id = run.meet(key.into(), (self.ir.input(), node.span), |graph, after| {
             let mut data = Vec::new();
             graph.holes_into(given, &mut data);
             Node {
@@ -919,11 +932,13 @@ pub(crate) fn run_node(
     let span = node.site.span;
     match (node.kind, StepCall::of(node)) {
         (NodeKind::Deferred, Some(call)) => {
-            let shared = Shared::new(extras.0, extras.1, extras.2);
+            let mut shared = Shared::new(extras.0, extras.1, extras.2);
+            shared.names = extras.3;
             call_step(&call, (stack, memo), &shared, true)
         }
         (NodeKind::Effect(builtin), None) => {
-            let shared = Shared::new(extras.0, extras.1, extras.2);
+            let mut shared = Shared::new(extras.0, extras.1, extras.2);
+            shared.names = extras.3;
             shared.context.replace(node.context.clone());
             apply_effect(
                 builtin,
@@ -943,6 +958,7 @@ pub(crate) type RunExtras<'a> = (
     Option<&'a Rc<crate::value::Layout>>,
     &'a [Rc<str>],
     &'a dyn super::Effects,
+    Option<&'a RefCell<crate::names::Names>>,
 );
 
 /// A deferred node's call, apart from its graph, which a run takes (see
@@ -1009,6 +1025,7 @@ pub(crate) fn run_step_call(
     run: &GraphRun<'_>,
 ) -> Result<Value, Diagnostic> {
     let mut shared = Shared::new(extras.0, extras.1, extras.2);
+    shared.names = extras.3;
     shared.graph = Some(run);
     // A step its body makes reports where this one does.
     shared.sites.borrow_mut().extend(call.reported);
@@ -1228,9 +1245,17 @@ pub(crate) fn flattened(context: Option<&Rc<ContextFrame>>) -> Vec<(crate::names
 }
 
 /// Appends the flattened context `context` to the key `out`: its bindings,
-/// never a frame's identity, which is new each time a `with` runs.
-fn encode_context(context: Option<&Rc<ContextFrame>>, out: &mut Vec<u8>) {
-    let bound = flattened(context);
+/// never a frame's identity, which is new each time a `with` runs, and, for
+/// a deferred call, never the definition it was made in, which the call's
+/// code cannot read (its host runs it in a directory of its own, see
+/// [Files](crate::eval::files#the-working-directory)), so that the same
+/// call made for two definitions, two targets of one build say, is one
+/// node and runs once.
+fn encode_context(context: Option<&Rc<ContextFrame>>, deferred: bool, out: &mut Vec<u8>) {
+    let mut bound = flattened(context);
+    if deferred {
+        bound.retain(|(key, _)| *key != crate::names::DEFINITION);
+    }
     out.push(b'c');
     out.extend_from_slice(&u32::try_from(bound.len()).unwrap_or(u32::MAX).to_le_bytes());
     for (key, value) in &bound {

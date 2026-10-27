@@ -121,6 +121,10 @@ pub(super) const fn mixed(node: &IrNode) -> bool {
                 kind: ValueKind::Mixed,
                 ..
             }
+            | IrKind::JsonDecode {
+                kind: ValueKind::Mixed,
+                ..
+            }
             | IrKind::Catch {
                 kind: ValueKind::Mixed,
                 ..

@@ -1951,6 +1951,8 @@ pub struct Checker<'a> {
     callback_positions: Vec<CallbackPosition>,
     /// See [`Resolution::test_of`].
     tests: HashMap<ExprId, TestResolution>,
+    /// What calls of `json.decode` decode as.
+    decoding: json::Decoding,
     /// Whether types are being resolved quietly, and whether one was
     /// erroneous with nothing to report here.
     quiet: Quiet,
@@ -2122,6 +2124,7 @@ impl<'a> Checker<'a> {
             callbacks: Vec::new(),
             callback_positions: Vec::new(),
             tests: HashMap::new(),
+            decoding: json::Decoding::default(),
             quiet: Quiet::default(),
             declared_types: Vec::new(),
             copies: HashMap::new(),
@@ -2254,6 +2257,7 @@ impl<'a> Checker<'a> {
                 returned_blocks: self.returned_blocks,
                 discarded: self.discarded,
                 tests: self.tests,
+                decodes: self.decoding.plans,
                 meta_reads: self.meta_reads,
                 metas: self.metas,
                 lowered: self.lowering,
@@ -3167,6 +3171,7 @@ pub(crate) mod builtin;
 pub(crate) mod calls;
 pub(crate) mod context;
 pub(crate) mod deftypes;
+pub(crate) mod entries;
 pub(crate) mod enums;
 pub(crate) mod expect;
 pub(crate) mod failure;
@@ -3177,6 +3182,7 @@ pub(crate) mod futures;
 pub(crate) mod imports;
 pub(crate) mod inference;
 pub(crate) mod items;
+pub(crate) mod json;
 pub(crate) mod lists;
 pub(crate) mod loops;
 pub(crate) mod methods;

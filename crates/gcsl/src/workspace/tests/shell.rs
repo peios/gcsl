@@ -292,8 +292,8 @@ fn every_record_exec_builds_shares_the_runs_one_layout() {
         .map(|&(path, text)| SourceFile::new(path, text).unwrap())
         .collect();
     let mut workspace = check(&sources).unwrap();
-    // The driver wrote the fifty-five built-in functions' cells.
-    assert_eq!(assert_builtins_written(&workspace).len(), 55);
+    // The driver wrote the fifty-seven built-in functions' cells.
+    assert_eq!(assert_builtins_written(&workspace).len(), 57);
     let a = workspace.file("a.gcsl").unwrap();
     let b = workspace.file("b.gcsl").unwrap();
     let first = workspace.run(a).unwrap().value;

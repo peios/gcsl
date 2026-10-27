@@ -438,13 +438,19 @@ impl Session {
         let direct = Direct {
             temp_dirs: Some(&self.temp_dirs),
         };
+        // The input's names, lent to its run, which adds the names of
+        // records it makes with names known only as it goes.
+        let names = std::cell::RefCell::new(std::mem::take(&mut self.names));
         let context = (
             &mut self.memo,
             self.exec_result.as_ref(),
             &standard.dirs[..],
             &direct as &dyn Effects,
+            Some(&names),
         );
-        match run_input(ir, &mut self.frame, context) {
+        let ran = run_input(ir, &mut self.frame, context);
+        self.names = names.into_inner();
+        match ran {
             Ok(value) => {
                 // A name the input bound that its scan could not see, as a
                 // spread's, shadows an import of it too.
@@ -572,25 +578,28 @@ pub(crate) fn run_input(
 pub(crate) fn run_input_in(
     ir: &Rc<Ir>,
     frame: &mut Vec<Value>,
-    (memo, exec_result, dirs, effects): RunContext,
+    (memo, exec_result, dirs, effects, names): RunContext,
     (root, graph): (Option<Rc<ContextFrame>>, Option<&GraphRun<'_>>),
 ) -> Result<Value, Diagnostic> {
     let frame_size = ir.frame_size() as usize;
     if frame.len() < frame_size {
         frame.resize(frame_size, Value::Empty);
     }
-    let extras = (exec_result, dirs, effects);
+    let extras = (exec_result, dirs, effects, names);
     eval::eval_rooted(ir, (frame, memo), extras, (root, graph))
 }
 
 /// What [`run_input`] runs an input with besides its frame: the memo tables
 /// of every input, the layout of what `exec` returns, the table of the
-/// run's directories, and the temporary directories of the run's owner.
+/// run's directories, the temporary directories of the run's owner, and the
+/// names of its owner, which a record made with names known only as it runs
+/// adds to, if it has a table of names.
 pub(crate) type RunContext<'a> = (
     &'a mut MemoTables,
     Option<&'a Rc<Layout>>,
     &'a [Rc<str>],
     &'a dyn Effects,
+    Option<&'a std::cell::RefCell<Names>>,
 );
 
 #[cfg(test)]

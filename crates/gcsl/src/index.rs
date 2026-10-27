@@ -1490,6 +1490,8 @@ impl Index {
             TyKind::Builtin(builtin) => match builtin {
                 Builtin::Len => "fn<T>(list: List<T>): Int",
                 Builtin::Show => "fn<T>(value: T): String",
+                Builtin::JsonDecode => "fn<T>(text: String): T",
+                Builtin::Record => "fn<T>(entries: List<{key: String, value: T}>): {*: T}",
                 _ => builtin.display(),
             }
             .to_owned(),

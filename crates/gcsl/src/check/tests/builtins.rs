@@ -133,7 +133,11 @@ fn the_alias_rule_lets_a_special_built_in_stand_only_where_it_says() {
         shown_result("import builtins\nlet l = builtins.len\nl([1])"),
         "Int"
     );
-    assert_eq!(messages("import builtins\nlet b = builtins"), [NOT_A_VALUE]);
+    // The record names the first special built-in among its fields.
+    assert_eq!(
+        messages("import builtins\nlet b = builtins"),
+        ["`json_decode` is a built-in function and cannot be used as a value yet"]
+    );
 }
 
 #[test]

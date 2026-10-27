@@ -94,6 +94,7 @@ impl Evaluator<'_> {
             | IrKind::Index { .. }
             | IrKind::Await { .. }
             | IrKind::As { .. }
+            | IrKind::JsonDecode { .. }
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::Assert { .. }
@@ -113,6 +114,7 @@ impl Evaluator<'_> {
                 self.record(branch)
             }
             IrKind::MakeRecord { layout, values } => self.make_record(layout, values),
+            IrKind::RecordOf { .. } => self.record_of(node),
             IrKind::UpdateField { .. } => self.update_field(node),
             IrKind::Update {
                 kind: ValueKind::Record,
