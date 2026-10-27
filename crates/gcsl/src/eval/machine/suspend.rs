@@ -63,6 +63,9 @@ pub(in crate::eval) enum Resume {
     /// The lookup of the memoised call on top of the machine's calls,
     /// again, its arguments still in its frame.
     Lookup,
+    /// The evaluation of the context read node, again: its turn to read a
+    /// context the run watches may have come.
+    Read(IrId),
 }
 
 /// A unit's evaluation, stopped where it waits (see the module
@@ -366,6 +369,7 @@ impl Machine<'_> {
                 Some(state) => self.enter_body(state),
                 None => self.lost_call(),
             },
+            Resume::Read(id) => Next::Eval(id),
         }
     }
 }

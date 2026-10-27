@@ -306,7 +306,7 @@ impl Machine<'_> {
             futures: shared.futures.take(),
             run: shared
                 .graph
-                .map_or_else(RunState::default, GraphRun::take_state),
+                .map_or_else(RunState::default, GraphRun::take_task_state),
             profile: shared
                 .profile
                 .map(|profile| profile.suspend(self.profiled_base)),

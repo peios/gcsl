@@ -639,6 +639,24 @@ impl<'g> GraphRun<'g> {
         }
     }
 
+    /// What the run keeps of itself that is a task's own, for a switch to
+    /// another task: all of [`GraphRun::take_state`] but what a step's run
+    /// has read of its context, which every task of the unit shares.
+    pub(crate) fn take_task_state(&self) -> RunState {
+        RunState {
+            scopes: std::mem::take(&mut *self.scopes.borrow_mut()),
+            last: self.last.get(),
+            watch: None,
+        }
+    }
+
+    /// Whether the run watches what it reads of a step's context: the host
+    /// gives the step what a context holds only once it is read, so that
+    /// reads, as effects, keep program order.
+    pub(crate) fn is_watching(&self) -> bool {
+        self.watch.borrow().is_some()
+    }
+
     /// Whether the node `id` waits for the host to give its result.
     pub(crate) fn is_waiting(&self, id: NodeId) -> bool {
         self.graph
