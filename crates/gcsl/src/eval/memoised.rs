@@ -108,6 +108,18 @@ impl Evaluator<'_> {
             self.stack.truncate(base);
             return Err(unwind);
         }
+        self.memo_lookup((closure, code), (base, depth), node)
+    }
+
+    /// The rest of [`Evaluator::memo_begin`], once the arguments are in the
+    /// callee's frame at `base`: the lookup, and the start of a running
+    /// entry if it finds none.
+    pub(super) fn memo_lookup(
+        &mut self,
+        (closure, code): (&Rc<Closure>, &FnCode),
+        (base, depth): (usize, u16),
+        node: &IrNode,
+    ) -> Flow<MemoBegin> {
         self.arguments_done();
         let caller = self.callee_caller();
         let params = base..base + code.param_count as usize;

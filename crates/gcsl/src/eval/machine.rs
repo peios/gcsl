@@ -14,6 +14,11 @@
 //! the calls running, each the code, the frame's base on the value stack,
 //! the closure and the caller a walker would hold.
 //!
+//! Graph mode runs on the machine. Plain evaluation never waits, and the
+//! walkers run it faster, so it runs on them, unless the crate is built
+//! with the feature `machine-everywhere`, with which the test suite checks
+//! the machine against them.
+//!
 //! The machine evaluates control nodes, those that a simple subtree cannot
 //! hold ([`crate::ir::Ir::is_simple`]), with frames of its own. A simple
 //! node, which can wait for nothing, it hands to the walkers, which
@@ -42,14 +47,22 @@
 //! on its way out, a call's frame truncating the value stack and reporting
 //! the error as the call does.
 
+mod loops;
+
 use std::rc::Rc;
 
-use crate::ir::{FnKind, Ir, IrId, IrKind, IrNode, IrRange, Operands};
+use crate::diagnostic::Mark as ErrorMark;
+use crate::ir::{ArgValue, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, Operands};
 use crate::value::{Caller, Closure, Value};
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
-use super::memo::MemoTables;
-use super::{Callee, Evaluator, Flow, Shared, Unwind, mistyped, nested_too_deeply};
+use loops::{ForState, LoopAt, LoopState};
+
+use super::memo::{Mark, MemoBegin, MemoTables};
+use super::{
+    Callee, Evaluator, Flow, GUARD_LEVELS, Shared, Unwind, mistyped, nested_too_deeply,
+    shown_duration,
+};
 
 /// A call running in the machine: what an [`Evaluator`] of its frame
 /// holds, owned.
@@ -102,10 +115,25 @@ enum Frame {
         operands: Operands,
         lhs: Option<i64>,
     },
-    /// A call's arguments, from `next` on, the one before evaluated above.
-    Arguments(Box<CallState>),
-    /// A call's body, evaluated above in an activation of its own.
-    Body(Box<CallState>),
+    /// The arguments of the innermost of the machine's calls, from `next`
+    /// on, the one before evaluated above.
+    Arguments,
+    /// The body of the innermost of the machine's calls, evaluated above in
+    /// an activation of its own.
+    Body,
+    /// A `for`'s iterable, evaluated above.
+    ForIterable(Box<ForState>),
+    /// A `for`'s guard, evaluated above.
+    ForGuard(Box<ForState>),
+    /// A `for`'s body, evaluated above.
+    ForBody(Box<ForState>),
+    /// A part of a condition loop, evaluated above.
+    Loop(Box<LoopState>, LoopAt),
+    /// The value of a `break`, `continue` or `return`, evaluated above.
+    Leave(IrId),
+    /// The body of a catch for the `return`s of this number, evaluated
+    /// above.
+    Catch(u32),
 }
 
 /// A call of a closure that the machine runs.
@@ -127,14 +155,48 @@ struct CallState {
     /// Whether the call goes from the workspace's own code into foreign
     /// code, and so is on the run's list of sites.
     crossing: bool,
+    /// For a memoised call, its entry, once its lookup has started one, and
+    /// whether its body is a graph-mode scope of its own.
+    memo: Option<(Option<Mark>, bool)>,
+    /// For a call of a function with `#[retry]` or `#[timeout]`, its
+    /// attempts, once its body runs.
+    guard: Option<Guard>,
 }
+
+/// The attempts of a call whose function has `#[retry]` or `#[timeout]`,
+/// as [`Evaluator::guarded_body`] makes them.
+struct Guard {
+    /// How many attempts have begun.
+    tried: u32,
+    /// The running attempt's deadline, if the function has a timeout.
+    deadline: Option<u32>,
+    /// The caller the body runs with.
+    caller: Caller,
+    /// The levels of nesting at the body, the guard's own included.
+    levels: usize,
+}
+
+/// What evaluating a node came to, in the machine: a [`Flow`] whose
+/// unwinding is boxed, so that what the machine moves at every step is a
+/// value's size, not an error's.
+type Outcome = Result<Value, Box<Unwind>>;
 
 /// What the machine does next.
 enum Next {
     /// Evaluate a node in the activation running.
     Eval(IrId),
     /// Give the frame on top what the node above it came to.
-    Give(Flow<Value>),
+    Give(Outcome),
+}
+
+/// Gives the frame on top `flow`, a walker's result.
+fn give(flow: Flow<Value>) -> Next {
+    Next::Give(flow.map_err(Box::new))
+}
+
+/// Gives the frame on top the unwinding `unwind`.
+fn fail(unwind: impl Into<Unwind>) -> Next {
+    Next::Give(Err(Box::new(unwind.into())))
 }
 
 /// A run of the machine over one value stack.
@@ -149,6 +211,10 @@ pub(super) struct Machine<'r> {
     activations: Vec<Activation>,
     /// The frames, innermost last.
     frames: Vec<Frame>,
+    /// The calls the machine runs whose arguments or body are being
+    /// evaluated, innermost last: one for each [`Frame::Arguments`] and
+    /// [`Frame::Body`], kept here so that a call allocates nothing.
+    calls: Vec<CallState>,
 }
 
 impl<'r> Machine<'r> {
@@ -165,6 +231,7 @@ impl<'r> Machine<'r> {
             shared,
             activations: vec![activation],
             frames: Vec::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -176,7 +243,7 @@ impl<'r> Machine<'r> {
                 Next::Eval(id) => self.eval(id),
                 Next::Give(result) => match self.frames.pop() {
                     Some(frame) => self.resume(frame, result),
-                    None => return result,
+                    None => return result.map_err(|unwind| *unwind),
                 },
             };
         }
@@ -222,7 +289,7 @@ impl<'r> Machine<'r> {
         let ir = &self.running().ir;
         let kind = ir.get(id).kind;
         if ir.is_simple(id) {
-            return Next::Give(self.walker(|walker| walker.value(id)));
+            return give(self.walker(|walker| walker.value(id)));
         }
         match kind {
             IrKind::Block { items, result } => self.items(items, 0, result),
@@ -249,13 +316,29 @@ impl<'r> Machine<'r> {
                 depth,
                 ..
             } => self.call(id, (callee, args, depth)),
-            _ => Next::Give(self.walker(|walker| walker.value(id))),
+            IrKind::For {
+                slot,
+                parts,
+                collect,
+            } => self.for_loop(id, (slot, parts, collect)),
+            IrKind::Loop {
+                parts,
+                collect,
+                test_first,
+            } => self.condition_loop(id, (parts, collect, test_first)),
+            IrKind::Break { .. } | IrKind::Continue { .. } | IrKind::Return { .. } => {
+                self.leave(id)
+            }
+            IrKind::Catch {
+                body, id: catch, ..
+            } => self.catch(body, catch.number()),
+            _ => give(self.walker(|walker| walker.value(id))),
         }
     }
 
     /// Takes up `frame` with `result`, what the node evaluated above it
     /// came to.
-    fn resume(&mut self, frame: Frame, result: Flow<Value>) -> Next {
+    fn resume(&mut self, frame: Frame, result: Outcome) -> Next {
         match frame {
             Frame::Items {
                 items,
@@ -279,8 +362,20 @@ impl<'r> Machine<'r> {
                 operands,
                 lhs,
             } => self.arithmetic(node, operands, lhs, result),
-            Frame::Arguments(state) => self.argument_done(state, result),
-            Frame::Body(state) => self.body_done(&state, result),
+            Frame::Arguments => match self.calls.pop() {
+                Some(state) => self.argument_done(state, result),
+                None => self.lost_call(),
+            },
+            Frame::Body => match self.calls.pop() {
+                Some(state) => self.body_done(state, result),
+                None => self.lost_call(),
+            },
+            Frame::ForIterable(state) => self.for_iterable(state, result),
+            Frame::ForGuard(state) => self.for_guard(state, result),
+            Frame::ForBody(state) => self.for_body(state, result),
+            Frame::Loop(state, at) => self.loop_resume(state, at, result),
+            Frame::Leave(id) => self.left(id, result),
+            Frame::Catch(catch) => Next::Give(loops::caught_return(catch, result)),
         }
     }
 
@@ -302,7 +397,7 @@ impl<'r> Machine<'r> {
                 return Next::Eval(item);
             }
             if let Err(unwind) = self.walker(|walker| walker.value(item)) {
-                return Next::Give(Err(unwind));
+                return fail(unwind);
             }
         }
     }
@@ -313,7 +408,7 @@ impl<'r> Machine<'r> {
         if self.running().ir.is_simple(cond) {
             return match self.walker(|walker| walker.bool(cond)) {
                 Ok(cond) => Next::Eval(if cond { then } else { else_ }),
-                Err(unwind) => Next::Give(Err(unwind)),
+                Err(unwind) => fail(unwind),
             };
         }
         self.frames.push(Frame::Branch { node, then, else_ });
@@ -329,11 +424,7 @@ impl<'r> Machine<'r> {
             return Next::Give(Ok(Value::Empty));
         }
         let span = self.running().ir.get(node).span;
-        Next::Give(Err(super::internal(
-            "store to a slot outside the frame",
-            span,
-        )
-        .into()))
+        fail(super::internal("store to a slot outside the frame", span))
     }
 
     /// Takes up the `Int` operator `node` of `operands` with `result`, the
@@ -343,7 +434,7 @@ impl<'r> Machine<'r> {
         node: IrId,
         operands: Operands,
         lhs: Option<i64>,
-        result: Flow<Value>,
+        result: Outcome,
     ) -> Next {
         let value = match result {
             Ok(Value::Int(value)) => value,
@@ -359,7 +450,7 @@ impl<'r> Machine<'r> {
             return Next::Eval(operands.rhs);
         };
         let pair = (lhs, value);
-        Next::Give(
+        give(
             self.walker(|walker| {
                 let node = walker.ir.get(node);
                 match node.kind {
@@ -389,18 +480,19 @@ impl<'r> Machine<'r> {
     }
 
     /// Evaluates the call node `id` of `callee` with the arguments `args`,
-    /// at depth `depth`: its callee, and then, for a closure the machine
-    /// runs itself ([`Machine::runs`]), its arguments and body, and for any
-    /// other callee the whole call by a walker.
+    /// at depth `depth`: its callee, and then, for a closure the host does
+    /// not take as a step, its arguments and body, as
+    /// [`Evaluator::call_closure`] runs them; any other callee's call is a
+    /// walker's ([`Evaluator::call_resolved`]).
     fn call(&mut self, id: IrId, (callee, args, depth): (IrId, IrRange, u16)) -> Next {
         let callee = match self.walker(|walker| walker.function(callee)) {
             Ok(callee) => callee,
-            Err(unwind) => return Next::Give(Err(unwind)),
+            Err(unwind) => return fail(unwind),
         };
         let closure = match callee {
-            Callee::Closure(closure) if self.runs(&closure) => closure,
+            Callee::Closure(closure) if !self.deferred(&closure) => closure,
             callee => {
-                return Next::Give(self.walker(|walker| {
+                return give(self.walker(|walker| {
                     let node = walker.ir.get(id);
                     walker.call_resolved(callee, (args, depth), node)
                 }));
@@ -409,32 +501,33 @@ impl<'r> Machine<'r> {
         let Some(code) = closure.code.find_function(closure.function) else {
             return self.mistyped(id, "a closure of a function its IR lacks");
         };
-        let (height, frame_size) = (code.height as usize, code.frame_size as usize);
+        let memo = code.kind == FnKind::Memo;
+        let height = code.height as usize;
         let running = self.running();
         let crossing = closure.code.is_foreign() && !running.ir.is_foreign();
         let entering = running.levels + usize::from(depth) + CALL_LEVELS;
-        let span = running.ir.get(id).span;
         if crossing {
-            let input = running.ir.input();
-            self.shared.sites.borrow_mut().push((input, span));
+            let at = (running.ir.input(), running.ir.get(id).span);
+            self.shared.sites.borrow_mut().push(at);
         }
-        let early = self.walker(|walker| {
-            let node = walker.ir.get(id);
+        if let Err(unwind) = self.walker(|walker| {
             if walker.past_deadline() {
-                walker.timed_out(node)
-            } else if entering + height > MAX_DEPTH {
-                Err(nested_too_deeply(node).into())
-            } else {
-                Ok(Value::Empty)
+                return walker.timed_out(walker.ir.get(id));
             }
-        });
-        if let Err(unwind) = early {
+            walker.profile_begin((&closure.code, closure.function, code), false);
+            if !memo && entering + height > MAX_DEPTH {
+                walker.profile_end();
+                return Err(nested_too_deeply(walker.ir.get(id)).into());
+            }
+            Ok(())
+        }) {
             self.leave_call(crossing);
-            return Next::Give(Err(unwind));
+            return fail(unwind);
         }
         let base = self.stack.len();
-        self.stack.resize(base + frame_size, Value::Empty);
-        self.next_argument(Box::new(CallState {
+        self.stack
+            .resize(base + code.frame_size as usize, Value::Empty);
+        self.next_argument(CallState {
             closure,
             node: id,
             args,
@@ -443,81 +536,66 @@ impl<'r> Machine<'r> {
             base,
             entering,
             crossing,
-        }))
+            memo: memo.then_some((None, false)),
+            guard: None,
+        })
     }
 
-    /// Whether the machine runs a call of `closure` itself: one of a
-    /// plain function, neither memoised, deferred, retried nor timed, in a
-    /// run that is not profiled.
-    fn runs(&mut self, closure: &Rc<Closure>) -> bool {
+    /// Whether the host takes a call of `closure` as a step, in graph mode.
+    fn deferred(&mut self, closure: &Rc<Closure>) -> bool {
         let Some(code) = closure.code.find_function(closure.function) else {
             return false;
         };
-        self.shared.profile.is_none()
-            && code.kind != FnKind::Memo
-            && code.retry == 0
-            && code.timeout.is_none()
-            && !self.walker(|walker| walker.defers(code))
+        self.walker(|walker| walker.defers(code))
     }
 
     /// Evaluates the call's arguments from `state.next` on, in the calling
     /// frame, the simple ones and defaults at once, and then its body.
-    fn next_argument(&mut self, mut state: Box<CallState>) -> Next {
+    fn next_argument(&mut self, mut state: CallState) -> Next {
         loop {
             let ir = &self.running().ir;
             let Some(&arg) = ir.items(state.args).get(state.next as usize) else {
                 return self.enter_body(state);
             };
-            let IrKind::Arg { value, .. } = ir.get(arg).kind else {
-                return self.argument_failed(
-                    &state,
-                    self.mistyped_unwind(arg, "a call's argument is not an argument"),
-                );
-            };
-            match value {
-                crate::ir::ArgValue::Node(value) if !ir.is_simple(value) => {
-                    self.frames.push(Frame::Arguments(state));
-                    return Next::Eval(value);
-                }
-                _ => {
-                    let written = self.walker(|walker| {
-                        walker.argument(arg, state.base, (&state.closure, state.depth))
-                    });
-                    if let Err(unwind) = written {
-                        return self.argument_failed(&state, unwind);
-                    }
-                    state.next += 1;
-                }
+            if let IrKind::Arg {
+                value: ArgValue::Node(value),
+                ..
+            } = ir.get(arg).kind
+                && !ir.is_simple(value)
+            {
+                self.calls.push(state);
+                self.frames.push(Frame::Arguments);
+                return Next::Eval(value);
             }
+            let written = self
+                .walker(|walker| walker.argument(arg, state.base, (&state.closure, state.depth)));
+            if let Err(unwind) = written {
+                return self.argument_failed(&state, unwind);
+            }
+            state.next += 1;
         }
     }
 
     /// Takes up a call's arguments with `result`, the value of argument
     /// `state.next`.
-    fn argument_done(&mut self, mut state: Box<CallState>, result: Flow<Value>) -> Next {
+    fn argument_done(&mut self, mut state: CallState, result: Outcome) -> Next {
         let value = match result {
             Ok(value) => value,
-            Err(unwind) => return self.argument_failed(&state, unwind),
+            Err(unwind) => return self.argument_failed(&state, *unwind),
         };
         let ir = &self.running().ir;
-        let param =
-            ir.items(state.args)
-                .get(state.next as usize)
-                .map(|&arg| match ir.get(arg).kind {
-                    IrKind::Arg { param, .. } => Some(param),
-                    _ => None,
-                });
-        let Some(Some(param)) = param else {
-            return self.argument_failed(
-                &state,
-                self.mistyped_unwind(state.node, "a call's argument is not an argument"),
-            );
+        let param = match ir.items(state.args).get(state.next as usize) {
+            Some(&arg) => match ir.get(arg).kind {
+                IrKind::Arg { param, .. } => Some(param),
+                _ => None,
+            },
+            None => None,
         };
-        let Some(slot) = self.stack.get_mut(state.base + param as usize) else {
-            return self.argument_failed(
-                &state,
-                self.mistyped_unwind(state.node, "an argument for a parameter outside the frame"),
-            );
+        let slot = param.and_then(|param| self.stack.get_mut(state.base + param as usize));
+        let Some(slot) = slot else {
+            let unwind =
+                self.mistyped_unwind(state.node, "an argument for a parameter outside the frame");
+            return self.argument_failed(&state, unwind);
         };
         *slot = value;
         state.next += 1;
@@ -530,22 +608,94 @@ impl<'r> Machine<'r> {
     fn argument_failed(&mut self, state: &CallState, unwind: Unwind) -> Next {
         self.stack.truncate(state.base);
         let unwind = self.walker(|walker| {
-            let node = walker.ir.get(state.node);
-            walker.argument_failed(unwind, node)
+            walker.profile_end();
+            walker.argument_failed(unwind, walker.ir.get(state.node))
         });
         self.leave_call(state.crossing);
-        Next::Give(Err(unwind))
+        fail(unwind)
     }
 
-    /// Runs the body of the call `state`, its arguments evaluated, in an
-    /// activation of its own.
-    fn enter_body(&mut self, state: Box<CallState>) -> Next {
-        let caller = self.walker(callee_caller);
+    /// Goes on with the call `state`, its arguments evaluated: a memoised
+    /// call's lookup, and then its body, in an activation of its own.
+    fn enter_body(&mut self, mut state: CallState) -> Next {
         let Some(code) = state.closure.code.find_function(state.closure.function) else {
-            return self.argument_failed(
-                &state,
-                self.mistyped_unwind(state.node, "a closure of a function its IR lacks"),
-            );
+            let unwind = self.mistyped_unwind(state.node, "a closure of a function its IR lacks");
+            return self.argument_failed(&state, unwind);
+        };
+        let (caller, levels) = if state.memo.is_some() {
+            let begun = self.walker(|walker| {
+                let node = walker.ir.get(state.node);
+                walker.memo_lookup((&state.closure, code), (state.base, state.depth), node)
+            });
+            match begun {
+                Err(unwind) => return self.argument_failed(&state, unwind),
+                Ok(MemoBegin::Found(value)) => return self.found(&state, value),
+                Ok(MemoBegin::Started(mark)) => {
+                    let scoped = self.memo_scope(&state);
+                    state.memo = Some((Some(mark), scoped));
+                    (mark.caller, mark.entering)
+                }
+                Ok(MemoBegin::Unkeyed(entering, caller)) => {
+                    let scoped = self.memo_scope(&state);
+                    state.memo = Some((None, scoped));
+                    (caller, entering)
+                }
+            }
+        } else {
+            let caller = self.walker(|walker| {
+                walker.arguments_done();
+                walker.callee_caller()
+            });
+            (caller, state.entering)
+        };
+        if code.retry > 0 || code.timeout.is_some() {
+            let levels = levels + GUARD_LEVELS;
+            if levels + code.height as usize > MAX_DEPTH {
+                let error = nested_too_deeply(self.running().ir.get(state.node));
+                return self.finish(&state, Err(Box::new(error.into())));
+            }
+            state.guard = Some(Guard {
+                tried: 0,
+                deadline: None,
+                caller,
+                levels,
+            });
+            return self.attempt(state);
+        }
+        self.push_body(state, caller, levels)
+    }
+
+    /// Whether the body of the memoised call `state` is a scope of its own,
+    /// in graph mode, keyed by its callee and arguments, entering it if so
+    /// (see [Graph mode](crate::eval::graph#graph-mode)).
+    fn memo_scope(&mut self, state: &CallState) -> bool {
+        if self.shared.graph.is_none() {
+            return false;
+        }
+        let Some(code) = state.closure.code.find_function(state.closure.function) else {
+            return false;
+        };
+        let params = state.base..state.base + code.param_count as usize;
+        let given: Vec<Value> = self.stack.get(params).unwrap_or_default().to_vec();
+        let function = Value::Fn(Rc::clone(&state.closure));
+        let mut parts: Vec<&Value> = vec![&function];
+        parts.extend(given.iter());
+        self.walker(|walker| walker.enter_scope(&parts))
+    }
+
+    /// Ends the memoised call `state`, whose lookup found `value`.
+    fn found(&mut self, state: &CallState, value: Value) -> Next {
+        self.walker(|walker| walker.profile_end());
+        self.leave_call(state.crossing);
+        Next::Give(Ok(value))
+    }
+
+    /// Runs the body of the call `state` with the caller `caller` at
+    /// `levels` of nesting, in an activation of its own.
+    fn push_body(&mut self, state: CallState, caller: Caller, levels: usize) -> Next {
+        let Some(code) = state.closure.code.find_function(state.closure.function) else {
+            let unwind = self.mistyped_unwind(state.node, "a closure of a function its IR lacks");
+            return self.finish(&state, Err(Box::new(unwind)));
         };
         let body = code.body;
         self.activations.push(Activation {
@@ -553,30 +703,119 @@ impl<'r> Machine<'r> {
             base: state.base,
             callee: Some(Rc::clone(&state.closure)),
             caller,
-            levels: state.entering,
+            levels,
         });
-        self.frames.push(Frame::Body(state));
+        self.calls.push(state);
+        self.frames.push(Frame::Body);
         Next::Eval(body)
     }
 
-    /// Ends the call `state` with `result`, what its body came to, as
-    /// [`Evaluator::run_closure`] does: its frame and activation go, a
-    /// `return` for the function is its value, and an error is reported
-    /// as the calling frame reports it.
-    fn body_done(&mut self, state: &CallState, result: Flow<Value>) -> Next {
+    /// Begins another attempt of the guarded call `state`, as
+    /// [`Evaluator::guarded_body`] does: its frame's variables emptied
+    /// after the first, and under its own deadline, if it has a timeout.
+    fn attempt(&mut self, mut state: CallState) -> Next {
+        let Some(code) = state.closure.code.find_function(state.closure.function) else {
+            let unwind = self.mistyped_unwind(state.node, "a closure of a function its IR lacks");
+            return self.finish(&state, Err(Box::new(unwind)));
+        };
+        let Some(guard) = state.guard.as_mut() else {
+            let unwind = self.mistyped_unwind(state.node, "an attempt of an unguarded call");
+            return self.finish(&state, Err(Box::new(unwind)));
+        };
+        guard.tried = guard.tried.saturating_add(1);
+        if guard.tried > 1 {
+            let locals =
+                state.base + code.param_count as usize..state.base + code.frame_size as usize;
+            for slot in self.stack.get_mut(locals).into_iter().flatten() {
+                *slot = Value::Empty;
+            }
+        }
+        guard.deadline = code.timeout.map(|limit| {
+            let message = format!("{} timed out after {}", shown(code), shown_duration(limit));
+            self.walker(|walker| walker.push_deadline(limit, &message))
+        });
+        let (caller, levels) = (guard.caller, guard.levels);
+        self.push_body(state, caller, levels)
+    }
+
+    /// Takes up the call `state` with `result`, what its body came to: a
+    /// guarded call's attempt ends, and may begin another; and then the
+    /// call ends.
+    fn body_done(&mut self, state: CallState, result: Outcome) -> Next {
         self.activations.pop();
-        self.stack.truncate(state.base);
+        let Some(guard) = state.guard.as_ref() else {
+            return self.finish(&state, result);
+        };
+        if let Some(number) = guard.deadline {
+            self.walker(|walker| walker.pop_deadline(number));
+        }
         let span = self.running().ir.get(state.node).span;
-        let outcome = result
-            .or_else(|unwind| unwind.returned(span))
-            .map_err(|error| {
-                self.walker(|walker| {
-                    let node = walker.ir.get(state.node);
-                    walker.call_error(error, &state.closure, node).into()
+        let mut error = match result.or_else(|unwind| unwind.returned(span)) {
+            Ok(value) => return self.finish(&state, Ok(value)),
+            Err(error) => error,
+        };
+        let Some(code) = state.closure.code.find_function(state.closure.function) else {
+            return self.finish(&state, Err(Box::new(error.into())));
+        };
+        // Its own deadline's passing is its own error.
+        if guard.deadline.is_some() && error.mark.deadline_number() == guard.deadline {
+            error.mark = ErrorMark::NONE;
+        }
+        if error.mark == ErrorMark::NONE && guard.tried <= code.retry {
+            return self.attempt(state);
+        }
+        if guard.tried > 1 && error.mark == ErrorMark::NONE {
+            error
+                .notes
+                .push(format!("{} was tried {} times", shown(code), guard.tried));
+        }
+        self.finish(&state, Err(Box::new(error.into())))
+    }
+
+    /// Ends the call `state` with `result`, what its body came to, as
+    /// [`Evaluator::run_closure`], [`Evaluator::guarded_call`] and
+    /// [`Evaluator::memo_call`] do: its frame goes, a `return` for the
+    /// function is its value, a memoised call's entry records it, and an
+    /// error is reported as the calling frame reports it.
+    fn finish(&mut self, state: &CallState, result: Outcome) -> Next {
+        let span = self.running().ir.get(state.node).span;
+        let outcome = if let Some((mark, scoped)) = state.memo {
+            self.walker(|walker| walker.leave_scope(scoped));
+            self.stack.truncate(state.base);
+            if mark.is_some() {
+                self.memo.running.pop();
+            }
+            let result = result.or_else(|unwind| unwind.returned(span));
+            self.walker(|walker| {
+                let node = walker.ir.get(state.node);
+                let ended = match mark {
+                    Some(mark) => walker.memo_end(&state.closure, mark, result, node),
+                    None => result.map_err(|error| {
+                        walker.memo_error(error, &state.closure, false, node).into()
+                    }),
+                };
+                ended.map_err(|unwind| walker.argument_failed(unwind, node))
+            })
+        } else {
+            self.stack.truncate(state.base);
+            result
+                .or_else(|unwind| unwind.returned(span))
+                .map_err(|error| {
+                    self.walker(|walker| {
+                        let node = walker.ir.get(state.node);
+                        walker.call_error(error, &state.closure, node).into()
+                    })
                 })
-            });
+        };
+        self.walker(|walker| walker.profile_end());
         self.leave_call(state.crossing);
-        Next::Give(outcome)
+        give(outcome)
+    }
+
+    /// The internal error of a call's frame without its call.
+    fn lost_call(&self) -> Next {
+        let span = self.running().ir.get(self.running().ir.root()).span;
+        fail(super::internal("a call's frame without its call", span))
     }
 
     /// Leaves a call, taking it off the run's list of sites if it is
@@ -589,7 +828,7 @@ impl<'r> Machine<'r> {
 
     /// The internal error of the mistyped node `id`, saying `what`.
     fn mistyped(&self, id: IrId, what: &'static str) -> Next {
-        Next::Give(Err(self.mistyped_unwind(id, what)))
+        fail(self.mistyped_unwind(id, what))
     }
 
     /// The internal error of the mistyped node `id`, saying `what`.
@@ -602,8 +841,10 @@ impl<'r> Machine<'r> {
     }
 }
 
-/// The caller `walker`'s frame gives a callee: [`Evaluator::callee_caller`],
-/// as a function a walker of any lifetime can be given to.
-fn callee_caller(walker: &mut Evaluator<'_>) -> Caller {
-    walker.callee_caller()
+/// How the function of `code` is named in its errors: "`name`", or "the
+/// call" for one without a name, as [`Evaluator::guarded_body`] names it.
+fn shown(code: &FnCode) -> String {
+    code.name_text
+        .as_deref()
+        .map_or_else(|| "the call".to_owned(), |name| format!("`{name}`"))
 }

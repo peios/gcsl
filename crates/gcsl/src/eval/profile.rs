@@ -332,6 +332,32 @@ impl Evaluator<'_> {
         }
     }
 
+    /// Begins a call of the function `function` of `code`, whose entry
+    /// there is `found`, if the run is profiled, as
+    /// [`Evaluator::profiled`] does, for a caller that ends it itself
+    /// ([`Evaluator::profile_end`]).
+    pub(super) fn profile_begin(
+        &self,
+        (code, function, found): (&Ir, FnId, &FnCode),
+        running: bool,
+    ) {
+        if let Some(profile) = self.shared.profile {
+            let site = Site::Code {
+                input: code.input(),
+                function,
+            };
+            profile.begin(site, Some((code, found)), running);
+        }
+    }
+
+    /// Ends the innermost call that [`Evaluator::profile_begin`] began, if
+    /// the run is profiled.
+    pub(super) fn profile_end(&self) {
+        if let Some(profile) = self.shared.profile {
+            profile.end();
+        }
+    }
+
     /// Runs `run` on this frame as a call of `builtin`, its arguments
     /// evaluated, tallied if the run is profiled (see
     /// [Profiling](#profiling)).

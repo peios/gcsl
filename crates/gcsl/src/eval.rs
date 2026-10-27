@@ -217,9 +217,25 @@ pub(crate) fn eval_rooted(
     let mut shared = extras.shared();
     shared.graph = graph;
     shared.context.replace(context);
-    let result =
+    // Graph mode runs on the machine, which can stop where it waits;
+    // plain evaluation never waits, so the walkers run it, faster.
+    let result = if graph.is_some() || cfg!(feature = "machine-everywhere") {
         machine::Machine::new((stack, memo), &shared, machine::Activation::top(ir, caller))
-            .run(root);
+            .run(root)
+    } else {
+        Evaluator {
+            ir,
+            stack,
+            base: 0,
+            captures: &[],
+            callee: None,
+            memo,
+            shared: &shared,
+            caller,
+            levels: 0,
+        }
+        .value(root)
+    };
     stack.truncate(frame_size);
     // The checker lets no `break` or `continue` out of the top level's
     // loops, so a stop arriving here is a bug.
