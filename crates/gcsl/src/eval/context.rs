@@ -88,18 +88,20 @@ impl Evaluator<'_> {
         self.stack
             .resize(base + code.frame_size as usize, Value::Empty);
         let passed = self.callee_caller();
-        let result = Evaluator {
-            ir: &closure.code,
-            stack: self.stack,
-            base,
-            captures: &closure.captures,
-            callee: Some(&closure),
-            memo: self.memo,
-            shared: self.shared,
-            caller: passed,
-            levels: entering,
-        }
-        .value(code.body);
+        let result = self.profiled((&closure.code, closure.function, code), true, |this| {
+            Evaluator {
+                ir: &closure.code,
+                stack: this.stack,
+                base,
+                captures: &closure.captures,
+                callee: Some(&closure),
+                memo: this.memo,
+                shared: this.shared,
+                caller: passed,
+                levels: entering,
+            }
+            .value(code.body)
+        });
         self.stack.truncate(base);
         match result.or_else(|unwind| unwind.returned(node.span)) {
             Err(error) => Err(self.call_error(error, &closure, node).into()),

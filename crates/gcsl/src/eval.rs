@@ -179,12 +179,14 @@ pub fn eval_with(
     memo: &mut MemoTables,
     (exec_result, dirs, effects): (Option<&Rc<Layout>>, &[Rc<str>], &dyn Effects),
 ) -> Result<Value, Diagnostic> {
-    eval_rooted(
-        ir,
-        (stack, memo),
-        (exec_result, dirs, effects, None),
-        (None, None),
-    )
+    let extras = graph::RunExtras {
+        exec_result,
+        dirs,
+        effects,
+        names: None,
+        profile: None,
+    };
+    eval_rooted(ir, (stack, memo), extras, (None, None))
 }
 
 /// [`eval_with`], in the root context `context`, the frame of the contexts
@@ -196,7 +198,7 @@ pub fn eval_with(
 pub(crate) fn eval_rooted(
     ir: &Rc<Ir>,
     (stack, memo): (&mut Vec<Value>, &mut MemoTables),
-    (exec_result, dirs, effects, names): graph::RunExtras<'_>,
+    extras: graph::RunExtras<'_>,
     (context, graph): (Option<Rc<ContextFrame>>, Option<&GraphRun<'_>>),
 ) -> Result<Value, Diagnostic> {
     let root = ir.root();
@@ -212,8 +214,7 @@ pub(crate) fn eval_rooted(
         helper: false,
         origin: NO_ORIGIN,
     };
-    let mut shared = Shared::new(exec_result, dirs, effects);
-    shared.names = names;
+    let mut shared = extras.shared();
     shared.graph = graph;
     shared.context.replace(context);
     let result = Evaluator {
@@ -385,6 +386,9 @@ struct Shared<'a> {
     /// names](crate::eval::records#records-of-any-names)); `None` in a run
     /// with no owner's names, where making one is an error.
     names: Option<&'a RefCell<crate::names::Names>>,
+    /// The profile being taken of the run, if it is profiled (see
+    /// [Profiling](crate::eval::profile#profiling)).
+    profile: Option<&'a profile::Profile>,
 }
 
 impl<'a> Shared<'a> {
@@ -410,6 +414,7 @@ impl<'a> Shared<'a> {
             operand_failed: Cell::new(false),
             sites: RefCell::new(Vec::new()),
             names: None,
+            profile: None,
         }
     }
 }
@@ -1396,6 +1401,7 @@ pub(crate) mod keychain;
 pub(crate) mod kinds;
 pub(crate) mod memo;
 pub mod plain;
+pub mod profile;
 pub(crate) mod sandbox;
 pub(crate) mod system;
 pub(crate) mod text;

@@ -108,6 +108,7 @@ impl Evaluator<'_> {
             self.stack.truncate(base);
             return Err(unwind);
         }
+        self.arguments_done();
         let caller = self.callee_caller();
         let params = base..base + code.param_count as usize;
         let Some(key) = self.stack.get(params.clone()) else {
@@ -134,6 +135,7 @@ impl Evaluator<'_> {
                         Replayed::All => self.note_step_reads_all(),
                     }
                 }
+                self.memo_found();
                 return Ok(MemoBegin::Found(value));
             }
             Lookup::Running => {

@@ -174,3 +174,31 @@ the attribute's arguments. An attribute declared as
 `type step = {on: Bool = true}` lets a function written `#[step(false)]`
 run inline. The host must decide the same way for the same call
 throughout one evaluation.
+
+## Seeing where evaluation spends its time
+
+Call `Workspace::start_profiling` before you run anything, and
+`Workspace::profile_report` once you're done. Every run of the
+workspace's code is profiled from then on: its files, its prepared calls
+and its steps, through every pause. The report has a row for each
+function and built-in that ran:
+
+- `calls`, how many calls of it ran, and `found`, how many of those were
+  memoised calls that found their entry;
+- `own`, the time spent in its body, less the calls made inside it;
+- `total`, the time of its calls including the calls inside them,
+  counted once for a function that calls itself.
+
+A call's time starts once its arguments are evaluated, so evaluating an
+argument counts toward the caller. `outermost` is the time spent in
+calls that no other call was running around. If you time your runs, the
+difference is the time spent at the top level of the files, outside any
+function. A profiled run costs a little more than one that isn't, and
+nothing changes for a workspace that never starts profiling.
+
+Remember that a unit runs again from its start after each pause. Code a
+unit runs before it reaches its steps and effects runs once for every
+pause, so a profile counts it that many times. When the same expensive
+work, such as parsing a lock file, shows up thousands of times, memoise
+the function that does it with `->>`. Later runs then find its entry
+instead of doing the work again.

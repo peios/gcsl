@@ -246,12 +246,13 @@ use crate::Outcome;
 use crate::check::ViewRecord;
 use crate::check::{Attribute, Builtin, KnownParams, Slot, Types};
 use crate::diagnostic::{Diagnostic, InternalError, Mark};
-use crate::eval::graph::{Graph, GraphHost, GraphRun, NodeId, NodeKind, run_node};
+use crate::eval::graph::{Graph, GraphHost, GraphRun, NodeId, NodeKind, RunExtras, run_node};
 use crate::eval::plain::{Plain, from_plain, to_identity_plain, to_key_plain, to_plain};
 
 /// A way to make a value plain data: [`to_plain`], [`to_key_plain`] or
 /// [`to_identity_plain`].
 type MakePlain = fn(&Value, &crate::names::Names) -> Result<Plain, String>;
+use crate::eval::profile::{Profile, ProfileReport};
 use crate::eval::{Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::names::{Name, Names};
@@ -526,6 +527,9 @@ pub struct Workspace {
     /// numbered after every file (see [Prepared
     /// calls](crate::workspace::graph#prepared-calls)).
     calls_prepared: u32,
+    /// The profile being taken of its runs, if they are profiled
+    /// ([`Workspace::start_profiling`]).
+    profile: Option<Profile>,
     /// The table the files' types are interned into.
     types: TypeTable,
     /// The name of every slot of the frame, the last variable's in it, for
@@ -605,6 +609,22 @@ impl Workspace {
     /// it changes nothing, and the parent made stays in use.
     pub fn set_temp_root(&mut self, root: PathBuf) {
         self.temp_dirs.set_root(root);
+    }
+
+    /// Profiles every run of the workspace's code from now on, its files',
+    /// its calls' and its steps', afresh if it was profiled before (see
+    /// [Profiling](crate::eval::profile#profiling)).
+    pub fn start_profiling(&mut self) {
+        self.profile = Some(Profile::new());
+    }
+
+    /// What the profile taken since [`Workspace::start_profiling`] found,
+    /// if one is being taken.
+    #[must_use]
+    pub fn profile_report(&self) -> Option<ProfileReport> {
+        self.profile
+            .as_ref()
+            .map(|profile| profile.report(&self.scan.names))
     }
 
     /// The syntax tree of file `index` annotated with the types it was
@@ -724,12 +744,13 @@ impl Workspace {
         };
         let context = (&mut self.frame, &mut self.memo);
         let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
-        let extras = (
-            Some(&self.exec_result),
-            &self.scan.dir_texts[..],
+        let extras = RunExtras {
+            exec_result: Some(&self.exec_result),
+            dirs: &self.scan.dir_texts[..],
             effects,
-            Some(&names),
-        );
+            names: Some(&names),
+            profile: self.profile.as_ref(),
+        };
         let ran = run_node(node, context, extras);
         self.scan.names = names.into_inner();
         ran.map_err(|mut error| {
@@ -966,10 +987,13 @@ impl Workspace {
             let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
             let context = (
                 &mut self.memo,
-                Some(&self.exec_result),
-                &self.scan.dir_texts[..],
-                effects,
-                Some(&names),
+                RunExtras {
+                    exec_result: Some(&self.exec_result),
+                    dirs: &self.scan.dir_texts[..],
+                    effects,
+                    names: Some(&names),
+                    profile: self.profile.as_ref(),
+                },
             );
             let run = graph
                 .as_mut()

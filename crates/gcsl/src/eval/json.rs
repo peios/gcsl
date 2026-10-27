@@ -20,7 +20,8 @@ use std::rc::Rc;
 
 use crate::check::Constant;
 use crate::diagnostic::Diagnostic;
-use crate::ir::{Ir, IrKind, IrNode};
+use crate::check::Builtin;
+use crate::ir::{DecodeId, Ir, IrKind, IrNode};
 use crate::names::Name;
 use crate::types::{Decode, DecodeField, DecodeRecord};
 use crate::value::{Layout, List, Record, Value};
@@ -70,11 +71,19 @@ impl Evaluator<'_> {
             return mistyped(node, "a node that is not a decode decoded");
         };
         let text = self.string(text)?;
+        self.profiled_builtin(Builtin::JsonDecode, |this| {
+            this.decode_text(&text, decode, node)
+        })
+    }
+
+    /// Parses `text` and decodes it by the plan `decode`, for the
+    /// `JsonDecode` `node`.
+    fn decode_text(&self, text: &str, decode: DecodeId, node: &IrNode) -> Flow<Value> {
         let ir = self.ir;
         let Some(plan) = ir.decode(decode) else {
             return mistyped(node, "a decode of a plan its IR lacks");
         };
-        let json = parse::parse(&text).map_err(|reason| {
+        let json = parse::parse(text).map_err(|reason| {
             Diagnostic::error(format!("the text is not JSON: {reason}"), node.span)
         })?;
         let mut decoder = Decoder {

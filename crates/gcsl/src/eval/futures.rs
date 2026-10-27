@@ -350,18 +350,20 @@ impl Evaluator<'_> {
         // the context it was made in.
         let outer = self.shared.context.replace(future.context.clone());
         let scoped = self.enter_scope_of(&future.code, future.function, &captures);
-        let result = Evaluator {
-            ir: &future.code,
-            stack: self.stack,
-            base,
-            captures: &captures,
-            callee: None,
-            memo: self.memo,
-            shared: self.shared,
-            caller: future.made,
-            levels: entering,
-        }
-        .value(code.body);
+        let result = self.profiled((&future.code, future.function, code), true, |this| {
+            Evaluator {
+                ir: &future.code,
+                stack: this.stack,
+                base,
+                captures: &captures,
+                callee: None,
+                memo: this.memo,
+                shared: this.shared,
+                caller: future.made,
+                levels: entering,
+            }
+            .value(code.body)
+        });
         self.leave_scope(scoped);
         self.shared.context.replace(outer);
         self.stack.truncate(base);

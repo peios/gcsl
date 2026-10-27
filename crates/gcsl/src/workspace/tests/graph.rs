@@ -13,7 +13,7 @@ const STEPS: &str = "#[attribute] #[defers] type step = {}\n\
 
 /// A checked workspace of the lone file `text`, after [`STEPS`], with the
 /// number of its file.
-fn lone_workspace(text: &str) -> (Workspace, u32) {
+pub(super) fn lone_workspace(text: &str) -> (Workspace, u32) {
     let source = SourceFile::new("lone.gcsl", format!("{STEPS}{text}")).unwrap();
     let (loaded, checked) = check_lone_with_standard(&source, "/");
     (checked.unwrap(), count(loaded.len()))
@@ -331,7 +331,7 @@ fn a_step_whose_key_changes_between_attempts_is_an_error_not_a_loop() {
 /// Runs file `file` of `workspace` in graph mode to the end, as a host
 /// would that runs every needed step, ready ones first, as plain GCSL runs
 /// it: its value with every result filled in, and the graph.
-fn drive(workspace: &mut Workspace, file: u32) -> (Value, Graph) {
+pub(super) fn drive(workspace: &mut Workspace, file: u32) -> (Value, Graph) {
     let mut graph = Graph::new();
     let direct = crate::eval::Direct { temp_dirs: None };
     loop {

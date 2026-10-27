@@ -933,13 +933,11 @@ pub(crate) fn run_node(
     let span = node.site.span;
     match (node.kind, StepCall::of(node)) {
         (NodeKind::Deferred, Some(call)) => {
-            let mut shared = Shared::new(extras.0, extras.1, extras.2);
-            shared.names = extras.3;
+            let shared = extras.shared();
             call_step(&call, (stack, memo), &shared, true)
         }
         (NodeKind::Effect(builtin), None) => {
-            let mut shared = Shared::new(extras.0, extras.1, extras.2);
-            shared.names = extras.3;
+            let shared = extras.shared();
             shared.context.replace(node.context.clone());
             apply_effect(
                 builtin,
@@ -953,14 +951,33 @@ pub(crate) fn run_node(
     }
 }
 
-/// The layout of `exec`'s result, the run's directories and its effect
-/// context, for [`run_node`] and [`run_step_call`].
-pub(crate) type RunExtras<'a> = (
-    Option<&'a Rc<crate::value::Layout>>,
-    &'a [Rc<str>],
-    &'a dyn super::Effects,
-    Option<&'a RefCell<crate::names::Names>>,
-);
+/// What a run shares besides its stack and memo tables, for
+/// [`run_node`], [`run_step_call`] and [`eval_rooted`](super::eval_rooted).
+#[derive(Clone, Copy)]
+pub(crate) struct RunExtras<'a> {
+    /// The layout of `exec`'s result; `None` in a run without the standard
+    /// library.
+    pub(crate) exec_result: Option<&'a Rc<crate::value::Layout>>,
+    /// The run's table of directories.
+    pub(crate) dirs: &'a [Rc<str>],
+    /// Its effect context.
+    pub(crate) effects: &'a dyn super::Effects,
+    /// The names of its owner, if it has a table of them.
+    pub(crate) names: Option<&'a RefCell<crate::names::Names>>,
+    /// The profile being taken of it, if it is profiled (see
+    /// [Profiling](crate::eval::profile#profiling)).
+    pub(crate) profile: Option<&'a super::profile::Profile>,
+}
+
+impl<'a> RunExtras<'a> {
+    /// What the frames of a run with these share, with no deadline running.
+    pub(super) fn shared(self) -> Shared<'a> {
+        let mut shared = Shared::new(self.exec_result, self.dirs, self.effects);
+        shared.names = self.names;
+        shared.profile = self.profile;
+        shared
+    }
+}
 
 /// A deferred node's call, apart from its graph, which a run takes (see
 /// [`run_step_call`]).
@@ -1025,8 +1042,7 @@ pub(crate) fn run_step_call(
     extras: RunExtras<'_>,
     run: &GraphRun<'_>,
 ) -> Result<Value, Diagnostic> {
-    let mut shared = Shared::new(extras.0, extras.1, extras.2);
-    shared.names = extras.3;
+    let mut shared = extras.shared();
     shared.graph = Some(run);
     // A step its body makes reports where this one does.
     shared.sites.borrow_mut().extend(call.reported);
@@ -1084,15 +1100,17 @@ fn call_step(
         caller: call.caller,
         levels: CALL_LEVELS,
     };
-    let result = if guarded && (code.retry > 0 || code.timeout.is_some()) {
-        evaluator
-            .guarded_call(closure, base, (call.caller, CALL_LEVELS), &call.site)
-            .map_err(|unwind| unwind.into_error(span))
-    } else {
-        evaluator
-            .value(code.body)
-            .or_else(|unwind| unwind.returned(span))
-    };
+    let result = evaluator.profiled((&closure.code, closure.function, code), true, |evaluator| {
+        if guarded && (code.retry > 0 || code.timeout.is_some()) {
+            evaluator
+                .guarded_call(closure, base, (call.caller, CALL_LEVELS), &call.site)
+                .map_err(|unwind| unwind.into_error(span))
+        } else {
+            evaluator
+                .value(code.body)
+                .or_else(|unwind| unwind.returned(span))
+        }
+    });
     stack.truncate(base);
     result
 }
@@ -1122,7 +1140,9 @@ fn apply_effect(
         caller: Caller::default(),
         levels: CALL_LEVELS,
     }
-    .apply_builtin(builtin, arguments, site)
+    .profiled_builtin(builtin, |evaluator| {
+        evaluator.apply_builtin(builtin, arguments, site)
+    })
     .map_err(|unwind| unwind.into_error(site.span));
     stack.truncate(base);
     result

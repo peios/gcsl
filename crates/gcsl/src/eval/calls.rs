@@ -397,6 +397,20 @@ impl Evaluator<'_> {
                 .defer_call((closure, code), (args, depth), node)
                 .map_err(|unwind| self.argument_failed(unwind, node));
         }
+        self.profiled((&closure.code, closure.function, code), false, |this| {
+            this.run_closure(closure, code, (args, depth), node)
+        })
+    }
+
+    /// [`Evaluator::call_closure`] of `closure`, whose code is `code`, a
+    /// call that runs it here.
+    fn run_closure(
+        &mut self,
+        closure: &Rc<Closure>,
+        code: &FnCode,
+        (args, depth): (IrRange, u16),
+        node: &IrNode,
+    ) -> Flow<Value> {
         if code.kind == FnKind::Memo {
             return self
                 .memo_call((closure, code), (args, depth), node)
@@ -415,6 +429,7 @@ impl Evaluator<'_> {
             self.stack.truncate(base);
             return Err(self.argument_failed(unwind, node));
         }
+        self.arguments_done();
         let passed = self.callee_caller();
         if code.retry > 0 || code.timeout.is_some() {
             return self.guarded_call(closure, base, (passed, entering), node);
@@ -707,7 +722,7 @@ impl Evaluator<'_> {
         if self.shared.graph.is_some() && effect_builtin(builtin) {
             return self.effect_node(builtin, &arguments, node);
         }
-        self.apply_builtin(builtin, arguments, node)
+        self.profiled_builtin(builtin, |this| this.apply_builtin(builtin, arguments, node))
     }
 
     /// Applies the built-in `builtin`, for its call `node`, to `arguments`,
@@ -886,18 +901,20 @@ impl Evaluator<'_> {
             }
         }
         let passed = self.callee_caller();
-        let result = Evaluator {
-            ir: &default.code,
-            stack: self.stack,
-            base,
-            captures: &default.captures,
-            callee: Some(&default),
-            memo: self.memo,
-            shared: self.shared,
-            caller: passed,
-            levels: entering,
-        }
-        .value(code.body);
+        let result = self.profiled((&default.code, default.function, code), true, |this| {
+            Evaluator {
+                ir: &default.code,
+                stack: this.stack,
+                base,
+                captures: &default.captures,
+                callee: Some(&default),
+                memo: this.memo,
+                shared: this.shared,
+                caller: passed,
+                levels: entering,
+            }
+            .value(code.body)
+        });
         self.stack.truncate(base);
         // Its call, not this argument, reports it ([`Evaluator::argument_failed`]).
         result

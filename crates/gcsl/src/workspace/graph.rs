@@ -19,8 +19,8 @@ use std::rc::Rc;
 
 use crate::diagnostic::{Diagnostic, Mark};
 use crate::eval::graph::{
-    EffectJob, Graph, GraphHost, GraphRun, NodeId, NodeKind, STEP_UNITS, StepCall, StepReads,
-    run_step_call,
+    EffectJob, Graph, GraphHost, GraphRun, NodeId, NodeKind, RunExtras, STEP_UNITS, StepCall,
+    StepReads, run_step_call,
 };
 use crate::ir::Ir;
 use crate::source::Span;
@@ -140,12 +140,13 @@ impl Workspace {
         )
         .watching(call.context(), self.context_texts());
         let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
-        let extras = (
-            Some(&self.exec_result),
-            &self.scan.dir_texts[..],
-            host.effects,
-            Some(&names),
-        );
+        let extras = RunExtras {
+            exec_result: Some(&self.exec_result),
+            dirs: &self.scan.dir_texts[..],
+            effects: host.effects,
+            names: Some(&names),
+            profile: self.profile.as_ref(),
+        };
         let outcome = run_step_call(&call, (&mut self.frame, &mut self.memo), extras, &run);
         self.scan.names = names.into_inner();
         let reads = run.reads();
@@ -371,10 +372,13 @@ impl Workspace {
         let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
         let context = (
             &mut self.memo,
-            Some(&self.exec_result),
-            &self.scan.dir_texts[..],
-            host.effects,
-            Some(&names),
+            RunExtras {
+                exec_result: Some(&self.exec_result),
+                dirs: &self.scan.dir_texts[..],
+                effects: host.effects,
+                names: Some(&names),
+                profile: self.profile.as_ref(),
+            },
         );
         let run = GraphRun::new(mem::take(graph), call.unit, host.defers);
         let outcome = session::run_input_in(&call.ir, &mut self.frame, context, (root, Some(&run)));

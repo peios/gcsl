@@ -530,6 +530,7 @@ fn assembled(
         exec_result: exec_layout(&mut scan.names),
         temp_dirs: TempDirs::new(),
         calls_prepared: 0,
+        profile: None,
         scan,
         runs,
         checked,

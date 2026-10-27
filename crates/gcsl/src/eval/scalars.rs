@@ -5,6 +5,7 @@ use std::fmt::Write;
 use std::num::NonZeroI64;
 use std::rc::Rc;
 
+use crate::check::Builtin;
 use crate::diagnostic::Diagnostic;
 use crate::ir::{Cmp, IrId, IrKind, IrNode, IrRange, Operands};
 use crate::source::Span;
@@ -614,7 +615,7 @@ impl Evaluator<'_> {
     /// value's GCSL source (see [`source_of`]).
     pub(super) fn show(&mut self, operand: IrId, node: &IrNode) -> Flow<Rc<str>> {
         let value = self.value(operand)?;
-        source_of(&value, node)
+        self.profiled_builtin(Builtin::Show, |_| source_of(&value, node))
     }
 
     /// A runtime error in a binary operator: the message points at the

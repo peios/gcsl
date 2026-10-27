@@ -309,6 +309,7 @@ mod memo;
 mod merging;
 mod metas;
 mod needs;
+mod profile;
 mod shadowing;
 mod shell;
 mod standard;
