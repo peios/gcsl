@@ -4,12 +4,16 @@
 //! # Tasks
 //!
 //! A unit's evaluation starts as one task, its root. When a task would
-//! stop to wait, the machine looks for the innermost iteration of a
-//! forkable `for` (see [`crate::ir::IrKind::For`]) on its frames, inside a
-//! function's body; if it finds one, it splits the task there: what the
-//! iteration was doing becomes a *child* task, which waits, and the task
-//! goes on with the next iteration. So a loop of a hundred fetches meets
-//! all of them before the host is asked for any.
+//! wait, for a node, another unit, its turn, a sibling or its own
+//! children, the machine looks for the innermost iteration of a forkable
+//! `for` (see [`crate::ir::IrKind::For`]) or piece of a list,
+//! interpolation or call (see [Pieces](super::pieces#pieces)) on its
+//! frames, inside a function's body; if it finds one, it splits the task
+//! there: what the iteration or piece was doing becomes a *child* task,
+//! which waits, and the task goes on with the next. So a loop of a hundred
+//! fetches meets all of them before the host is asked for any. What was
+//! split off from the loops, nodes and calls the child takes with it is
+//! the child's to wait for.
 //!
 //! The task running has its frames, activations and calls in the
 //! machine's fields, its value stack in the run's, and what the run shares
@@ -34,10 +38,13 @@
 //!
 //! **Program order.** A task's *path* is where its work is in the program:
 //! its base, the path its parent was at when it split it off, and then the
-//! iteration each split loop on its frames is at, a loop waiting for its
-//! children past every iteration. An effect the host does not isolate
-//! ([`crate::eval::Effects::isolates`]) is made only when no live task's
-//! path is earlier, so that such effects reach the host in program order.
+//! iteration or piece each split loop, node or call on its frames is at,
+//! one waiting for its children past every iteration or piece. An effect
+//! the host does not isolate ([`crate::eval::Effects::isolates`]) is made
+//! only when no live task's path is earlier, so that such effects reach the
+//! host in program order; and never once an iteration or piece split off
+//! from one the task is in has failed, since a run in order would have
+//! stopped there.
 //!
 //! A task that needs a memoised call or a `lazy` another task of the unit
 //! is running waits for it; one that waits for its turn or for a sibling
@@ -130,8 +137,10 @@ pub(in crate::eval) struct Task {
     pub(super) status: Status,
 }
 
-/// Where an iteration of a forkable `for` began: what the task had then,
-/// to which a split takes it back (see [Tasks](#tasks)).
+/// Where an iteration of a forkable `for`, or a piece (see
+/// [Pieces](super::pieces#pieces)), began: what the task had then, to
+/// which a split takes it back (see [Tasks](#tasks)).
+#[derive(Clone)]
 pub(in crate::eval) struct Marks {
     /// Its frames, the iteration's own above them.
     frames: usize,
@@ -182,8 +191,64 @@ impl Join {
     }
 }
 
+impl Marks {
+    /// Moves where it began by `delta` slots up the stack, wrapping, as
+    /// its unit's frames move.
+    pub(super) const fn rebase(&mut self, delta: usize) {
+        self.stack = self.stack.wrapping_add(delta);
+    }
+}
+
+/// Where the iteration or piece running began, if it may be split off:
+/// its [`Marks`], in a box kept for the next one, so that a loop or node
+/// allocates once however many of its iterations or pieces are marked,
+/// and what holds it stays small.
+#[derive(Clone, Default)]
+pub(in crate::eval) struct Begun {
+    /// Whether the one running is marked.
+    marked: bool,
+    /// Its marks, if it is; an earlier one's, if not.
+    marks: Option<Box<Marks>>,
+}
+
+impl Begun {
+    /// Marks the one running as beginning at `marks`.
+    pub(super) fn mark(&mut self, marks: Marks) {
+        match &mut self.marks {
+            Some(kept) => **kept = marks,
+            None => self.marks = Some(Box::new(marks)),
+        }
+        self.marked = true;
+    }
+
+    /// Whether the one running is marked.
+    pub(super) const fn is_marked(&self) -> bool {
+        self.marked
+    }
+
+    /// Ends the one running: whether it was marked.
+    pub(super) const fn end(&mut self) -> bool {
+        std::mem::replace(&mut self.marked, false)
+    }
+
+    /// The marks of the one running, taken, for a split; it is no longer
+    /// marked.
+    pub(super) fn take(&mut self) -> Option<Box<Marks>> {
+        if self.end() { self.marks.take() } else { None }
+    }
+
+    /// The marks of the one running, if it is marked.
+    pub(super) fn marks_mut(&mut self) -> Option<&mut Marks> {
+        if self.marked {
+            self.marks.as_deref_mut()
+        } else {
+            None
+        }
+    }
+}
+
 /// The error a cancelled task unwinds with, which nothing catches.
-fn cancelled(span: Span) -> Unwind {
+pub(super) fn cancelled(span: Span) -> Unwind {
     let mut error = internal("a cancelled iteration", span);
     error.mark = Mark::CANCELLED;
     Unwind::Error(error)
@@ -464,7 +529,7 @@ impl Machine<'_> {
 
     /// The path of the task running (see [Tasks](#tasks)).
     pub(super) fn path(&self) -> Vec<u32> {
-        path_of(&self.meta, &self.frames)
+        path_of(&self.meta, &self.frames, &self.calls)
     }
 
     /// Whether a live task other than the one running is earlier in program
@@ -476,7 +541,7 @@ impl Machine<'_> {
         let mine = self.path();
         self.tasks
             .iter()
-            .any(|task| path_of(&task.meta, &task.frames) < mine)
+            .any(|task| path_of(&task.meta, &task.frames, &task.calls) < mine)
     }
 
     /// Splits the task running at the marks `marks` of an iteration of a
@@ -488,11 +553,25 @@ impl Machine<'_> {
         &mut self,
         marks: &Marks,
         (join, at): (Rc<RefCell<Join>>, usize),
-        (wait, resume): (Wait, Resume),
+        status: Status,
         base: Vec<u32>,
     ) {
+        let id = self.next_task;
+        self.next_task += 1;
         let mut frames = vec![Frame::Deliver(join, at)];
         frames.extend(self.frames.split_off(marks.frames.min(self.frames.len())));
+        // What was split off from the loops, nodes and calls it takes is
+        // the child's to wait for.
+        let joins = frames.iter().skip(1).filter_map(Frame::join).chain(
+            self.calls
+                .get(marks.calls..)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|call| call.pieces.join.as_ref()),
+        );
+        for join in joins {
+            join.borrow_mut().parent = id;
+        }
         // The child runs in the activations its iteration ran in, copied,
         // and in its own above them.
         let kept = marks.activations.min(self.activations.len());
@@ -528,8 +607,6 @@ impl Machine<'_> {
                 .last()
                 .map(|deadline| deadline.effective),
         );
-        let id = self.next_task;
-        self.next_task += 1;
         self.tasks.push(Task {
             meta: Meta { id, base },
             frames,
@@ -537,7 +614,7 @@ impl Machine<'_> {
             calls,
             stack,
             own,
-            status: Status::Blocked(wait, resume),
+            status,
         });
     }
 
@@ -575,13 +652,13 @@ fn split_kept<T: Clone>(values: &mut Vec<T>, kept: usize) -> Vec<T> {
 
 /// The path of a task whose place is `meta` and whose frames are `frames`
 /// (see [Tasks](#tasks)).
-pub(super) fn path_of(meta: &Meta, frames: &[Frame]) -> Vec<u32> {
+pub(super) fn path_of(meta: &Meta, frames: &[Frame], calls: &[CallState]) -> Vec<u32> {
     let mut path = meta.base.clone();
-    for frame in frames {
+    for (frame, call) in super::pieces::with_calls(frames, calls) {
         if let Some(at) = match frame {
             Frame::ForBody(state) => ForState::split_at(state),
-            Frame::ForJoin(_) => Some(u32::MAX),
-            _ => None,
+            Frame::ForJoin(_) | Frame::PiecesJoin(_) => Some(u32::MAX),
+            frame => frame.pieces(call).and_then(super::pieces::Pieces::split_at),
         } {
             path.push(at);
         }

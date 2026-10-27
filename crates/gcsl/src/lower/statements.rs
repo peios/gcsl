@@ -37,14 +37,19 @@ impl Lowerer<'_> {
                 span: item.span,
             });
         }
-        if let ItemKind::Rebind { .. } = item.kind {
+        let rebinds = matches!(item.kind, ItemKind::Rebind { .. });
+        if rebinds {
             self.assigns(slot);
         }
         let value = match path {
             Some(path) => self.lower_declaration(id, path, value)?,
             None => self.lower_expr(value)?,
         };
-        Ok(self.builder.alloc(IrKind::Store(slot, value), item.span))
+        let store = self.builder.alloc(IrKind::Store(slot, value), item.span);
+        if rebinds {
+            self.builder.note_assignment(store);
+        }
+        Ok(store)
     }
 
     /// Lowers the `break` or `continue` item `id`, whose value, if any, is

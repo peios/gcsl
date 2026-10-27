@@ -284,3 +284,179 @@ fn iterations_that_call_one_memoised_call_share_it() {
 fn text(text: &str) -> Value {
     Value::Str(Rc::from(text))
 }
+
+/// Runs `file` of `workspace` in graph mode under `host`, giving each read
+/// the text of its path, in upper case, until it ends: how many nodes each
+/// stop waited for, and what it came to.
+fn run_reads(
+    workspace: &mut Workspace,
+    file: u32,
+    host: crate::eval::graph::GraphHost<'static>,
+) -> (Vec<usize>, Value) {
+    let mut graph = Graph::new();
+    let mut stops = Vec::new();
+    loop {
+        match workspace.run_graph(file, &mut graph, host).unwrap() {
+            Progress::Paused(nodes) => {
+                stops.push(nodes.len());
+                for node in nodes.iter().rev() {
+                    let Value::Str(path) = graph.node(*node).unwrap().args()[0].clone() else {
+                        panic!("a read of no path");
+                    };
+                    let upper = path.trim_start_matches('/').to_uppercase();
+                    assert!(graph.resolve(*node, Ok(text(&upper))));
+                }
+            }
+            Progress::Waiting(unit) => panic!("waits for unit {unit}"),
+            Progress::Done(value) => return (stops, value),
+        }
+    }
+}
+
+#[test]
+fn the_pieces_of_lists_interpolations_and_calls_wait_apart() {
+    let cases = [
+        (
+            "List<String>",
+            "= [fs.read(\"/a\"), fs.read(\"/b\")]",
+            "[\"A\", \"B\"]",
+        ),
+        ("String", "= \"{fs.read(\"/a\")}-{fs.read(\"/b\")}\"", "A-B"),
+        ("String", "= pair(fs.read(\"/a\"), fs.read(\"/b\"))", "A+B"),
+        // A built-in's arguments.
+        (
+            "String",
+            "= [fs.read(\"/a\"), fs.read(\"/b\")].join(fs.read(\"/c\"))",
+            "ACB",
+        ),
+        // A default reads the arguments before it, split off: it waits for
+        // them.
+        (
+            "String",
+            "= defaulted(fs.read(\"/a\"), fs.read(\"/b\"))",
+            "A+B+A!",
+        ),
+    ];
+    for (ty, body, shown) in cases {
+        let (mut workspace, file) = super::graph::lone_workspace(&format!(
+            "import fs\n\
+             fn pair(a: String, b: String) -> String {{ = \"{{a}}+{{b}}\" }}\n\
+             fn defaulted(a: String, b: String, c: String = \"{{a}}!\") -> String {{\n\
+             \x20   = \"{{a}}+{{b}}+{{c}}\"\n\
+             }}\n\
+             fn f() -> {ty} {{ {body} }}\n\
+             = f()"
+        ));
+        let (stops, value) = run_reads(&mut workspace, file, isolating());
+        // Every read at once, in one stop.
+        assert_eq!(stops.len(), 1, "{body}: {stops:?}");
+        assert_eq!(value.to_string(), shown, "{body}");
+    }
+}
+
+#[test]
+fn the_earliest_piece_s_failure_is_reported_whichever_fails_first() {
+    let (mut workspace, file) = super::graph::lone_workspace(
+        "import fs\n\
+         fn f() -> List<String> { = [fs.read(\"/a\"), fs.read(\"/b\"), fs.read(\"/c\")] }\n\
+         = f()",
+    );
+    let mut graph = Graph::new();
+    let Progress::Paused(nodes) = workspace.run_graph(file, &mut graph, isolating()).unwrap()
+    else {
+        panic!("the run did not stop for its reads");
+    };
+    assert_eq!(nodes.len(), 3);
+    let failure = |what: &str| Err(Diagnostic::error(what, crate::source::Span::new(0, 0)));
+    assert!(graph.resolve(nodes[2], failure("third")));
+    assert!(graph.resolve(nodes[1], failure("second")));
+    assert!(graph.resolve(nodes[0], Ok(text("A"))));
+    let errors = workspace
+        .run_graph(file, &mut graph, isolating())
+        .unwrap_err();
+    assert_eq!(errors[0].message, "second", "{errors:?}");
+}
+
+/// Effects a host isolates: reads, but no others.
+#[derive(Debug)]
+struct ReadsIsolated;
+
+impl crate::eval::Effects for ReadsIsolated {
+    fn temp_dir(&self) -> Option<Result<String, String>> {
+        None
+    }
+
+    fn isolates(&self, builtin: crate::check::Builtin) -> bool {
+        builtin == crate::check::Builtin::FsRead
+    }
+}
+
+#[test]
+fn an_effect_in_order_after_a_piece_that_failed_is_never_made() {
+    let host = crate::eval::graph::GraphHost {
+        defers: &|_: &[crate::check::Attribute]| true,
+        effects: &ReadsIsolated,
+    };
+    for (ty, body, reads) in [
+        (
+            "String",
+            "= both(fs.read(\"/a\"), fs.write(\"/w\", \"x\"))",
+            1,
+        ),
+        // Each iteration's read is made, the second's write waiting its
+        // turn behind the first iteration.
+        (
+            "List<String>",
+            "= for path in [\"/a\", \"/b\"] { = both(fs.read(path), fs.write(\"/w\", \"x\")) }",
+            2,
+        ),
+    ] {
+        let (mut workspace, file) = super::graph::lone_workspace(&format!(
+            "import fs\n\
+             fn both(a: String, w: {{}}) -> String {{ = a }}\n\
+             fn f() -> {ty} {{ {body} }}\n\
+             = f()"
+        ));
+        let mut graph = Graph::new();
+        let Progress::Paused(nodes) = workspace.run_graph(file, &mut graph, host).unwrap() else {
+            panic!("{body}: the run did not stop for its read");
+        };
+        // The write waits its turn, behind the first read.
+        assert_eq!(nodes.len(), reads, "{body}: {nodes:?}");
+        let failure = Diagnostic::error("unreadable", crate::source::Span::new(0, 0));
+        assert!(graph.resolve(nodes[0], Err(failure)));
+        let errors = workspace.run_graph(file, &mut graph, host).unwrap_err();
+        assert_eq!(errors[0].message, "unreadable", "{body}: {errors:?}");
+        // A run in order fails at the first read: no write is ever made.
+        assert_eq!(graph.len(), reads, "{body}");
+    }
+}
+
+#[test]
+fn what_waits_inside_what_is_split_off_still_meets_every_effect_at_once() {
+    let cases = [
+        // The second element assigns, so it is not split off: the
+        // iteration is, with the first element split off from it.
+        (
+            "List<List<String>>",
+            "= for path in [\"/a\", \"/b\"] {\n\
+             \x20   = [fs.read(path), { let mut t = \"\"; t := fs.read(\"{path}2\"); = t }]\n\
+             }",
+            "[[\"A\", \"A2\"], [\"B\", \"B2\"]]",
+        ),
+        // The first element waits for its loop's iterations: it is split
+        // off, and the second runs.
+        (
+            "List<List<String>>",
+            "= [read_all([\"/a\", \"/b\"]), read_all([\"/c\", \"/d\"])]",
+            "[[\"A\", \"B\"], [\"C\", \"D\"]]",
+        ),
+    ];
+    for (ty, body, shown) in cases {
+        let (mut workspace, file) =
+            super::graph::lone_workspace(&format!("{READ_ALL}fn f() -> {ty} {{ {body} }}\n= f()"));
+        let (stops, value) = run_reads(&mut workspace, file, isolating());
+        assert_eq!(stops, [4], "{body}");
+        assert_eq!(value.to_string(), shown, "{body}");
+    }
+}

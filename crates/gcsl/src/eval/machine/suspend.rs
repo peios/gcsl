@@ -331,13 +331,16 @@ impl Parked {
         }
         for call in &mut self.calls {
             call.base = call.base.wrapping_add(delta);
+            if let Some(marks) = call.pieces.begun.marks_mut() {
+                marks.rebase(delta);
+            }
         }
         for frame in &mut self.frames {
             match frame {
                 Frame::Future(run) => run.rebase(delta),
                 Frame::Default(run) => run.rebase(delta),
                 Frame::ArgDefault(run) => run.base = run.base.wrapping_add(delta),
-                _ => {}
+                frame => frame.rebase_marks(delta),
             }
         }
     }

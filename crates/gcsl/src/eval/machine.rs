@@ -52,6 +52,7 @@ mod control;
 mod data;
 mod futures;
 mod loops;
+mod pieces;
 mod suspend;
 mod tasks;
 
@@ -73,6 +74,7 @@ use control::{AssertState, DefaultRun, WithState};
 use data::OperandsState;
 use futures::{AwaitState, FutureRun};
 use loops::{ForState, LoopAt, LoopState};
+use pieces::{Joining, Pieces, PiecesJoin};
 
 use super::kinds::into_callee;
 use super::memo::{Mark, MemoBegin, MemoTables};
@@ -199,6 +201,9 @@ enum Frame {
     Deliver(Rc<std::cell::RefCell<Join>>, usize),
     /// A `for` waiting for the iterations split off from it.
     ForJoin(Box<ForState>),
+    /// A node or call waiting for the pieces split off from it (see
+    /// [Pieces](pieces#pieces)).
+    PiecesJoin(Box<PiecesJoin>),
     /// The value of a secret, read deeply if `true`, evaluated above.
     SecretValue(bool),
     /// The operation of the `SecretWrap` node, of the operation node and
@@ -239,6 +244,9 @@ struct CallState {
     /// Whether the host takes the call as a step, in graph mode: its
     /// arguments are evaluated, and it becomes a node.
     deferred: bool,
+    /// Its arguments split off, between the frames of its arguments (see
+    /// [Pieces](pieces#pieces)).
+    pieces: Pieces,
 }
 
 /// A parameter's default running in the machine, as a call of its
@@ -467,13 +475,15 @@ impl<'r> Machine<'r> {
                     Some(frame) => self.resume(frame, result),
                     None => return Ran::Done(result.map_err(|unwind| *unwind)),
                 },
-                Next::Block(wait, resume) => match self.fork_for(wait, resume) {
+                // A task that would wait splits, if it can, and goes on.
+                Next::Block(wait, resume) => match self.fork(Status::Blocked(wait, resume)) {
                     Ok(next) => next,
-                    Err((wait, resume)) => self
-                        .park(Status::Blocked(wait, resume))
-                        .unwrap_or(Next::Stop),
+                    Err(status) => self.park(status).unwrap_or(Next::Stop),
                 },
-                Next::Park(status) => self.park(*status).unwrap_or(Next::Stop),
+                Next::Park(status) => match self.fork(*status) {
+                    Ok(next) => next,
+                    Err(status) => self.park(status).unwrap_or(Next::Stop),
+                },
                 Next::Stop => return self.stopped(),
             };
         }
@@ -667,6 +677,7 @@ impl<'r> Machine<'r> {
             Frame::Default(run) => self.default_done(&run, result),
             Frame::Deliver(join, at) => self.deliver(&join, at, result).unwrap_or(Next::Stop),
             Frame::ForJoin(state) => self.joined(*state, result),
+            Frame::PiecesJoin(state) => self.pieces_joined(*state, result),
             Frame::Step(base, span) => {
                 self.walker(|walker| walker.profile_end());
                 self.stack.truncate(base);
@@ -867,6 +878,7 @@ impl<'r> Machine<'r> {
             memo: memo.then_some((None, false)),
             guard: None,
             deferred,
+            pieces: Pieces::default(),
         })
     }
 
@@ -904,6 +916,10 @@ impl<'r> Machine<'r> {
         loop {
             let ir = &self.running().ir;
             let Some(&arg) = ir.items(state.args).get(state.next as usize) else {
+                if let Some(join) = state.pieces.join.take() {
+                    self.calls.push(state);
+                    return self.join_pieces(Joining::Arguments, join, None);
+                }
                 return self.enter_body(state);
             };
             match ir.get(arg).kind {
@@ -911,9 +927,29 @@ impl<'r> Machine<'r> {
                     value: ArgValue::Node(value),
                     ..
                 } if !ir.is_simple(value) => {
+                    let later = ir.items(state.args).get(state.next as usize + 1..);
+                    let split = pieces::any_later_argument(ir, later.unwrap_or_default())
+                        && self.splittable(value);
+                    let at = state.next;
                     self.calls.push(state);
                     self.frames.push(Frame::Arguments);
+                    if split {
+                        self.piece_begin(at);
+                    }
                     return Next::Eval(value);
+                }
+                // A default reads the parameters before it: the arguments
+                // split off are waited for first.
+                IrKind::Arg {
+                    value: ArgValue::Default { .. },
+                    ..
+                } if state.pieces.join.is_some() => {
+                    let join = state.pieces.join.take();
+                    self.calls.push(state);
+                    return match join {
+                        Some(join) => self.join_pieces(Joining::Arguments, join, None),
+                        None => self.lost_call(),
+                    };
                 }
                 IrKind::Arg {
                     param,
@@ -1028,9 +1064,18 @@ impl<'r> Machine<'r> {
     /// Takes up a call's arguments with `result`, the value of argument
     /// `state.next`.
     fn argument_done(&mut self, mut state: CallState, result: Outcome) -> Next {
+        self.piece_end(&mut state.pieces);
         let value = match result {
             Ok(value) => value,
-            Err(unwind) => return self.argument_failed(&state, *unwind),
+            Err(unwind) => {
+                // A failure waits behind the arguments split off before it.
+                if let Some(join) = state.pieces.join.take() {
+                    let at = state.next as usize;
+                    self.calls.push(state);
+                    return self.join_pieces(Joining::Arguments, join, Some((at, unwind)));
+                }
+                return self.argument_failed(&state, *unwind);
+            }
         };
         let ir = &self.running().ir;
         let param = match ir.items(state.args).get(state.next as usize) {

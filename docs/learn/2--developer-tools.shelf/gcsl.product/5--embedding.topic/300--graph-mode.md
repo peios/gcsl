@@ -40,7 +40,7 @@ The host keeps a `Graph` for the whole evaluation and drives it:
 1. Run a unit, a file with `Workspace::run_graph` or a target with
    `Workspace::prepare_call` and `Workspace::run_prepared`. You get
    `Progress::Paused(nodes)` if the unit needs results it doesn't have
-   yet (see [Loops that wait](#loops-that-wait)),
+   yet (see [Code that waits](#code-that-waits)),
    `Progress::Waiting(unit)` if it needs a result that another unit is
    computing (see [Units that share work](#units-that-share-work)), or
    `Progress::Done(value)` once it finishes.
@@ -63,7 +63,7 @@ value itself: pekit packs a package as `packaging.pack(package NAME())`.
 Several prepared calls are units of their own, and can be driven together
 against one graph, sharing the steps they both reach.
 
-## Loops that wait
+## Code that waits
 
 When an iteration of a `for` loop in a function stops to wait, the rest
 of the loop doesn't wait with it: the iteration is set aside, and the
@@ -78,12 +78,22 @@ assigns a variable declared outside the loop with `:=`, and none leaves
 it with `break` or `return`. Any other loop runs its iterations in
 order.
 
+The same goes for the elements of a list, the pieces of a string with
+`{}` in it, and the arguments of a call. In
+`link(compile(a), compile(b))`, both compiles are met before the unit
+stops. A call's body runs, and a parameter's default is evaluated, only
+once every argument before it is there. An element or argument is set
+aside only if it assigns no variable with `:=` and has no `break`,
+`continue` or `return` in it.
+
 An iteration set aside can still reach effects that must happen in
 program order, such as programs that write files the next one reads.
 Your `Effects` says which effects it isolates, through
 `Effects::isolates`: an effect you don't isolate is only made once
 nothing earlier in the program is still waiting, so you still see such
-effects one at a time, in program order. By default nothing is
+effects one at a time, in program order. Once something set aside has
+failed, nothing after it that you don't isolate is made at all, as the
+program would have stopped at the failure. By default nothing is
 isolated. Isolate an effect only if its order can't matter, such as a
 fetch pinned by its digest.
 

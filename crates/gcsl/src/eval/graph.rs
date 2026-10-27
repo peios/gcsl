@@ -90,7 +90,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::rc::Rc;
 
 use crate::check::{Attribute, Builtin};
@@ -483,8 +483,12 @@ struct Scope {
     path: u64,
     /// How many nodes have been met in it.
     met: u32,
-    /// How many scopes of each key it has entered.
-    entered: HashMap<u64, u32>,
+    /// How many scopes of each key it has entered, by keys that are
+    /// hashes already, so that a scope made allocates and seeds nothing.
+    entered: HashMap<u64, u32, BuildHasherDefault<DefaultHasher>>,
+    /// How many pieces' scopes it has entered (see
+    /// [`GraphRun::enter_piece`]).
+    pieces: u32,
 }
 
 /// One run of a unit in graph mode (see [Graph mode](#graph-mode)), shared by
@@ -781,8 +785,26 @@ impl<'g> GraphRun<'g> {
         });
     }
 
+    /// Enters the scope of a piece that may be split off, inside the
+    /// innermost scope (see [Pieces](crate::eval::machine::pieces#pieces)):
+    /// named by its number among the pieces begun in that scope, which one
+    /// task at a time begins, in program order, so that it is named the
+    /// same in every run however the pieces before it were split off.
+    pub(crate) fn enter_piece(&self) {
+        let mut scopes = self.scopes.borrow_mut();
+        let Some(scope) = scopes.last_mut() else {
+            return;
+        };
+        scope.pieces += 1;
+        let path = mix(scope.path, scope.pieces);
+        scopes.push(Scope {
+            path,
+            ..Scope::default()
+        });
+    }
+
     /// Leaves the innermost scope, but the unit's own.
-    fn leave(&self) {
+    pub(crate) fn leave(&self) {
         let mut scopes = self.scopes.borrow_mut();
         if scopes.len() > 1 {
             scopes.pop();
@@ -1425,6 +1447,16 @@ impl EffectJob {
         )?;
         to_plain(&value, &names).map_err(|message| Diagnostic::error(message, self.span))
     }
+}
+
+/// A path from the path `path` and the number `number`, mixed as
+/// `SplitMix64` mixes, cheaper than [`hash_of`] for a piece's scope, which
+/// is entered far more often than any other.
+const fn mix(path: u64, number: u32) -> u64 {
+    let mut z = path ^ (number as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// A hash of `value`, for a scope's path and a position.

@@ -2882,3 +2882,26 @@ fn an_iteration_is_forkable_unless_it_assigns_outside_or_leaves() {
         [true]
     );
 }
+
+#[test]
+fn a_piece_is_independent_unless_it_assigns_or_stops() {
+    let independent = |text: &str| lower_text(text).independent_arguments();
+    let g = "fn g(a: Int, b: Int): Int { = a + b }\n";
+    assert_eq!(independent(&format!("{g}= g(g(1, 2), 3)")), [true; 4]);
+    // An assignment, even of the piece's own variable: conservatively.
+    assert_eq!(
+        independent(&format!("{g}let mut t = 0\n= g({{ t := 1\n = t }}, 2)")),
+        [false, true]
+    );
+    assert_eq!(
+        independent(&format!("{g}= g({{ let mut u = 1\n u := 2\n = u }}, 2)")),
+        [false, true]
+    );
+    // A stop, of a loop outside the piece.
+    assert_eq!(
+        independent(&format!(
+            "{g}= for x in [1] {{ = g(if x > 0 {{ continue }} else {{ 1 }}, 2) }}"
+        )),
+        [false, true]
+    );
+}

@@ -2012,6 +2012,9 @@ pub struct Ir {
     references: Vec<FnId>,
     /// For each node, whether it is simple (see [`Ir::is_simple`]).
     simple: Vec<bool>,
+    /// For each node, whether it is independent (see
+    /// [`Ir::is_independent`]).
+    independent: Vec<bool>,
 }
 
 /// Where the meta of a function's closures is, for a function that has one
@@ -2081,6 +2084,23 @@ impl Ir {
             .collect()
     }
 
+    /// For each argument given a value, in the order its node was made,
+    /// whether the value is independent (see [`Ir::is_independent`]), for
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn independent_arguments(&self) -> Vec<bool> {
+        self.nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                IrKind::Arg {
+                    value: ArgValue::Node(value),
+                    ..
+                } => Some(self.is_independent(value)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether node `id` is *simple*: whether its subtree runs nothing but
     /// operators, constants, reads, literals, `if`s and blocks, and so
     /// calls, loops, awaits, reads no context, sets none, recovers from no
@@ -2090,6 +2110,20 @@ impl Ir {
     #[must_use]
     pub(crate) fn is_simple(&self, id: IrId) -> bool {
         self.simple.get(id.index()).copied().unwrap_or(false)
+    }
+
+    /// Whether node `id` is *independent*: whether its subtree assigns no
+    /// variable (`:=`) and holds no `break`, `continue` or `return`, outside
+    /// the bodies of the functions it makes closures of. The evaluation of
+    /// an independent element of a list, field of a record, piece of an
+    /// interpolation or argument of a call writes nothing the pieces after
+    /// it read and leaves nothing it is in, so that in graph mode it may be
+    /// split off to wait apart (see [Tasks](crate::eval::machine::tasks)).
+    /// Conservative: a subtree that assigns only its own variables, or
+    /// stops only its own loops, is not independent.
+    #[must_use]
+    pub(crate) fn is_independent(&self, id: IrId) -> bool {
+        self.independent.get(id.index()).copied().unwrap_or(false)
     }
 
     /// Every call in the frame whose body is `body`, with its depth and
@@ -2564,6 +2598,8 @@ pub(crate) struct IrBuilder {
     name_texts: HashMap<Name, Box<str>>,
     update_steps: Vec<UpdateStep>,
     update_paths: Vec<StepRange>,
+    /// The `Store`s of assignments, `:=` (see [`Ir::is_independent`]).
+    assignments: Vec<IrId>,
 }
 
 impl IrBuilder {
@@ -2583,7 +2619,14 @@ impl IrBuilder {
             name_texts: HashMap::new(),
             update_steps: Vec::new(),
             update_paths: Vec::new(),
+            assignments: Vec::new(),
         }
+    }
+
+    /// Notes that the `Store` node `id` is an assignment, `:=` (see
+    /// [`Ir::is_independent`]).
+    pub(crate) fn note_assignment(&mut self, id: IrId) {
+        self.assignments.push(id);
     }
 
     /// Adds a node and returns its id. The builder holds at most one node
@@ -2870,8 +2913,10 @@ impl IrBuilder {
         (input, dir): (u32, u32),
     ) -> Ir {
         let simple = simple_nodes(&self.nodes, &self.item_lists);
+        let independent = independent_nodes(&self.nodes, &self.item_lists, self.assignments);
         Ir {
             simple,
+            independent,
             nodes: self.nodes,
             item_lists: self.item_lists,
             strings: self.strings,
@@ -2916,6 +2961,33 @@ fn simple_nodes(nodes: &[IrNode], pool: &[IrId]) -> Vec<bool> {
         simple.push(answer);
     }
     simple
+}
+
+/// For each of `nodes`, whose lists are in `pool` and whose assignments are
+/// `assignments`, whether it is independent (see [`Ir::is_independent`]):
+/// a node that is no assignment, `break`, `continue` or `return`, and all
+/// of whose children are independent, found in one pass as
+/// [`simple_nodes`] finds its answers.
+fn independent_nodes(nodes: &[IrNode], pool: &[IrId], mut assignments: Vec<IrId>) -> Vec<bool> {
+    assignments.sort_unstable_by_key(|id| id.index());
+    let mut independent = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        let leaves = matches!(
+            node.kind,
+            IrKind::Break { .. } | IrKind::Continue { .. } | IrKind::Return { .. }
+        );
+        let assigns = assignments
+            .binary_search_by_key(&index, |id| id.index())
+            .is_ok();
+        let answer = !leaves
+            && !assigns
+            && node
+                .kind
+                .children(pool)
+                .all(|child| independent.get(child.index()).copied().unwrap_or(false));
+        independent.push(answer);
+    }
+    independent
 }
 
 struct Pretty<'a> {
