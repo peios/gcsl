@@ -138,16 +138,19 @@ impl Mark {
     /// which only its root catches (see [Graph
     /// mode](crate::eval::graph#graph-mode)).
     pub(crate) const PENDING: Mark = Mark(u32::MAX - 2);
+    /// A task of a unit in graph mode being cancelled, which nothing
+    /// catches (see [Tasks](crate::eval::machine::tasks#tasks)).
+    pub(crate) const CANCELLED: Mark = Mark(u32::MAX - 3);
 
     /// The passing of deadline number `number`, which is neither 0 nor one
-    /// of the last three `u32`s.
+    /// of the last four `u32`s.
     pub(crate) const fn deadline(number: u32) -> Mark {
         Mark(number)
     }
 
     /// The number of the deadline whose passing the error is, if it is one.
     pub(crate) const fn deadline_number(self) -> Option<u32> {
-        if self.0 == 0 || self.0 >= u32::MAX - 2 {
+        if self.0 == 0 || self.0 >= u32::MAX - 3 {
             None
         } else {
             Some(self.0)

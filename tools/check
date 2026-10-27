@@ -10,3 +10,6 @@ python3 tools/style-check.py
 ./bazel test //...
 cargo +1.98.1 clippy --workspace --all-targets --locked -- -D warnings
 cargo +1.98.1 test --workspace --locked
+# Every GCSL test again with plain runs on the machine, as graph mode runs.
+cargo +1.98.1 clippy -p gcsl --all-targets --locked --features machine-everywhere -- -D warnings
+cargo +1.98.1 test -p gcsl --locked --features machine-everywhere

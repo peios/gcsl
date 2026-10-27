@@ -300,6 +300,7 @@ mod files;
 mod fs;
 mod graph;
 mod imports;
+mod suspension;
 
 mod invoke;
 mod keychain;
@@ -309,6 +310,7 @@ mod memo;
 mod merging;
 mod metas;
 mod needs;
+mod profile;
 mod shadowing;
 mod shell;
 mod standard;

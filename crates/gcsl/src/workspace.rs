@@ -246,12 +246,13 @@ use crate::Outcome;
 use crate::check::ViewRecord;
 use crate::check::{Attribute, Builtin, KnownParams, Slot, Types};
 use crate::diagnostic::{Diagnostic, InternalError, Mark};
-use crate::eval::graph::{Graph, GraphHost, GraphRun, NodeId, NodeKind, run_node};
+use crate::eval::graph::{Graph, GraphHost, GraphRun, NodeId, NodeKind, RunExtras, Wait, run_node};
 use crate::eval::plain::{Plain, from_plain, to_identity_plain, to_key_plain, to_plain};
 
 /// A way to make a value plain data: [`to_plain`], [`to_key_plain`] or
 /// [`to_identity_plain`].
 type MakePlain = fn(&Value, &crate::names::Names) -> Result<Plain, String>;
+use crate::eval::profile::{Profile, ProfileReport};
 use crate::eval::{Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::names::{Name, Names};
@@ -473,15 +474,43 @@ pub enum Progress {
     /// It finished with this value, which may hold results the host has yet
     /// to give.
     Done(Value),
-    /// It stopped for the result of this node, which it needs.
-    Paused(NodeId),
+    /// It stopped for the results of these nodes, which its tasks need,
+    /// none of them given yet (see [Tasks](crate::eval::machine::tasks#tasks)).
+    Paused(Vec<NodeId>),
+    /// It stopped for the run of this unit, which computes a memoised
+    /// call's value or a `lazy`'s that it needs, and has stopped itself: run
+    /// it again once that unit has run (see [Graph
+    /// mode](crate::eval::graph#graph-mode)).
+    Waiting(u32),
+}
+
+impl Progress {
+    /// What a run that stopped for `waits` is: the nodes it waits for, or,
+    /// if it waits for none, the first unit it waits for. `None` if it
+    /// waits for nothing.
+    pub(crate) fn stopped(waits: &[Wait]) -> Option<Self> {
+        let nodes: Vec<NodeId> = waits
+            .iter()
+            .filter_map(|wait| match *wait {
+                Wait::Node(id) => Some(id),
+                Wait::Unit(_) => None,
+            })
+            .collect();
+        if !nodes.is_empty() {
+            return Some(Progress::Paused(nodes));
+        }
+        waits.iter().find_map(|wait| match *wait {
+            Wait::Unit(unit) => Some(Progress::Waiting(unit)),
+            Wait::Node(_) => None,
+        })
+    }
 }
 
 /// A file runs at most once. A failed attempt must remain a failure for every
 /// later request that needs it, without repeating any of its earlier effects.
 /// Boxing keeps this state table compact after the large IR is released. A
 /// file whose run in graph mode stopped for a step's result keeps its IR,
-/// shared, to run again from its start, its closures' code the same (see
+/// shared, to take up where it stopped, its closures' code the same (see
 /// [Graph mode](crate::eval::graph#graph-mode)).
 #[derive(Debug)]
 enum FileRun {
@@ -526,6 +555,13 @@ pub struct Workspace {
     /// numbered after every file (see [Prepared
     /// calls](crate::workspace::graph#prepared-calls)).
     calls_prepared: u32,
+    /// The evaluation of each unit in graph mode that stopped where it
+    /// waits, by its number, for its next run to take up (see
+    /// [Suspension](crate::eval::machine#suspension)).
+    suspended: std::collections::HashMap<u32, crate::eval::machine::Suspended>,
+    /// The profile being taken of its runs, if they are profiled
+    /// ([`Workspace::start_profiling`]).
+    profile: Option<Profile>,
     /// The table the files' types are interned into.
     types: TypeTable,
     /// The name of every slot of the frame, the last variable's in it, for
@@ -605,6 +641,22 @@ impl Workspace {
     /// it changes nothing, and the parent made stays in use.
     pub fn set_temp_root(&mut self, root: PathBuf) {
         self.temp_dirs.set_root(root);
+    }
+
+    /// Profiles every run of the workspace's code from now on, its files',
+    /// its calls' and its steps', afresh if it was profiled before (see
+    /// [Profiling](crate::eval::profile#profiling)).
+    pub fn start_profiling(&mut self) {
+        self.profile = Some(Profile::new());
+    }
+
+    /// What the profile taken since [`Workspace::start_profiling`] found,
+    /// if one is being taken.
+    #[must_use]
+    pub fn profile_report(&self) -> Option<ProfileReport> {
+        self.profile
+            .as_ref()
+            .map(|profile| profile.report(&self.scan.names))
     }
 
     /// The syntax tree of file `index` annotated with the types it was
@@ -687,8 +739,8 @@ impl Workspace {
         graph: &mut Graph,
         host: GraphHost<'_>,
     ) -> Result<Progress, Vec<Diagnostic>> {
-        if let Some(node) = self.run_files(index, Some((graph, host)))? {
-            return Ok(Progress::Paused(node));
+        if let Some(progress) = self.run_files(index, Some((graph, host)))? {
+            return Ok(progress);
         }
         Ok(Progress::Done(
             self.values
@@ -724,12 +776,13 @@ impl Workspace {
         };
         let context = (&mut self.frame, &mut self.memo);
         let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
-        let extras = (
-            Some(&self.exec_result),
-            &self.scan.dir_texts[..],
+        let extras = RunExtras {
+            exec_result: Some(&self.exec_result),
+            dirs: &self.scan.dir_texts[..],
             effects,
-            Some(&names),
-        );
+            names: Some(&names),
+            profile: self.profile.as_ref(),
+        };
         let ran = run_node(node, context, extras);
         self.scan.names = names.into_inner();
         ran.map_err(|mut error| {
@@ -929,8 +982,8 @@ impl Workspace {
     /// [`Workspace::run_needed`] does, each in graph mode, as unit number its
     /// file's, if `graph` is given, the graph and which deferring calls the
     /// host takes as steps (see [Graph mode](crate::eval::graph#graph-mode)).
-    /// Returns the node the run stopped for, if it stopped, the file that
-    /// stopped kept to run again from its start.
+    /// Returns what the run stopped for, if it stopped, the file that
+    /// stopped kept to take up where it stopped.
     ///
     /// # Errors
     ///
@@ -939,7 +992,7 @@ impl Workspace {
         &mut self,
         index: u32,
         mut graph: Option<(&mut Graph, GraphHost<'_>)>,
-    ) -> Result<Option<NodeId>, Vec<Diagnostic>> {
+    ) -> Result<Option<Progress>, Vec<Diagnostic>> {
         for at in self.scan.needed(index) {
             let Some(state) = self.runs.get_mut(at as usize) else {
                 continue;
@@ -966,24 +1019,31 @@ impl Workspace {
             let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
             let context = (
                 &mut self.memo,
-                Some(&self.exec_result),
-                &self.scan.dir_texts[..],
-                effects,
-                Some(&names),
+                RunExtras {
+                    exec_result: Some(&self.exec_result),
+                    dirs: &self.scan.dir_texts[..],
+                    effects,
+                    names: Some(&names),
+                    profile: self.profile.as_ref(),
+                },
             );
-            let run = graph
-                .as_mut()
-                .map(|(graph, host)| GraphRun::new(mem::take(*graph), at, host.defers));
+            let suspended = self.suspended.remove(&at);
+            let run = graph.as_mut().map(|(graph, host)| {
+                GraphRun::new(mem::take(*graph), at, host.defers).resuming(suspended)
+            });
             let outcome =
                 session::run_input_in(&ir, &mut self.frame, context, (None, run.as_ref()));
             self.scan.names = names.into_inner();
             let paused = match (run, graph.as_mut()) {
                 (Some(run), Some((graph, _))) => {
+                    if let Some(suspended) = run.take_suspended() {
+                        self.suspended.insert(at, suspended);
+                    }
                     let (left, paused) = run.finish();
                     **graph = left;
                     paused
                 }
-                _ => None,
+                _ => Vec::new(),
             };
             let Some(state) = self.runs.get_mut(at as usize) else {
                 continue;
@@ -994,12 +1054,12 @@ impl Workspace {
                         *entry = value;
                     }
                 }
-                // Stopped for a step's result: run again, from its start,
+                // Stopped for a step's result: taken up where it stopped
                 // once the host has given it.
                 Err(error) if error.mark == Mark::PENDING => {
                     *state = FileRun::Paused(ir);
-                    return match paused {
-                        Some(node) => Ok(Some(node)),
+                    return match Progress::stopped(&paused) {
+                        Some(progress) => Ok(Some(progress)),
                         None => Err(vec![
                             InternalError {
                                 message: "a unit stopped for no step",

@@ -65,7 +65,14 @@ impl Evaluator<'_> {
     /// for that operation: its [`Value::derivation`], every secret in it
     /// its identity, digested if it is long ([`token`]).
     pub(super) fn secret_value(&mut self, secret: IrId, deep: bool) -> Flow<Value> {
-        let value = match self.value(secret) {
+        let result = self.value(secret);
+        self.secret_value_of(result, deep)
+    }
+
+    /// [`Evaluator::secret_value`] of `result`, what the secret's node came
+    /// to, evaluated already.
+    pub(super) fn secret_value_of(&self, result: Flow<Value>, deep: bool) -> Flow<Value> {
+        let value = match result {
             Ok(value) => value,
             Err(unwind) => {
                 // A failure of an operand, none of the operation's own.
@@ -106,6 +113,19 @@ impl Evaluator<'_> {
     ) -> Flow<Value> {
         let depth = self.shared.identities.borrow().len();
         let result = self.value(computed);
+        self.secret_wrap_of((computed, revealed), depth, result, node)
+    }
+
+    /// [`Evaluator::secret_wrap`] of `result`, what `computed` came to,
+    /// evaluated already, the identities of its operands those computed
+    /// since there were `depth` of them.
+    pub(super) fn secret_wrap_of(
+        &self,
+        (computed, revealed): (IrId, bool),
+        depth: usize,
+        result: Flow<Value>,
+        node: &IrNode,
+    ) -> Flow<Value> {
         let tokens: Vec<Rc<str>> = self.shared.identities.borrow_mut().split_off(depth);
         let of_operand = self.shared.operand_failed.replace(false);
         match result {

@@ -518,6 +518,7 @@ pub fn lower(
         lazy_pending: Vec::new(),
         functions: vec![None; ast.fn_count()],
         loops: Vec::new(),
+        forks: Vec::new(),
         catches: Vec::new(),
         next_catch: 0,
         reads_caller: Vec::new(),
@@ -653,6 +654,11 @@ struct Lowerer<'a> {
     /// lowered, outermost first: how many loops out a `break` or
     /// `continue` goes is counted on it.
     loops: Vec<ForId>,
+    /// The iterations among [`Lowerer::loops`], outermost first, each with
+    /// the slot of its variable, below which every variable declared
+    /// outside it lies, and whether it is forkable so far (see
+    /// [`IrKind::For`]).
+    forks: Vec<(ForId, Slot, bool)>,
     /// The catches of the labelled blocks and loops that some `return`
     /// leaves whose items or bodies are being lowered, of the function
     /// being lowered, outermost first, each with what it catches for: a

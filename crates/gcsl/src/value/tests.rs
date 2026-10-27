@@ -526,7 +526,7 @@ fn a_future_displays_as_its_type_and_compares_by_identity() {
     );
     // Done or not, it shows as its type.
     assert_eq!(value.to_string(), "Future<Int>");
-    assert!(pending.finish(FutureState::Running));
+    assert!(pending.finish(FutureState::Running(None)));
     assert!(format!("{pending:?}").contains("state: \"running\""));
     // By identity: equal only to itself.
     let other = Value::Future(future(&code, vec![Value::Int(1)]));
@@ -541,15 +541,21 @@ fn a_future_displays_as_its_type_and_compares_by_identity() {
 fn beginning_an_await_takes_the_captures_and_marks_it_running() {
     let code = one_function("Future<Int>");
     let pending = future(&code, vec![Value::Int(7)]);
-    let Some(Begin::Pending(captures)) = pending.begin() else {
+    let Some(Begin::Pending(captures)) = pending.begin(None) else {
         panic!("expected the captures");
     };
     assert_eq!(&*captures, &[Value::Int(7)]);
-    assert!(matches!(pending.begin(), Some(Begin::Running)));
+    assert!(matches!(pending.begin(None), Some(Begin::Running)));
     assert!(pending.finish(FutureState::Done(Value::Int(8))));
-    assert!(matches!(pending.begin(), Some(Begin::Done(Value::Int(8)))));
+    assert!(matches!(
+        pending.begin(None),
+        Some(Begin::Done(Value::Int(8)))
+    ));
     // Still done.
-    assert!(matches!(pending.begin(), Some(Begin::Done(Value::Int(8)))));
+    assert!(matches!(
+        pending.begin(None),
+        Some(Begin::Done(Value::Int(8)))
+    ));
 }
 
 #[test]

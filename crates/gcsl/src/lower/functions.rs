@@ -126,9 +126,10 @@ impl Lowerer<'_> {
         let outer = (
             std::mem::take(&mut self.loops),
             std::mem::take(&mut self.catches),
+            std::mem::take(&mut self.forks),
         );
         let body = self.lower_expr(body_expr);
-        (self.loops, self.catches) = outer;
+        (self.loops, self.catches, self.forks) = outer;
         let captures = body.and_then(|body| {
             // A default is called by its caller, whose needs it charges.
             let display = Box::from("default");
@@ -431,9 +432,10 @@ impl Lowerer<'_> {
         let outer = (
             std::mem::take(&mut self.loops),
             std::mem::take(&mut self.catches),
+            std::mem::take(&mut self.forks),
         );
         let body = self.lower_expr(self.ast.fn_decl(function).body);
-        (self.loops, self.catches) = outer;
+        (self.loops, self.catches, self.forks) = outer;
         let body = body?;
         let body = if self.definitions.contains(&function) {
             self.as_definition(id, body)?

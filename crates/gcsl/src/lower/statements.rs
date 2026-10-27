@@ -37,6 +37,9 @@ impl Lowerer<'_> {
                 span: item.span,
             });
         }
+        if let ItemKind::Rebind { .. } = item.kind {
+            self.assigns(slot);
+        }
         let value = match path {
             Some(path) => self.lower_declaration(id, path, value)?,
             None => self.lower_expr(value)?,
@@ -65,6 +68,7 @@ impl Lowerer<'_> {
                 span: item.span,
             });
         };
+        self.leaves(at, matches!(item.kind, ItemKind::Break(_)));
         let loops = u32::try_from(self.loops.len() - 1 - at).unwrap_or(u32::MAX);
         let value = jump.value.map(|value| self.lower_expr(value)).transpose()?;
         let kind = match item.kind {
@@ -102,6 +106,8 @@ impl Lowerer<'_> {
                 });
             }
         };
+        // It leaves every loop it is in, conservatively.
+        self.leaves(0, true);
         let value = jump.value.map(|value| self.lower_expr(value)).transpose()?;
         Ok(self.builder.alloc(IrKind::Return { to, value }, item.span))
     }

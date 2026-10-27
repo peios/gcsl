@@ -49,10 +49,19 @@ impl Evaluator<'_> {
     /// not an Int", at the node, labelled with what the value is (see
     /// [`failure`]).
     pub(super) fn narrowed(&mut self, node: &IrNode) -> Flow<Value> {
-        let IrKind::As { value, test, .. } = node.kind else {
+        let IrKind::As { value, .. } = node.kind else {
             return mistyped(node, "a node that is not an `as` narrowed");
         };
         let value = self.value(value)?;
+        self.narrowed_of(node, value)
+    }
+
+    /// The `As` `node` of `value`, its value's, evaluated already, as
+    /// [`Evaluator::narrowed`] narrows it.
+    pub(super) fn narrowed_of(&self, node: &IrNode, value: Value) -> Flow<Value> {
+        let IrKind::As { test, .. } = node.kind else {
+            return mistyped(node, "a node that is not an `as` narrowed");
+        };
         let ir = self.ir;
         let Some(code) = ir.test(test) else {
             return mistyped(node, "an `as` of a test its IR lacks");
@@ -72,10 +81,19 @@ impl Evaluator<'_> {
     /// written to the node's slot if it has one, and whether it passes the
     /// node's test.
     pub(super) fn is_test(&mut self, node: &IrNode) -> Flow<bool> {
-        let IrKind::Is { value, test, slot } = node.kind else {
+        let IrKind::Is { value, .. } = node.kind else {
             return mistyped(node, "a node that is not an `is` tested");
         };
         let value = self.value(value)?;
+        self.is_test_of(node, value)
+    }
+
+    /// The `Is` `node` of `value`, its value's, evaluated already, as
+    /// [`Evaluator::is_test`] tests it, the value written to its slot.
+    pub(super) fn is_test_of(&mut self, node: &IrNode, value: Value) -> Flow<bool> {
+        let IrKind::Is { test, slot, .. } = node.kind else {
+            return mistyped(node, "a node that is not an `is` tested");
+        };
         let Some(code) = self.ir.test(test) else {
             return mistyped(node, "an `is` of a test its IR lacks");
         };

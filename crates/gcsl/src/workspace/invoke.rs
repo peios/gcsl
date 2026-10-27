@@ -10,6 +10,7 @@ use crate::ast::{
 };
 use crate::check::{Checker, KnownParams, Scope, Slot};
 use crate::diagnostic::Diagnostic;
+use crate::eval::graph::RunExtras;
 use crate::eval::{Direct, Effects};
 use crate::ir::Ir;
 use crate::names::{self, Name, Names};
@@ -1219,10 +1220,13 @@ impl Workspace {
         let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
         let context = (
             &mut self.memo,
-            Some(&self.exec_result),
-            &self.scan.dir_texts[..],
-            &direct as &dyn Effects,
-            Some(&names),
+            RunExtras {
+                exec_result: Some(&self.exec_result),
+                dirs: &self.scan.dir_texts[..],
+                effects: &direct as &dyn Effects,
+                names: Some(&names),
+                profile: self.profile.as_ref(),
+            },
         );
         let mut warnings = self.warnings.clone();
         warnings.extend(own);

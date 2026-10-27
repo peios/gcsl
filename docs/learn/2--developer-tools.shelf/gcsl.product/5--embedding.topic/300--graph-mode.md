@@ -39,16 +39,19 @@ The host keeps a `Graph` for the whole evaluation and drives it:
 
 1. Run a unit, a file with `Workspace::run_graph` or a target with
    `Workspace::prepare_call` and `Workspace::run_prepared`. You get
-   `Progress::Paused(node)` if the unit needs a result it doesn't have
-   yet, or `Progress::Done(value)` once it finishes.
+   `Progress::Paused(nodes)` if the unit needs results it doesn't have
+   yet (see [Loops that wait](#loops-that-wait)),
+   `Progress::Waiting(unit)` if it needs a result that another unit is
+   computing (see [Units that share work](#units-that-share-work)), or
+   `Progress::Done(value)` once it finishes.
 2. Find what to run. `graph.holes(&value)` lists the results a finished
    value still waits for, `graph.needed(&demands)` adds every step they
    depend on, and `graph.ready(&needed)` keeps those whose own inputs are
    all known. Steps that nothing needs never run.
 3. For each ready step, either give its result from your cache, or run it
    with `Workspace::evaluate`, then pass the outcome to `graph.resolve`.
-4. Run the unit again. It starts from the beginning, finds the steps it
-   made before, and continues past the point where it stopped.
+4. Run the unit again. It carries on from the point where it stopped:
+   nothing it did before runs again.
 
 A target's call can set root contexts as it starts, from values you give
 or from a top-level field of a file, `Workspace::prepare_call_with`. With
@@ -59,6 +62,46 @@ how a host runs code of its own over a target without calling a function
 value itself: pekit packs a package as `packaging.pack(package NAME())`.
 Several prepared calls are units of their own, and can be driven together
 against one graph, sharing the steps they both reach.
+
+## Loops that wait
+
+When an iteration of a `for` loop in a function stops to wait, the rest
+of the loop doesn't wait with it: the iteration is set aside, and the
+next one runs. So a loop that fetches a hundred files stops once, with
+all hundred fetches in `Progress::Paused(nodes)`, rather than a hundred
+times. The loop's value is the same as if its iterations had run in
+order, and if several fail, the earliest iteration's failure is the one
+reported.
+
+A loop is only split like this if its iterations are independent: none
+assigns a variable declared outside the loop with `:=`, and none leaves
+it with `break` or `return`. Any other loop runs its iterations in
+order.
+
+An iteration set aside can still reach effects that must happen in
+program order, such as programs that write files the next one reads.
+Your `Effects` says which effects it isolates, through
+`Effects::isolates`: an effect you don't isolate is only made once
+nothing earlier in the program is still waiting, so you still see such
+effects one at a time, in program order. By default nothing is
+isolated. Isolate an effect only if its order can't matter, such as a
+fetch pinned by its digest.
+
+## Units that share work
+
+A unit that stops keeps everything it was doing, including the memoised
+calls it is in the middle of. If another unit makes the same memoised
+call with the same arguments, or awaits the same `lazy` value, it
+doesn't compute it again. It stops with `Progress::Waiting(unit)`,
+naming the unit that is computing it. Run that unit, or anything else
+that can make progress, and then run the waiting unit again. It looks
+the call up again, and finds the result once the other unit has
+finished it.
+
+A unit that waits on another never makes a node of its own for the
+shared work, so the work is done once, by whichever unit reached it
+first. If every unit you have is waiting on another, they are waiting
+on each other: report that as an error rather than running them again.
 
 A step's failure is raised where its result is used, so a `recover`
 around that use catches it, as with any failure. A finished value can
@@ -85,7 +128,8 @@ into an `EffectJob`, plain data you can send to a worker thread, where
 one. Give the result back with `Workspace::from_plain` and
 `graph.resolve`, and run the step again; it carries on to its next
 effect. One GCSL thread can drive as many running programs as you have
-workers. A step's own `#[retry]` and `#[timeout]` are left to you, since
+workers. A step's `exec`s run in the order its code makes them. A
+step's own `#[retry]` and `#[timeout]` are left to you, since
 you see every attempt: read them from its attributes with
 `check::retry_of` and `check::timeout_of`, as GCSL itself does. To run a
 failed step again from its start, call `graph.forget_unit` with its unit
@@ -111,14 +155,14 @@ session, then doesn't change the key of a step that never reads it.
 
 `Workspace::run_step` also gives what the step's run read of the context
 it was made in: each context whose binding is the step's own, with
-whether it was bound or its default read. A run that ends ran from its
-start, so its reads are the step's, and you can key the step by the
-values of those contexts alone, rather than by every context it could
-read. A memoised call found in its table counts the reads it made, so a
-cache hit hides none. Each context is also told to your
-`Effects::context_read` the first time a run reads it, before the step
-does anything with it, so you can give the step that context's files only
-then.
+whether it was bound or its default read. A step keeps what it read while
+it is stopped, so the reads a run that ends gives are everything the step
+read, and you can key the step by the values of those contexts alone,
+rather than by every context it could read. A memoised call found in its
+table counts the reads it made, so a cache hit hides none. Each context
+is also told to your `Effects::context_read` the first time a run reads
+it, before the step does anything with it, so you can give the step that
+context's files only then.
 
 A deferred call is one node however many times, and wherever, it is
 made: by its function, its arguments and the context it was made in, but
@@ -174,3 +218,31 @@ the attribute's arguments. An attribute declared as
 `type step = {on: Bool = true}` lets a function written `#[step(false)]`
 run inline. The host must decide the same way for the same call
 throughout one evaluation.
+
+## Seeing where evaluation spends its time
+
+Call `Workspace::start_profiling` before you run anything, and
+`Workspace::profile_report` once you're done. Every run of the
+workspace's code is profiled from then on: its files, its prepared calls
+and its steps, through every pause. The report has a row for each
+function and built-in that ran:
+
+- `calls`, how many calls of it ran, and `found`, how many of those were
+  memoised calls that found their entry;
+- `own`, the time spent in its body, less the calls made inside it;
+- `total`, the time of its calls including the calls inside them,
+  counted once for a function that calls itself.
+
+A call's time starts once its arguments are evaluated, so evaluating an
+argument counts toward the caller. `outermost` is the time spent in
+calls that no other call was running around. If you time your runs, the
+difference is the time spent at the top level of the files, outside any
+function. A profiled run costs a little more than one that isn't, and
+nothing changes for a workspace that never starts profiling.
+
+A target's unit carries on from where it stopped after each pause, so a
+profile counts each call it makes once, however often it stops. Time a
+unit spends stopped isn't counted. When the same expensive work, such as
+parsing a lock file, shows up thousands of times, it's being done by
+that many calls: memoise the function that does it with `->>`, and
+later calls find its entry instead of doing the work again.

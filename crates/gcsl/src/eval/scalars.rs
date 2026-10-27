@@ -5,6 +5,7 @@ use std::fmt::Write;
 use std::num::NonZeroI64;
 use std::rc::Rc;
 
+use crate::check::Builtin;
 use crate::diagnostic::Diagnostic;
 use crate::ir::{Cmp, IrId, IrKind, IrNode, IrRange, Operands};
 use crate::source::Span;
@@ -140,15 +141,28 @@ impl Evaluator<'_> {
     /// operator is "duration overflow" or "size overflow", saying what
     /// overflowed, rather than the `Int` operator's "integer overflow".
     pub(super) fn quantity_amount(&mut self, quantity: Quantity, amount: IrId) -> Flow<i64> {
+        let result = self.int(amount);
+        result.map_err(|unwind| self.quantity_overflow(quantity, amount, unwind))
+    }
+
+    /// `unwind`, out of the evaluation of `amount`, the `Int` node of a
+    /// quantity node of `quantity`: an overflow in its own operator says
+    /// what overflowed (see [`Evaluator::quantity_amount`]).
+    pub(super) fn quantity_overflow(
+        &self,
+        quantity: Quantity,
+        amount: IrId,
+        unwind: Unwind,
+    ) -> Unwind {
         let inner = self.ir.get(amount);
         let at = inner.operator_span().unwrap_or(inner.span);
-        self.int(amount).map_err(|unwind| match unwind {
+        match unwind {
             Unwind::Error(mut error) if error.message == OVERFLOW && error.span == at => {
                 error.message = format!("{} overflow", quantity.name());
                 Unwind::Error(error)
             }
             unwind => unwind,
-        })
+        }
     }
 
     /// The text an operator's error labels its operand `operand` with, whose
@@ -170,6 +184,12 @@ impl Evaluator<'_> {
     /// Evaluates the `IntNeg` `node` of `operand`.
     pub(super) fn int_neg(&mut self, node: &IrNode, operand: IrId) -> Flow<i64> {
         let value = self.int(operand)?;
+        self.int_neg_of(node, operand, value)
+    }
+
+    /// The `IntNeg` `node` of `operand`, whose value is `value`, evaluated
+    /// already.
+    pub(super) fn int_neg_of(&self, node: &IrNode, operand: IrId, value: i64) -> Flow<i64> {
         value
             .checked_neg()
             .ok_or_else(|| self.unary_error(node, operand, OVERFLOW, value).into())
@@ -187,6 +207,18 @@ impl Evaluator<'_> {
         // arithmetic chain, so it saves that frame.
         let lhs = self.int(operands.lhs)?;
         let rhs = self.int(operands.rhs)?;
+        self.int_arithmetic_of(node, operands, op, (lhs, rhs))
+    }
+
+    /// The `+`, `-` or `*` `node`, which `op` computes, of its operands'
+    /// values `lhs` and `rhs`, evaluated already.
+    pub(super) fn int_arithmetic_of(
+        &self,
+        node: &IrNode,
+        operands: Operands,
+        op: fn(i64, i64) -> Option<i64>,
+        (lhs, rhs): (i64, i64),
+    ) -> Flow<i64> {
         op(lhs, rhs).ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs).into())
     }
 
@@ -200,6 +232,18 @@ impl Evaluator<'_> {
     ) -> Flow<i64> {
         let lhs = self.int(operands.lhs)?;
         let rhs = self.int(operands.rhs)?;
+        self.int_division_of(node, operands, op, (lhs, rhs))
+    }
+
+    /// The `//` or `%` `node`, which `op` computes, of its operands' values
+    /// `lhs` and `rhs`, evaluated already.
+    pub(super) fn int_division_of(
+        &self,
+        node: &IrNode,
+        operands: Operands,
+        op: fn(i64, NonZeroI64) -> Option<i64>,
+        (lhs, rhs): (i64, i64),
+    ) -> Flow<i64> {
         let Some(divisor) = NonZeroI64::new(rhs) else {
             return Err(self
                 .binary_error(node, operands, DIVISION_BY_ZERO, lhs, rhs)
@@ -614,7 +658,7 @@ impl Evaluator<'_> {
     /// value's GCSL source (see [`source_of`]).
     pub(super) fn show(&mut self, operand: IrId, node: &IrNode) -> Flow<Rc<str>> {
         let value = self.value(operand)?;
-        source_of(&value, node)
+        self.profiled_builtin(Builtin::Show, |_| source_of(&value, node))
     }
 
     /// A runtime error in a binary operator: the message points at the

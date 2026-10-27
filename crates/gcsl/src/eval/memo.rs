@@ -485,13 +485,15 @@ impl MemoTables {
     /// entry found as re-entered, for the error's label. A value found
     /// passes the entry's dependencies on to the running calls of
     /// `caller`'s origin if `inherited`, the caller passed on by a helper,
-    /// as a read would, which allocates a copy of them if there are any.
+    /// as a read would, which allocates a copy of them if there are any. A
+    /// running entry of another unit than `unit`, in graph mode, is
+    /// [`Lookup::Elsewhere`], and is not marked.
     pub(super) fn lookup(
         &mut self,
         closure: &Rc<Closure>,
         key: &[Value],
         (caller, inherited): (Caller, bool),
-        context: Option<&Rc<ContextFrame>>,
+        (context, unit): (Option<&Rc<ContextFrame>>, Option<u32>),
     ) -> Lookup {
         let hash = key_hash(key);
         let Some(bucket) = self
@@ -519,7 +521,19 @@ impl MemoTables {
                     .collect();
                 (value.clone(), passed)
             }
-            EntryState::Running { reentered } => {
+            EntryState::Running {
+                owner: Some(owner), ..
+            } if Some(*owner) != unit => {
+                return Lookup::Elsewhere(*owner);
+            }
+            // Running, but not on this task's line of control: another task
+            // of the unit runs it (see [Tasks](crate::eval::machine::tasks#tasks)).
+            EntryState::Running { .. }
+                if !self.running.iter().any(|running| running.entry == entry.id) =>
+            {
+                return Lookup::Sibling;
+            }
+            EntryState::Running { reentered, .. } => {
                 *reentered = true;
                 return Lookup::Running;
             }
@@ -542,12 +556,18 @@ impl MemoTables {
     }
 
     /// Records `key`, whose hash is `hash`, as running in `closure`'s
+    /// table for the run of the unit `owner`, if it is one's in graph mode,
     /// table, which is made if the closure has none, after sweeping if the
     /// number of tables has reached the threshold. Returns the entry's
     /// identity, by which [`MemoTables::finish`] finds it again, whatever
     /// its key compares equal to, and however many other entries of its
     /// bucket have empty keys.
-    pub(super) fn start(&mut self, closure: &Rc<Closure>, hash: u64, key: &[Value]) -> u64 {
+    pub(super) fn start(
+        &mut self,
+        closure: &Rc<Closure>,
+        (hash, key): (u64, &[Value]),
+        owner: Option<u32>,
+    ) -> u64 {
         let address = Rc::as_ptr(closure);
         if self.tables.len() >= self.threshold && !self.tables.contains_key(&address) {
             self.sweep();
@@ -559,7 +579,10 @@ impl MemoTables {
         });
         let entry = Entry {
             key: Box::from(key),
-            state: EntryState::Running { reentered: false },
+            state: EntryState::Running {
+                reentered: false,
+                owner,
+            },
             deps: Box::default(),
             generation: self.generation,
             id,
@@ -588,7 +611,7 @@ impl MemoTables {
         let table = self.tables.get_mut(&Rc::as_ptr(closure))?;
         let Some(value) = value else {
             return match table.remove(mark)? {
-                EntryState::Running { reentered } => Some(reentered),
+                EntryState::Running { reentered, .. } => Some(reentered),
                 EntryState::Done(_) => Some(false),
             };
         };
@@ -729,6 +752,9 @@ pub(super) enum EntryState {
     Running {
         /// Whether a call inside the body has found this entry running.
         reentered: bool,
+        /// The unit whose run computes it, in graph mode; `None` in a plain
+        /// run.
+        owner: Option<u32>,
     },
     /// The body returned this value.
     Done(Value),
@@ -739,8 +765,16 @@ pub(super) enum Lookup {
     /// The closure returned this value for equal arguments, the reads it
     /// replays here with it.
     Done(Value, Vec<Replayed>),
-    /// The closure is running with equal arguments.
+    /// The closure is running with equal arguments, further up this run's
+    /// stack.
     Running,
+    /// The closure is running with equal arguments in the run of another
+    /// unit, this one, in graph mode, which has stopped: the call waits for
+    /// it (see [Graph mode](crate::eval::graph#graph-mode)).
+    Elsewhere(u32),
+    /// The closure is running with equal arguments in another task of this
+    /// unit, which has stopped: the call waits for it.
+    Sibling,
     /// No entry: the arguments' hash, for recording them.
     Missing(u64),
 }
@@ -754,6 +788,15 @@ pub(super) enum MemoBegin {
     /// The arguments equal nothing, so the call is not recorded: its frame
     /// is on the stack, and its body runs at this nesting, with this caller.
     Unkeyed(usize, Caller),
+    /// The call is running with equal arguments in the run of this unit,
+    /// in graph mode, which has stopped: its frame is on the stack, with
+    /// the arguments, for the call to wait for that unit and look them up
+    /// again.
+    Elsewhere(u32),
+    /// The call is running with equal arguments in another task of the
+    /// unit: its frame is on the stack, with the arguments, for the call to
+    /// wait for that task and look them up again.
+    Sibling,
 }
 
 /// A running memoised call, as [`MemoTables::start`] recorded it.

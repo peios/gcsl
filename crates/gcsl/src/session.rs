@@ -238,7 +238,7 @@ use crate::Outcome;
 use crate::ast::{Ast, TypeStore};
 use crate::check::{CheckOutput, Scope};
 use crate::diagnostic::{self, Diagnostic};
-use crate::eval::graph::GraphRun;
+use crate::eval::graph::{GraphRun, RunExtras};
 use crate::eval::{self, Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::lower;
@@ -443,10 +443,13 @@ impl Session {
         let names = std::cell::RefCell::new(std::mem::take(&mut self.names));
         let context = (
             &mut self.memo,
-            self.exec_result.as_ref(),
-            &standard.dirs[..],
-            &direct as &dyn Effects,
-            Some(&names),
+            RunExtras {
+                exec_result: self.exec_result.as_ref(),
+                dirs: &standard.dirs[..],
+                effects: &direct as &dyn Effects,
+                names: Some(&names),
+                profile: None,
+            },
         );
         let ran = run_input(ir, &mut self.frame, context);
         self.names = names.into_inner();
@@ -578,29 +581,22 @@ pub(crate) fn run_input(
 pub(crate) fn run_input_in(
     ir: &Rc<Ir>,
     frame: &mut Vec<Value>,
-    (memo, exec_result, dirs, effects, names): RunContext,
+    (memo, extras): RunContext,
     (root, graph): (Option<Rc<ContextFrame>>, Option<&GraphRun<'_>>),
 ) -> Result<Value, Diagnostic> {
     let frame_size = ir.frame_size() as usize;
     if frame.len() < frame_size {
         frame.resize(frame_size, Value::Empty);
     }
-    let extras = (exec_result, dirs, effects, names);
     eval::eval_rooted(ir, (frame, memo), extras, (root, graph))
 }
 
 /// What [`run_input`] runs an input with besides its frame: the memo tables
-/// of every input, the layout of what `exec` returns, the table of the
-/// run's directories, the temporary directories of the run's owner, and the
-/// names of its owner, which a record made with names known only as it runs
-/// adds to, if it has a table of names.
-pub(crate) type RunContext<'a> = (
-    &'a mut MemoTables,
-    Option<&'a Rc<Layout>>,
-    &'a [Rc<str>],
-    &'a dyn Effects,
-    Option<&'a std::cell::RefCell<Names>>,
-);
+/// of every input, and what the run shares: the layout of what `exec`
+/// returns, the table of the run's directories, its effects, the names of
+/// its owner, which a record made with names known only as it runs adds to,
+/// if it has a table of names, and its profile, if it is profiled.
+pub(crate) type RunContext<'a> = (&'a mut MemoTables, eval::graph::RunExtras<'a>);
 
 #[cfg(test)]
 mod tests;

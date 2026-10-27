@@ -2024,6 +2024,7 @@ fn a_for_lowers_to_its_slot_and_parts() {
         slot,
         parts,
         collect,
+        ..
     } = ir.get(for_node).kind
     else {
         panic!("expected a for, got {:?}", ir.get(for_node));
@@ -2834,5 +2835,50 @@ fn a_dotted_def_s_closure_is_stored_in_its_leaf_s_cell() {
                  \x20     (load k#3 @10..30)))\n"
         ),
         "{made}"
+    );
+}
+
+#[test]
+fn an_iteration_is_forkable_unless_it_assigns_outside_or_leaves() {
+    let forkable = |text: &str| lower_text(text).forkable_fors();
+    assert_eq!(forkable("let xs = [1, 2]\n= for x in xs { x + 1 }"), [true]);
+    // An accumulator: each iteration reads what the one before wrote.
+    assert_eq!(
+        forkable("let mut t = 0\nfor x in [1, 2] { t := t + x }\n= t"),
+        [false]
+    );
+    // A variable declared in the body is the iteration's own.
+    assert_eq!(
+        forkable("= for x in [1, 2] { let mut y = x\n y := y + 1\n = y }"),
+        [true]
+    );
+    // A `break` ends the loop: later iterations may not run.
+    assert_eq!(
+        forkable("= for x in [1, 2] { if x > 1 { break }\n = x }"),
+        [false]
+    );
+    // A `continue` ends only its own iteration.
+    assert_eq!(
+        forkable("= for x in [1, 2] { if x > 1 { continue }\n = x }"),
+        [true]
+    );
+    // An inner loop's `break` leaves only the inner loop.
+    assert_eq!(
+        forkable("= for x in [1, 2] { = for y in [3] { if y > x { break }\n = y } }"),
+        [false, true]
+    );
+    // A `return` leaves every loop it is in.
+    assert_eq!(
+        forkable(
+            "fn first(xs: List<Int>) -> Int { for x in xs { if x > 1 { return x } }\n = 0 }\n= first([1])"
+        ),
+        [false]
+    );
+    // A function inside the body assigns only its own variables.
+    assert_eq!(
+        forkable(
+            "= for x in [1, 2] { let f = fn(): Int { let mut z = x\n z := z + 1\n = z }\n = f() }"
+        ),
+        [true]
     );
 }

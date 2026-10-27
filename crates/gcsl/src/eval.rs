@@ -179,12 +179,14 @@ pub fn eval_with(
     memo: &mut MemoTables,
     (exec_result, dirs, effects): (Option<&Rc<Layout>>, &[Rc<str>], &dyn Effects),
 ) -> Result<Value, Diagnostic> {
-    eval_rooted(
-        ir,
-        (stack, memo),
-        (exec_result, dirs, effects, None),
-        (None, None),
-    )
+    let extras = graph::RunExtras {
+        exec_result,
+        dirs,
+        effects,
+        names: None,
+        profile: None,
+    };
+    eval_rooted(ir, (stack, memo), extras, (None, None))
 }
 
 /// [`eval_with`], in the root context `context`, the frame of the contexts
@@ -196,7 +198,7 @@ pub fn eval_with(
 pub(crate) fn eval_rooted(
     ir: &Rc<Ir>,
     (stack, memo): (&mut Vec<Value>, &mut MemoTables),
-    (exec_result, dirs, effects, names): graph::RunExtras<'_>,
+    extras: graph::RunExtras<'_>,
     (context, graph): (Option<Rc<ContextFrame>>, Option<&GraphRun<'_>>),
 ) -> Result<Value, Diagnostic> {
     let root = ir.root();
@@ -212,22 +214,33 @@ pub(crate) fn eval_rooted(
         helper: false,
         origin: NO_ORIGIN,
     };
-    let mut shared = Shared::new(exec_result, dirs, effects);
-    shared.names = names;
+    let mut shared = extras.shared();
     shared.graph = graph;
     shared.context.replace(context);
-    let result = Evaluator {
-        ir,
-        stack,
-        base: 0,
-        captures: &[],
-        callee: None,
-        memo,
-        shared: &shared,
-        caller,
-        levels: 0,
-    }
-    .value(root);
+    // Graph mode runs on the machine, which can stop where it waits;
+    // plain evaluation never waits, so the walkers run it, faster.
+    let result = if graph.is_some() || cfg!(feature = "machine-everywhere") {
+        let own = graph.and_then(GraphRun::own);
+        machine::run_machine(
+            machine::Entry::Root(ir, caller),
+            (stack, memo),
+            &shared,
+            own,
+        )
+    } else {
+        Evaluator {
+            ir,
+            stack,
+            base: 0,
+            captures: &[],
+            callee: None,
+            memo,
+            shared: &shared,
+            caller,
+            levels: 0,
+        }
+        .value(root)
+    };
     stack.truncate(frame_size);
     // The checker lets no `break` or `continue` out of the top level's
     // loops, so a stop arriving here is a bug.
@@ -385,6 +398,41 @@ struct Shared<'a> {
     /// names](crate::eval::records#records-of-any-names)); `None` in a run
     /// with no owner's names, where making one is an error.
     names: Option<&'a RefCell<crate::names::Names>>,
+    /// The profile being taken of the run, if it is profiled (see
+    /// [Profiling](crate::eval::profile#profiling)).
+    profile: Option<&'a profile::Profile>,
+    /// A machine's deep await through a walker (see [`Ahead`]).
+    ahead: Ahead,
+    /// The `lazy`s whose bodies the machine's task running, or a task it
+    /// was split off from, is running: one it meets running that is not
+    /// among them another task runs (see
+    /// [Tasks](crate::eval::machine::tasks#tasks)).
+    futures: RefCell<Vec<Rc<crate::value::Future>>>,
+}
+
+/// A machine's deep await through a walker, which leaves the futures it
+/// meets that have not run to the machine (see
+/// [Suspension](crate::eval::machine#suspension)).
+#[derive(Debug, Default)]
+struct Ahead {
+    /// Whether one is awaiting so.
+    awaiting: Cell<bool>,
+    /// The future the walker met that has not run, and where it met it.
+    met: RefCell<Option<Met>>,
+}
+
+/// A future a walker met awaiting ahead for a machine, which has not run
+/// (see [`Ahead`]).
+#[derive(Debug)]
+struct Met {
+    /// The future.
+    future: Rc<crate::value::Future>,
+    /// The depth of what awaits it in its frame's body.
+    depth: u16,
+    /// Its level of record and list nesting below that.
+    level: usize,
+    /// Where its errors are reported.
+    span: Span,
 }
 
 impl<'a> Shared<'a> {
@@ -410,13 +458,16 @@ impl<'a> Shared<'a> {
             operand_failed: Cell::new(false),
             sites: RefCell::new(Vec::new()),
             names: None,
+            profile: None,
+            ahead: Ahead::default(),
+            futures: RefCell::new(Vec::new()),
         }
     }
 }
 
 /// The deadline of a running call of a function with `#[timeout]` (see
 /// [Retry and timeout](crate::eval::retry#retry-and-timeout)).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Deadline {
     /// Its number, unique in the run: what the error of its passing is
     /// marked with ([`ErrorMark::deadline`](crate::diagnostic::Mark::deadline)).
@@ -1396,6 +1447,7 @@ pub(crate) mod keychain;
 pub(crate) mod kinds;
 pub(crate) mod memo;
 pub mod plain;
+pub mod profile;
 pub(crate) mod sandbox;
 pub(crate) mod system;
 pub(crate) mod text;
@@ -1409,6 +1461,7 @@ pub(crate) mod futures;
 pub(crate) mod json;
 pub(crate) mod lists;
 pub(crate) mod loops;
+pub(crate) mod machine;
 pub(crate) mod memoised;
 pub(crate) mod metas;
 pub(crate) mod narrowing;

@@ -155,6 +155,16 @@ impl Evaluator<'_> {
         let mut value = value;
         loop {
             match value {
+                // Left to the machine awaiting deeply, which runs it.
+                Value::Future(future) if self.shared.ahead.awaiting.get() && !future.is_done() => {
+                    self.shared.ahead.met.replace(Some(super::Met {
+                        future,
+                        depth,
+                        level,
+                        span: node.span,
+                    }));
+                    return Err(super::graph::pending(node.span).into());
+                }
                 Value::Future(future) => value = self.run_future(&future, depth, level, node)?,
                 present => return Ok(present),
             }
@@ -332,9 +342,10 @@ impl Evaluator<'_> {
         if entering + code.height as usize > MAX_DEPTH {
             return Err(nested_too_deeply(node).into());
         }
-        let captures = match future.begin() {
+        let captures = match future.begin(self.unit()) {
             Some(Begin::Done(value)) => return Ok(value),
             Some(Begin::Running) => return Err(depends_on_itself(node).into()),
+            Some(Begin::Elsewhere(owner)) => return self.wait_for_unit(owner, node),
             Some(Begin::Pending(captures)) => captures,
             // A step's result the host has yet to give, or its failure (see
             // [Graph mode](crate::eval::graph#graph-mode)).
@@ -350,18 +361,20 @@ impl Evaluator<'_> {
         // the context it was made in.
         let outer = self.shared.context.replace(future.context.clone());
         let scoped = self.enter_scope_of(&future.code, future.function, &captures);
-        let result = Evaluator {
-            ir: &future.code,
-            stack: self.stack,
-            base,
-            captures: &captures,
-            callee: None,
-            memo: self.memo,
-            shared: self.shared,
-            caller: future.made,
-            levels: entering,
-        }
-        .value(code.body);
+        let result = self.profiled((&future.code, future.function, code), true, |this| {
+            Evaluator {
+                ir: &future.code,
+                stack: this.stack,
+                base,
+                captures: &captures,
+                callee: None,
+                memo: this.memo,
+                shared: this.shared,
+                caller: future.made,
+                levels: entering,
+            }
+            .value(code.body)
+        });
         self.leave_scope(scoped);
         self.shared.context.replace(outer);
         self.stack.truncate(base);

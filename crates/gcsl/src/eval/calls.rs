@@ -338,10 +338,22 @@ use super::kinds::{as_function, float_to_int, into_callee, mixed};
 use super::elements::element_builtin;
 use super::files::{dir_files, fetch, fetch_git, inside, read_file, unpack, which};
 use super::keychain::keychain;
-use super::graph::effect_builtin;
+use super::graph::{NodeId, effect_builtin};
 use super::sandbox::{sandbox_entry, sandbox_exec};
 use super::system::{exec, file_system, write_file};
 use super::text::{join, sort_versions, split, string_list, strip_prefix, strip_suffix, trim};
+
+/// The arguments of a call of a built-in, each with its span, by its
+/// parameter's index.
+pub(super) type BuiltinArguments = [Option<(Value, Span)>; Builtin::MAX_PARAMS];
+
+/// What applying a built-in gives ([`Evaluator::apply_or_meet`]).
+pub(super) enum Applied {
+    /// Its value.
+    Value(Value),
+    /// In graph mode, an effect's node, whose result is not given yet.
+    Waiting(NodeId),
+}
 
 impl Evaluator<'_> {
     /// Evaluates the `Call` `node` of `callee` with the arguments `args`,
@@ -353,7 +365,18 @@ impl Evaluator<'_> {
         (callee, args, depth): (IrId, IrRange, u16),
         node: &IrNode,
     ) -> Flow<Value> {
-        let closure = match self.function(callee)? {
+        let callee = self.function(callee)?;
+        self.call_resolved(callee, (args, depth), node)
+    }
+
+    /// [`Evaluator::call`] of `callee`, evaluated already.
+    pub(super) fn call_resolved(
+        &mut self,
+        callee: Callee,
+        (args, depth): (IrRange, u16),
+        node: &IrNode,
+    ) -> Flow<Value> {
+        let closure = match callee {
             Callee::Closure(closure) => closure,
             Callee::Builtin(builtin) => return self.call_builtin(builtin, args, node),
             Callee::Tag(tag) => return self.call_tag(tag, args, node),
@@ -397,6 +420,20 @@ impl Evaluator<'_> {
                 .defer_call((closure, code), (args, depth), node)
                 .map_err(|unwind| self.argument_failed(unwind, node));
         }
+        self.profiled((&closure.code, closure.function, code), false, |this| {
+            this.run_closure(closure, code, (args, depth), node)
+        })
+    }
+
+    /// [`Evaluator::call_closure`] of `closure`, whose code is `code`, a
+    /// call that runs it here.
+    fn run_closure(
+        &mut self,
+        closure: &Rc<Closure>,
+        code: &FnCode,
+        (args, depth): (IrRange, u16),
+        node: &IrNode,
+    ) -> Flow<Value> {
         if code.kind == FnKind::Memo {
             return self
                 .memo_call((closure, code), (args, depth), node)
@@ -415,6 +452,7 @@ impl Evaluator<'_> {
             self.stack.truncate(base);
             return Err(self.argument_failed(unwind, node));
         }
+        self.arguments_done();
         let passed = self.callee_caller();
         if code.retry > 0 || code.timeout.is_some() {
             return self.guarded_call(closure, base, (passed, entering), node);
@@ -563,7 +601,7 @@ impl Evaluator<'_> {
     /// `error`, out of a frame of the program `callee`, marked with its
     /// input and whether it is foreign if it was raised in another input than
     /// this frame's and no inner call has marked it.
-    fn marked(&self, mut error: Diagnostic, callee: &Ir) -> Diagnostic {
+    pub(super) fn marked(&self, mut error: Diagnostic, callee: &Ir) -> Diagnostic {
         if error.input.is_none() && callee.input() != self.ir.input() {
             error.input = Some(callee.input());
             error.foreign = callee.is_foreign();
@@ -588,7 +626,7 @@ impl Evaluator<'_> {
     /// reported at the call if this frame is the workspace's own code (see
     /// [Errors in a library](#errors-in-a-library)); an argument written
     /// here fails where it is.
-    fn argument_failed(&self, unwind: Unwind, node: &IrNode) -> Unwind {
+    pub(super) fn argument_failed(&self, unwind: Unwind, node: &IrNode) -> Unwind {
         match unwind {
             Unwind::Error(error) => Unwind::Error(self.reported_here(error, node)),
             stop @ Unwind::Stop(_) => stop,
@@ -674,23 +712,59 @@ impl Evaluator<'_> {
         node: &IrNode,
     ) -> Flow<Value> {
         // Each parameter's argument, with its span, by the parameter's index.
-        let mut arguments: [Option<(Value, Span)>; Builtin::MAX_PARAMS] = Default::default();
+        let mut arguments: BuiltinArguments = Default::default();
         for &arg in self.ir.items(args) {
-            let arg = self.ir.get(arg);
-            let IrKind::Arg {
-                param,
-                value: ArgValue::Node(value),
-            } = arg.kind
-            else {
-                return mistyped(arg, "a built-in's argument is not a node's value");
-            };
+            let (param, value) = self.builtin_argument(arg)?;
             let span = self.ir.get(value).span;
             let value = self.value(value)?;
             let Some(entry) = arguments.get_mut(param as usize) else {
-                return mistyped(arg, "an argument for a parameter the built-in lacks");
+                return mistyped(
+                    self.ir.get(arg),
+                    "an argument for a parameter the built-in lacks",
+                );
             };
             *entry = Some((value, span));
         }
+        self.apply_called(builtin, arguments, node)
+    }
+
+    /// The parameter and the value node of `arg`, an argument of a call of
+    /// a built-in.
+    pub(super) fn builtin_argument(&self, arg: IrId) -> Flow<(u32, IrId)> {
+        let node = self.ir.get(arg);
+        match node.kind {
+            IrKind::Arg {
+                param,
+                value: ArgValue::Node(value),
+            } => Ok((param, value)),
+            _ => mistyped(node, "a built-in's argument is not a node's value"),
+        }
+    }
+
+    /// The rest of [`Evaluator::call_builtin`], once the arguments are
+    /// evaluated: the call `node` of `builtin` with `arguments`, or, in
+    /// graph mode, the effect's node.
+    pub(super) fn apply_called(
+        &mut self,
+        builtin: Builtin,
+        arguments: BuiltinArguments,
+        node: &IrNode,
+    ) -> Flow<Value> {
+        match self.apply_or_meet(builtin, arguments, node)? {
+            Applied::Value(value) => Ok(value),
+            Applied::Waiting(id) => self.pause(id, node),
+        }
+    }
+
+    /// [`Evaluator::apply_called`], but for an effect, in graph mode, whose
+    /// node's result is not given yet, that node, rather than the stop for
+    /// it, for a machine to wait for.
+    pub(super) fn apply_or_meet(
+        &mut self,
+        builtin: Builtin,
+        mut arguments: BuiltinArguments,
+        node: &IrNode,
+    ) -> Flow<Applied> {
         // A program's relative `cwd` is resolved here, where the code that
         // wrote it is running, before it can become a node, which runs apart
         // from it (see [Where a path is](crate::eval::files#where-a-path-is)).
@@ -705,9 +779,14 @@ impl Evaluator<'_> {
         // An effect is a node, in graph mode (see [Graph
         // mode](crate::eval::graph#graph-mode)).
         if self.shared.graph.is_some() && effect_builtin(builtin) {
-            return self.effect_node(builtin, &arguments, node);
+            let id = self.meet_effect(builtin, &arguments, node)?;
+            return Ok(match self.node_outcome(id, node)? {
+                Some(value) => Applied::Value(value),
+                None => Applied::Waiting(id),
+            });
         }
-        self.apply_builtin(builtin, arguments, node)
+        self.profiled_builtin(builtin, |this| this.apply_builtin(builtin, arguments, node))
+            .map(Applied::Value)
     }
 
     /// Applies the built-in `builtin`, for its call `node`, to `arguments`,
@@ -826,22 +905,35 @@ impl Evaluator<'_> {
         (callee, depth): (&Rc<Closure>, u16),
     ) -> Flow<()> {
         for &arg in self.ir.items(args) {
-            let node = self.ir.get(arg);
-            let IrKind::Arg { param, value } = node.kind else {
-                return mistyped(node, "a call's argument is not an argument");
-            };
-            let value = match value {
-                ArgValue::Node(value) => self.value(value)?,
-                ArgValue::Default { capture, .. } => {
-                    let earlier = base..base + param as usize;
-                    self.default_arg((callee, capture), earlier, (depth, node))?
-                }
-            };
-            let Some(slot) = self.stack.get_mut(base + param as usize) else {
-                return mistyped(node, "an argument for a parameter outside the frame");
-            };
-            *slot = value;
+            self.argument(arg, base, (callee, depth))?;
         }
+        Ok(())
+    }
+
+    /// Evaluates the argument `arg` of a call of `callee` at depth `depth`,
+    /// writing it to its parameter's slot of the frame that starts at
+    /// `base`, as [`Evaluator::arguments`] evaluates each.
+    pub(super) fn argument(
+        &mut self,
+        arg: IrId,
+        base: usize,
+        (callee, depth): (&Rc<Closure>, u16),
+    ) -> Flow<()> {
+        let node = self.ir.get(arg);
+        let IrKind::Arg { param, value } = node.kind else {
+            return mistyped(node, "a call's argument is not an argument");
+        };
+        let value = match value {
+            ArgValue::Node(value) => self.value(value)?,
+            ArgValue::Default { capture, .. } => {
+                let earlier = base..base + param as usize;
+                self.default_arg((callee, capture), earlier, (depth, node))?
+            }
+        };
+        let Some(slot) = self.stack.get_mut(base + param as usize) else {
+            return mistyped(node, "an argument for a parameter outside the frame");
+        };
+        *slot = value;
         Ok(())
     }
 
@@ -886,18 +978,20 @@ impl Evaluator<'_> {
             }
         }
         let passed = self.callee_caller();
-        let result = Evaluator {
-            ir: &default.code,
-            stack: self.stack,
-            base,
-            captures: &default.captures,
-            callee: Some(&default),
-            memo: self.memo,
-            shared: self.shared,
-            caller: passed,
-            levels: entering,
-        }
-        .value(code.body);
+        let result = self.profiled((&default.code, default.function, code), true, |this| {
+            Evaluator {
+                ir: &default.code,
+                stack: this.stack,
+                base,
+                captures: &default.captures,
+                callee: Some(&default),
+                memo: this.memo,
+                shared: this.shared,
+                caller: passed,
+                levels: entering,
+            }
+            .value(code.body)
+        });
         self.stack.truncate(base);
         // Its call, not this argument, reports it ([`Evaluator::argument_failed`]).
         result

@@ -380,8 +380,9 @@ pub(crate) enum FutureState {
     /// Not yet run: the values its body captured, until its first await
     /// succeeds.
     Pending(Box<[Value]>),
-    /// Its body is running, for an await in progress.
-    Running,
+    /// Its body is running, for an await in progress, in the run of this
+    /// unit, in graph mode; `None` in a plain run.
+    Running(Option<u32>),
     /// Run: the value it yielded, which every later await yields.
     Done(Value),
     /// A step's result that a host has yet to give, the step its node of
@@ -396,8 +397,12 @@ pub(crate) enum FutureState {
 pub(crate) enum Begin {
     /// The future has yielded this value already.
     Done(Value),
-    /// The future's body is running: the await depends on itself.
+    /// The future's body is running, further up this run's stack: the
+    /// await depends on itself.
     Running,
+    /// The future's body is running in the run of another unit, this one,
+    /// in graph mode, which has stopped: the await waits for it.
+    Elsewhere(u32),
     /// The future had not run: its captured values, taken out, and it is
     /// now running. The await must end it with [`Future::finish`].
     Pending(Box<[Value]>),
@@ -624,12 +629,14 @@ impl Future {
         matches!(self.state.try_borrow().as_deref(), Ok(FutureState::Done(_)))
     }
 
-    /// Starts an await of the future: a copy of its value if it has run; a
-    /// note that it is running; or, if it has not run, its captured values,
-    /// taken out, leaving it running. `None` only if the state is borrowed,
+    /// Starts an await of the future, in the run of the unit `unit` in
+    /// graph mode, `None` in a plain run: a copy of its value if it has run;
+    /// a note that it is running, in this run or another unit's; or, if it
+    /// has not run, its captured values, taken out, leaving it running in
+    /// this one. `None` only if the state is borrowed,
     /// which never happens, since no borrow outlives a call of this or of
     /// [`Future::finish`].
-    pub(crate) fn begin(&self) -> Option<Begin> {
+    pub(crate) fn begin(&self, unit: Option<u32>) -> Option<Begin> {
         let mut state = self.state.try_borrow_mut().ok()?;
         if let FutureState::Done(value) = &*state {
             return Some(Begin::Done(value.clone()));
@@ -637,27 +644,35 @@ impl Future {
         match &*state {
             FutureState::Host(node) => return Some(Begin::Host(*node)),
             FutureState::Failed(error) => return Some(Begin::Failed((**error).clone())),
+            FutureState::Running(Some(owner)) if Some(*owner) != unit => {
+                return Some(Begin::Elsewhere(*owner));
+            }
             _ => {}
         }
-        Some(match std::mem::replace(&mut *state, FutureState::Running) {
-            FutureState::Pending(captures) => Begin::Pending(captures),
-            FutureState::Running => Begin::Running,
-            // Handled above; put back unchanged if they were reached.
-            FutureState::Host(node) => {
-                *state = FutureState::Host(node);
-                Begin::Host(node)
-            }
-            FutureState::Failed(error) => {
-                let raised = (*error).clone();
-                *state = FutureState::Failed(error);
-                Begin::Failed(raised)
-            }
-            // Handled above; put back unchanged if it were reached.
-            FutureState::Done(value) => {
-                *state = FutureState::Done(value.clone());
-                Begin::Done(value)
-            }
-        })
+        Some(
+            match std::mem::replace(&mut *state, FutureState::Running(unit)) {
+                FutureState::Pending(captures) => Begin::Pending(captures),
+                FutureState::Running(owner) => {
+                    *state = FutureState::Running(owner);
+                    Begin::Running
+                }
+                // Handled above; put back unchanged if they were reached.
+                FutureState::Host(node) => {
+                    *state = FutureState::Host(node);
+                    Begin::Host(node)
+                }
+                FutureState::Failed(error) => {
+                    let raised = (*error).clone();
+                    *state = FutureState::Failed(error);
+                    Begin::Failed(raised)
+                }
+                // Handled above; put back unchanged if it were reached.
+                FutureState::Done(value) => {
+                    *state = FutureState::Done(value.clone());
+                    Begin::Done(value)
+                }
+            },
+        )
     }
 
     /// Ends the await that [`Future::begin`] started on a pending future:
@@ -681,7 +696,7 @@ impl Future {
         match self.state.get_mut() {
             FutureState::Pending(captures) => captures,
             FutureState::Done(value) => std::slice::from_mut(value),
-            FutureState::Running | FutureState::Host(_) | FutureState::Failed(_) => &mut [],
+            FutureState::Running(_) | FutureState::Host(_) | FutureState::Failed(_) => &mut [],
         }
     }
 
@@ -689,7 +704,7 @@ impl Future {
     fn state_name(&self) -> &'static str {
         match self.state.try_borrow().as_deref() {
             Ok(FutureState::Pending(_)) => "pending",
-            Ok(FutureState::Running) | Err(_) => "running",
+            Ok(FutureState::Running(_)) | Err(_) => "running",
             Ok(FutureState::Done(_)) => "done",
             Ok(FutureState::Host(_)) => "waiting",
             Ok(FutureState::Failed(_)) => "failed",

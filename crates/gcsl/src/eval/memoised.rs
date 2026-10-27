@@ -34,6 +34,18 @@ impl Evaluator<'_> {
                 MemoBegin::Found(value) => return Ok(value),
                 MemoBegin::Started(mark) => (Some(mark), mark.entering, mark.caller),
                 MemoBegin::Unkeyed(entering, caller) => (None, entering, caller),
+                MemoBegin::Elsewhere(owner) => {
+                    self.stack.truncate(base);
+                    return self.wait_for_unit(owner, node);
+                }
+                // Only a machine runs tasks, and a walker never runs in one
+                // that has others.
+                MemoBegin::Sibling => {
+                    self.stack.truncate(base);
+                    let error =
+                        super::internal("a walker met another task's memoised call", node.span);
+                    return Err(error.into());
+                }
             };
         // Its body is a scope of its own, in graph mode, keyed by the call's
         // callee and arguments (see [Graph mode](crate::eval::graph#graph-mode)).
@@ -108,6 +120,19 @@ impl Evaluator<'_> {
             self.stack.truncate(base);
             return Err(unwind);
         }
+        self.memo_lookup((closure, code), (base, depth), node)
+    }
+
+    /// The rest of [`Evaluator::memo_begin`], once the arguments are in the
+    /// callee's frame at `base`: the lookup, and the start of a running
+    /// entry if it finds none.
+    pub(super) fn memo_lookup(
+        &mut self,
+        (closure, code): (&Rc<Closure>, &FnCode),
+        (base, depth): (usize, u16),
+        node: &IrNode,
+    ) -> Flow<MemoBegin> {
+        self.arguments_done();
         let caller = self.callee_caller();
         let params = base..base + code.param_count as usize;
         let Some(key) = self.stack.get(params.clone()) else {
@@ -119,28 +144,35 @@ impl Evaluator<'_> {
         // in it would.
         let inherited = self.caller.helper;
         let context = self.shared.context.borrow().clone();
-        let hash = match self
-            .memo
-            .lookup(closure, key, (caller, inherited), context.as_ref())
-        {
-            Lookup::Missing(hash) => hash,
-            Lookup::Done(value, replayed) => {
-                self.stack.truncate(base);
-                // As reads here, of the step whose unit is running.
-                let context = self.shared.context.borrow().clone();
-                for read in replayed {
-                    match read {
-                        Replayed::Context(key) => self.note_step_read(key, context.as_ref()),
-                        Replayed::All => self.note_step_reads_all(),
+        let unit = self.unit();
+        let hash =
+            match self
+                .memo
+                .lookup(closure, key, (caller, inherited), (context.as_ref(), unit))
+            {
+                Lookup::Missing(hash) => hash,
+                Lookup::Done(value, replayed) => {
+                    self.stack.truncate(base);
+                    // As reads here, of the step whose unit is running.
+                    let context = self.shared.context.borrow().clone();
+                    for read in replayed {
+                        match read {
+                            Replayed::Context(key) => self.note_step_read(key, context.as_ref()),
+                            Replayed::All => self.note_step_reads_all(),
+                        }
                     }
+                    self.memo_found();
+                    return Ok(MemoBegin::Found(value));
                 }
-                return Ok(MemoBegin::Found(value));
-            }
-            Lookup::Running => {
-                self.stack.truncate(base);
-                return Err(depends_on_own_result(node).into());
-            }
-        };
+                Lookup::Running => {
+                    self.stack.truncate(base);
+                    return Err(depends_on_own_result(node).into());
+                }
+                // The frame is left as it is, the arguments in it, for a
+                // machine to look them up again once the unit has run.
+                Lookup::Elsewhere(owner) => return Ok(MemoBegin::Elsewhere(owner)),
+                Lookup::Sibling => return Ok(MemoBegin::Sibling),
+            };
         let entering = self.levels + usize::from(depth) + CALL_LEVELS;
         if entering + code.height as usize > MAX_DEPTH {
             self.stack.truncate(base);
@@ -162,7 +194,7 @@ impl Evaluator<'_> {
         } else {
             caller
         };
-        let entry = self.memo.start(closure, hash, key);
+        let entry = self.memo.start(closure, (hash, key), unit);
         let context = self.shared.context.borrow().clone();
         self.memo.running.push(Running {
             closure: Rc::as_ptr(closure),

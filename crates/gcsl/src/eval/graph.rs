@@ -21,16 +21,18 @@
 //!   `file` and `dir`, which only read the working directory, fixed for an
 //!   evaluation, are computed as ever.
 //!
-//! So a unit performs no effect of its own. A node whose result is not
-//! given yet stops the unit where the result is needed (`Evaluator::pause`):
-//! an await of a deferred call's future, or an effect's call. The stop is an
-//! error marked [`Mark::PENDING`], which nothing but the unit's root
-//! catches, `recover` and `#[retry]` included, and which unwinds by every
-//! path an error unwinds by; the node it waits on is the run's `paused`.
-//! Once the host gives that node's result ([`Graph::resolve`]), the unit
-//! runs again from its start: everything before the stop computes again to
-//! the same values, the calls that made nodes find them, and the stop is
-//! passed. A node's failure is raised where its result is needed, as any
+//! So a unit performs no effect of its own. A unit runs on the machine
+//! (see [Suspension](crate::eval::machine#suspension)), and a node whose
+//! result is not given yet stops it where the result is needed: an await
+//! of a deferred call's future, or an effect's call. The machine sets the
+//! unit's evaluation aside, the run's `paused` the node it waits on, and
+//! the run ends with an error marked [`Mark::PENDING`]. Once the host gives
+//! that node's result ([`Graph::resolve`]), the unit's next run takes up
+//! where it stopped: nothing before the stop runs again. A unit that needs
+//! a memoised call or a `lazy` another unit is running stops for that
+//! unit's run instead ([`Wait::Unit`]). A walker, which could only stop by
+//! unwinding, never stops in graph mode: one that would is an internal
+//! error. A node's failure is raised where its result is needed, as any
 //! failure there, so `recover` around it catches it; a `#[retry]` around an
 //! await raises it again, never running the step again.
 //!
@@ -67,8 +69,9 @@
 //! every context the step's binds. The first such read of a run is told to
 //! the host's effects at once ([`crate::eval::Effects::context_read`]),
 //! before the step does anything with it, so that a host can give the step
-//! the context's files then. A run that ends ran from the start, so its
-//! reads are the step's.
+//! the context's files then. A step's unit keeps what it read while it is
+//! stopped, so the reads a run that ends gives are every read the step
+//! made.
 //!
 //! # Errors in a library
 //!
@@ -119,6 +122,26 @@ impl NodeId {
     pub const fn number(self) -> u32 {
         self.0
     }
+}
+
+/// The stop of a run in graph mode for what it waits for, at `span`: the
+/// error marked [`Mark::PENDING`], which nothing but the unit's root
+/// catches.
+pub(super) fn pending(span: Span) -> Diagnostic {
+    let mut stop = Diagnostic::error("waiting for a step's result", span);
+    stop.mark = Mark::PENDING;
+    stop
+}
+
+/// What a run in graph mode stopped for (see [Graph mode](#graph-mode)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wait {
+    /// The result of this node, which the host gives.
+    Node(NodeId),
+    /// The run of this unit, which computes a memoised call's value or a
+    /// `lazy`'s that the run needs, and has stopped itself: the host runs
+    /// that unit, and then this one again.
+    Unit(u32),
 }
 
 /// What a node is (see [Graph mode](#graph-mode)).
@@ -453,7 +476,7 @@ pub fn effect_builtin(builtin: Builtin) -> bool {
 }
 
 /// The scope a node is met in (see [Graph mode](#graph-mode)).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Scope {
     /// Its path: a hash of its parent's, its key and its number among its
     /// parent's scopes of that key.
@@ -474,8 +497,9 @@ pub(crate) struct GraphRun<'g> {
     /// Whether the host takes a call of a function with these attributes, a
     /// deferring attribute among them, as a step.
     defers: Defers<'g>,
-    /// The node the run stopped for, once it has.
-    paused: Cell<Option<NodeId>>,
+    /// What the run stopped for, once it has: every node and unit its
+    /// tasks wait for.
+    paused: RefCell<Vec<Wait>>,
     /// The node met last, in program order.
     last: Cell<Option<NodeId>>,
     /// The scopes being run, innermost last.
@@ -486,6 +510,26 @@ pub(crate) struct GraphRun<'g> {
     /// The text of each context's key, by which a read is told to the
     /// host.
     texts: HashMap<crate::names::Name, Rc<str>>,
+    /// The unit's evaluation, suspended where it stopped: the one it takes
+    /// up, given before the run, and then the one it leaves, if it stops
+    /// on the machine (see [Suspension](crate::eval::machine#suspension)).
+    suspended: RefCell<Option<super::machine::Suspended>>,
+    /// Where the unit's own top-level slots begin, for a prepared call,
+    /// whose slots others share; `None` for a file or a step.
+    own: Option<usize>,
+}
+
+/// What a run of a unit in graph mode keeps of itself while the unit is
+/// suspended: where in its scopes it is, the node it met last, and, of a
+/// step's unit, what it has read of the step's context.
+#[derive(Debug, Default)]
+pub(crate) struct RunState {
+    /// The scopes being run, innermost last.
+    scopes: Vec<Scope>,
+    /// The node met last, in program order.
+    last: Option<NodeId>,
+    /// What a step's unit has read of the step's context.
+    watch: Option<Watch>,
 }
 
 /// What a run of a step's unit read of the context the step was made in
@@ -518,7 +562,7 @@ impl std::fmt::Debug for GraphRun<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GraphRun")
             .field("unit", &self.unit)
-            .field("paused", &self.paused.get())
+            .field("paused", &self.paused.borrow())
             .finish_non_exhaustive()
     }
 }
@@ -536,11 +580,100 @@ impl<'g> GraphRun<'g> {
             graph: RefCell::new(graph),
             unit,
             defers,
-            paused: Cell::new(None),
+            paused: RefCell::new(Vec::new()),
             last: Cell::new(None),
             scopes: RefCell::new(vec![root]),
             watch: RefCell::new(None),
             texts: HashMap::new(),
+            suspended: RefCell::new(None),
+            own: None,
+        }
+    }
+
+    /// The run, of a prepared call whose own top-level slots begin at
+    /// `own`.
+    pub(crate) const fn owning(mut self, own: usize) -> Self {
+        self.own = Some(own);
+        self
+    }
+
+    /// Where the unit's own top-level slots begin, for a prepared call.
+    pub(crate) const fn own(&self) -> Option<usize> {
+        self.own
+    }
+
+    /// Notes that the run stopped for `wait`, among what it waits for.
+    pub(crate) fn stopped(&self, wait: Wait) {
+        self.paused.borrow_mut().push(wait);
+    }
+
+    /// Gives the run the unit's evaluation to take up, suspended where an
+    /// earlier run left it, if it was.
+    pub(crate) fn resuming(self, suspended: Option<super::machine::Suspended>) -> Self {
+        self.suspended.replace(suspended);
+        self
+    }
+
+    /// Takes the unit's suspended evaluation: the one to take up, before
+    /// the run's evaluation starts, or the one the run left, after.
+    pub(crate) fn take_suspended(&self) -> Option<super::machine::Suspended> {
+        self.suspended.take()
+    }
+
+    /// Leaves `suspended`, the unit's evaluation stopped where it waits, for
+    /// the next run to take up.
+    pub(crate) fn suspend(&self, suspended: super::machine::Suspended) {
+        self.suspended.replace(Some(suspended));
+    }
+
+    /// Takes what the run keeps of itself while its unit is suspended.
+    pub(crate) fn take_state(&self) -> RunState {
+        RunState {
+            scopes: std::mem::take(&mut *self.scopes.borrow_mut()),
+            last: self.last.get(),
+            watch: self.watch.borrow_mut().take(),
+        }
+    }
+
+    /// Whether the node `id` waits for the host to give its result.
+    pub(crate) fn is_waiting(&self, id: NodeId) -> bool {
+        self.graph
+            .borrow()
+            .node(id)
+            .is_some_and(|node| node.state == NodeState::Waiting)
+    }
+
+    /// How many scopes are being run.
+    pub(crate) fn scope_depth(&self) -> usize {
+        self.scopes.borrow().len()
+    }
+
+    /// The node met last.
+    pub(crate) fn last_met(&self) -> Option<NodeId> {
+        self.last.get()
+    }
+
+    /// What the run keeps of itself, for a task split off now, which keeps
+    /// it all; the task running is cut back to its first `kept` scopes and
+    /// `last` (see [Tasks](crate::eval::machine::tasks#tasks)).
+    pub(crate) fn fork_state(&self, kept: usize, last: Option<NodeId>) -> RunState {
+        let mut scopes = self.scopes.borrow_mut();
+        let state = RunState {
+            scopes: scopes.clone(),
+            last: self.last.get(),
+            watch: None,
+        };
+        scopes.truncate(kept);
+        self.last.set(last);
+        state
+    }
+
+    /// Takes up `state`, what an earlier run of the unit kept of itself.
+    pub(crate) fn restore_state(&self, state: RunState) {
+        self.scopes.replace(state.scopes);
+        self.last.set(state.last);
+        if state.watch.is_some() {
+            self.watch.replace(state.watch);
         }
     }
 
@@ -619,8 +752,8 @@ impl<'g> GraphRun<'g> {
 
     /// The graph, as the run left it, and the node the run stopped for, if
     /// it did.
-    pub(crate) fn finish(self) -> (Graph, Option<NodeId>) {
-        (self.graph.into_inner(), self.paused.get())
+    pub(crate) fn finish(self) -> (Graph, Vec<Wait>) {
+        (self.graph.into_inner(), self.paused.into_inner())
     }
 
     /// The position of the next node met, in the innermost scope.
@@ -708,12 +841,28 @@ impl Evaluator<'_> {
     /// result: the error marked [`Mark::PENDING`], the run's `paused` the node
     /// (see [Graph mode](#graph-mode)).
     pub(super) fn pause<T>(&self, id: NodeId, node: &IrNode) -> Flow<T> {
+        self.stop_for(Wait::Node(id), node)
+    }
+
+    /// The stop for the run of the unit `unit`, which computes a memoised
+    /// call or a `lazy` this run needs and has stopped, at the node `node`
+    /// that needs it: the error marked [`Mark::PENDING`], the run's `paused`
+    /// the unit (see [Graph mode](#graph-mode)).
+    pub(super) fn wait_for_unit<T>(&self, unit: u32, node: &IrNode) -> Flow<T> {
+        self.stop_for(Wait::Unit(unit), node)
+    }
+
+    /// The stop for `wait`, at the node `node`.
+    fn stop_for<T>(&self, wait: Wait, node: &IrNode) -> Flow<T> {
         if let Some(run) = self.shared.graph {
-            run.paused.set(Some(id));
+            run.stopped(wait);
         }
-        let mut stop = Diagnostic::error("waiting for a step's result", node.span);
-        stop.mark = Mark::PENDING;
-        Err(stop.into())
+        Err(pending(node.span).into())
+    }
+
+    /// The unit whose run this is, in graph mode; `None` in a plain run.
+    pub(super) fn unit(&self) -> Option<u32> {
+        self.shared.graph.map(|run| run.unit)
     }
 
     /// Whether the call of `closure`, of code `code`, is a step the host takes,
@@ -751,9 +900,6 @@ impl Evaluator<'_> {
         (args, depth): (IrRange, u16),
         node: &IrNode,
     ) -> Flow<Value> {
-        let Some(run) = self.shared.graph else {
-            return Err(internal("a call deferred outside graph mode", node.span).into());
-        };
         let base = self.stack.len();
         self.stack
             .resize(base + code.frame_size as usize, Value::Empty);
@@ -761,6 +907,22 @@ impl Evaluator<'_> {
             self.stack.truncate(base);
             return Err(unwind);
         }
+        self.defer_made((closure, code), base, node)
+    }
+
+    /// The rest of [`Evaluator::defer_call`], once the arguments are in the
+    /// callee's frame at `base`, which goes: the step's node, made or
+    /// found, and the future that stands for its result.
+    pub(super) fn defer_made(
+        &mut self,
+        (closure, code): (&Rc<Closure>, &FnCode),
+        base: usize,
+        node: &IrNode,
+    ) -> Flow<Value> {
+        let Some(run) = self.shared.graph else {
+            self.stack.truncate(base);
+            return Err(internal("a call deferred outside graph mode", node.span).into());
+        };
         let params = base..base + code.param_count as usize;
         let given: Box<[Value]> = self.stack.get(params).unwrap_or_default().into();
         self.stack.truncate(base);
@@ -810,18 +972,18 @@ impl Evaluator<'_> {
         }
     }
 
-    /// The call `node` of the effectful built-in `builtin` with the arguments
-    /// `arguments`, by parameter, as an effect's node (see [Graph
-    /// mode](#graph-mode)): its result if the host has given it, its failure
-    /// if it failed, and otherwise the stop for it. Apart from the built-in's
-    /// call, which every call passes through, so that its frame stays small.
+    /// The node of the call `node` of the effectful built-in `builtin` with
+    /// the arguments `arguments`, by parameter, an effect's (see [Graph
+    /// mode](#graph-mode)), made, or found where an earlier attempt made it.
+    /// Apart from the built-in's call, which every call passes through, so
+    /// that its frame stays small.
     #[inline(never)]
-    pub(super) fn effect_node(
+    pub(super) fn meet_effect(
         &self,
         builtin: Builtin,
         arguments: &[Option<(Value, Span)>],
         node: &IrNode,
-    ) -> Flow<Value> {
+    ) -> Flow<NodeId> {
         let given: Vec<Value> = arguments
             .iter()
             .flatten()
@@ -860,11 +1022,20 @@ impl Evaluator<'_> {
                 future: None,
             }
         })?;
+        Ok(id)
+    }
+
+    /// The outcome of the node `id`, which the effect `node` made: its
+    /// result, its failure, or `None` while the host has yet to give it.
+    pub(super) fn node_outcome(&self, id: NodeId, node: &IrNode) -> Flow<Option<Value>> {
+        let Some(run) = self.shared.graph else {
+            return Err(internal("an effect made a node outside graph mode", node.span).into());
+        };
         let state = run.graph.borrow().node(id).map(|found| found.state.clone());
         match state {
-            Some(NodeState::Done(value)) => Ok(value),
+            Some(NodeState::Done(value)) => Ok(Some(value)),
             Some(NodeState::Failed(error)) => Err(error.into()),
-            Some(NodeState::Waiting) => self.pause(id, node),
+            Some(NodeState::Waiting) => Ok(None),
             None => Err(internal("an effect's node is missing", node.span).into()),
         }
     }
@@ -933,13 +1104,11 @@ pub(crate) fn run_node(
     let span = node.site.span;
     match (node.kind, StepCall::of(node)) {
         (NodeKind::Deferred, Some(call)) => {
-            let mut shared = Shared::new(extras.0, extras.1, extras.2);
-            shared.names = extras.3;
+            let shared = extras.shared();
             call_step(&call, (stack, memo), &shared, true)
         }
         (NodeKind::Effect(builtin), None) => {
-            let mut shared = Shared::new(extras.0, extras.1, extras.2);
-            shared.names = extras.3;
+            let shared = extras.shared();
             shared.context.replace(node.context.clone());
             apply_effect(
                 builtin,
@@ -953,14 +1122,33 @@ pub(crate) fn run_node(
     }
 }
 
-/// The layout of `exec`'s result, the run's directories and its effect
-/// context, for [`run_node`] and [`run_step_call`].
-pub(crate) type RunExtras<'a> = (
-    Option<&'a Rc<crate::value::Layout>>,
-    &'a [Rc<str>],
-    &'a dyn super::Effects,
-    Option<&'a RefCell<crate::names::Names>>,
-);
+/// What a run shares besides its stack and memo tables, for
+/// [`run_node`], [`run_step_call`] and [`eval_rooted`](super::eval_rooted).
+#[derive(Clone, Copy)]
+pub(crate) struct RunExtras<'a> {
+    /// The layout of `exec`'s result; `None` in a run without the standard
+    /// library.
+    pub(crate) exec_result: Option<&'a Rc<crate::value::Layout>>,
+    /// The run's table of directories.
+    pub(crate) dirs: &'a [Rc<str>],
+    /// Its effect context.
+    pub(crate) effects: &'a dyn super::Effects,
+    /// The names of its owner, if it has a table of them.
+    pub(crate) names: Option<&'a RefCell<crate::names::Names>>,
+    /// The profile being taken of it, if it is profiled (see
+    /// [Profiling](crate::eval::profile#profiling)).
+    pub(crate) profile: Option<&'a super::profile::Profile>,
+}
+
+impl<'a> RunExtras<'a> {
+    /// What the frames of a run with these share, with no deadline running.
+    pub(super) fn shared(self) -> Shared<'a> {
+        let mut shared = Shared::new(self.exec_result, self.dirs, self.effects);
+        shared.names = self.names;
+        shared.profile = self.profile;
+        shared
+    }
+}
 
 /// A deferred node's call, apart from its graph, which a run takes (see
 /// [`run_step_call`]).
@@ -1004,6 +1192,26 @@ impl StepCall {
     }
 
     /// The context it was made in, which its run reads.
+    /// Its callee, the closure of the step's function.
+    pub(super) const fn closure(&self) -> &Rc<Closure> {
+        &self.closure
+    }
+
+    /// Its arguments, in parameter order.
+    pub(super) fn args(&self) -> &[Value] {
+        &self.args
+    }
+
+    /// The caller its body runs with.
+    pub(super) const fn caller(&self) -> Caller {
+        self.caller
+    }
+
+    /// Where it was made, which its errors are reported at.
+    pub(super) const fn span(&self) -> Span {
+        self.site.span
+    }
+
     pub(crate) fn context(&self) -> Option<Rc<ContextFrame>> {
         self.context.clone()
     }
@@ -1025,12 +1233,14 @@ pub(crate) fn run_step_call(
     extras: RunExtras<'_>,
     run: &GraphRun<'_>,
 ) -> Result<Value, Diagnostic> {
-    let mut shared = Shared::new(extras.0, extras.1, extras.2);
-    shared.names = extras.3;
+    let mut shared = extras.shared();
     shared.graph = Some(run);
     // A step its body makes reports where this one does.
     shared.sites.borrow_mut().extend(call.reported);
-    call_step(call, (stack, memo), &shared, false).map_err(|mut error| {
+    let entry = super::machine::Entry::Step(call);
+    let outcome = super::machine::run_machine(entry, (stack, memo), &shared, None)
+        .map_err(|unwind| unwind.into_error(call.site.span));
+    outcome.map_err(|mut error| {
         if error.mark == Mark::PENDING {
             return error;
         }
@@ -1084,15 +1294,17 @@ fn call_step(
         caller: call.caller,
         levels: CALL_LEVELS,
     };
-    let result = if guarded && (code.retry > 0 || code.timeout.is_some()) {
-        evaluator
-            .guarded_call(closure, base, (call.caller, CALL_LEVELS), &call.site)
-            .map_err(|unwind| unwind.into_error(span))
-    } else {
-        evaluator
-            .value(code.body)
-            .or_else(|unwind| unwind.returned(span))
-    };
+    let result = evaluator.profiled((&closure.code, closure.function, code), true, |evaluator| {
+        if guarded && (code.retry > 0 || code.timeout.is_some()) {
+            evaluator
+                .guarded_call(closure, base, (call.caller, CALL_LEVELS), &call.site)
+                .map_err(|unwind| unwind.into_error(span))
+        } else {
+            evaluator
+                .value(code.body)
+                .or_else(|unwind| unwind.returned(span))
+        }
+    });
     stack.truncate(base);
     result
 }
@@ -1122,7 +1334,9 @@ fn apply_effect(
         caller: Caller::default(),
         levels: CALL_LEVELS,
     }
-    .apply_builtin(builtin, arguments, site)
+    .profiled_builtin(builtin, |evaluator| {
+        evaluator.apply_builtin(builtin, arguments, site)
+    })
     .map_err(|unwind| unwind.into_error(site.span));
     stack.truncate(base);
     result

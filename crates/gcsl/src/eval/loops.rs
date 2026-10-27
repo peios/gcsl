@@ -242,6 +242,7 @@ impl Evaluator<'_> {
                 slot,
                 parts,
                 collect,
+                ..
             } => self.for_loop((slot, parts, collect), node),
             IrKind::Loop {
                 parts,

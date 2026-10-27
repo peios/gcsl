@@ -668,6 +668,7 @@ fn ranges_and_fors_have_kinds_children_and_print() {
             slot: Slot::new(0),
             parts,
             collect: true,
+            forkable: true,
         },
         Span::new(0, 24),
     );
@@ -677,6 +678,7 @@ fn ranges_and_fors_have_kinds_children_and_print() {
             slot: Slot::new(0),
             parts,
             collect: false,
+            forkable: true,
         },
         Span::new(0, 25),
     );
