@@ -84,7 +84,7 @@ environment of its own instead of GCSL's.
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `cwd` | `""` | The working directory. `""` keeps GCSL's own; a relative path is relative to it, or in a definition to the definition's directory. |
+| `cwd` | `""` | The working directory. `""` keeps the run's own; a relative path is relative to the directory of the file it's written in. |
 | `env` | `{}` | Variables set over the environment, as a record of strings. |
 | `panic` | `true` | A nonzero exit status fails the call with its standard error. When false, the status is data. |
 | `until` | `""` | When set, the program is stopped at the first line of output containing this text. |
@@ -120,15 +120,17 @@ let notes = file(path.join(directory, "notes.txt"))
 notes.read()
 ```
 
-`f.path` is the file's path, always absolute. Outside a definition, a
-relative path given to `file` is resolved against the working directory,
-the same directory `exec` runs a program in by default. So once a command
-has written a file, the same relative path names it:
+`f.path` is the file's path, always absolute. A relative path given to
+`file` or `dir` is resolved against the directory of the file it's
+written in (see [Where relative paths
+point](#where-relative-paths-point)). A program runs somewhere else: in
+the run's working directory, which `working_dir()` names. So once a
+command has written a file, find it there:
 
 ```gcsl
 let tool = file("/bin/sh")
 tool.exec("-c", "echo hello > greeting.txt")
-file("greeting.txt").read()
+working_dir().file("greeting.txt").read()
 ```
 
 `f.exec(...words)` runs the file as a program, with `words` as its
@@ -146,23 +148,43 @@ pekit find every file a step uses and produces, and move it in and out of
 the step's sandbox. Under plain GCSL, two files are equal when their paths
 are; a build tool can also compare their contents. Under a build tool, the
 tool chooses the working directory. Pekit gives each step a directory of
-its own, which both `file()` and `exec` use.
+its own, where its programs run and where it writes the files it makes:
+`working_dir()` names it.
 
-### Relative paths in a definition
+### Where relative paths point
 
-Inside a definition, such as `def build lib() { ... }`, a relative path is
-resolved against the directory of the definition's own file, whoever calls
-the definition. That covers `file`, `dir`, and a relative `cwd`, in the
-definition's body and in every function it calls. So `build lib()` reads
-the same `lib.c` whether you build it on its own or another definition, in
-another directory, builds it. You don't need `fileroot.this` to name a
-definition's own files.
+A relative path is resolved against the directory of the file it's
+written in, the way a name means what it means where it's written. That
+covers `file`, `dir`, and a relative `cwd`, wherever the code runs and
+whoever calls it. So a function in `_lib/c.gcsl` that reads `file("lib.c")`
+reads `_lib/lib.c`, and a library reads its own files wherever it's used.
+You don't need `fileroot.this` to name the files beside it.
 
-A program that `exec` runs with no `cwd` still runs in GCSL's own working
-directory, which stays the same for the whole run. That way, a memoised
-function that starts something once, such as a test machine, is one call
-for every definition that uses it. Pass `cwd = "."` to run a program in
-the definition's directory instead.
+A function that works on its caller's files takes them as a `File` or a
+`Dir`. The caller writes the path, so it's resolved against the caller's
+directory:
+
+```text
+# _lib/c.gcsl
+def compile(source: File) -> File { ... }
+
+# app/build.gcsl
+def build app() { = c.compile(file("main.c")) }   # app/main.c
+```
+
+Take a `File`, not a `String`, for a path a caller gives: a `String`
+turned into a file inside the function is resolved against the
+function's own directory.
+
+The standard library works for its caller: `exec`'s `cwd = "."` and
+`d.exec` are the caller's directory, not the standard library's.
+
+A program that `exec` runs with no `cwd` runs in the run's working
+directory, `working_dir()`, which stays the same for the whole run. That
+way, a memoised function that starts something once, such as a test
+machine, is one call for every definition that uses it. Pass `cwd = "."`
+to run a program in the directory of the file the call is written in
+instead.
 
 ## Fetching
 

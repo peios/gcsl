@@ -92,6 +92,10 @@ pub struct Scan {
     /// `fileroot.caller` reads (see [`crate::eval`], "Callers and
     /// helpers"). Empty until the scan is located.
     pub(super) dir_texts: Vec<Rc<str>>,
+    /// Where the host found each library's directory that it said, by the
+    /// directory's path, `<lib>/PATH` ([`SourceFile::with_dir`](crate::source::SourceFile::with_dir)):
+    /// what [`Scan::locate`] names it by.
+    pub(super) located: HashMap<String, Rc<str>>,
     /// Each file's directory, by its index in `dir_texts`, by input number.
     pub(super) file_dirs: Vec<u32>,
     /// The `type` declarations of every file, in path order, each file's in
@@ -645,7 +649,8 @@ impl Scan {
     /// each in its root, need; then each other directory with a file, once,
     /// in the order of [`Scan::dirs`], each by its absolute path, its path
     /// relative to the root joined to `root` with a `/` (no other after a
-    /// `root` of `/`); the standard files' `<stdlib>` once, as its own
+    /// `root` of `/`), or a library's where its host found it, if it said
+    /// ([`Scan::located`]); the standard files' `<stdlib>` once, as its own
     /// path, though each standard file is a directory of its own.
     pub(super) fn locate(&mut self, root: &str) {
         let mut texts: Vec<Rc<str>> = vec![Rc::from(root)];
@@ -667,7 +672,9 @@ impl Scan {
                 .dirs
                 .get(file.dir as usize)
                 .map_or("", |d| d.path.as_str());
-            let text: Rc<str> = if path.is_empty() {
+            let text: Rc<str> = if let Some(found) = self.located.get(path) {
+                Rc::clone(found)
+            } else if path.is_empty() {
                 Rc::from(root)
             } else if path == STANDARD_DIR {
                 Rc::from(path)

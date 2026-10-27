@@ -253,6 +253,12 @@ def (f: File) exec(
 # call: they are `#[track_caller]`.
 dir = builtins.dir
 
+# `working_dir()` is the run's working directory: where a program given no
+# `cwd` runs, and under pekit a step's own directory, where the files it
+# makes go. A relative path is never against it, but against the directory
+# of the file it is written in.
+working_dir = builtins.working_dir
+
 #[track_caller]
 def (d: Dir) file(path: String): File {
     builtins.dir_file(d, path)

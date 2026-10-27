@@ -97,24 +97,16 @@ pub trait Effects: std::fmt::Debug {
         Ok(PathBuf::from(path))
     }
 
-    /// The working directory, as GCSL code names paths, that a relative
-    /// path is against, outside every definition's body (see [The working
-    /// directory](crate::eval::files#the-working-directory)).
+    /// The working directory, as GCSL code names paths: where a program
+    /// given no `cwd` runs, which `working_dir()` names, and what a relative
+    /// path is against in a run with no table of directories (see [Where a
+    /// path is](crate::eval::files#where-a-path-is)).
     ///
     /// # Errors
     ///
     /// Why there is none.
     fn working_dir(&self) -> Result<PathBuf, String> {
         std::env::current_dir().map_err(|error| error.to_string())
-    }
-
-    /// Whether code in a definition's body is in the definition's
-    /// directory, as by default, rather than in the host's working
-    /// directory (see [The working
-    /// directory](crate::eval::files#the-working-directory)): `false` for a
-    /// host whose code is always in a directory of its own, as a step's.
-    fn follows_definitions(&self) -> bool {
-        true
     }
 
     /// What the host makes of the keychain's secret `secret` (see

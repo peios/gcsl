@@ -34,6 +34,11 @@
 //! - `fileroot.caller` (`IrKind::Caller`) yields the text of the frame's
 //!   caller, from the table, a reference-count increment, after recording
 //!   it as an ambient input of the running memoised calls it can affect.
+//! - A standard file's code is a helper always ([`Ir::is_standard`](super::Ir::is_standard)):
+//!   its frames pass their caller on, and its relative paths are its
+//!   caller's (see [Where a path is](crate::eval::files#where-a-path-is)),
+//!   so that `exec`'s `cwd = "."`, which the prelude's `exec` hands the
+//!   built-in, is the caller's directory.
 //! - `fileroot.helper()` (`IrKind::Helper`) sets the frame's helper flag,
 //!   for the rest of the frame: the calls it made before are unaffected,
 //!   and every call it makes after passes its own caller on, so a library
@@ -110,11 +115,11 @@ impl Evaluator<'_> {
     /// The caller a call this frame makes gives its callee (see [Callers and
     /// helpers](#callers-and-helpers)): this frame's own, sharing its
     /// origin, given now if it had none, once `fileroot.helper()` has run in
-    /// it; else the directory of the file this frame's code is of, with no
+    /// it or if its code is a standard file's; else the directory of the file this frame's code is of, with no
     /// origin yet, which the callee is given only if it needs one. The
     /// callee's helper flag is false.
     pub(super) fn callee_caller(&mut self) -> Caller {
-        if self.caller.helper {
+        if self.caller.helper || self.ir.is_standard() {
             Caller {
                 helper: false,
                 ..self.shared_caller()

@@ -365,6 +365,9 @@ fn read_libraries(
             path: shown(&dir),
             error,
         };
+        // Where the library's own relative paths are against.
+        let found = dir.canonicalize().map_err(unreadable)?;
+        let found = found.to_string_lossy().into_owned();
         let mut files: Vec<PathBuf> = fs::read_dir(&dir)
             .map_err(unreadable)?
             .filter_map(Result::ok)
@@ -392,8 +395,10 @@ fn read_libraries(
                 file_name.unwrap_or_default()
             );
             let shown_name = shown(&path).display().to_string();
-            let loaded = SourceFile::new(name, text.clone())
-                .and_then(|source| Ok((source, SourceFile::new(shown_name.clone(), text)?)));
+            let loaded = SourceFile::new(name, text.clone()).and_then(|source| {
+                let source = source.with_dir(found.clone());
+                Ok((source, SourceFile::new(shown_name.clone(), text)?))
+            });
             let (source, shown_source) = loaded.map_err(|error| ReadError::Unloadable {
                 name: shown_name,
                 error,

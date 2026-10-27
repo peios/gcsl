@@ -1965,6 +1965,8 @@ pub struct Ir {
     /// Whether the program is foreign to its workspace, a library's or the
     /// standard library's (see [`Ir::is_foreign`]).
     foreign: bool,
+    /// Whether the program is a standard file's (see [`Ir::is_standard`]).
+    standard: bool,
     /// Each top-level function named by a dotted path, `def
     /// dev.peios.hello`, which refers to itself by no name, with its path,
     /// which [`Ir::pretty`] shows where it shows another's name. For
@@ -2351,6 +2353,20 @@ impl Ir {
     /// ([`Ir::is_foreign`]).
     pub(crate) fn set_foreign(&mut self, foreign: bool) {
         self.foreign = foreign;
+    }
+
+    /// Whether the program is a standard file's, whose code works for its
+    /// caller: its relative paths are its caller's, and it passes its
+    /// caller on to every call it makes (see [Where a path
+    /// is](crate::eval::files#where-a-path-is)).
+    #[must_use]
+    pub fn is_standard(&self) -> bool {
+        self.standard
+    }
+
+    /// Marks the program a standard file's, or not ([`Ir::is_standard`]).
+    pub(crate) fn set_standard(&mut self, standard: bool) {
+        self.standard = standard;
     }
 
     /// The kind of value node `id` produces: [`ValueKind::Deferred`] for a
@@ -2819,6 +2835,7 @@ impl IrBuilder {
             input,
             dir,
             foreign: false,
+            standard: false,
             paths: Vec::new(),
             metas: Vec::new(),
             references: Vec::new(),

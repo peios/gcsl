@@ -12,47 +12,39 @@
 //! result, it finds with [`Value::files`].
 //!
 //! `file(path)`, the built-in `file`, makes one (`make_file`). A relative
-//! path is resolved against the working directory (see [The working
-//! directory](#the-working-directory)), the one a program that `exec` runs
-//! is given by default, so that a file a program writes there is found by
-//! the same relative path. The path is then normalised lexically, as
-//! `path.normalize` does: `.`
-//! segments and repeated `/` dropped and each `..` taking the segment
-//! before it, never above `/`; no symbolic link is resolved. Nothing is read:
-//! a file that is not there is found missing when it is read. An empty path
-//! is "`file` needs a path", and a working directory that cannot be found
-//! is "cannot find the working directory", noted with the OS's reason.
+//! path is resolved where it is written (see [Where a path
+//! is](#where-a-path-is)), then normalised lexically, as `path.normalize`
+//! does: `.` segments and repeated `/` dropped and each `..` taking the
+//! segment before it, never above `/`; no symbolic link is resolved.
+//! Nothing is read: a file that is not there is found missing when it is
+//! read. An empty path is "`file` needs a path", and a working directory
+//! that cannot be found is "cannot find the working directory", noted with
+//! the OS's reason.
 //!
-//! # The working directory
+//! # Where a path is
 //!
-//! Code running in a definition's body, `def build lib() { ... }`, and in
-//! every function it calls, is in the definition's own directory, the
-//! directory of its file, whoever calls the definition: so a definition's
-//! `file("lib.c")` is the same file whether it is built on its own or for
-//! another definition elsewhere. Which definition's body is running is the
-//! context of [`DEFINITION_CONTEXT`](crate::lower::DEFINITION_CONTEXT),
-//! which a definition's body binds to itself; its closure's code names its
-//! directory ([`Ir::dir`](crate::ir::Ir::dir)), from the run's table. A
-//! read of it is a read of a context, an ambient input of the memoised
-//! calls running, so that a memoised function's relative path in two
-//! definitions is two files. Code in no definition's body, a file's own
-//! run say, is in the host's working directory, [`Effects::working_dir`]:
-//! this process's under plain GCSL. A host whose code always runs in a
-//! directory of its own, as pekit runs a step in its own, says so
-//! ([`Effects::follows_definitions`]), and its code is always in the
-//! host's.
+//! A relative path is against the directory of the file the code that
+//! makes it is written in, as a name is bound where it is written: the
+//! directory of the running code's file, from the run's table
+//! ([`Ir::dir`](crate::ir::Ir::dir)), the one `fileroot.this` names there.
+//! So `file("lib.c")` in a function of `_lib/c.gcsl` is `_lib/lib.c`
+//! whoever calls it, and a library's own files are its own wherever it is
+//! used. A function that works on its caller's files takes them, a `File`
+//! or a `Dir` its caller made, by a path relative to the caller's file. A
+//! standard file's code works for its caller, as the prelude's `exec`
+//! does, so its relative paths are its caller's (see [Callers and
+//! helpers](crate::eval::callers#callers-and-helpers)). A run with no table
+//! of directories, one with no workspace's context, is in the host's
+//! working directory, [`Effects::working_dir`]. A relative
+//! `cwd` of `exec` is a path too, made the directory it names before the
+//! call runs or becomes an effect's node (`Evaluator::exec_options`).
 //!
-//! A program is not given its definition's directory: `exec` with a `cwd`
-//! of `""` runs it in the host's working directory, the one a run has
-//! throughout, so that a memoised function that runs a program, a test
-//! environment that boots a machine say, is one call for every definition
-//! that calls it, not one for each. A relative `cwd` is a path, and is
-//! against the definition's directory as any is, so `cwd = "."` runs a
-//! program in it: the call's `cwd` is made the directory it names before
-//! the call runs or becomes an effect's node, which is run apart from the
-//! context and keyed by what it is given (`Evaluator::exec_options`).
-//! Outside every definition's body, a relative `cwd` is left to the host,
-//! against its working directory.
+//! A program is given no file's directory: `exec` with a `cwd` of `""`
+//! runs it in the host's working directory, the one a run has throughout,
+//! a step's own directory under pekit, so that a memoised function that
+//! runs a program is one call for whatever code calls it.
+//! `working_dir()`, the built-in `working_dir`, is that directory, as a
+//! `Dir`, where a step writes the files it makes.
 //!
 //! `f.read()`, the built-in `file_read` (`read_file`), is the file's
 //! contents, which must be UTF-8: "cannot read `/a/b`", noted with the
@@ -141,8 +133,7 @@ use std::rc::Rc;
 use crate::check::Builtin;
 use crate::diagnostic::Diagnostic;
 use crate::ir::IrNode;
-use crate::names::DEFINITION;
-use crate::value::{ContextFrame, File, List, Record, Value};
+use crate::value::{File, List, Record, Value};
 
 use super::effects::Effects;
 use super::{Evaluator, Flow, internal, mistyped};
@@ -150,7 +141,8 @@ use super::{Evaluator, Flow, internal, mistyped};
 impl Evaluator<'_> {
     /// Applies `file`, or `dir` if `builtin` is that, for the call `node`,
     /// to `path` (see [Files](#files)): the file or directory at `path`, made
-    /// absolute against the working directory and normalised lexically.
+    /// absolute where it is written (see [Where a path is](#where-a-path-is))
+    /// and normalised lexically.
     pub(super) fn make_file(&mut self, builtin: Builtin, path: &str, node: &IrNode) -> Flow<Value> {
         if path.is_empty() {
             let message = format!("`{}` needs a path", builtin.name());
@@ -160,7 +152,7 @@ impl Evaluator<'_> {
         let absolute = if given.is_absolute() {
             given.to_path_buf()
         } else {
-            self.working_dir(node)?.join(given)
+            self.code_dir(node)?.join(given)
         };
         let Some(text) = normalised(&absolute) else {
             return Err(Diagnostic::error(
@@ -173,10 +165,9 @@ impl Evaluator<'_> {
     }
 
     /// The options `options` of a call `node` of `exec`, `exec_live` or
-    /// `exec_secret`, a relative `cwd` of theirs made the one under the
-    /// definition's directory, in a definition's directory (see [The
-    /// working directory](#the-working-directory)); as they are otherwise,
-    /// or if their `cwd` is absolute or `""`.
+    /// `exec_secret`, a relative `cwd` of theirs made absolute where it is
+    /// written (see [Where a path is](#where-a-path-is)); as they are if
+    /// their `cwd` is absolute or `""`.
     pub(super) fn exec_options(&mut self, options: Value, node: &IrNode) -> Flow<Value> {
         let Value::Record(record) = &options else {
             return Ok(options);
@@ -190,10 +181,7 @@ impl Evaluator<'_> {
         if cwd.is_empty() || Path::new(&**cwd).is_absolute() {
             return Ok(options);
         }
-        let Some(dir) = self.definition_dir(node)? else {
-            return Ok(options);
-        };
-        let joined = Path::new(&*dir).join(&**cwd);
+        let joined = self.code_dir(node)?.join(&**cwd);
         let Some(text) = normalised(&joined) else {
             return Err(Diagnostic::error(
                 format!("`{}` is not a UTF-8 path", joined.display()),
@@ -211,41 +199,46 @@ impl Evaluator<'_> {
         })))
     }
 
-    /// The working directory of the code running the call `node`, as GCSL
-    /// code names paths (see [The working directory](#the-working-directory)):
-    /// its definition's directory, or else the host's.
-    fn working_dir(&mut self, node: &IrNode) -> Flow<PathBuf> {
-        if let Some(dir) = self.definition_dir(node)? {
-            return Ok(PathBuf::from(&*dir));
+    /// The directory a relative path is against in the code running the
+    /// call `node` (see [Where a path is](#where-a-path-is)): its file's,
+    /// its caller's for a standard file's code, or the host's working
+    /// directory in a run with no table of directories.
+    fn code_dir(&mut self, node: &IrNode) -> Flow<PathBuf> {
+        if self.shared.dirs.is_empty() {
+            return self.working_dir(node);
         }
+        if self.ir.is_standard() {
+            return Ok(PathBuf::from(&*self.caller_text(node)?));
+        }
+        self.shared
+            .dirs
+            .get(self.ir.dir() as usize)
+            .map(|dir| PathBuf::from(&**dir))
+            .ok_or_else(|| internal("code outside the run's directories", node.span).into())
+    }
+
+    /// Applies `working_dir` for the call `node` (see [Where a path
+    /// is](#where-a-path-is)): the host's working directory, as a `Dir`.
+    pub(super) fn working_dir_value(&mut self, node: &IrNode) -> Flow<Value> {
+        let dir = self.working_dir(node)?;
+        let Some(text) = normalised(&dir) else {
+            return Err(Diagnostic::error(
+                format!("`{}` is not a UTF-8 path", dir.display()),
+                node.span,
+            )
+            .into());
+        };
+        Ok(entry(true, Rc::from(text)))
+    }
+
+    /// The host's working directory, as GCSL code names paths, for the call
+    /// `node` (see [Where a path is](#where-a-path-is)).
+    pub(super) fn working_dir(&mut self, node: &IrNode) -> Flow<PathBuf> {
         self.shared.effects.working_dir().map_err(|reason| {
             Diagnostic::error("cannot find the working directory", node.span)
                 .with_note(reason)
                 .into()
         })
-    }
-
-    /// The directory of the definition whose body the code running the call
-    /// `node` is of, from the run's table, read as a context is; `None`
-    /// outside every definition's body, or under a host whose code is
-    /// always in its own working directory (see [The working
-    /// directory](#the-working-directory)).
-    fn definition_dir(&mut self, node: &IrNode) -> Flow<Option<Rc<str>>> {
-        if !self.shared.effects.follows_definitions() {
-            return Ok(None);
-        }
-        let context = self.shared.context.borrow().clone();
-        self.memo.depend_context(DEFINITION, context.as_ref());
-        self.note_step_read(DEFINITION, context.as_ref());
-        let Some((_, Value::Fn(definition))) = ContextFrame::find(context.as_ref(), DEFINITION)
-        else {
-            return Ok(None);
-        };
-        self.shared
-            .dirs
-            .get(definition.code.dir() as usize)
-            .map(|dir| Some(Rc::clone(dir)))
-            .ok_or_else(|| internal("a definition outside the run's directories", node.span).into())
     }
 }
 

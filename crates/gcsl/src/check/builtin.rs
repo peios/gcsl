@@ -128,9 +128,9 @@ pub enum Builtin {
     /// (see [Secrets](crate::check::secrets#secrets)).
     SecretReveal,
     /// `file(path: String) -> File`: the file at `path`, made absolute
-    /// against the working directory (see [Files](crate::check::files#files)),
-    /// the prelude's `file(path)`. Impure: what a relative path means
-    /// depends on where it runs.
+    /// against the directory of the file the call is written in (see [Where
+    /// a path is](crate::eval::files#where-a-path-is)), the prelude's
+    /// `file(path)`. Impure: it names a file of the host's.
     File,
     /// `file_read(f: File) -> String`: the contents of the file `f`, which
     /// must be UTF-8, the prelude's `f.read()`. Impure.
@@ -234,6 +234,11 @@ pub enum Builtin {
     /// result's type has a rest-field alone, which no field is read by (see
     /// [Records of any names](crate::check::entries#records-of-any-names)).
     Record,
+    /// `working_dir() -> Dir`: the run's working directory, where a program
+    /// given no `cwd` runs, a step's own under pekit, the prelude's
+    /// `working_dir()` (see [Where a path
+    /// is](crate::eval::files#where-a-path-is)). Impure.
+    WorkingDir,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -257,7 +262,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 57] = [
+    pub const ALL: [Builtin; 58] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -315,6 +320,7 @@ impl Builtin {
         Builtin::ListContains,
         Builtin::JsonDecode,
         Builtin::Record,
+        Builtin::WorkingDir,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -388,6 +394,7 @@ impl Builtin {
             Builtin::KeychainFile => "keychain_file",
             Builtin::ExecSecret => "exec_secret",
             Builtin::Dir => "dir",
+            Builtin::WorkingDir => "working_dir",
             Builtin::DirFiles => "dir_files",
             Builtin::DirFile => "dir_file",
             Builtin::DirDir => "dir_dir",
@@ -457,6 +464,7 @@ impl Builtin {
             | Builtin::KeychainFile
             | Builtin::ExecSecret
             | Builtin::Dir
+            | Builtin::WorkingDir
             | Builtin::DirFiles
             | Builtin::DirFile
             | Builtin::DirDir
@@ -486,6 +494,7 @@ impl Builtin {
                 | Builtin::KeychainString
                 | Builtin::KeychainFile
                 | Builtin::Dir
+                | Builtin::WorkingDir
                 | Builtin::DirFiles
                 | Builtin::DirFile
                 | Builtin::DirDir
@@ -546,7 +555,7 @@ impl Builtin {
             Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
             Builtin::FsCopy => &["from", "to"],
             Builtin::FsSetExecutable => &["p", "executable"],
-            Builtin::FsTempDir | Builtin::HostArch | Builtin::HostOs => &[],
+            Builtin::FsTempDir | Builtin::HostArch | Builtin::HostOs | Builtin::WorkingDir => &[],
             Builtin::FsWrite => &["p", "contents"],
             Builtin::SortVersions => &["vs"],
             Builtin::Show => &["value"],
@@ -587,6 +596,7 @@ impl Builtin {
             | Builtin::KeychainFile
             | Builtin::ExecSecret
             | Builtin::Dir
+            | Builtin::WorkingDir
             | Builtin::DirFiles
             | Builtin::FsComposeDir
             | Builtin::FsCompose
@@ -674,6 +684,7 @@ impl Builtin {
             | Builtin::KeychainFile
             | Builtin::ExecSecret
             | Builtin::Dir
+            | Builtin::WorkingDir
             | Builtin::DirFiles
             | Builtin::DirFile
             | Builtin::DirDir
@@ -750,6 +761,7 @@ impl Builtin {
                 "fn(name: String, from: {file: String, profile: String}) -> Secret<File>"
             }
             Builtin::Dir => "fn(path: String) -> Dir",
+            Builtin::WorkingDir => "fn() -> Dir",
             Builtin::DirFiles => "fn(d: Dir) -> List<File>",
             Builtin::DirFile => "fn(d: Dir, path: String): File",
             Builtin::DirDir => "fn(d: Dir, path: String): Dir",
@@ -812,6 +824,7 @@ impl Builtin {
             Builtin::FetchGit => ([TyId::STRING, TyId::STRING], TyId::DIR),
             Builtin::ArchiveUnpack => ([TyId::FILE, TyId::INT], TyId::DIR),
             Builtin::Dir => ([TyId::STRING, UNUSED], TyId::DIR),
+            Builtin::WorkingDir => ([UNUSED, UNUSED], TyId::DIR),
             Builtin::DirFiles => ([TyId::DIR, UNUSED], types.list(TyId::FILE)),
             Builtin::DirFile => ([TyId::DIR, TyId::STRING], TyId::FILE),
             Builtin::DirDir => ([TyId::DIR, TyId::STRING], TyId::DIR),

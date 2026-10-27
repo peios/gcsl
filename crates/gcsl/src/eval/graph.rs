@@ -1246,9 +1246,9 @@ pub(crate) fn flattened(context: Option<&Rc<ContextFrame>>) -> Vec<(crate::names
 
 /// Appends the flattened context `context` to the key `out`: its bindings,
 /// never a frame's identity, which is new each time a `with` runs, and, for
-/// a deferred call, never the definition it was made in, which the call's
-/// code cannot read (its host runs it in a directory of its own, see
-/// [Files](crate::eval::files#the-working-directory)), so that the same
+/// a deferred call, never the definition it was made in, which no code
+/// reads (a relative path is where it is written, see [Where a path
+/// is](crate::eval::files#where-a-path-is)), so that the same
 /// call made for two definitions, two targets of one build say, is one
 /// node and runs once.
 fn encode_context(context: Option<&Rc<ContextFrame>>, deferred: bool, out: &mut Vec<u8>) {
