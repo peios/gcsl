@@ -134,10 +134,10 @@ whether it was bound or its default read. A step keeps what it read while
 it is stopped, so the reads a run that ends gives are everything the step
 read, and you can key the step by the values of those contexts alone,
 rather than by every context it could read. A memoised call found in its
-table counts the reads it made, so a cache hit hides none. Each context is also told to your
-`Effects::context_read` the first time a run reads it, before the step
-does anything with it, so you can give the step that context's files only
-then.
+table counts the reads it made, so a cache hit hides none. Each context
+is also told to your `Effects::context_read` the first time a run reads
+it, before the step does anything with it, so you can give the step that
+context's files only then.
 
 A deferred call is one node however many times, and wherever, it is
 made: by its function, its arguments and the context it was made in, but
