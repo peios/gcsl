@@ -444,11 +444,12 @@ impl Graph {
 }
 
 /// Whether `builtin` is an effect in graph mode (see [Graph mode](#graph-mode)):
-/// every impure built-in but `file` and `dir`, which only read the working
-/// directory.
+/// every impure built-in but `file`, `dir` and `working_dir`, which only
+/// name a path, from where the code is or the host's working directory.
 #[must_use]
 pub fn effect_builtin(builtin: Builtin) -> bool {
-    builtin.effect() != crate::ast::Effect::Pure && !matches!(builtin, Builtin::File | Builtin::Dir)
+    builtin.effect() != crate::ast::Effect::Pure
+        && !matches!(builtin, Builtin::File | Builtin::Dir | Builtin::WorkingDir)
 }
 
 /// The scope a node is met in (see [Graph mode](#graph-mode)).
