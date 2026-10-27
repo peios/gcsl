@@ -531,7 +531,7 @@ impl MemoTables {
             EntryState::Running { .. }
                 if !self.running.iter().any(|running| running.entry == entry.id) =>
             {
-                return Lookup::Sibling;
+                return Lookup::Sibling(entry.id);
             }
             EntryState::Running { reentered, .. } => {
                 *reentered = true;
@@ -773,8 +773,8 @@ pub(super) enum Lookup {
     /// it (see [Graph mode](crate::eval::graph#graph-mode)).
     Elsewhere(u32),
     /// The closure is running with equal arguments in another task of this
-    /// unit, which has stopped: the call waits for it.
-    Sibling,
+    /// unit, which has stopped, its entry this one: the call waits for it.
+    Sibling(u64),
     /// No entry: the arguments' hash, for recording them.
     Missing(u64),
 }
@@ -794,9 +794,10 @@ pub(super) enum MemoBegin {
     /// again.
     Elsewhere(u32),
     /// The call is running with equal arguments in another task of the
-    /// unit: its frame is on the stack, with the arguments, for the call to
-    /// wait for that task and look them up again.
-    Sibling,
+    /// unit, its entry this one: its frame is on the stack, with the
+    /// arguments, for the call to wait for that task and look them up
+    /// again.
+    Sibling(u64),
 }
 
 /// A running memoised call, as [`MemoTables::start`] recorded it.

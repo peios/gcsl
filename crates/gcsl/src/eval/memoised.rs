@@ -40,7 +40,7 @@ impl Evaluator<'_> {
                 }
                 // Only a machine runs tasks, and a walker never runs in one
                 // that has others.
-                MemoBegin::Sibling => {
+                MemoBegin::Sibling(_) => {
                     self.stack.truncate(base);
                     let error =
                         super::internal("a walker met another task's memoised call", node.span);
@@ -171,7 +171,7 @@ impl Evaluator<'_> {
                 // The frame is left as it is, the arguments in it, for a
                 // machine to look them up again once the unit has run.
                 Lookup::Elsewhere(owner) => return Ok(MemoBegin::Elsewhere(owner)),
-                Lookup::Sibling => return Ok(MemoBegin::Sibling),
+                Lookup::Sibling(entry) => return Ok(MemoBegin::Sibling(entry)),
             };
         let entering = self.levels + usize::from(depth) + CALL_LEVELS;
         if entering + code.height as usize > MAX_DEPTH {

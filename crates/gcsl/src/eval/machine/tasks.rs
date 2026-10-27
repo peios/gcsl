@@ -49,6 +49,23 @@
 //! A task that needs a memoised call or a `lazy` another task of the unit
 //! is running waits for it; one that waits for its turn or for a sibling
 //! is woken whenever a task ends.
+//!
+//! # Wound-wait
+//!
+//! Tasks that wait for each other's memoised calls or `lazy`s can wait in
+//! a circle that a run in order never meets: a later task begins a call
+//! that an earlier one needs, and then, inside it, waits for its turn
+//! behind the earlier task. So a task never waits for a later one's run:
+//! it *wounds* it ([`Machine::wound`]). The later task is cancelled as far
+//! as the call or `lazy` it was running ([`Meta::wound`]), whose frame
+//! catches the cancellation: the entry goes, or the `lazy` is left unrun,
+//! the earlier task is woken, and the later one waits to look it up or
+//! await it again. The earlier task then runs it as a run in order would:
+//! it finishes it, or, if it truly depends on itself, fails where a run in
+//! order fails. Waits then only ever go from a later task to an earlier
+//! one, and cannot form a circle. A wounded task's work inside the call is
+//! lost, as are its children's; an effect the host does not isolate that
+//! it was waiting to make is never made.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -56,7 +73,7 @@ use std::time::Instant;
 
 use crate::diagnostic::Mark;
 use crate::source::Span;
-use crate::value::{ContextFrame, Value};
+use crate::value::{ContextFrame, List, Value};
 
 use super::super::graph::{GraphRun, NodeId, RunState, Wait};
 use super::super::memo::Running;
@@ -71,8 +88,20 @@ use super::{Activation, CallState, Frame, Machine, Next, Outcome};
 pub(in crate::eval) struct Meta {
     /// Its number, the root's 0.
     pub(super) id: u32,
+    /// What it is to abandon its run of, and the task that wounded it, once
+    /// one has (see [Wound-wait](#wound-wait)).
+    pub(super) wound: Option<(Wound, u32)>,
     /// The path its parent was at when it split it off.
     base: Vec<u32>,
+}
+
+/// What a wounded task abandons its run of (see [Wound-wait](#wound-wait)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::eval) enum Wound {
+    /// A memoised call, by its entry's identity.
+    Entry(u64),
+    /// A `lazy`'s body.
+    Future(*const crate::value::Future),
 }
 
 /// What the run shares that is a task's own (see [Tasks](#tasks)).
@@ -115,8 +144,9 @@ pub(in crate::eval) enum Status {
     /// It waits for its turn to make an effect, or for a sibling's
     /// memoised call or `lazy`, to take up after the resume.
     Waiting(Resume),
-    /// It is to be cancelled.
-    Cancel,
+    /// It is to be cancelled; `true` if a call of it, on top of its calls
+    /// with no frame of its own, waited to be looked up again.
+    Cancel(bool),
 }
 
 /// A task that is not running (see [Tasks](#tasks)).
@@ -179,6 +209,10 @@ pub(in crate::eval) struct Join {
     pub(super) parent: u32,
     /// The first iteration that failed, if one has.
     pub(super) failed: Option<usize>,
+    /// For each child that is a block's item, by its number, the slots of
+    /// the value stack it declares, whose values it comes to (see
+    /// [Pieces](super::pieces#pieces)).
+    pub(super) slots: Vec<(usize, Vec<usize>)>,
 }
 
 impl Join {
@@ -330,7 +364,7 @@ impl Machine<'_> {
         let Some(ready) = self.tasks.iter().position(|task| {
             matches!(
                 task.status,
-                Status::Ready(_) | Status::Wake(_) | Status::Cancel
+                Status::Ready(_) | Status::Wake(_) | Status::Cancel(_)
             )
         }) else {
             self.status = Some(status);
@@ -350,8 +384,15 @@ impl Machine<'_> {
         match status {
             Status::Ready(next) => next,
             Status::Wake(resume) => self.resume_next(resume),
-            Status::Cancel => {
+            Status::Cancel(looked_up) => {
                 let span = self.running().ir.get(self.running().ir.root()).span;
+                if looked_up {
+                    // The call that waited fails, its frame going.
+                    return match self.calls.pop() {
+                        Some(state) => self.argument_failed(&state, cancelled(span)),
+                        None => self.lost_call(),
+                    };
+                }
                 Next::Give(Err(Box::new(cancelled(span))))
             }
             Status::Blocked(..) | Status::Joining | Status::Waiting(_) => {
@@ -440,7 +481,7 @@ impl Machine<'_> {
         let ready = self.tasks.iter().position(|task| {
             matches!(
                 task.status,
-                Status::Ready(_) | Status::Wake(_) | Status::Cancel
+                Status::Ready(_) | Status::Wake(_) | Status::Cancel(_)
             )
         });
         let Some(ready) = ready else {
@@ -471,6 +512,16 @@ impl Machine<'_> {
         result: Outcome,
     ) -> Option<Next> {
         let mut joined = join.borrow_mut();
+        // A block's item comes to the values of the slots it declares.
+        let result = match joined.slots.iter().find(|(number, _)| *number == at) {
+            Some((_, slots)) if result.is_ok() => Ok(Value::List(List::from_vec(
+                slots
+                    .iter()
+                    .map(|&slot| self.stack.get(slot).cloned().unwrap_or(Value::Empty))
+                    .collect(),
+            ))),
+            _ => result,
+        };
         let iteration = joined.children.get(at).map_or(0, |child| child.0);
         let cancelled_too = matches!(&result, Err(unwind)
             if matches!(&**unwind, Unwind::Error(error) if error.mark == Mark::CANCELLED));
@@ -503,11 +554,54 @@ impl Machine<'_> {
         self.finished()
     }
 
+    /// Wounds the task that runs `target`, if it is later in program order
+    /// than the task running, which needs it: it abandons its run, so that
+    /// the task running can run it, as a run in order would (see
+    /// [Wound-wait](#wound-wait)).
+    pub(super) fn wound(&mut self, target: Wound) {
+        let mine = self.path();
+        let wounder = self.meta.id;
+        for task in &mut self.tasks {
+            let runs = match target {
+                Wound::Entry(entry) => task
+                    .calls
+                    .iter()
+                    .any(|call| matches!(call.memo, Some((Some(mark), _)) if mark.entry == entry)),
+                Wound::Future(future) => task
+                    .frames
+                    .iter()
+                    .any(|frame| matches!(frame, Frame::Future(run) if run.runs(future))),
+            };
+            if runs
+                && task.meta.wound.is_none()
+                && !matches!(task.status, Status::Cancel(_))
+                && path_of(&task.meta, &task.frames, &task.calls) > mine
+            {
+                task.meta.wound = Some((target, wounder));
+                task.status = Status::Cancel(looks_up(&task.status));
+            }
+        }
+    }
+
+    /// Wakes the task `id`, if it waits for a sibling, to look again.
+    pub(super) fn wake_task(&mut self, id: u32) {
+        for task in &mut self.tasks {
+            if task.meta.id == id {
+                let status = std::mem::replace(&mut task.status, Status::Joining);
+                task.status = match status {
+                    Status::Waiting(resume) => Status::Wake(resume),
+                    status => status,
+                };
+            }
+        }
+    }
+
     /// Cancels the tasks `ids` that are set aside and still waiting.
     pub(super) fn cancel(&mut self, ids: &[u32]) {
         for task in &mut self.tasks {
-            if ids.contains(&task.meta.id) && !matches!(task.status, Status::Cancel) {
-                task.status = Status::Cancel;
+            if ids.contains(&task.meta.id) && !matches!(task.status, Status::Cancel(_)) {
+                task.status = Status::Cancel(looks_up(&task.status));
+                task.meta.wound = None;
             }
         }
     }
@@ -608,7 +702,11 @@ impl Machine<'_> {
                 .map(|deadline| deadline.effective),
         );
         self.tasks.push(Task {
-            meta: Meta { id, base },
+            meta: Meta {
+                id,
+                base,
+                wound: None,
+            },
             frames,
             activations,
             calls,
@@ -648,6 +746,17 @@ fn split_kept<T: Clone>(values: &mut Vec<T>, kept: usize) -> Vec<T> {
     let whole = values.clone();
     values.truncate(kept);
     whole
+}
+
+/// Whether a task waiting as `status` says has a call on top of its calls,
+/// with no frame of its own, waiting to be looked up again.
+const fn looks_up(status: &Status) -> bool {
+    matches!(
+        status,
+        Status::Blocked(_, Resume::Lookup)
+            | Status::Waiting(Resume::Lookup)
+            | Status::Wake(Resume::Lookup)
+    )
 }
 
 /// The path of a task whose place is `meta` and whose frames are `frames`

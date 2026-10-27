@@ -27,6 +27,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::diagnostic::Mark;
+use crate::check::Slot;
 use crate::ir::{ArgValue, Ir, IrId, IrKind, IrRange};
 use crate::value::Value;
 
@@ -64,8 +65,25 @@ impl Pieces {
     }
 }
 
+/// A block's items split off, once one is marked (see [Pieces](#pieces)).
+#[derive(Default)]
+pub(in crate::eval) struct ItemsSplit {
+    /// Its items, as pieces.
+    pub(super) pieces: Pieces,
+    /// The slots that the items split off declare: a later item that uses
+    /// one waits for them first.
+    pub(super) pending: Vec<Slot>,
+}
+
+/// The box of a block's split kept for reuse, its allocation being what is
+/// kept (see [`ItemsSplit`]).
+pub(in crate::eval) struct Spare(pub(super) Box<ItemsSplit>);
+
 /// What waits for its pieces split off (see [Pieces](#pieces)).
 pub(in crate::eval) enum Joining {
+    /// A block, its items from the one numbered on and then its result
+    /// left (see [`Frame::Items`]).
+    Items(IrRange, u32, IrId, Option<Box<ItemsSplit>>),
     /// A list, record or interpolation, its operands evaluated.
     Operands(Box<OperandsState>),
     /// The innermost of the machine's calls, its arguments up to a
@@ -137,16 +155,18 @@ impl Frame {
             Self::Operands(state) => Some(&state.pieces),
             Self::Arguments => call.map(|call| &call.pieces),
             Self::BuiltinArgument(call) => Some(&call.pieces),
+            Self::Items { split, .. } => split.as_ref().map(|state| &state.pieces),
             _ => None,
         }
     }
 
     /// As [`Frame::pieces`], to change, but for a call's arguments, whose
     /// pieces are its call's.
-    const fn pieces_mut(&mut self) -> Option<&mut Pieces> {
+    fn pieces_mut(&mut self) -> Option<&mut Pieces> {
         match self {
             Self::Operands(state) => Some(&mut state.pieces),
             Self::BuiltinArgument(call) => Some(&mut call.pieces),
+            Self::Items { split, .. } => split.as_mut().map(|state| &mut state.pieces),
             _ => None,
         }
     }
@@ -225,6 +245,12 @@ impl Machine<'_> {
         }
         let pieces = match self.frames.last_mut() {
             Some(Frame::Arguments) => self.calls.last_mut().map(|call| &mut call.pieces),
+            Some(Frame::Items { split, .. }) => {
+                let spare = &mut self.spare;
+                let state =
+                    split.get_or_insert_with(|| spare.pop().map(|kept| kept.0).unwrap_or_default());
+                Some(&mut state.pieces)
+            }
             Some(frame) => frame.pieces_mut(),
             None => None,
         };
@@ -297,27 +323,37 @@ impl Machine<'_> {
         );
         let number = join.borrow().children.len();
         self.split(&marks, (Rc::clone(&join), number), status, base);
+        Ok(self.split_off(piece, &join))
+    }
+
+    /// Goes on with the next piece of the node, call or block whose frame
+    /// is on top again, its piece numbered `piece` split off as the child
+    /// split off last, whose place is held among those of `join`.
+    fn split_off(&mut self, piece: u32, join: &Rc<RefCell<Join>>) -> Next {
         let child = self.next_task - 1;
-        let held = |position: usize| {
+        let held = |position: usize, slots: Vec<usize>| {
             let mut joined = join.borrow_mut();
+            if !slots.is_empty() {
+                let number = joined.children.len();
+                joined.slots.push((number, slots));
+            }
             joined
                 .children
                 .push((piece as usize, position, child, None));
             joined.live += 1;
         };
-        // The frame split at is on top again, the piece's place held.
-        Ok(match self.frames.pop() {
+        match self.frames.pop() {
             Some(Frame::Operands(mut state)) => {
-                held(state.values.len());
+                held(state.values.len(), Vec::new());
                 state.values.push(Value::Empty);
                 self.next_operand(state)
             }
             Some(Frame::Arguments) => match self.calls.pop() {
                 Some(mut state) => {
                     let Some(param) = self.param_of(state.args, piece) else {
-                        return Ok(self.lost_call());
+                        return self.lost_call();
                     };
-                    held(param);
+                    held(param, Vec::new());
                     state.next += 1;
                     self.next_argument(state)
                 }
@@ -325,14 +361,40 @@ impl Machine<'_> {
             },
             Some(Frame::BuiltinArgument(mut call)) => {
                 let Some(param) = self.param_of(call.args, piece) else {
-                    return Ok(self.lost_call());
+                    return self.lost_call();
                 };
-                held(param);
+                held(param, Vec::new());
                 call.next += 1;
                 self.builtin_next(call)
             }
+            // An item's place is the slot it declares, if it is a `let`'s
+            // store, which the block's later items wait for if they use it.
+            Some(Frame::Items {
+                items,
+                next,
+                result,
+                mut split,
+            }) => {
+                let ir = &self.running().ir;
+                let item = ir.items(items).get(piece as usize).copied();
+                let declared = item.and_then(|item| match ir.get(item).kind {
+                    IrKind::Store(slot, _) => Some(slot),
+                    _ => None,
+                });
+                let base = self.running().base;
+                held(
+                    0,
+                    declared
+                        .map(|slot| vec![base + slot.index()])
+                        .unwrap_or_default(),
+                );
+                if let (Some(slot), Some(state)) = (declared, split.as_mut()) {
+                    state.pending.push(slot);
+                }
+                self.items(items, next, result, split)
+            }
             _ => self.lost_call(),
-        })
+        }
     }
 
     /// The parameter of the argument `at` of `args`, by its index.
@@ -420,7 +482,37 @@ impl Machine<'_> {
         if let Some(unwind) = first.map(|(_, unwind)| unwind).or(cancelled) {
             return self.pieces_failed(&what, unwind);
         }
+        let slots = std::mem::take(&mut join.borrow_mut().slots);
+        self.pieces_placed(what, values, slots)
+    }
+
+    /// Goes on with `what`, its pieces split off all come to `values`,
+    /// each with its piece and its place, and each of those that are a
+    /// block's items to the slots `slots` says, by its number: each value
+    /// put in its place.
+    fn pieces_placed(
+        &mut self,
+        what: Joining,
+        values: Vec<(usize, usize, Value)>,
+        slots: Vec<(usize, Vec<usize>)>,
+    ) -> Next {
         match what {
+            Joining::Items(items, next, result, mut split) => {
+                for (number, slots) in slots {
+                    let Some((_, _, Value::List(list))) = values.get(number) else {
+                        continue;
+                    };
+                    for (&slot, value) in slots.iter().zip(list.values()) {
+                        if let Some(place) = self.stack.get_mut(slot) {
+                            *place = value.clone();
+                        }
+                    }
+                }
+                if let Some(state) = split.as_mut() {
+                    state.pending.clear();
+                }
+                self.items(items, next, result, split)
+            }
             Joining::Operands(mut state) => {
                 for (_, position, value) in values {
                     if let Some(place) = state.values.get_mut(position) {
@@ -470,7 +562,9 @@ impl Machine<'_> {
     /// failure would end it.
     fn pieces_failed(&mut self, what: &Joining, unwind: Box<Unwind>) -> Next {
         match what {
-            Joining::Operands(_) | Joining::Builtin(_) => Next::Give(Err(unwind)),
+            Joining::Operands(_) | Joining::Builtin(_) | Joining::Items(..) => {
+                Next::Give(Err(unwind))
+            }
             Joining::Arguments => match self.calls.pop() {
                 Some(state) => self.argument_failed(&state, *unwind),
                 None => self.lost_call(),

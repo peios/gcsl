@@ -14,7 +14,7 @@ use crate::value::{Begin, Future, FutureState, Value};
 use super::super::graph::{NodeId, Wait};
 use super::super::kinds::of_kind;
 use super::super::{depends_on_itself, nested_too_deeply};
-use super::tasks::Status;
+use super::tasks::{Status, Wound};
 use super::{Activation, Frame, Machine, Next, Outcome, Resume, fail, give};
 
 /// An await running in the machine: of an `Await` node, or of a step of an
@@ -95,6 +95,13 @@ pub(super) struct FutureRun {
     then: Then,
 }
 
+impl FutureRun {
+    /// Whether it is a run of `future`'s body.
+    pub(super) fn runs(&self, future: *const Future) -> bool {
+        std::ptr::eq(Rc::as_ptr(&self.future), future)
+    }
+}
+
 impl Machine<'_> {
     /// Evaluates the `Await` node `id` of `value`: its value, here unless
     /// it is simple, and then the await of it.
@@ -173,7 +180,8 @@ impl Machine<'_> {
                     .any(|running| Rc::ptr_eq(running, &future)) =>
             {
                 // Another task of the unit runs it: waited for, and awaited
-                // again.
+                // again; a later task's run of it is abandoned for this one.
+                self.wound(Wound::Future(Rc::as_ptr(&future)));
                 let waiting = Status::Waiting(resumed(state, future, then));
                 return Err(Next::Park(Box::new(waiting)));
             }
@@ -255,6 +263,24 @@ impl Machine<'_> {
                 } else {
                     self.mistyped(state.node, "a future's state is in use")
                 }
+            }
+            // Its run abandoned for an earlier task's (see
+            // [Wound-wait](super::tasks#wound-wait)): left unrun, for that
+            // task to run, and awaited again.
+            Err(error)
+                if self
+                    .meta
+                    .wound
+                    .is_some_and(|(wound, _)| wound == Wound::Future(Rc::as_ptr(&future)))
+                    && error.mark == crate::diagnostic::Mark::CANCELLED =>
+            {
+                if !future.finish(FutureState::Pending(captures)) {
+                    return self.mistyped(state.node, "a future's state is in use");
+                }
+                if let Some((_, wounder)) = self.meta.wound.take() {
+                    self.wake_task(wounder);
+                }
+                Next::Park(Box::new(Status::Waiting(resumed(state, future, then))))
             }
             Err(error) => {
                 // Left unrun, so that a later await runs it again.

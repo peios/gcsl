@@ -460,3 +460,182 @@ fn what_waits_inside_what_is_split_off_still_meets_every_effect_at_once() {
         assert_eq!(value.to_string(), shown, "{body}");
     }
 }
+
+#[test]
+fn the_items_of_a_block_and_the_fields_of_a_record_wait_apart() {
+    let cases = [
+        (
+            "String",
+            "let a = fs.read(\"/a\")\n let b = fs.read(\"/b\")\n = \"{a}{b}\"",
+            vec![2],
+            "AB",
+        ),
+        (
+            "{x: String, y: String}",
+            "= {x = fs.read(\"/a\"); y = fs.read(\"/b\")}",
+            vec![2],
+            "{x = \"A\"; y = \"B\"}",
+        ),
+        // An item that uses what an item set aside declares waits for it.
+        (
+            "String",
+            "let a = fs.read(\"/a\")\n let b = fs.read(\"/{a}x\")\n = b",
+            vec![1, 1],
+            "AX",
+        ),
+        // So does one that assigns it, or a variable it shares a slot with.
+        (
+            "String",
+            "let mut t = \"\"\n let a = fs.read(\"/a\")\n let b = fs.read(\"/b\")\n t := a\n = \"{t}{b}\"",
+            vec![2],
+            "AB",
+        ),
+    ];
+    for (ty, body, stops, shown) in cases {
+        let (mut workspace, file) = super::graph::lone_workspace(&format!(
+            "import fs\nfn f() -> {ty} {{\n {body}\n}}\n= f()"
+        ));
+        let (seen, value) = run_reads(&mut workspace, file, isolating());
+        assert_eq!(seen, stops, "{body}");
+        assert_eq!(value.to_string(), shown, "{body}");
+    }
+}
+
+#[test]
+fn the_earliest_item_s_failure_is_reported_whichever_fails_first() {
+    let (mut workspace, file) = super::graph::lone_workspace(
+        "import fs\n\
+         fn f() -> String {\n\
+         \x20   let a = fs.read(\"/a\")\n\
+         \x20   let b = fs.read(\"/b\")\n\
+         \x20   = \"{a}{b}\"\n\
+         }\n\
+         = f()",
+    );
+    let mut graph = Graph::new();
+    let Progress::Paused(nodes) = workspace.run_graph(file, &mut graph, isolating()).unwrap()
+    else {
+        panic!("the run did not stop for its reads");
+    };
+    assert_eq!(nodes.len(), 2);
+    let failure = |what: &str| Err(Diagnostic::error(what, crate::source::Span::new(0, 0)));
+    assert!(graph.resolve(nodes[1], failure("second")));
+    assert!(graph.resolve(nodes[0], failure("first")));
+    let errors = workspace
+        .run_graph(file, &mut graph, isolating())
+        .unwrap_err();
+    assert_eq!(errors[0].message, "first", "{errors:?}");
+}
+
+#[test]
+fn an_earlier_task_runs_a_memoised_call_a_later_one_began_and_waits_in() {
+    // The second element begins `shared` while the first waits for its
+    // read; inside, its write waits its turn behind the first. The first
+    // then needs `shared`: the second abandons its run, and the first runs
+    // it, as a run in order would, so the write is made once.
+    let (mut workspace, file) = super::graph::lone_workspace(
+        "import fs\n\
+         fn shared() ->> String {\n\
+         \x20   let w = fs.write(\"/w\", \"x\")\n\
+         \x20   = \"s\"\n\
+         }\n\
+         fn g(t: String) -> String { = \"{t}{shared()}\" }\n\
+         fn f() -> List<String> { = [g(fs.read(\"/a\")), shared()] }\n\
+         = f()",
+    );
+    let host = crate::eval::graph::GraphHost {
+        defers: &|_: &[crate::check::Attribute]| true,
+        effects: &ReadsIsolated,
+    };
+    let mut graph = Graph::new();
+    let value = loop {
+        match workspace.run_graph(file, &mut graph, host).unwrap() {
+            Progress::Paused(nodes) => {
+                for node in nodes {
+                    let given = match graph.node(node).unwrap().args()[0].clone() {
+                        Value::Str(path) if &*path == "/a" => text("A"),
+                        _ => Value::Empty,
+                    };
+                    assert!(graph.resolve(node, Ok(given)));
+                }
+            }
+            Progress::Waiting(unit) => panic!("waits for unit {unit}"),
+            Progress::Done(value) => break value,
+        }
+    };
+    assert_eq!(value, texts(&["As", "s"]));
+    // One read and one write.
+    assert_eq!(graph.len(), 2);
+}
+
+#[test]
+fn memoised_calls_that_need_each_other_across_tasks_fail_as_a_run_in_order_does() {
+    // A run in order calls `p`, then `q` inside it, then `p` inside that:
+    // a call that depends on its own result. Split into tasks, each may
+    // begin one; the earlier then runs the other's for it.
+    for list in ["[p(), q()]", "[q(), p()]"] {
+        let (mut workspace, file) = super::graph::lone_workspace(&format!(
+            "import fs\n\
+             fn p() ->> String {{ = \"{{fs.read(\"/a\")}}{{q()}}\" }}\n\
+             fn q() ->> String {{ = \"{{fs.read(\"/b\")}}{{p()}}\" }}\n\
+             fn f() -> List<String> {{ = {list} }}\n\
+             = f()"
+        ));
+        let mut graph = Graph::new();
+        let errors = loop {
+            match workspace.run_graph(file, &mut graph, isolating()) {
+                Ok(Progress::Paused(nodes)) => {
+                    for node in nodes {
+                        assert!(graph.resolve(node, Ok(text("x"))));
+                    }
+                }
+                Ok(other) => panic!("{list}: {other:?}"),
+                Err(errors) => break errors,
+            }
+        };
+        assert_eq!(
+            errors[0].message, "this call depends on its own result",
+            "{list}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn an_earlier_task_runs_a_lazy_a_later_one_began_and_waits_in() {
+    // As for a memoised call: the second element begins the `lazy`, whose
+    // write waits its turn behind the first; the first needs it too.
+    let (mut workspace, file) = super::graph::lone_workspace(
+        "import fs\n\
+         fn g(t: String, s: Future<String>) -> String { = \"{t}{await s}\" }\n\
+         fn f() -> List<String> {\n\
+         \x20   let s = lazy {\n\
+         \x20       let w = fs.write(\"/w\", \"x\")\n\
+         \x20       = \"s\"\n\
+         \x20   }\n\
+         \x20   = [g(fs.read(\"/a\"), s), await s]\n\
+         }\n\
+         = f()",
+    );
+    let host = crate::eval::graph::GraphHost {
+        defers: &|_: &[crate::check::Attribute]| true,
+        effects: &ReadsIsolated,
+    };
+    let mut graph = Graph::new();
+    let value = loop {
+        match workspace.run_graph(file, &mut graph, host).unwrap() {
+            Progress::Paused(nodes) => {
+                for node in nodes {
+                    let given = match graph.node(node).unwrap().args()[0].clone() {
+                        Value::Str(path) if &*path == "/a" => text("A"),
+                        _ => Value::Empty,
+                    };
+                    assert!(graph.resolve(node, Ok(given)));
+                }
+            }
+            Progress::Waiting(unit) => panic!("waits for unit {unit}"),
+            Progress::Done(value) => break value,
+        }
+    };
+    assert_eq!(value, texts(&["As", "s"]));
+    assert_eq!(graph.len(), 2);
+}

@@ -74,7 +74,7 @@ use control::{AssertState, DefaultRun, WithState};
 use data::OperandsState;
 use futures::{AwaitState, FutureRun};
 use loops::{ForState, LoopAt, LoopState};
-use pieces::{Joining, Pieces, PiecesJoin};
+use pieces::{ItemsSplit, Joining, Pieces, PiecesJoin};
 
 use super::kinds::into_callee;
 use super::memo::{Mark, MemoBegin, MemoTables};
@@ -119,13 +119,20 @@ impl Activation {
     }
 }
 
+/// How many boxes of blocks' splits the machine keeps for reuse: one per
+/// level of blocks nested in one another that a run usually reaches.
+const SPARE_SPLITS: usize = 16;
+
 /// What to do with the value of the node evaluated above a frame.
 enum Frame {
-    /// The items of a block from `next` on, and then its result.
+    /// The items of a block from `next` on, and then its result, with the
+    /// items split off from it, once one is marked (see
+    /// [Pieces](pieces#pieces)).
     Items {
         items: IrRange,
         next: u32,
         result: IrId,
+        split: Option<Box<ItemsSplit>>,
     },
     /// The branches of the `if` `node`, its condition evaluated above.
     Branch { node: IrId, then: IrId, else_: IrId },
@@ -359,6 +366,10 @@ pub(super) struct Machine<'r> {
     /// How many profiled calls were running when the run began, below
     /// which none is a task's.
     profiled_base: usize,
+    /// The boxes of blocks' splits that ended with nothing split off, kept
+    /// for the next block that marks an item, so that a block run again
+    /// and again allocates none (see [Pieces](pieces#pieces)).
+    spare: Vec<pieces::Spare>,
 }
 
 impl<'r> Machine<'r> {
@@ -382,6 +393,7 @@ impl<'r> Machine<'r> {
             tasks: Vec::new(),
             next_task: 1,
             profiled_base,
+            spare: Vec::new(),
         }
     }
 
@@ -406,6 +418,7 @@ impl<'r> Machine<'r> {
             tasks,
             next_task: parked.next_task,
             profiled_base,
+            spare: Vec::new(),
         }
     }
 
@@ -550,7 +563,7 @@ impl<'r> Machine<'r> {
             return give(self.walker(|walker| walker.value(id)));
         }
         match kind {
-            IrKind::Block { items, result } => self.items(items, 0, result),
+            IrKind::Block { items, result } => self.items(items, 0, result, None),
             IrKind::If { cond, then, else_ } => self.branch(id, cond, (then, else_)),
             IrKind::Store(slot, value) => {
                 self.frames.push(Frame::Store { slot, node: id });
@@ -618,10 +631,26 @@ impl<'r> Machine<'r> {
                 items,
                 next,
                 result: last,
-            } => match result {
-                Ok(_) => self.items(items, next, last),
-                Err(unwind) => Next::Give(Err(unwind)),
-            },
+                mut split,
+            } => {
+                if let Some(state) = split.as_mut() {
+                    self.piece_end(&mut state.pieces);
+                }
+                match result {
+                    Ok(_) => self.items(items, next, last, split),
+                    // A failure waits behind the items split off before it.
+                    Err(unwind) => {
+                        match split.as_mut().and_then(|state| state.pieces.join.take()) {
+                            Some(join) => {
+                                let at = next.saturating_sub(1) as usize;
+                                let what = Joining::Items(items, next, last, split);
+                                self.join_pieces(what, join, Some((at, unwind)))
+                            }
+                            None => Next::Give(Err(unwind)),
+                        }
+                    }
+                }
+            }
             Frame::Branch { node, then, else_ } => match result {
                 Ok(Value::Bool(cond)) => Next::Eval(if cond { then } else { else_ }),
                 Ok(_) => self.mistyped(node, "a condition that is not a Bool"),
@@ -697,20 +726,54 @@ impl<'r> Machine<'r> {
     }
 
     /// Evaluates the items of a block from `next` on, the simple ones at
-    /// once, and then its result.
-    fn items(&mut self, items: IrRange, mut next: u32, result: IrId) -> Next {
+    /// once, and then its result, `split` the items split off from it, if
+    /// any are: the result, and an item that uses a slot one of them
+    /// declares, wait for them first (see [Pieces](pieces#pieces)).
+    fn items(
+        &mut self,
+        items: IrRange,
+        mut next: u32,
+        result: IrId,
+        mut split: Option<Box<ItemsSplit>>,
+    ) -> Next {
         loop {
             let ir = &self.running().ir;
-            let Some(&item) = ir.items(items).get(next as usize) else {
+            let item = ir.items(items).get(next as usize).copied();
+            let waits = split.as_ref().is_some_and(|state| {
+                state.pieces.join.is_some()
+                    && item.is_none_or(|item| ir.uses_slots(item, &state.pending))
+            });
+            if waits {
+                let join = split.as_mut().and_then(|state| state.pieces.join.take());
+                return match join {
+                    Some(join) => {
+                        self.join_pieces(Joining::Items(items, next, result, split), join, None)
+                    }
+                    None => self.lost_call(),
+                };
+            }
+            let Some(item) = item else {
+                if let Some(state) = split
+                    && self.spare.len() < SPARE_SPLITS
+                {
+                    self.spare.push(pieces::Spare(state));
+                }
                 return Next::Eval(result);
             };
             next += 1;
             if !ir.is_simple(item) {
+                let later = ir.items(items).get(next as usize..);
+                let marked =
+                    pieces::any_later(ir, later.unwrap_or_default()) && self.splittable(item);
                 self.frames.push(Frame::Items {
                     items,
                     next,
                     result,
+                    split,
                 });
+                if marked {
+                    self.piece_begin(next - 1);
+                }
                 return Next::Eval(item);
             }
             if let Err(unwind) = self.walker(|walker| walker.value(item)) {
@@ -1144,7 +1207,9 @@ impl<'r> Machine<'r> {
                     self.calls.push(state);
                     return Next::Block(Wait::Unit(owner), Resume::Lookup);
                 }
-                Ok(MemoBegin::Sibling) => {
+                // A later task's run of it is abandoned for this one.
+                Ok(MemoBegin::Sibling(entry)) => {
+                    self.wound(tasks::Wound::Entry(entry));
                     self.calls.push(state);
                     return Next::Park(Box::new(Status::Waiting(Resume::Lookup)));
                 }
@@ -1262,6 +1327,15 @@ impl<'r> Machine<'r> {
     /// call ends.
     fn body_done(&mut self, state: CallState, result: Outcome) -> Next {
         self.activations.pop();
+        if let (Some((Some(mark), scoped)), Some((tasks::Wound::Entry(entry), wounder))) =
+            (state.memo, self.meta.wound)
+            && mark.entry == entry
+            && result
+                .as_ref()
+                .is_err_and(|unwind| pieces::is_cancelled(unwind))
+        {
+            return self.abandon(state, (mark, scoped), wounder);
+        }
         let Some(guard) = state.guard.as_ref() else {
             return self.finish(&state, result);
         };
@@ -1289,6 +1363,31 @@ impl<'r> Machine<'r> {
                 .push(format!("{} was tried {} times", shown(code), guard.tried));
         }
         self.finish(&state, Err(Box::new(error.into())))
+    }
+
+    /// Abandons the memoised call `state`, its entry `mark`, its body a
+    /// scope of its own if `scoped`, whose run a task earlier in program
+    /// order, `wounder`, needs (see [Wound-wait](tasks#wound-wait)): its
+    /// entry goes, for `wounder` to run it, and the call waits to look its
+    /// arguments, still in its frame, up again.
+    fn abandon(
+        &mut self,
+        mut state: CallState,
+        (mark, scoped): (Mark, bool),
+        wounder: u32,
+    ) -> Next {
+        if let Some(number) = state.guard.as_ref().and_then(|guard| guard.deadline) {
+            self.walker(|walker| walker.pop_deadline(number));
+        }
+        self.walker(|walker| walker.leave_scope(scoped));
+        self.memo.running.pop();
+        self.memo.finish(&state.closure, &mark, None);
+        self.meta.wound = None;
+        state.memo = Some((None, false));
+        state.guard = None;
+        self.wake_task(wounder);
+        self.calls.push(state);
+        Next::Park(Box::new(Status::Waiting(Resume::Lookup)))
     }
 
     /// Ends the call `state` with `result`, what its body came to, as

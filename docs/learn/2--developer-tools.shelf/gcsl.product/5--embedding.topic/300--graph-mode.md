@@ -79,12 +79,26 @@ it with `break` or `return`. Any other loop runs its iterations in
 order.
 
 The same goes for the elements of a list, the pieces of a string with
-`{}` in it, and the arguments of a call. In
-`link(compile(a), compile(b))`, both compiles are met before the unit
-stops. A call's body runs, and a parameter's default is evaluated, only
-once every argument before it is there. An element or argument is set
-aside only if it assigns no variable with `:=` and has no `break`,
-`continue` or `return` in it.
+`{}` in it, the arguments of a call, the statements of a block and the
+fields of a record. In `link(compile(a), compile(b))`, both compiles are
+met before the unit stops, and so are both reads in:
+
+```text
+let a = fs.read("a.txt")
+let b = fs.read("b.txt")
+```
+
+A call's body runs, and a parameter's default is evaluated, only once
+every argument before it is there. A statement that uses a variable an
+earlier statement set aside declares waits for that statement first, and
+a block's value waits for all of them. An element, argument or statement
+is set aside only if it assigns no variable with `:=` and has no
+`break`, `continue` or `return` in it.
+
+If two parts set aside need the same memoised call or `lazy` value, it
+runs once. Should a later part have begun it and then had to wait for an
+earlier one, the later part gives up its run and the earlier part runs
+it, as the program would in order.
 
 An iteration set aside can still reach effects that must happen in
 program order, such as programs that write files the next one reads.

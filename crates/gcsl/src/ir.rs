@@ -2084,6 +2084,29 @@ impl Ir {
             .collect()
     }
 
+    /// Whether the subtree of node `id` reads or writes any of `slots` of
+    /// the frame it runs in: loads, stores, a `for`'s variable or an `is`'s
+    /// binding; not the bodies of the functions it makes closures of, which
+    /// run in frames of their own.
+    pub(crate) fn uses_slots(&self, id: IrId, slots: &[Slot]) -> bool {
+        let mut walk = vec![id];
+        while let Some(node) = walk.pop() {
+            let kind = self.get(node).kind;
+            let used = match kind {
+                IrKind::Load(slot, _)
+                | IrKind::Store(slot, _)
+                | IrKind::For { slot, .. }
+                | IrKind::Is { slot, .. } => Some(slot),
+                _ => None,
+            };
+            if used.is_some_and(|slot| slots.contains(&slot)) {
+                return true;
+            }
+            walk.extend(kind.children(&self.item_lists));
+        }
+        false
+    }
+
     /// For each argument given a value, in the order its node was made,
     /// whether the value is independent (see [`Ir::is_independent`]), for
     /// tests.
