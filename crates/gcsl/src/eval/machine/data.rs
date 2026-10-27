@@ -17,6 +17,7 @@ use super::super::{
     source_of,
 };
 use super::futures::{AwaitState, Then};
+use super::pieces::{Joining, Pieces, any_later, splits};
 use super::{Frame, Machine, Next, Outcome, fail, give};
 
 /// A node whose operands the machine evaluates, in order, before applying
@@ -27,8 +28,12 @@ pub(in crate::eval) struct OperandsState {
     node: IrId,
     /// Its operands, in order.
     operands: Vec<IrId>,
-    /// Their values so far.
-    values: Vec<Value>,
+    /// Their values so far, each split-off operand's place held by `{}`
+    /// until it ends.
+    pub(super) values: Vec<Value>,
+    /// Its operands split off, if it has pieces that may be split off (see
+    /// [Pieces](super::pieces#pieces)).
+    pub(super) pieces: Pieces,
 }
 
 impl Machine<'_> {
@@ -103,18 +108,31 @@ impl Machine<'_> {
             node: id,
             operands,
             values: Vec::new(),
+            pieces: Pieces::default(),
         }))
     }
 
-    /// Evaluates the operands of `state` from the next on, and then applies
-    /// its node.
-    fn next_operand(&mut self, mut state: Box<OperandsState>) -> Next {
+    /// Evaluates the operands of `state` from the next on, and then, those
+    /// split off ended, applies its node.
+    pub(super) fn next_operand(&mut self, mut state: Box<OperandsState>) -> Next {
         loop {
             let Some(&operand) = state.operands.get(state.values.len()) else {
+                if let Some(join) = state.pieces.join.take() {
+                    return self.join_pieces(Joining::Operands(state), join, None);
+                }
                 return self.apply_again(state);
             };
-            if !self.running().ir.is_simple(operand) {
+            let ir = &self.running().ir;
+            if !ir.is_simple(operand) {
+                let later = state.operands.get(state.values.len() + 1..);
+                let split = splits(ir.get(state.node).kind)
+                    && any_later(ir, later.unwrap_or_default())
+                    && self.splittable(operand);
+                let at = state.values.len();
                 self.frames.push(Frame::Operands(state));
+                if split {
+                    self.piece_begin(u32::try_from(at).unwrap_or(u32::MAX));
+                }
                 return Next::Eval(operand);
             }
             match self.walker(|walker| walker.value(operand)) {
@@ -130,10 +148,21 @@ impl Machine<'_> {
     /// [`Evaluator::quantity_amount`](super::Evaluator::quantity_amount)
     /// says it.
     pub(super) fn operand(&mut self, mut state: Box<OperandsState>, result: Outcome) -> Next {
+        self.piece_end(&mut state.pieces);
         match result {
             Ok(value) => {
                 state.values.push(value);
                 self.next_operand(state)
+            }
+            // A failure waits behind the operands split off before it.
+            Err(unwind) if state.pieces.join.is_some() => {
+                let at = state.values.len();
+                match state.pieces.join.take() {
+                    Some(join) => {
+                        self.join_pieces(Joining::Operands(state), join, Some((at, unwind)))
+                    }
+                    None => Next::Give(Err(unwind)),
+                }
             }
             Err(unwind) => match self.running().ir.get(state.node).kind {
                 IrKind::Quantity(quantity, amount) => {

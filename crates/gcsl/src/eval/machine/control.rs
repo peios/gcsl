@@ -12,6 +12,9 @@ use crate::value::{Closure, ContextFrame, Value};
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
 use super::super::{Callee, Unwind, nested_too_deeply};
+use super::super::graph::GraphRun;
+use super::suspend::Resume;
+use super::tasks::Status;
 use super::{Activation, Frame, Machine, Next, Outcome, fail, give};
 
 /// A `with` running in the machine.
@@ -158,6 +161,17 @@ impl Machine<'_> {
         key: Name,
         (default, depth): (IrId, u16),
     ) -> Next {
+        // A step's run hands the host what it reads of its context, which
+        // the host then gives the step: the read keeps program order as an
+        // effect the host does not isolate does.
+        if self.shared.graph.is_some_and(GraphRun::is_watching) {
+            if self.doomed() {
+                return fail(super::tasks::cancelled(self.running().ir.get(id).span));
+            }
+            if self.earlier_live() {
+                return Next::Park(Box::new(Status::Waiting(Resume::Read(id))));
+            }
+        }
         let context = self.shared.context.borrow().clone();
         self.memo.depend_context(key, context.as_ref());
         self.walker(|walker| walker.note_step_read(key, context.as_ref()));

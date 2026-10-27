@@ -1229,6 +1229,56 @@ fn a_step_s_run_tells_what_it_read_of_its_context() {
 }
 
 #[test]
+fn a_step_reads_its_context_in_program_order_while_programs_wait() {
+    // The first program's statement is split off when it waits; the read
+    // after it, which the host acts on, waits for it, and is still told.
+    let (mut workspace, file) = lone_workspace(
+        "context level: Int = 1\n\
+         #[step] fn ordered(n: Int) -> String {\n\
+         \x20   let before = exec([\"echo\", \"a\"]).stdout.trim()\n\
+         \x20   let read = ^level\n\
+         \x20   let after = exec([\"echo\", \"b\"]).stdout.trim()\n\
+         \x20   = \"{before}{read}{after}\"\n\
+         }\n\
+         = ordered(1) with { level = 3 }",
+    );
+    let mut graph = Graph::new();
+    workspace.run_graph(file, &mut graph, every()).unwrap();
+    let told = Told::default();
+    let host = GraphHost {
+        defers: &|_: &[crate::check::Attribute]| false,
+        effects: &told,
+    };
+    let step = NodeId::of(0);
+    let mut stops = 0;
+    let (value, reads) = loop {
+        match workspace.run_step(&mut graph, step, host).unwrap() {
+            (Progress::Paused(effects), _) => {
+                // At the first stop, the first program waits: nothing read.
+                if stops == 0 {
+                    assert!(told.read.borrow().is_empty());
+                }
+                stops += 1;
+                for effect in effects {
+                    let job = workspace.effect_job(&graph, effect).unwrap();
+                    let value = workspace.from_plain(&on_a_thread(job, None).unwrap());
+                    assert!(graph.resolve(effect, Ok(value)));
+                }
+            }
+            (Progress::Waiting(unit), _) => panic!("waits for unit {unit}"),
+            (Progress::Done(value), reads) => break (value, reads),
+        }
+    };
+    assert_eq!(value, text("a3b"));
+    let read: Vec<String> = reads
+        .keys
+        .iter()
+        .map(|(key, _)| context_name(key))
+        .collect();
+    assert_eq!(read, ["level"]);
+}
+
+#[test]
 fn a_lazy_made_in_a_memoised_call_and_awaited_after_converges() {
     let (mut workspace, file) = lone_workspace(
         "fn made(x: String) ->> {name: String, later: Future<String>} {\n\

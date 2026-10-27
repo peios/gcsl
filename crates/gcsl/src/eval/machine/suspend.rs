@@ -63,6 +63,9 @@ pub(in crate::eval) enum Resume {
     /// The lookup of the memoised call on top of the machine's calls,
     /// again, its arguments still in its frame.
     Lookup,
+    /// The evaluation of the context read node, again: its turn to read a
+    /// context the run watches may have come.
+    Read(IrId),
 }
 
 /// A unit's evaluation, stopped where it waits (see the module
@@ -331,13 +334,16 @@ impl Parked {
         }
         for call in &mut self.calls {
             call.base = call.base.wrapping_add(delta);
+            if let Some(marks) = call.pieces.begun.marks_mut() {
+                marks.rebase(delta);
+            }
         }
         for frame in &mut self.frames {
             match frame {
                 Frame::Future(run) => run.rebase(delta),
                 Frame::Default(run) => run.rebase(delta),
                 Frame::ArgDefault(run) => run.base = run.base.wrapping_add(delta),
-                _ => {}
+                frame => frame.rebase_marks(delta),
             }
         }
     }
@@ -363,6 +369,7 @@ impl Machine<'_> {
                 Some(state) => self.enter_body(state),
                 None => self.lost_call(),
             },
+            Resume::Read(id) => Next::Eval(id),
         }
     }
 }

@@ -10,11 +10,9 @@ use std::rc::Rc;
 use crate::diagnostic::Mark as ErrorMark;
 use crate::value::{List, Value};
 
-use super::super::graph::Wait;
-
 use super::super::{Elements, FOR_RESERVE, Flow, Stop, StopKind, Unwind, caught};
-use super::suspend::Resume;
-use super::tasks::{Join, Marks, Status, path_of};
+use super::pieces::is_cancelled;
+use super::tasks::{Begun, Join, Marks, Status, path_of};
 use super::{Frame, Machine, Next, Outcome, fail, give};
 
 /// A `for` running in the machine.
@@ -41,7 +39,7 @@ pub(super) struct ForState {
     /// in a function's body.
     forkable: bool,
     /// Where the iteration running began, if it may be split off.
-    marks: Option<Box<Marks>>,
+    begun: Begun,
     /// Its iterations split off, once one is.
     join: Option<Rc<RefCell<Join>>>,
     /// Its own failure, once iterations are split off, by its iteration.
@@ -49,12 +47,36 @@ pub(super) struct ForState {
 }
 
 impl ForState {
-    /// The iteration it is at, as part of a task's path, if it has split
-    /// iterations off (see [Tasks](super::tasks#tasks)).
+    /// The iteration it is at, as part of a task's path, if its iterations
+    /// may be split off, whether or not any has been (see
+    /// [Tasks](super::tasks#tasks)).
     pub(super) fn split_at(&self) -> Option<u32> {
+        self.forkable
+            .then(|| u32::try_from(self.index.saturating_sub(1)).unwrap_or(u32::MAX))
+    }
+
+    /// Whether the iteration running may be split off: where it began is
+    /// marked.
+    pub(super) const fn marked(&self) -> bool {
+        self.begun.is_marked()
+    }
+
+    /// Where the iteration running began, if it may be split off.
+    pub(super) fn marks_mut(&mut self) -> Option<&mut Marks> {
+        self.begun.marks_mut()
+    }
+
+    /// Its iterations split off, once one is.
+    pub(super) const fn join(&self) -> Option<&Rc<RefCell<Join>>> {
+        self.join.as_ref()
+    }
+
+    /// Whether an iteration split off has failed, so that what the loop
+    /// does after it would not be done in program order.
+    pub(super) fn failed(&self) -> bool {
         self.join
             .as_ref()
-            .map(|_| u32::try_from(self.index.saturating_sub(1)).unwrap_or(u32::MAX))
+            .is_some_and(|join| join.borrow().failed.is_some())
     }
 }
 
@@ -113,7 +135,7 @@ impl Machine<'_> {
             values: Vec::new(),
             index: 0,
             forkable,
-            marks: None,
+            begun: Begun::default(),
             join: None,
             failure: None,
         });
@@ -256,7 +278,7 @@ impl Machine<'_> {
 
     /// Takes up the `for` `state` with `result`, what its body came to.
     pub(super) fn for_body(&mut self, mut state: Box<ForState>, result: Outcome) -> Next {
-        if state.marks.take().is_some() {
+        if state.begun.end() {
             self.walker(|walker| walker.leave_scope(true));
         }
         match collected(&mut state, result) {
@@ -287,7 +309,7 @@ impl Machine<'_> {
         let marks = self.marks();
         self.walker(|walker| walker.enter_scope(&[&key.0, &key.1]));
         if let Some(Frame::ForBody(state)) = self.frames.last_mut() {
-            state.marks = Some(Box::new(marks));
+            state.begun.mark(marks);
         }
         Next::Eval(body)
     }
@@ -299,12 +321,14 @@ impl Machine<'_> {
         let Some(join) = state.join.clone() else {
             return Next::Give(Ok(loop_result(state.collect, state.values)));
         };
-        if let Some((failed, _)) = &state.failure {
+        if let Some((failed, unwind)) = &state.failure {
+            // A cancellation of the loop's own cancels every iteration.
+            let every = is_cancelled(unwind);
             let later: Vec<u32> = join
                 .borrow()
                 .children
                 .iter()
-                .filter(|child| child.0 > *failed && child.3.is_none())
+                .filter(|child| (every || child.0 > *failed) && child.3.is_none())
                 .map(|child| child.2)
                 .collect();
             self.cancel(&later);
@@ -393,17 +417,10 @@ impl Machine<'_> {
     /// split off, which stops for `wait`, to take up after `resume`, into a
     /// child, and goes on with its loop's next iteration; or, if there is
     /// none, gives `wait` and `resume` back (see [Tasks](super::tasks#tasks)).
-    pub(super) fn fork_for(&mut self, wait: Wait, resume: Resume) -> Result<Next, (Wait, Resume)> {
-        let Some(at) = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, Frame::ForBody(state) if state.marks.is_some()))
-        else {
-            return Err((wait, resume));
-        };
+    pub(super) fn fork_for(&mut self, at: usize, status: Status) -> Result<Next, Status> {
         let (parent, child) = (self.meta.id, self.next_task);
         let Some(Frame::ForBody(state)) = self.frames.get_mut(at) else {
-            return Err((wait, resume));
+            return Err(status);
         };
         let join = Rc::clone(
             state
@@ -424,11 +441,15 @@ impl Machine<'_> {
             joined.live += 1;
             joined.children.len() - 1
         };
-        let Some(marks) = state.marks.take() else {
-            return Err((wait, resume));
+        let Some(marks) = state.begun.take() else {
+            return Err(status);
         };
-        let base = path_of(&self.meta, self.frames.get(..=at).unwrap_or_default());
-        self.split(&marks, (join, number), (wait, resume), base);
+        let base = path_of(
+            &self.meta,
+            self.frames.get(..=at).unwrap_or_default(),
+            &self.calls,
+        );
+        self.split(&marks, (join, number), status, base);
         match self.frames.pop() {
             Some(Frame::ForBody(state)) => Ok(self.for_next(state)),
             _ => Ok(self.lost_call()),

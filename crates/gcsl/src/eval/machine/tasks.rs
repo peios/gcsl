@@ -4,12 +4,16 @@
 //! # Tasks
 //!
 //! A unit's evaluation starts as one task, its root. When a task would
-//! stop to wait, the machine looks for the innermost iteration of a
-//! forkable `for` (see [`crate::ir::IrKind::For`]) on its frames, inside a
-//! function's body; if it finds one, it splits the task there: what the
-//! iteration was doing becomes a *child* task, which waits, and the task
-//! goes on with the next iteration. So a loop of a hundred fetches meets
-//! all of them before the host is asked for any.
+//! wait, for a node, another unit, its turn, a sibling or its own
+//! children, the machine looks for the innermost iteration of a forkable
+//! `for` (see [`crate::ir::IrKind::For`]) or piece of a list,
+//! interpolation or call (see [Pieces](super::pieces#pieces)) on its
+//! frames, inside a function's body; if it finds one, it splits the task
+//! there: what the iteration or piece was doing becomes a *child* task,
+//! which waits, and the task goes on with the next. So a loop of a hundred
+//! fetches meets all of them before the host is asked for any. What was
+//! split off from the loops, nodes and calls the child takes with it is
+//! the child's to wait for.
 //!
 //! The task running has its frames, activations and calls in the
 //! machine's fields, its value stack in the run's, and what the run shares
@@ -34,14 +38,37 @@
 //!
 //! **Program order.** A task's *path* is where its work is in the program:
 //! its base, the path its parent was at when it split it off, and then the
-//! iteration each split loop on its frames is at, a loop waiting for its
-//! children past every iteration. An effect the host does not isolate
-//! ([`crate::eval::Effects::isolates`]) is made only when no live task's
-//! path is earlier, so that such effects reach the host in program order.
+//! iteration or piece that each loop whose iterations may be split off,
+//! and each list, interpolation, call and block, on its frames is at,
+//! whether or not anything was split off from it, so that paths taken at
+//! different times compare as the program orders them; one waiting for
+//! its children is past every iteration or piece. An effect
+//! the host does not isolate ([`crate::eval::Effects::isolates`]) is made
+//! only when no live task's path is earlier, so that such effects reach the
+//! host in program order; and never once an iteration or piece split off
+//! from one the task is in has failed, since a run in order would have
+//! stopped there.
 //!
 //! A task that needs a memoised call or a `lazy` another task of the unit
 //! is running waits for it; one that waits for its turn or for a sibling
 //! is woken whenever a task ends.
+//!
+//! # Wound-wait
+//!
+//! Tasks that wait for each other's memoised calls or `lazy`s can wait in
+//! a circle that a run in order never meets: a later task begins a call
+//! that an earlier one needs, and then, inside it, waits for its turn
+//! behind the earlier task. So a task never waits for a later one's run:
+//! it *wounds* it ([`Machine::wound`]). The later task is cancelled as far
+//! as the call or `lazy` it was running ([`Meta::wound`]), whose frame
+//! catches the cancellation: the entry goes, or the `lazy` is left unrun,
+//! the earlier task is woken, and the later one waits to look it up or
+//! await it again. The earlier task then runs it as a run in order would:
+//! it finishes it, or, if it truly depends on itself, fails where a run in
+//! order fails. Waits then only ever go from a later task to an earlier
+//! one, and cannot form a circle. A wounded task's work inside the call is
+//! lost, as are its children's; an effect the host does not isolate that
+//! it was waiting to make is never made.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -49,7 +76,7 @@ use std::time::Instant;
 
 use crate::diagnostic::Mark;
 use crate::source::Span;
-use crate::value::{ContextFrame, Value};
+use crate::value::{ContextFrame, List, Value};
 
 use super::super::graph::{GraphRun, NodeId, RunState, Wait};
 use super::super::memo::Running;
@@ -64,8 +91,20 @@ use super::{Activation, CallState, Frame, Machine, Next, Outcome};
 pub(in crate::eval) struct Meta {
     /// Its number, the root's 0.
     pub(super) id: u32,
+    /// What it is to abandon its run of, and the task that wounded it, once
+    /// one has (see [Wound-wait](#wound-wait)).
+    pub(super) wound: Option<(Wound, u32)>,
     /// The path its parent was at when it split it off.
     base: Vec<u32>,
+}
+
+/// What a wounded task abandons its run of (see [Wound-wait](#wound-wait)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::eval) enum Wound {
+    /// A memoised call, by its entry's identity.
+    Entry(u64),
+    /// A `lazy`'s body.
+    Future(*const crate::value::Future),
 }
 
 /// What the run shares that is a task's own (see [Tasks](#tasks)).
@@ -108,8 +147,9 @@ pub(in crate::eval) enum Status {
     /// It waits for its turn to make an effect, or for a sibling's
     /// memoised call or `lazy`, to take up after the resume.
     Waiting(Resume),
-    /// It is to be cancelled.
-    Cancel,
+    /// It is to be cancelled; `true` if a call of it, on top of its calls
+    /// with no frame of its own, waited to be looked up again.
+    Cancel(bool),
 }
 
 /// A task that is not running (see [Tasks](#tasks)).
@@ -130,8 +170,10 @@ pub(in crate::eval) struct Task {
     pub(super) status: Status,
 }
 
-/// Where an iteration of a forkable `for` began: what the task had then,
-/// to which a split takes it back (see [Tasks](#tasks)).
+/// Where an iteration of a forkable `for`, or a piece (see
+/// [Pieces](super::pieces#pieces)), began: what the task had then, to
+/// which a split takes it back (see [Tasks](#tasks)).
+#[derive(Clone)]
 pub(in crate::eval) struct Marks {
     /// Its frames, the iteration's own above them.
     frames: usize,
@@ -170,6 +212,11 @@ pub(in crate::eval) struct Join {
     pub(super) parent: u32,
     /// The first iteration that failed, if one has.
     pub(super) failed: Option<usize>,
+    /// For each child that is a block's item, by its number, the slots it
+    /// declares, of the frame the block runs in, whose values it comes to
+    /// (see [Pieces](super::pieces#pieces)): by their indices in that
+    /// frame, so that they hold however its unit's frames are moved.
+    pub(super) slots: Vec<(usize, Vec<usize>)>,
 }
 
 impl Join {
@@ -182,8 +229,64 @@ impl Join {
     }
 }
 
+impl Marks {
+    /// Moves where it began by `delta` slots up the stack, wrapping, as
+    /// its unit's frames move.
+    pub(super) const fn rebase(&mut self, delta: usize) {
+        self.stack = self.stack.wrapping_add(delta);
+    }
+}
+
+/// Where the iteration or piece running began, if it may be split off:
+/// its [`Marks`], in a box kept for the next one, so that a loop or node
+/// allocates once however many of its iterations or pieces are marked,
+/// and what holds it stays small.
+#[derive(Clone, Default)]
+pub(in crate::eval) struct Begun {
+    /// Whether the one running is marked.
+    marked: bool,
+    /// Its marks, if it is; an earlier one's, if not.
+    marks: Option<Box<Marks>>,
+}
+
+impl Begun {
+    /// Marks the one running as beginning at `marks`.
+    pub(super) fn mark(&mut self, marks: Marks) {
+        match &mut self.marks {
+            Some(kept) => **kept = marks,
+            None => self.marks = Some(Box::new(marks)),
+        }
+        self.marked = true;
+    }
+
+    /// Whether the one running is marked.
+    pub(super) const fn is_marked(&self) -> bool {
+        self.marked
+    }
+
+    /// Ends the one running: whether it was marked.
+    pub(super) const fn end(&mut self) -> bool {
+        std::mem::replace(&mut self.marked, false)
+    }
+
+    /// The marks of the one running, taken, for a split; it is no longer
+    /// marked.
+    pub(super) fn take(&mut self) -> Option<Box<Marks>> {
+        if self.end() { self.marks.take() } else { None }
+    }
+
+    /// The marks of the one running, if it is marked.
+    pub(super) fn marks_mut(&mut self) -> Option<&mut Marks> {
+        if self.marked {
+            self.marks.as_deref_mut()
+        } else {
+            None
+        }
+    }
+}
+
 /// The error a cancelled task unwinds with, which nothing catches.
-fn cancelled(span: Span) -> Unwind {
+pub(super) fn cancelled(span: Span) -> Unwind {
     let mut error = internal("a cancelled iteration", span);
     error.mark = Mark::CANCELLED;
     Unwind::Error(error)
@@ -204,7 +307,7 @@ impl Machine<'_> {
             futures: shared.futures.take(),
             run: shared
                 .graph
-                .map_or_else(RunState::default, GraphRun::take_state),
+                .map_or_else(RunState::default, GraphRun::take_task_state),
             profile: shared
                 .profile
                 .map(|profile| profile.suspend(self.profiled_base)),
@@ -265,7 +368,7 @@ impl Machine<'_> {
         let Some(ready) = self.tasks.iter().position(|task| {
             matches!(
                 task.status,
-                Status::Ready(_) | Status::Wake(_) | Status::Cancel
+                Status::Ready(_) | Status::Wake(_) | Status::Cancel(_)
             )
         }) else {
             self.status = Some(status);
@@ -285,8 +388,15 @@ impl Machine<'_> {
         match status {
             Status::Ready(next) => next,
             Status::Wake(resume) => self.resume_next(resume),
-            Status::Cancel => {
+            Status::Cancel(looked_up) => {
                 let span = self.running().ir.get(self.running().ir.root()).span;
+                if looked_up {
+                    // The call that waited fails, its frame going.
+                    return match self.calls.pop() {
+                        Some(state) => self.argument_failed(&state, cancelled(span)),
+                        None => self.lost_call(),
+                    };
+                }
                 Next::Give(Err(Box::new(cancelled(span))))
             }
             Status::Blocked(..) | Status::Joining | Status::Waiting(_) => {
@@ -375,7 +485,7 @@ impl Machine<'_> {
         let ready = self.tasks.iter().position(|task| {
             matches!(
                 task.status,
-                Status::Ready(_) | Status::Wake(_) | Status::Cancel
+                Status::Ready(_) | Status::Wake(_) | Status::Cancel(_)
             )
         });
         let Some(ready) = ready else {
@@ -406,6 +516,19 @@ impl Machine<'_> {
         result: Outcome,
     ) -> Option<Next> {
         let mut joined = join.borrow_mut();
+        // A block's item comes to the values of the slots it declares.
+        let result = match joined.slots.iter().find(|(number, _)| *number == at) {
+            Some((_, slots)) if result.is_ok() => Ok(Value::List(List::from_vec(
+                slots
+                    .iter()
+                    .map(|&slot| {
+                        let at = self.running().base + slot;
+                        self.stack.get(at).cloned().unwrap_or(Value::Empty)
+                    })
+                    .collect(),
+            ))),
+            _ => result,
+        };
         let iteration = joined.children.get(at).map_or(0, |child| child.0);
         let cancelled_too = matches!(&result, Err(unwind)
             if matches!(&**unwind, Unwind::Error(error) if error.mark == Mark::CANCELLED));
@@ -421,7 +544,8 @@ impl Machine<'_> {
         }
         joined.live = joined.live.saturating_sub(1);
         let failed = joined.failed;
-        let woken = (joined.live == 0).then_some(joined.parent);
+        let parent = joined.parent;
+        let woken = (joined.live == 0).then_some(parent);
         let later: Vec<u32> = failed.map_or_else(Vec::new, |failed| {
             joined
                 .children
@@ -432,31 +556,108 @@ impl Machine<'_> {
         });
         drop(joined);
         self.cancel(&later);
+        // What the task that split it off does now is after the failure:
+        // it is cancelled as far as the loop, node or call, which then
+        // reports the failure.
+        if failed.is_some() {
+            self.halt(parent, join);
+        }
         if let Some(parent) = woken {
-            self.wake(parent);
+            self.wake(parent, join);
         }
         self.finished()
+    }
+
+    /// Wounds the task that runs `target`, if it is later in program order
+    /// than the task running, which needs it: it abandons its run, so that
+    /// the task running can run it, as a run in order would (see
+    /// [Wound-wait](#wound-wait)).
+    pub(super) fn wound(&mut self, target: Wound) {
+        let mine = self.path();
+        let wounder = self.meta.id;
+        for task in &mut self.tasks {
+            let runs = match target {
+                Wound::Entry(entry) => task
+                    .calls
+                    .iter()
+                    .any(|call| matches!(call.memo, Some((Some(mark), _)) if mark.entry == entry)),
+                Wound::Future(future) => task
+                    .frames
+                    .iter()
+                    .any(|frame| matches!(frame, Frame::Future(run) if run.runs(future))),
+            };
+            if runs
+                && task.meta.wound.is_none()
+                && !matches!(task.status, Status::Cancel(_))
+                && path_of(&task.meta, &task.frames, &task.calls) > mine
+            {
+                task.meta.wound = Some((target, wounder));
+                task.status = Status::Cancel(looks_up(&task.status));
+            }
+        }
+    }
+
+    /// Cancels the task `id`, set aside, unless it waits for the children
+    /// of `join`, whose last child to end wakes it: one of its children
+    /// failed, and what it does now comes after the failure in program
+    /// order. Its cancellation stops at the loop, node or call that `join`
+    /// is of, which waits for its children and reports the failure.
+    fn halt(&mut self, id: u32, join: &Rc<RefCell<Join>>) {
+        for task in &mut self.tasks {
+            let waits = matches!(task.status, Status::Joining)
+                && task
+                    .frames
+                    .last()
+                    .and_then(Frame::join)
+                    .is_some_and(|waited| Rc::ptr_eq(waited, join));
+            if task.meta.id == id && !waits && !matches!(task.status, Status::Cancel(_)) {
+                task.status = Status::Cancel(looks_up(&task.status));
+                task.meta.wound = None;
+            }
+        }
+    }
+
+    /// Wakes the task `id`, if it waits for a sibling, to look again.
+    pub(super) fn wake_task(&mut self, id: u32) {
+        for task in &mut self.tasks {
+            if task.meta.id == id {
+                let status = std::mem::replace(&mut task.status, Status::Joining);
+                task.status = match status {
+                    Status::Waiting(resume) => Status::Wake(resume),
+                    status => status,
+                };
+            }
+        }
     }
 
     /// Cancels the tasks `ids` that are set aside and still waiting.
     pub(super) fn cancel(&mut self, ids: &[u32]) {
         for task in &mut self.tasks {
-            if ids.contains(&task.meta.id) && !matches!(task.status, Status::Cancel) {
-                task.status = Status::Cancel;
+            if ids.contains(&task.meta.id) && !matches!(task.status, Status::Cancel(_)) {
+                task.status = Status::Cancel(looks_up(&task.status));
+                task.meta.wound = None;
             }
         }
     }
 
-    /// Wakes the loop of the task `id`, which waits for its children.
-    fn wake(&mut self, id: u32) {
+    /// Wakes the task `id` if it waits for the children of `join`: its
+    /// innermost frame waits for them. A task may hold other joins further
+    /// down its frames, whose children end while it waits for this one.
+    fn wake(&mut self, id: u32, join: &Rc<RefCell<Join>>) {
+        let waits = |frames: &[Frame]| {
+            frames
+                .last()
+                .and_then(Frame::join)
+                .is_some_and(|waited| Rc::ptr_eq(waited, join))
+        };
         if self.meta.id == id {
-            if matches!(self.status, Some(Status::Joining)) {
+            if matches!(self.status, Some(Status::Joining)) && waits(&self.frames) {
                 self.status = Some(Status::Ready(Next::Give(Ok(Value::Empty))));
             }
             return;
         }
         for task in &mut self.tasks {
-            if task.meta.id == id && matches!(task.status, Status::Joining) {
+            if task.meta.id == id && matches!(task.status, Status::Joining) && waits(&task.frames) {
                 task.status = Status::Ready(Next::Give(Ok(Value::Empty)));
             }
         }
@@ -464,7 +665,7 @@ impl Machine<'_> {
 
     /// The path of the task running (see [Tasks](#tasks)).
     pub(super) fn path(&self) -> Vec<u32> {
-        path_of(&self.meta, &self.frames)
+        path_of(&self.meta, &self.frames, &self.calls)
     }
 
     /// Whether a live task other than the one running is earlier in program
@@ -476,7 +677,7 @@ impl Machine<'_> {
         let mine = self.path();
         self.tasks
             .iter()
-            .any(|task| path_of(&task.meta, &task.frames) < mine)
+            .any(|task| path_of(&task.meta, &task.frames, &task.calls) < mine)
     }
 
     /// Splits the task running at the marks `marks` of an iteration of a
@@ -488,11 +689,25 @@ impl Machine<'_> {
         &mut self,
         marks: &Marks,
         (join, at): (Rc<RefCell<Join>>, usize),
-        (wait, resume): (Wait, Resume),
+        status: Status,
         base: Vec<u32>,
     ) {
+        let id = self.next_task;
+        self.next_task += 1;
         let mut frames = vec![Frame::Deliver(join, at)];
         frames.extend(self.frames.split_off(marks.frames.min(self.frames.len())));
+        // What was split off from the loops, nodes and calls it takes is
+        // the child's to wait for.
+        let joins = frames.iter().skip(1).filter_map(Frame::join).chain(
+            self.calls
+                .get(marks.calls..)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|call| call.pieces.join.as_ref()),
+        );
+        for join in joins {
+            join.borrow_mut().parent = id;
+        }
         // The child runs in the activations its iteration ran in, copied,
         // and in its own above them.
         let kept = marks.activations.min(self.activations.len());
@@ -528,16 +743,18 @@ impl Machine<'_> {
                 .last()
                 .map(|deadline| deadline.effective),
         );
-        let id = self.next_task;
-        self.next_task += 1;
         self.tasks.push(Task {
-            meta: Meta { id, base },
+            meta: Meta {
+                id,
+                base,
+                wound: None,
+            },
             frames,
             activations,
             calls,
             stack,
             own,
-            status: Status::Blocked(wait, resume),
+            status,
         });
     }
 
@@ -573,15 +790,26 @@ fn split_kept<T: Clone>(values: &mut Vec<T>, kept: usize) -> Vec<T> {
     whole
 }
 
+/// Whether a task waiting as `status` says has a call on top of its calls,
+/// with no frame of its own, waiting to be looked up again.
+const fn looks_up(status: &Status) -> bool {
+    matches!(
+        status,
+        Status::Blocked(_, Resume::Lookup)
+            | Status::Waiting(Resume::Lookup)
+            | Status::Wake(Resume::Lookup)
+    )
+}
+
 /// The path of a task whose place is `meta` and whose frames are `frames`
 /// (see [Tasks](#tasks)).
-pub(super) fn path_of(meta: &Meta, frames: &[Frame]) -> Vec<u32> {
+pub(super) fn path_of(meta: &Meta, frames: &[Frame], calls: &[CallState]) -> Vec<u32> {
     let mut path = meta.base.clone();
-    for frame in frames {
+    for (frame, call) in super::pieces::with_calls(frames, calls) {
         if let Some(at) = match frame {
             Frame::ForBody(state) => ForState::split_at(state),
-            Frame::ForJoin(_) => Some(u32::MAX),
-            _ => None,
+            Frame::ForJoin(_) | Frame::PiecesJoin(_) => Some(u32::MAX),
+            frame => frame.piece_running(call),
         } {
             path.push(at);
         }

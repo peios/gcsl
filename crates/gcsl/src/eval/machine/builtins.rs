@@ -8,7 +8,8 @@ use crate::ir::{ArgValue, IrId, IrKind, IrRange};
 
 use super::super::calls::{Applied, BuiltinArguments};
 use super::super::graph::{Wait, effect_builtin};
-use super::tasks::Status;
+use super::pieces::{Joining, Pieces, any_later_argument};
+use super::tasks::{Status, cancelled};
 use super::{Frame, Machine, Next, Outcome, Resume, fail, give};
 
 /// A call of a built-in running in the machine.
@@ -18,11 +19,14 @@ pub(in crate::eval) struct BuiltinCall {
     /// The call node.
     node: IrId,
     /// Its arguments.
-    args: IrRange,
+    pub(super) args: IrRange,
     /// The argument evaluated next.
-    next: u32,
+    pub(super) next: u32,
     /// The arguments evaluated so far, by their parameters' indices.
-    arguments: BuiltinArguments,
+    pub(super) arguments: BuiltinArguments,
+    /// Its arguments split off, if it has pieces that may be split off (see
+    /// [Pieces](super::pieces#pieces)).
+    pub(super) pieces: Pieces,
 }
 
 impl Machine<'_> {
@@ -35,15 +39,19 @@ impl Machine<'_> {
             args,
             next: 0,
             arguments: Default::default(),
+            pieces: Pieces::default(),
         }))
     }
 
     /// Evaluates the arguments of `call` from its next on, the simple ones
-    /// at once, and then applies the built-in.
-    fn builtin_next(&mut self, mut call: Box<BuiltinCall>) -> Next {
+    /// at once, and then, those split off ended, applies the built-in.
+    pub(super) fn builtin_next(&mut self, mut call: Box<BuiltinCall>) -> Next {
         loop {
             let ir = &self.running().ir;
             let Some(&arg) = ir.items(call.args).get(call.next as usize) else {
+                if let Some(join) = call.pieces.join.take() {
+                    return self.join_pieces(Joining::Builtin(call), join, None);
+                }
                 return self.builtin_apply(call);
             };
             let IrKind::Arg {
@@ -58,7 +66,14 @@ impl Machine<'_> {
                 }));
             };
             if !ir.is_simple(value) {
+                let later = ir.items(call.args).get(call.next as usize + 1..);
+                let split =
+                    any_later_argument(ir, later.unwrap_or_default()) && self.splittable(value);
+                let at = call.next;
                 self.frames.push(Frame::BuiltinArgument(call));
+                if split {
+                    self.piece_begin(at);
+                }
                 return Next::Eval(value);
             }
             match self.walker(|walker| walker.value(value)) {
@@ -80,9 +95,15 @@ impl Machine<'_> {
         if self.shared.graph.is_some()
             && effect_builtin(call.builtin)
             && !self.shared.effects.isolates(call.builtin)
-            && self.earlier_live()
         {
-            return Next::Park(Box::new(Status::Waiting(Resume::Builtin(call))));
+            // Something before it in program order failed: a run in order
+            // would never make it.
+            if self.doomed() {
+                return fail(cancelled(self.running().ir.get(call.node).span));
+            }
+            if self.earlier_live() {
+                return Next::Park(Box::new(Status::Waiting(Resume::Builtin(call))));
+            }
         }
         let BuiltinCall {
             builtin,
@@ -102,12 +123,20 @@ impl Machine<'_> {
 
     /// Takes up `call` with `result`, the value of its next argument.
     pub(super) fn builtin_argument(&mut self, mut call: Box<BuiltinCall>, result: Outcome) -> Next {
+        self.piece_end(&mut call.pieces);
         match result {
             Ok(value) => match self.builtin_argument_done(&mut call, value) {
                 Ok(()) => self.builtin_next(call),
                 Err(next) => next,
             },
-            Err(unwind) => Next::Give(Err(unwind)),
+            // A failure waits behind the arguments split off before it.
+            Err(unwind) => match call.pieces.join.take() {
+                Some(join) => {
+                    let at = call.next as usize;
+                    self.join_pieces(Joining::Builtin(call), join, Some((at, unwind)))
+                }
+                None => Next::Give(Err(unwind)),
+            },
         }
     }
 
