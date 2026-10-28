@@ -62,13 +62,18 @@
 //! it *wounds* it ([`Machine::wound`]). The later task is cancelled as far
 //! as the call or `lazy` it was running ([`Meta::wound`]), whose frame
 //! catches the cancellation: the entry goes, or the `lazy` is left unrun,
-//! the earlier task is woken, and the later one waits to look it up or
-//! await it again. The earlier task then runs it as a run in order would:
-//! it finishes it, or, if it truly depends on itself, fails where a run in
-//! order fails. Waits then only ever go from a later task to an earlier
-//! one, and cannot form a circle. A wounded task's work inside the call is
-//! lost, as are its children's; an effect the host does not isolate that
-//! it was waiting to make is never made.
+//! every task that waits for a sibling's call or `lazy` is woken, and the
+//! later one waits to look it up or await it again. Of the tasks woken to
+//! look again, the earliest in program order runs first, so that the
+//! earliest task that needs the call begins it again: were a later one to,
+//! the earlier would only wound it again, and so on without end. That task
+//! then runs it as a run in order would: it finishes it, or, if it truly
+//! depends on itself, fails where a run in order fails. Waits then only
+//! ever go from a later task to an earlier one, and cannot form a circle. A
+//! wounded task's work inside the call is lost, as are its children's; an
+//! effect the host does not isolate that it was waiting to make is never
+//! made. A call abandoned far more often than this allows is reported as
+//! an internal error ([`Machine::abandoned_too_often`]).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -91,9 +96,9 @@ use super::{Activation, CallState, Frame, Machine, Next, Outcome};
 pub(in crate::eval) struct Meta {
     /// Its number, the root's 0.
     pub(super) id: u32,
-    /// What it is to abandon its run of, and the task that wounded it, once
-    /// one has (see [Wound-wait](#wound-wait)).
-    pub(super) wound: Option<(Wound, u32)>,
+    /// What it is to abandon its run of, once a task has wounded it (see
+    /// [Wound-wait](#wound-wait)).
+    pub(super) wound: Option<Wound>,
     /// The path its parent was at when it split it off.
     base: Vec<u32>,
 }
@@ -103,6 +108,17 @@ pub(in crate::eval) struct Meta {
 pub(in crate::eval) enum Wound {
     /// A memoised call, by its entry's identity.
     Entry(u64),
+    /// A `lazy`'s body.
+    Future(*const crate::value::Future),
+}
+
+/// What a run abandoned was of, as [`Machine::abandoned_too_often`] counts
+/// them: a memoised call by its function and the hash of its arguments,
+/// since its entry is new each time it is begun, or a `lazy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::eval) enum Abandoned {
+    /// A memoised call of the function of the IR, its arguments' hash.
+    Call(*const crate::ir::Ir, crate::ast::FnId, u64),
     /// A `lazy`'s body.
     Future(*const crate::value::Future),
 }
@@ -144,9 +160,16 @@ pub(in crate::eval) enum Status {
     Blocked(Wait, Resume),
     /// Its loop waits for its children.
     Joining,
-    /// It waits for its turn to make an effect, or for a sibling's
-    /// memoised call or `lazy`, to take up after the resume.
+    /// It waits for its turn to make an effect or read a context, to take
+    /// up after the resume.
     Waiting(Resume),
+    /// It waits for a sibling's memoised call or `lazy`, to take up after
+    /// the resume, which looks it up or awaits it again.
+    Sibling(Resume),
+    /// It may run, to look up a sibling's memoised call or await its `lazy`
+    /// again, taking up after the resume: the earliest such task in program
+    /// order runs first (see [Wound-wait](#wound-wait)).
+    Again(Resume),
     /// It is to be cancelled; `true` if a call of it, on top of its calls
     /// with no frame of its own, waited to be looked up again.
     Cancel(bool),
@@ -285,6 +308,16 @@ impl Begun {
     }
 }
 
+/// The internal error of a memoised call or `lazy` whose run the tasks of
+/// a unit abandon to each other far more often than wound-wait allows
+/// (see [`Machine::abandoned_too_often`]).
+pub(super) fn handed_back(span: Span) -> Unwind {
+    Unwind::Error(internal(
+        "the tasks of a unit abandon a call to each other without end",
+        span,
+    ))
+}
+
 /// The error a cancelled task unwinds with, which nothing catches.
 pub(super) fn cancelled(span: Span) -> Unwind {
     let mut error = internal("a cancelled iteration", span);
@@ -365,12 +398,7 @@ impl Machine<'_> {
     /// run: what it does next, or `None` if every task waits, the one that
     /// ran left running with `status`.
     pub(super) fn park(&mut self, status: Status) -> Option<Next> {
-        let Some(ready) = self.tasks.iter().position(|task| {
-            matches!(
-                task.status,
-                Status::Ready(_) | Status::Wake(_) | Status::Cancel(_)
-            )
-        }) else {
+        let Some(ready) = self.next_ready() else {
             self.status = Some(status);
             return None;
         };
@@ -387,7 +415,7 @@ impl Machine<'_> {
     pub(super) fn start(&mut self, status: Status) -> Next {
         match status {
             Status::Ready(next) => next,
-            Status::Wake(resume) => self.resume_next(resume),
+            Status::Wake(resume) | Status::Again(resume) => self.resume_next(resume),
             Status::Cancel(looked_up) => {
                 let span = self.running().ir.get(self.running().ir.root()).span;
                 if looked_up {
@@ -399,7 +427,7 @@ impl Machine<'_> {
                 }
                 Next::Give(Err(Box::new(cancelled(span))))
             }
-            Status::Blocked(..) | Status::Joining | Status::Waiting(_) => {
+            Status::Blocked(..) | Status::Joining | Status::Waiting(_) | Status::Sibling(_) => {
                 let span = self.running().ir.get(self.running().ir.root()).span;
                 Next::Give(Err(Box::new(internal("a waiting task ran", span).into())))
             }
@@ -453,6 +481,7 @@ impl Machine<'_> {
         for task in &mut self.tasks {
             let woken = match std::mem::replace(&mut task.status, Status::Joining) {
                 Status::Waiting(resume) => Status::Wake(resume),
+                Status::Sibling(resume) => Status::Again(resume),
                 Status::Blocked(_, resume) if blocked_too => Status::Wake(resume),
                 status => status,
             };
@@ -472,6 +501,7 @@ impl Machine<'_> {
                     Status::Blocked(Wait::Node(id), resume)
                 }
                 Status::Waiting(resume) | Status::Blocked(_, resume) => Status::Wake(resume),
+                Status::Sibling(resume) => Status::Again(resume),
                 status => status,
             };
             task.status = woken;
@@ -482,13 +512,7 @@ impl Machine<'_> {
     /// may run runs, or `None` if every task waits.
     pub(super) fn finished(&mut self) -> Option<Next> {
         self.wake_waiting(false);
-        let ready = self.tasks.iter().position(|task| {
-            matches!(
-                task.status,
-                Status::Ready(_) | Status::Wake(_) | Status::Cancel(_)
-            )
-        });
-        let Some(ready) = ready else {
+        let Some(ready) = self.next_ready() else {
             // Every other task waits: the one that ended is not set aside,
             // the root's frames being run next by whoever wakes it.
             let root = self.tasks.iter().position(|task| task.meta.id == 0)?;
@@ -574,7 +598,6 @@ impl Machine<'_> {
     /// [Wound-wait](#wound-wait)).
     pub(super) fn wound(&mut self, target: Wound) {
         let mine = self.path();
-        let wounder = self.meta.id;
         for task in &mut self.tasks {
             let runs = match target {
                 Wound::Entry(entry) => task
@@ -591,7 +614,7 @@ impl Machine<'_> {
                 && !matches!(task.status, Status::Cancel(_))
                 && path_of(&task.meta, &task.frames, &task.calls) > mine
             {
-                task.meta.wound = Some((target, wounder));
+                task.meta.wound = Some(target);
                 task.status = Status::Cancel(looks_up(&task.status));
             }
         }
@@ -617,17 +640,64 @@ impl Machine<'_> {
         }
     }
 
-    /// Wakes the task `id`, if it waits for a sibling, to look again.
-    pub(super) fn wake_task(&mut self, id: u32) {
+    /// Counts an abandoned run of `what`, a memoised call or a `lazy`:
+    /// whether its runs have been abandoned far more
+    /// often than wound-wait allows. Each abandoned run goes to a task
+    /// earlier in program order than the one that ran it, the earliest of
+    /// those that wait for it (see [Wound-wait](#wound-wait)), so it is
+    /// abandoned about once for each task that needs it. Far more is a
+    /// fault, reported as an internal error rather than left to spin. The
+    /// limit is based on the most tasks the run has had at once.
+    pub(super) fn abandoned_too_often(&mut self, what: Abandoned) -> bool {
+        let limit = 4 * (self.most_tasks + 1) + 64;
+        let count =
+            if let Some((_, count)) = self.abandons.iter_mut().find(|(seen, _)| *seen == what) {
+                *count += 1;
+                *count
+            } else {
+                self.abandons.push((what, 1));
+                1
+            };
+        count > limit
+    }
+
+    /// Wakes every task that waits for a sibling's memoised call or
+    /// `lazy`, to look again: a run of one was abandoned, which the
+    /// earliest of them runs (see [Wound-wait](#wound-wait)). The task that
+    /// wounded the one that abandoned it may have been split since, its
+    /// wait taken by a child, so it is not woken by its number.
+    pub(super) fn wake_siblings(&mut self) {
         for task in &mut self.tasks {
-            if task.meta.id == id {
-                let status = std::mem::replace(&mut task.status, Status::Joining);
-                task.status = match status {
-                    Status::Waiting(resume) => Status::Wake(resume),
-                    status => status,
-                };
-            }
+            let status = std::mem::replace(&mut task.status, Status::Joining);
+            task.status = match status {
+                Status::Sibling(resume) => Status::Again(resume),
+                status => status,
+            };
         }
+    }
+
+    /// The place among the tasks set aside of the one to run next: the
+    /// first that may run in their order, but a task that looks up or
+    /// awaits a sibling's call or `lazy` again only once no other may run,
+    /// the earliest of those in program order. A run abandoned for an
+    /// earlier task is thus begun again by the earliest task that waits for
+    /// it, not by a later one that the earlier wounds again, and so on
+    /// without end (see [Wound-wait](#wound-wait)).
+    fn next_ready(&self) -> Option<usize> {
+        let first = self.tasks.iter().position(|task| {
+            matches!(
+                task.status,
+                Status::Ready(_) | Status::Wake(_) | Status::Cancel(_)
+            )
+        });
+        first.or_else(|| {
+            self.tasks
+                .iter()
+                .enumerate()
+                .filter(|(_, task)| matches!(task.status, Status::Again(_)))
+                .min_by_key(|(_, task)| path_of(&task.meta, &task.frames, &task.calls))
+                .map(|(at, _)| at)
+        })
     }
 
     /// Cancels the tasks `ids` that are set aside and still waiting.
@@ -756,6 +826,7 @@ impl Machine<'_> {
             own,
             status,
         });
+        self.most_tasks = self.most_tasks.max(self.tasks.len());
     }
 
     /// The marks of an iteration beginning now (see [`Marks`]).
@@ -796,7 +867,8 @@ const fn looks_up(status: &Status) -> bool {
     matches!(
         status,
         Status::Blocked(_, Resume::Lookup)
-            | Status::Waiting(Resume::Lookup)
+            | Status::Sibling(Resume::Lookup)
+            | Status::Again(Resume::Lookup)
             | Status::Wake(Resume::Lookup)
     )
 }
@@ -824,9 +896,13 @@ impl Machine<'_> {
     pub(super) fn take_up_tasks(&mut self) -> Next {
         self.wake_given();
         match self.status.take() {
-            Some(Status::Blocked(_, resume) | Status::Waiting(resume) | Status::Wake(resume)) => {
-                self.resume_next(resume)
-            }
+            Some(
+                Status::Blocked(_, resume)
+                | Status::Waiting(resume)
+                | Status::Wake(resume)
+                | Status::Sibling(resume)
+                | Status::Again(resume),
+            ) => self.resume_next(resume),
             Some(Status::Ready(next)) => next,
             Some(status) => self.park(status).unwrap_or(Next::Stop),
             None => {

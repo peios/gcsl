@@ -370,6 +370,13 @@ pub(super) struct Machine<'r> {
     /// for the next block that marks an item, so that a block run again
     /// and again allocates none (see [Pieces](pieces#pieces)).
     spare: Vec<pieces::Spare>,
+    /// How often each memoised call and `lazy` has been abandoned in this
+    /// run (see [Wound-wait](tasks#wound-wait)).
+    abandons: Vec<(tasks::Abandoned, usize)>,
+    /// The most tasks the unit has had set aside at once in this run, on
+    /// which [`Machine::abandoned_too_often`] bases its limit, so that the
+    /// limit never falls as tasks end.
+    most_tasks: usize,
 }
 
 impl<'r> Machine<'r> {
@@ -394,6 +401,8 @@ impl<'r> Machine<'r> {
             next_task: 1,
             profiled_base,
             spare: Vec::new(),
+            abandons: Vec::new(),
+            most_tasks: 0,
         }
     }
 
@@ -407,6 +416,7 @@ impl<'r> Machine<'r> {
         profiled_base: usize,
     ) -> Self {
         let (tasks, meta, status) = parked.tasks;
+        let most_tasks = tasks.len();
         Self {
             stack,
             memo,
@@ -420,6 +430,8 @@ impl<'r> Machine<'r> {
             next_task: parked.next_task,
             profiled_base,
             spare: Vec::new(),
+            abandons: Vec::new(),
+            most_tasks,
         }
     }
 
@@ -1212,7 +1224,7 @@ impl<'r> Machine<'r> {
                 Ok(MemoBegin::Sibling(entry)) => {
                     self.wound(tasks::Wound::Entry(entry));
                     self.calls.push(state);
-                    return Next::Park(Box::new(Status::Waiting(Resume::Lookup)));
+                    return Next::Park(Box::new(Status::Sibling(Resume::Lookup)));
                 }
                 Ok(MemoBegin::Started(mark)) => {
                     let scoped = self.memo_scope(&state);
@@ -1328,14 +1340,14 @@ impl<'r> Machine<'r> {
     /// call ends.
     fn body_done(&mut self, state: CallState, result: Outcome) -> Next {
         self.activations.pop();
-        if let (Some((Some(mark), scoped)), Some((tasks::Wound::Entry(entry), wounder))) =
+        if let (Some((Some(mark), scoped)), Some(tasks::Wound::Entry(entry))) =
             (state.memo, self.meta.wound)
             && mark.entry == entry
             && result
                 .as_ref()
                 .is_err_and(|unwind| pieces::is_cancelled(unwind))
         {
-            return self.abandon(state, (mark, scoped), wounder);
+            return self.abandon(state, (mark, scoped));
         }
         let Some(guard) = state.guard.as_ref() else {
             return self.finish(&state, result);
@@ -1368,15 +1380,11 @@ impl<'r> Machine<'r> {
 
     /// Abandons the memoised call `state`, its entry `mark`, its body a
     /// scope of its own if `scoped`, whose run a task earlier in program
-    /// order, `wounder`, needs (see [Wound-wait](tasks#wound-wait)): its
-    /// entry goes, for `wounder` to run it, and the call waits to look its
-    /// arguments, still in its frame, up again.
-    fn abandon(
-        &mut self,
-        mut state: CallState,
-        (mark, scoped): (Mark, bool),
-        wounder: u32,
-    ) -> Next {
+    /// order needs (see [Wound-wait](tasks#wound-wait)): its entry goes,
+    /// every task that waits for a sibling's call is woken, so that the
+    /// earliest of them runs it, and the call waits to look its arguments,
+    /// still in its frame, up again.
+    fn abandon(&mut self, mut state: CallState, (mark, scoped): (Mark, bool)) -> Next {
         if let Some(number) = state.guard.as_ref().and_then(|guard| guard.deadline) {
             self.walker(|walker| walker.pop_deadline(number));
         }
@@ -1396,9 +1404,18 @@ impl<'r> Machine<'r> {
         self.meta.wound = None;
         state.memo = Some((None, false));
         state.guard = None;
-        self.wake_task(wounder);
+        let call = tasks::Abandoned::Call(
+            Rc::as_ptr(&state.closure.code),
+            state.closure.function,
+            mark.hash,
+        );
+        if self.abandoned_too_often(call) {
+            let span = self.running().ir.get(state.node).span;
+            return self.argument_failed(&state, tasks::handed_back(span));
+        }
+        self.wake_siblings();
         self.calls.push(state);
-        Next::Park(Box::new(Status::Waiting(Resume::Lookup)))
+        Next::Park(Box::new(Status::Sibling(Resume::Lookup)))
     }
 
     /// Ends the call `state` with `result`, what its body came to, as
