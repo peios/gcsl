@@ -30,6 +30,11 @@ of present values awaits each element. It applies the same purity
 restriction to explicit and implicit awaits. A call to a pure
 function never secretly starts deferred work inside that function.
 
+An implicit await of a record or a list awaits only the fields and
+elements that the expected type needs present. A field typed
+`T | Future<T>` keeps its future, so a list of records can collect
+deferred results without waiting for any of them.
+
 ## Writing contracts
 
 Use explicit wrappers when the distinction is part of an interface:

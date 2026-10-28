@@ -551,10 +551,14 @@ impl Checker<'_> {
                     let found = claimed.unwrap_or(list);
                     // Its elements fit once the list is awaited deeply.
                     if let Some(kind) = self.types.needs_await(found, expected) {
-                        self.await_here(value, found, kind, AwaitSite::Implicit);
                         let awaited = match kind {
-                            AwaitKind::Top => self.types.strip(found),
-                            AwaitKind::Deep => self.types.present(found),
+                            AwaitKind::Top => {
+                                self.await_here(value, found, kind, AwaitSite::Implicit);
+                                self.types.strip(found)
+                            }
+                            AwaitKind::Deep => {
+                                self.await_toward(value, (found, expected), AwaitSite::Implicit)
+                            }
                         };
                         return self.types.list_element(awaited).unwrap_or(TyId::ERROR);
                     }

@@ -335,7 +335,7 @@ impl Lowerer<'_> {
         );
         let record = match mark {
             AwaitMark::None => call,
-            AwaitMark::Top | AwaitMark::Deep => {
+            AwaitMark::Top | AwaitMark::Deep | AwaitMark::Toward(_) => {
                 let present = self.table.strip(meta_ty);
                 self.builder.alloc(
                     IrKind::Await {

@@ -75,6 +75,34 @@ fn independent_steps_are_found_before_any_is_needed() {
 }
 
 #[test]
+fn a_step_s_result_kept_where_a_future_is_allowed_is_not_awaited() {
+    // Each record a pure function returns fits the list's element type
+    // once awaited deeply, for the field it leaves to its default; its
+    // `out`, typed to hold a future, is left one, so the loop goes on to
+    // the next step without waiting for any.
+    let (mut workspace, file) = lone_workspace(
+        "type Built = {kind: String, out: String | Future<String>, files: List<String> = []}\n\
+         fn one(src: String) -> Built { = {kind = \"k\"; out = compile(src)} }\n\
+         fn all() ->> List<Built> {\n\
+         \x20   let mut made: List<Built> = []\n\
+         \x20   for src in [\"a\", \"b\", \"c\"] { made := [...made, one(src)] }\n\
+         \x20   = made\n\
+         }\n\
+         = link(for each in all() { = each.out })",
+    );
+    let mut graph = Graph::new();
+    let Progress::Done(value) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
+        panic!("stopped for a step's result");
+    };
+    assert_eq!(graph.len(), 4);
+    let needed = graph.needed(&graph.holes(&value));
+    assert_eq!(
+        graph.ready(&needed),
+        [NodeId::of(0), NodeId::of(1), NodeId::of(2)]
+    );
+}
+
+#[test]
 fn a_unit_that_needs_a_result_stops_and_runs_again_once_it_is_given() {
     let (mut workspace, file) =
         lone_workspace("let a = compile(\"a\")\nlet b = compile(\"b\")\n= \"{a} and {b}\"");

@@ -943,6 +943,7 @@ impl Checker<'_> {
             AwaitMark::None => ty,
             AwaitMark::Top => self.types.strip(ty),
             AwaitMark::Deep => self.types.present(ty),
+            AwaitMark::Toward(awaited) => awaited,
         }
     }
 }

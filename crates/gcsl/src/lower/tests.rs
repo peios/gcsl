@@ -1212,6 +1212,24 @@ fn a_call_of_an_inferred_present_result_is_not_awaited() {
 }
 
 #[test]
+fn a_deep_await_toward_a_type_leaves_what_it_admits_lazy() {
+    // `a` may stay a future where it is put; `b` must be present.
+    let shown = dump(
+        "let r = { a = lazy 1; b = lazy 2 }\n\
+         let t: {a: Int | Future<Int>, b: Present<Int>} = r\n\
+         = t",
+    );
+    assert!(shown.contains("(await [b!] @"), "{shown}");
+    // So within a list, element by element.
+    let shown = dump(
+        "let r = [{ a = lazy 1; b = lazy 2 }]\n\
+         let t: List<{a: Int | Future<Int>, b: Present<Int>}> = r\n\
+         = t",
+    );
+    assert!(shown.contains("(await *[b!] @"), "{shown}");
+}
+
+#[test]
 fn a_deep_await_carries_a_lazy_shape() {
     let text = "let r = { a = lazy 1; b = { c = lazy 2; d = 3 }; e = 4 }\n\"{r}\"";
     let shown = dump(text);

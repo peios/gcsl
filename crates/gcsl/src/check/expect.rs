@@ -68,13 +68,10 @@ impl Checker<'_> {
                     None => found,
                 };
                 match self.types.needs_await(found, expected) {
-                    Some(kind) => {
-                        // Only an await at the top is the parameter's doing.
-                        let site = match (kind, site) {
-                            (AwaitKind::Top, site) => site,
-                            (AwaitKind::Deep, _) => AwaitSite::Implicit,
-                        };
-                        self.await_here(expr, found, kind, site);
+                    // Only an await at the top is the parameter's doing.
+                    Some(AwaitKind::Top) => self.await_here(expr, found, AwaitKind::Top, site),
+                    Some(AwaitKind::Deep) => {
+                        self.await_toward(expr, (found, expected), AwaitSite::Implicit);
                     }
                     None => self.mismatch(expr, (found, expected), (context, why), filling),
                 }

@@ -1465,6 +1465,35 @@ fn list_joins() {
 }
 
 #[test]
+fn a_deep_await_toward_a_type_leaves_what_it_admits_lazy() {
+    let (mut table, _, [a, b, c]) = setup();
+    let either = table.deferrable(TyId::INT);
+    let future = table.future(TyId::INT);
+    // A field the expected type admits lazy is left as it is; one it needs
+    // present is presented, within a list too.
+    let found = table.record([(a, future), (b, future)]);
+    let expected = table.record([(a, either), (b, TyId::INT)]);
+    assert_eq!(table.needs_await(found, expected), Some(AwaitKind::Deep));
+    let toward = table.record([(a, future), (b, TyId::INT)]);
+    assert_eq!(table.present_toward(found, expected), toward);
+    let found_list = table.list(found);
+    let expected_list = table.list(expected);
+    let toward_list = table.list(toward);
+    assert_eq!(table.present_toward(found_list, expected_list), toward_list);
+    // Within a future at the top, which is awaited whole.
+    let future_record = table.future(found);
+    assert_eq!(table.present_toward(future_record, expected), toward);
+    // What fits as it is is left whole; what the expected type does not
+    // line up with field by field, here through a union, is presented
+    // whole.
+    assert_eq!(table.present_toward(toward, expected), toward);
+    let other = table.record([(c, TyId::STRING)]);
+    let union = table.union(vec![expected, other]);
+    let present = table.present(found);
+    assert_eq!(table.present_toward(found, union), present);
+}
+
+#[test]
 fn strip_present_and_futures_through_lists() {
     let (mut table, _, [a, ..]) = setup();
     let either = table.deferrable(TyId::INT);

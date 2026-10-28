@@ -2271,11 +2271,14 @@ fn an_impure_functions_inferred_result_is_what_it_returns() {
     assert_eq!(run(&format!("{m}r.a")).unwrap(), Value::Int(7));
     assert_eq!(run(&format!("{m}await r.b")).unwrap(), Value::Int(7));
     assert_eq!(run(&format!("{m}r.a + r.b")).unwrap(), Value::Int(14));
-    // A body awaited deeply is present at every position.
+    // A body awaited to fit is awaited only where its type needs a present
+    // value: a bare field keeps its future, which reads back as its value.
+    let f = "fn f() -> {a: Present<Int>, b: Int} { = { a = lazy 1; b = lazy 2 } }\n";
     assert_eq!(
-        show("fn f() -> {a: Present<Int>, b: Int} { = { a = lazy 1; b = lazy 2 } }\nf()"),
-        "{a = 1; b = 2} : {a: Int, b: Int}"
+        show(&format!("{f}f()")),
+        "{a = 1; b = Future<Int>} : {a: Int, b: Future<Int>}"
     );
+    assert_eq!(run(&format!("{f}f().a + f().b")).unwrap(), Value::Int(3));
     // Nested records, and recursion.
     assert_eq!(
         run("fn n() -> {a: {b: Int}} { a = { b = 1 } }\nn().a.b + 1").unwrap(),

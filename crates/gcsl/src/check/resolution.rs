@@ -26,6 +26,10 @@ pub enum AwaitMark {
     /// Awaited fully at the top and then in every lazy field of the record
     /// it is, at any depth.
     Deep,
+    /// Awaited fully at the top and then deeply only where the type it is
+    /// expected to have needs it, to the type given ([`TypeTable::present_toward`](crate::types::TypeTable::present_toward)):
+    /// a field it leaves lazy is not awaited.
+    Toward(TyId),
 }
 
 impl From<AwaitKind> for AwaitMark {

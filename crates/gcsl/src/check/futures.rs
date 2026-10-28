@@ -159,7 +159,10 @@ use crate::source::Span;
 use crate::strings::FieldName;
 use crate::types::{AwaitKind, Laziness, TyId};
 
-use super::{AwaitSite, CallSite, Checker, Function, PURE_CONTEXT, Site, VarRef, explicit_await_error};
+use super::{
+    AwaitMark, AwaitSite, CallSite, Checker, Function, PURE_CONTEXT, Site, VarRef,
+    explicit_await_error,
+};
 
 impl Checker<'_> {
     /// Where `expr`, of type `ty`, is used as its bits at the top, by a
@@ -208,6 +211,23 @@ impl Checker<'_> {
         };
         self.await_here(expr, ty, kind, AwaitSite::Implicit);
         present
+    }
+
+    /// Marks `expr`, of type `found`, which fits `expected` once awaited
+    /// deeply, to be awaited toward it, `site` as [`Checker::await_here`]
+    /// takes it: the type it has once awaited, which leaves lazy each field
+    /// `expected` admits lazy (see
+    /// [`TypeTable::present_toward`](crate::types::TypeTable::present_toward)).
+    pub(super) fn await_toward(
+        &mut self,
+        expr: ExprId,
+        (found, expected): (TyId, TyId),
+        site: AwaitSite,
+    ) -> TyId {
+        self.await_here(expr, found, AwaitKind::Deep, site);
+        let awaited = self.types.present_toward(found, expected);
+        self.awaits[expr.index()] = AwaitMark::Toward(awaited);
+        awaited
     }
 
     /// Marks `expr`, of type `ty`, to be awaited as `kind` says, and applies

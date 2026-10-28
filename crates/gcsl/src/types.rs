@@ -744,6 +744,11 @@ pub enum Laziness {
     Provisional,
 }
 
+/// How many levels of record and list nesting
+/// [`TypeTable::present_toward`] follows an expected type through, below
+/// which it makes a value present whole.
+pub const TOWARD_DEPTH: u32 = 32;
+
 /// How a value is awaited where it is used as its bits: see
 /// [`TypeTable::needs_await`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2426,6 +2431,70 @@ impl TypeTable {
         if changed {
             // Still sorted, so interning does not sort it again.
             self.record_like(top, presented, rest)
+        } else {
+            top
+        }
+    }
+
+    /// The type of a value of type `found` once awaited deeply toward
+    /// `expected`, which it fits once awaited deeply (see
+    /// [`TypeTable::needs_await`]): awaited fully at the top, and then, in
+    /// each field of a record and each element of a list, only where
+    /// `expected` needs it, a field `expected` admits as it is left as it
+    /// is, a future it allows among them. So a deep await of a value into
+    /// a place typed to hold a future leaves that future unawaited. Where
+    /// the two types do not line up field by field, as through a union or
+    /// a rest-field, the value is made present as [`TypeTable::present`]
+    /// makes it, as it is too below [`TOWARD_DEPTH`] levels of nesting.
+    pub fn present_toward(&mut self, found: TyId, expected: TyId) -> TyId {
+        let toward = self.toward(found, expected, TOWARD_DEPTH);
+        if self.is_subtype(toward, expected) {
+            toward
+        } else {
+            self.present(found)
+        }
+    }
+
+    /// [`TypeTable::present_toward`] at `depth` more levels of nesting.
+    fn toward(&mut self, found: TyId, expected: TyId, depth: u32) -> TyId {
+        if self.is_subtype(found, expected) {
+            return found;
+        }
+        let top = self.strip(found);
+        let goal = self.strip(expected);
+        let Some(depth) = depth.checked_sub(1) else {
+            return self.present(found);
+        };
+        if let (Some(element), Some(wanted)) = (self.list_element(top), self.list_element(goal)) {
+            let awaited = self.toward(element, wanted, depth);
+            return if awaited == element {
+                top
+            } else {
+                self.list(awaited)
+            };
+        }
+        let (Some(fields), Some(wanted)) = (self.record_fields(top), self.record_fields(goal))
+        else {
+            return self.present(found);
+        };
+        if self.record_rest(top).is_some() {
+            return self.present(found);
+        }
+        // Copies (ids only), since awaiting a field may intern types.
+        let (fields, wanted) = (fields.to_vec(), wanted.to_vec());
+        let mut changed = false;
+        let mut awaited = Vec::with_capacity(fields.len());
+        for (name, ty) in fields {
+            let field = match wanted.iter().find(|&&(other, _)| other == name) {
+                Some(&(_, expected)) => self.toward(ty, expected, depth),
+                None => self.present(ty),
+            };
+            changed |= field != ty;
+            awaited.push((name, field));
+        }
+        if changed {
+            // Still sorted, so interning does not sort it again.
+            self.record_like(top, awaited, None)
         } else {
             top
         }

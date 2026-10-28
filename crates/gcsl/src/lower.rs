@@ -515,6 +515,7 @@ pub fn lower(
         shapes: HashMap::new(),
         shape_pending: Vec::new(),
         lazy_shapes: HashMap::new(),
+        lazy_toward: HashMap::new(),
         lazy_pending: Vec::new(),
         functions: vec![None; ast.fn_count()],
         loops: Vec::new(),
@@ -644,6 +645,10 @@ struct Lowerer<'a> {
     /// The lazy shape already made for each record and list type, or
     /// [`LazyShapeId::NONE`] if it has no lazy values at any depth.
     lazy_shapes: HashMap<TyId, LazyShapeId>,
+    /// The lazy shape of each await toward an expected type, by the type
+    /// awaited and the type it has once awaited (see
+    /// [`Lowerer::lazy_shape_toward`]).
+    lazy_toward: HashMap<(TyId, TyId), LazyShapeId>,
     /// Reused as the work list of record and list types whose lazy shapes
     /// are being made, each with whether the types inside it have been
     /// queued.
@@ -719,7 +724,7 @@ impl Lowerer<'_> {
         let ty = self.expr_types.get(id);
         match self.resolution.await_of(id) {
             AwaitMark::None => ty,
-            AwaitMark::Top | AwaitMark::Deep => self.table.strip(ty),
+            AwaitMark::Top | AwaitMark::Deep | AwaitMark::Toward(_) => self.table.strip(ty),
         }
     }
 
@@ -937,6 +942,10 @@ impl Lowerer<'_> {
         let kind = self.kind(id)?;
         let shape = match mark {
             AwaitMark::Deep => self.lazy_shape(self.used_type(id)),
+            AwaitMark::Toward(awaited) => {
+                let found = self.used_type(id);
+                self.lazy_shape_toward(found, awaited)
+            }
             AwaitMark::Top | AwaitMark::None => LazyShapeId::NONE,
         };
         Ok(self.builder.alloc(

@@ -6,7 +6,7 @@ use crate::diagnostic::InternalError;
 use crate::ir::{LazyField, LazyRest, LazyShape, LazyShapeId, ListShape, RestShape, Shape, ShapeId};
 use crate::names::Name;
 use crate::source::Span;
-use crate::types::{Laziness, TyId};
+use crate::types::{Laziness, TOWARD_DEPTH, TyId};
 
 use super::Lowerer;
 
@@ -201,5 +201,81 @@ impl Lowerer<'_> {
             .get(&ty)
             .copied()
             .unwrap_or(LazyShapeId::NONE)
+    }
+
+    /// The lazy shape of an await of a value of type `found`, present at
+    /// its top, toward an expected type, which leaves it of type `awaited`
+    /// (see [`TypeTable::present_toward`](crate::types::TypeTable::present_toward)):
+    /// as [`Lowerer::lazy_shape`]'s, but that a field or an element whose
+    /// type `awaited` leaves as `found` has it is left as it is, a future
+    /// among them. Where the two do not line up, as through a union or a
+    /// rest-field, it is [`Lowerer::lazy_shape`]'s; and so it is below
+    /// [`TOWARD_DEPTH`] levels of nesting, which `awaited` never leaves lazy
+    /// below.
+    pub(super) fn lazy_shape_toward(&mut self, found: TyId, awaited: TyId) -> LazyShapeId {
+        self.shape_toward(found, self.table.strip(awaited), TOWARD_DEPTH)
+    }
+
+    /// [`Lowerer::lazy_shape_toward`] at `depth` more levels of nesting.
+    fn shape_toward(&mut self, found: TyId, awaited: TyId, depth: u32) -> LazyShapeId {
+        let table = self.table;
+        if found == awaited {
+            return LazyShapeId::NONE;
+        }
+        if let Some(&id) = self.lazy_toward.get(&(found, awaited)) {
+            return id;
+        }
+        let Some(depth) = depth.checked_sub(1) else {
+            return self.lazy_shape(found);
+        };
+        // What the await does with a field or an element of type `ty`,
+        // which it leaves of type `left`.
+        let action = |lowerer: &mut Self, ty: TyId, left: TyId| {
+            if ty == left {
+                return None;
+            }
+            let inner = lowerer.shape_toward(table.strip(ty), table.strip(left), depth);
+            if table.laziness(ty) != Laziness::Present {
+                Some(LazyField::Await(inner))
+            } else if inner != LazyShapeId::NONE {
+                Some(LazyField::Within(inner))
+            } else {
+                None
+            }
+        };
+        let id = if let (Some(element), Some(left)) =
+            (table.list_element(found), table.list_element(awaited))
+        {
+            match action(self, element, left) {
+                Some(each) => self.builder.push_lazy_list(each),
+                None => LazyShapeId::NONE,
+            }
+        } else if let (Some(fields), Some(left), None) = (
+            table.record_fields(found),
+            table.record_fields(awaited),
+            table.record_rest(found),
+        ) {
+            let mut lazy: Vec<(Name, LazyField)> = Vec::new();
+            for &(name, ty) in fields {
+                let Some(&(_, left)) = left.iter().find(|&&(other, _)| other == name) else {
+                    return self.lazy_shape(found);
+                };
+                if let Some(field) = action(self, ty, left) {
+                    lazy.push((name, field));
+                }
+            }
+            if lazy.is_empty() {
+                LazyShapeId::NONE
+            } else {
+                self.builder.push_lazy_shape(LazyShape {
+                    fields: lazy.into_boxed_slice(),
+                    rest: None,
+                })
+            }
+        } else {
+            self.lazy_shape(found)
+        };
+        self.lazy_toward.insert((found, awaited), id);
+        id
     }
 }

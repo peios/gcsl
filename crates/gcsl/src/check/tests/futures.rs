@@ -6,13 +6,22 @@ use super::*;
 /// Every expression of `text`, which must check, that is awaited where
 /// it is used, as its source text and its mark, in allocation order.
 pub(super) fn marks(text: &str) -> Vec<(&str, AwaitMark)> {
-    let (ast, _, output) = check_prelude(text);
+    let (ast, mut table, output) = check_prelude(text);
     let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
     let resolution = output.checked.resolution;
+    let types = output.checked.types;
     ast.expr_ids()
         .filter_map(|id| match resolution.await_of(id) {
             AwaitMark::None => None,
             mark => {
+                // An await toward a type that awaits all of it is as deep
+                // as an await can be.
+                let mark = match mark {
+                    AwaitMark::Toward(awaited) if table.present(types.get(id)) == awaited => {
+                        AwaitMark::Deep
+                    }
+                    mark => mark,
+                };
                 let span = ast.get(id).span;
                 Some((&text[span.start as usize..span.end as usize], mark))
             }

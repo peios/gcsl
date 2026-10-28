@@ -574,14 +574,15 @@ fn an_impure_functions_bare_result_is_inferred() {
 
 #[test]
 fn an_inferred_result_is_what_the_body_returns_once_awaited() {
-    // A body awaited deeply to fit a field written present is present at
-    // every bare position too, since the deep await resolves them all.
+    // A body awaited deeply to fit a field written present is awaited only
+    // toward the type it fits: a bare position, which a future fits, keeps
+    // its laziness.
     let text = "fn f() -> {a: Present<Int>, b: Int} { = { a = lazy 1; b = lazy 2 } }\nf";
-    assert_eq!(shown_result(text), "fn() -> {a: Int, b: Int}");
-    assert_eq!(
-        marks(text),
-        vec![("{ = { a = lazy 1; b = lazy 2 } }", AwaitMark::Deep)]
-    );
+    assert_eq!(shown_result(text), "fn() -> {a: Int, b: Future<Int>}");
+    assert!(matches!(
+        marks(text)[..],
+        [("{ = { a = lazy 1; b = lazy 2 } }", AwaitMark::Toward(_))]
+    ));
     // A field's value awaited to fit its field is present; one that is
     // not keeps its laziness.
     let text = "fn m(x: Future<Int>) -> {a: Present<Int>, b: Int} { a = x; b = x }\nm";
