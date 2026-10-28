@@ -64,7 +64,9 @@
 //! directory itself. Neither reads anything. `d.files()` (`dir_files`)
 //! is every entry of its tree that is no directory, a symbolic link
 //! included and never followed, sorted by path: "cannot list `/d`" if it
-//! cannot be read.
+//! cannot be read. A directory the host hides ([`Effects::hides`]), as
+//! pekit hides its outputs from its workspace, is left out with all it
+//! holds.
 //!
 //! `fs.compose_dir(entries)` (`Evaluator::compose_dir`) makes a new
 //! directory of the run, removed with its temporary directories, and places
@@ -72,9 +74,10 @@
 //! `/` or `.` being the directory itself, in order: a `Dir`'s tree under
 //! it, a `File` at it, and each file of a `List<File>` under it by its name.
 //! Directories merge; everything is copied, a file's permissions kept and a
-//! symbolic link copied as a link, so that a program writing in the new
-//! directory changes nothing it was made of. Two entries placing one path
-//! is "two entries place `a/b`", a key that would leave the directory is
+//! symbolic link copied as a link, but a directory the host hides, so that
+//! a program writing in the new directory changes nothing it was made of.
+//! Two entries placing one path is "two entries place `a/b`", a key that
+//! would leave the directory is
 //! "`../x` is outside the directory", and a file at the directory itself,
 //! or a copy that fails, are errors too, each naming `fs.compose_dir`.
 
@@ -306,7 +309,7 @@ pub(super) fn dir_files(dir: &File, effects: &dyn Effects, node: &IrNode) -> Flo
     let walked = effects
         .host_path(&dir.path)
         .map_err(io::Error::other)
-        .and_then(|host| walk(&host, (&dir.path, ""), &mut found));
+        .and_then(|host| walk(&host, (&dir.path, ""), (effects, &mut found)));
     if let Err(error) = walked {
         return Err(
             Diagnostic::error(format!("cannot list `{}`", dir.path), node.span)
@@ -326,8 +329,13 @@ pub(super) fn dir_files(dir: &File, effects: &dyn Effects, node: &IrNode) -> Flo
 /// file system, that is no directory onto `found`, as GCSL code names it:
 /// `root`, the directory's own name for it, joined with its path under the
 /// directory, `under` so far. It descends into directories but never
-/// through a symbolic link. A name that is not UTF-8 is an error.
-fn walk(host: &Path, (root, under): (&str, &str), found: &mut Vec<String>) -> io::Result<()> {
+/// through a symbolic link, nor into one `effects` hides. A name that is not
+/// UTF-8 is an error.
+fn walk(
+    host: &Path,
+    (root, under): (&str, &str),
+    (effects, found): (&dyn Effects, &mut Vec<String>),
+) -> io::Result<()> {
     for entry in fs::read_dir(host)? {
         let entry = entry?;
         let name = entry.file_name().into_string().map_err(|name| {
@@ -335,7 +343,9 @@ fn walk(host: &Path, (root, under): (&str, &str), found: &mut Vec<String>) -> io
         })?;
         let inner = join(under, &name);
         if entry.file_type()?.is_dir() {
-            walk(&entry.path(), (root, &inner), found)?;
+            if !effects.hides(&entry.path()) {
+                walk(&entry.path(), (root, &inner), (effects, &mut *found))?;
+            }
         } else if root == "/" {
             found.push(format!("/{inner}"));
         } else {
@@ -497,7 +507,8 @@ impl Composer<'_> {
     }
 
     /// Copies the tree at `source` under `at`, its directories merged with
-    /// any already there, its symbolic links copied as links.
+    /// any already there, its symbolic links copied as links, and none the
+    /// effect context hides ([`Effects::hides`]).
     pub(super) fn tree(&mut self, source: &Path, at: &str) -> Result<(), String> {
         let target = self.root.join(at);
         fs::create_dir_all(&target).map_err(|error| format!("could not create `{at}`: {error}"))?;
@@ -516,7 +527,9 @@ impl Composer<'_> {
                 .map_err(|error| format!("could not read `{}`: {error}", entry.path().display()))?;
             let inner = join(at, name);
             if kind.is_dir() {
-                self.tree(&entry.path(), &inner)?;
+                if !self.effects.hides(&entry.path()) {
+                    self.tree(&entry.path(), &inner)?;
+                }
             } else {
                 self.file(&entry.path(), &inner)?;
             }

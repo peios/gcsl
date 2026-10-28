@@ -237,6 +237,11 @@ is finished, so you can make it read-only. `Effects::make_sandbox` lets
 you make a sandbox yourself, as an overlay over its directory, say; you
 then answer `Effects::host_path` for paths in it, upper layer over lower.
 
+`Effects::hides` keeps your own directories out of the code's view. A
+directory it names is left out of `d.files()` and of every copy, as if it
+were not there, though it can still be read by its path. Pekit uses it to
+keep its outputs, `pekit-out/`, out of the workspace.
+
 A host decides, per call, whether to take a deferred call as a step, from
 the attribute's arguments. An attribute declared as
 `type step = {on: Bool = true}` lets a function written `#[step(false)]`

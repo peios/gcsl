@@ -2,7 +2,7 @@
 //! a run goes (see [Effects](crate::eval::effects#effects)).
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::*;
@@ -10,8 +10,8 @@ use crate::eval::{Effects, eval_with};
 use crate::workspace::tests::fs::fs_scratch;
 
 /// A host that roots every path in a directory of its own, as a sandbox
-/// would, gives `/work` as the working directory, and records the
-/// programs it is asked to run.
+/// would, gives `/work` as the working directory, records the programs it
+/// is asked to run, and hides every directory named `hidden`.
 #[derive(Debug)]
 struct Rooted {
     /// Where `/` is.
@@ -37,6 +37,10 @@ impl Effects for Rooted {
             return Err("it is outside the step".to_owned());
         }
         Ok(self.root.join(path.trim_start_matches('/')))
+    }
+
+    fn hides(&self, host: &Path) -> bool {
+        host.file_name().is_some_and(|name| name == "hidden")
     }
 
     fn working_dir(&self) -> Result<PathBuf, String> {
@@ -123,6 +127,32 @@ fn every_effect_goes_through_the_host_s_context() {
         error.message,
         "`fs.read` cannot use `/outside/x`: it is outside the step"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_directory_the_host_hides_is_neither_listed_nor_copied() {
+    let root = PathBuf::from(fs_scratch("effects-hidden"));
+    let effects = Rooted {
+        root: root.clone(),
+        ran: RefCell::new(Vec::new()),
+        temps: Cell::new(0),
+    };
+    let text = "import fs\n\
+                fs.mkdir(\"/d/hidden/deep\")\n\
+                fs.mkdir(\"/d/sub\")\n\
+                fs.write(\"/d/hidden/deep/x\", \"h\")\n\
+                fs.write(\"/d/sub/kept\", \"k\")\n\
+                let composed = fs.compose_dir({\"c\" = dir(\"/d\")})\n\
+                let listed = dir(\"/d\").files()\n\
+                = [\"{len(listed)}\", listed[0].path, composed.path]";
+    let value = run_through(text, &effects).unwrap();
+    assert_eq!(value.to_string(), "[\"1\", \"/d/sub/kept\", \"/tmp/0\"]");
+    // The copy has what is not hidden, and nothing of what is.
+    assert!(root.join("tmp/0/c/sub/kept").is_file());
+    assert!(!root.join("tmp/0/c/hidden").exists());
+    // It is still there, to be read by its path.
+    assert!(root.join("d/hidden/deep/x").is_file());
     let _ = std::fs::remove_dir_all(&root);
 }
 
