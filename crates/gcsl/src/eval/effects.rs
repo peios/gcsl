@@ -48,15 +48,39 @@ pub trait Effects: std::fmt::Debug {
     }
 
     /// Places the file at `source` at `target`, both paths of the host's
-    /// file system, for `fs.compose_dir` or a sandbox's copy: a copy of its
-    /// own, its mode kept, as by default, or what the host makes of it more
-    /// cheaply, such as a hard link to a file that nothing can change.
+    /// file system, for `fs.compose_dir`: a copy of its own, its mode kept,
+    /// as by default, or what the host makes of it more cheaply, such as a
+    /// hard link to a file that nothing can change. A sandbox's copy is a
+    /// copy, every file its own, which its commands may change.
     ///
     /// # Errors
     ///
     /// Why it could not be placed.
     fn place_file(&self, source: &Path, target: &Path) -> std::io::Result<()> {
         std::fs::copy(source, target).map(|_| ())
+    }
+
+    /// Places the tree of the directory at `source` at `target`, both paths
+    /// of the host's file system, for `fs.compose_dir`, as the host's own:
+    /// a directory of the composition that nothing else is placed in, whose
+    /// parent is there and which is not, such as a mount of a directory
+    /// that nothing can change. GCSL then finds what is in it where the
+    /// host says ([`Effects::contents`]). `None`, as by default, for GCSL to
+    /// place each of its entries itself, offering each directory among them
+    /// in turn (see [Directories](crate::eval::files#directories)).
+    fn place_tree(&self, source: &Path, target: &Path) -> Option<std::io::Result<()>> {
+        let _ = (source, target);
+        None
+    }
+
+    /// Where the contents of the directory at `host`, a path of the host's
+    /// file system met within a directory GCSL lists, copies or composes,
+    /// are, if they are not there: a directory the host placed whole
+    /// ([`Effects::place_tree`]), say. `None`, as by default, for the
+    /// directory's own.
+    fn contents(&self, host: &Path) -> Option<PathBuf> {
+        let _ = host;
+        None
     }
 
     /// Tells the host that the directory `root`, as GCSL code names it, is a
@@ -95,6 +119,19 @@ pub trait Effects: std::fmt::Debug {
     /// Why the host gives `path` no place, one outside a sandbox say.
     fn host_path(&self, path: &str) -> Result<PathBuf, String> {
         Ok(PathBuf::from(path))
+    }
+
+    /// The path of the host's file system that `path`, an absolute path as
+    /// GCSL code names it, is, for GCSL to write a file there, make a
+    /// directory, or change a file's mode: [`Effects::host_path`]'s, as by
+    /// default.
+    ///
+    /// # Errors
+    ///
+    /// Why the host gives `path` no place, or will not have it changed: it
+    /// is a step's input, say.
+    fn write_path(&self, path: &str) -> Result<PathBuf, String> {
+        self.host_path(path)
     }
 
     /// Whether the directory at `host`, a path of the host's file system

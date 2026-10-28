@@ -240,3 +240,185 @@ fn a_host_can_place_compositions_files_and_make_sandboxes_itself() {
     assert_eq!(value.to_string(), "[\"/tmp/0\", \"false\"]");
     assert!(root.join("tmp/1/work").is_dir());
 }
+
+/// A host as [`Rooted`] is, which places whole each directory named `big`
+/// it is offered, and no other, recording each it is offered, and finds
+/// what each holds where it was; and which will not have anything under
+/// `/d/big` changed.
+#[derive(Debug)]
+struct Placing {
+    /// Where paths are rooted, and how programs run.
+    rooted: Rooted,
+    /// Each directory offered whole, its path and where it was to be placed,
+    /// both relative to the root, and whether it was taken.
+    offered: RefCell<Vec<(String, String, bool)>>,
+    /// Each directory placed whole, where it is and what it holds, on the
+    /// host.
+    placed: RefCell<Vec<(PathBuf, PathBuf)>>,
+}
+
+impl Placing {
+    /// `host`, a path under the root, relative to it.
+    fn shown(&self, host: &Path) -> String {
+        host.strip_prefix(&self.rooted.root).map_or_else(
+            |_| host.display().to_string(),
+            |path| path.display().to_string(),
+        )
+    }
+}
+
+impl Effects for Placing {
+    fn command(&self, command: Command) -> Result<Command, String> {
+        self.rooted.command(command)
+    }
+
+    fn place_tree(&self, source: &Path, target: &Path) -> Option<std::io::Result<()>> {
+        let taken = source.file_name().is_some_and(|name| name == "big");
+        self.offered
+            .borrow_mut()
+            .push((self.shown(source), self.shown(target), taken));
+        if !taken {
+            return None;
+        }
+        self.placed
+            .borrow_mut()
+            .push((target.to_path_buf(), source.to_path_buf()));
+        Some(std::fs::create_dir(target))
+    }
+
+    fn contents(&self, host: &Path) -> Option<PathBuf> {
+        self.placed
+            .borrow()
+            .iter()
+            .find(|(at, _)| at == host)
+            .map(|(_, source)| source.clone())
+    }
+
+    fn host_path(&self, path: &str) -> Result<PathBuf, String> {
+        self.rooted.host_path(path)
+    }
+
+    fn write_path(&self, path: &str) -> Result<PathBuf, String> {
+        if path.starts_with("/d/big") {
+            return Err("it is the step's input".to_owned());
+        }
+        self.rooted.host_path(path)
+    }
+
+    fn working_dir(&self) -> Result<PathBuf, String> {
+        self.rooted.working_dir()
+    }
+
+    fn temp_dir(&self) -> Option<Result<String, String>> {
+        self.rooted.temp_dir()
+    }
+}
+
+/// A [`Placing`] host rooted in a new scratch directory named `name`, of
+/// `/d/big/a`, `/d/big/sub/b` and `/d/small/c`.
+fn placing(name: &str) -> Placing {
+    let root = PathBuf::from(fs_scratch(name));
+    for (path, contents) in [("d/big/a", "a"), ("d/big/sub/b", "b"), ("d/small/c", "c")] {
+        let at = root.join(path);
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::fs::write(at, contents).unwrap();
+    }
+    Placing {
+        rooted: Rooted {
+            root,
+            ran: RefCell::new(Vec::new()),
+            temps: Cell::new(0),
+        },
+        offered: RefCell::new(Vec::new()),
+        placed: RefCell::new(Vec::new()),
+    }
+}
+
+#[test]
+fn a_host_can_place_a_composition_s_directories_whole() {
+    let effects = placing("effects-placing");
+    let text = "import fs\n\
+                let composed = fs.compose_dir({\"t\" = dir(\"/d/big\"); \"s\" = dir(\"/d/small\"); \
+                \"u/x\" = file(\"/d/small/c\")})\n\
+                let again = fs.compose_dir({\"in\" = composed})\n\
+                = for each in [...composed.files(), ...again.files()] { = each.path }";
+    let value = run_through(text, &effects).unwrap();
+    // Each directory is offered once nothing else can be placed in it, and
+    // what one the host took holds is found where it was.
+    assert_eq!(
+        value.to_string(),
+        "[\"/tmp/0/s/c\", \"/tmp/0/t/a\", \"/tmp/0/t/sub/b\", \"/tmp/0/u/x\", \
+         \"/tmp/1/in/s/c\", \"/tmp/1/in/t/a\", \"/tmp/1/in/t/sub/b\", \"/tmp/1/in/u/x\"]"
+    );
+    let offered =
+        |source: &str, target: &str, taken: bool| (source.to_owned(), target.to_owned(), taken);
+    assert_eq!(
+        *effects.offered.borrow(),
+        [
+            offered("d/big", "tmp/0/t", true),
+            offered("d/small", "tmp/0/s", false),
+            offered("tmp/0", "tmp/1/in", false),
+            offered("tmp/0/s", "tmp/1/in/s", false),
+            offered("d/big", "tmp/1/in/t", true),
+            offered("tmp/0/u", "tmp/1/in/u", false),
+        ]
+    );
+    let root = &effects.rooted.root;
+    assert!(root.join("tmp/1/in/s/c").is_file());
+    assert!(!root.join("tmp/1/in/t/a").exists());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_directory_something_is_placed_in_is_placed_entry_by_entry() {
+    let effects = placing("effects-placing-in");
+    let text = "import fs\n\
+                let composed = fs.compose([{at = \"t\"; place = dir(\"/d/big\")}, \
+                {at = \"t/x\"; place = file(\"/d/small/c\")}, \
+                {at = \"v\"; place = dir(\"/d/big\")}, {at = \"v\"; place = dir(\"/d/small\")}])\n\
+                = for each in composed.files() { = each.path }";
+    let value = run_through(text, &effects).unwrap();
+    assert_eq!(
+        value.to_string(),
+        "[\"/tmp/0/t/a\", \"/tmp/0/t/sub/b\", \"/tmp/0/t/x\", \"/tmp/0/v/a\", \
+         \"/tmp/0/v/c\", \"/tmp/0/v/sub/b\"]"
+    );
+    let offered: Vec<String> = effects
+        .offered
+        .borrow()
+        .iter()
+        .map(|(source, target, _)| format!("{source} {target}"))
+        .collect();
+    assert_eq!(offered, ["d/big/sub tmp/0/t/sub", "d/big/sub tmp/0/v/sub"]);
+    // A file placed where a placed directory has one is placed twice.
+    let text = "import fs\n\
+                = fs.compose([{at = \"t\"; place = dir(\"/d/big\")}, \
+                {at = \"t/a\"; place = file(\"/d/small/c\")}])";
+    let error = run_through(text, &effects).unwrap_err();
+    assert!(
+        error.message.contains("two entries place `t/a`"),
+        "{}",
+        error.message
+    );
+    let _ = std::fs::remove_dir_all(&effects.rooted.root);
+}
+
+#[test]
+fn a_host_can_refuse_to_have_a_path_changed() {
+    let effects = placing("effects-placing-write");
+    for call in [
+        "fs.write(\"/d/big/z\", \"z\")",
+        "fs.mkdir(\"/d/big/z\")",
+        "fs.copy(\"/d/small/c\", \"/d/big/z\")",
+        "fs.set_executable(\"/d/big/a\", true)",
+    ] {
+        let error = run_through(&format!("import fs\n{call}"), &effects).unwrap_err();
+        assert!(
+            error.message.contains("it is the step's input"),
+            "{}",
+            error.message
+        );
+    }
+    assert!(!effects.rooted.root.join("d/big/z").exists());
+    let _ = std::fs::remove_dir_all(&effects.rooted.root);
+}

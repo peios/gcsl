@@ -38,7 +38,6 @@
 //! of its own, pekit, mounts the directory as an overlay rather than
 //! copying it, and gives the paths as the commands see them.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
@@ -86,12 +85,7 @@ impl Evaluator<'_> {
                 ));
             }
             None => {
-                let mut copier = Composer {
-                    root: host_root.clone(),
-                    placed: HashSet::new(),
-                    dirs: HashSet::new(),
-                    effects,
-                };
+                let mut copier = Composer::copying(host_root.clone(), effects);
                 if let Err(message) = copier.tree_at(&dir.path, "") {
                     return fail(format!(
                         "a sandbox could not copy `{}`: {message}",

@@ -80,6 +80,18 @@
 //! would leave the directory is
 //! "`../x` is outside the directory", and a file at the directory itself,
 //! or a copy that fails, are errors too, each naming `fs.compose_dir`.
+//!
+//! A directory placed is placed last, once nothing else can be placed in
+//! it: until then it is *deferred*, and an entry placed at or under it, or
+//! a directory placed where it is, places what it holds first, file by
+//! file and directory by directory, each of its directories deferred in
+//! turn, so that what is placed, and every error, are as if each had been
+//! placed in order. A deferred directory is offered to the host whole
+//! ([`Effects::place_tree`]), which may place it more cheaply than file by
+//! file, by mounting it say; else what it holds is placed, each of its
+//! directories offered in turn. A directory whose contents are elsewhere
+//! ([`Effects::contents`]), one the host placed whole, is listed, copied and
+//! composed from there.
 
 //! # Fetching
 //!
@@ -126,7 +138,7 @@
 //! into place. A host may answer it itself, as pekit does, from its store when
 //! it has unpacked the same archive before.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::process::Command;
 use std::io;
@@ -343,8 +355,10 @@ fn walk(
         })?;
         let inner = join(under, &name);
         if entry.file_type()?.is_dir() {
-            if !effects.hides(&entry.path()) {
-                walk(&entry.path(), (root, &inner), (effects, &mut *found))?;
+            let path = entry.path();
+            if !effects.hides(&path) {
+                let contents = effects.contents(&path).unwrap_or(path);
+                walk(&contents, (root, &inner), (effects, &mut *found))?;
             }
         } else if root == "/" {
             found.push(format!("/{inner}"));
@@ -426,12 +440,7 @@ impl Evaluator<'_> {
                 ));
             }
         };
-        let mut composer = Composer {
-            root: host_root,
-            placed: HashSet::new(),
-            dirs: HashSet::new(),
-            effects,
-        };
+        let mut composer = Composer::composing(host_root, effects);
         for (key, value) in pairs {
             let Some(at) = relative(key) else {
                 return fail(format!("`{shown}`: `{key}` is outside the directory"));
@@ -440,27 +449,59 @@ impl Evaluator<'_> {
                 return fail(format!("`{shown}`: {message}"));
             }
         }
+        if let Err(message) = composer.finish() {
+            return fail(format!("`{shown}`: {message}"));
+        }
         effects.composed(&root);
         Ok(entry(true, Rc::from(root)))
     }
 }
 
 /// What [`Evaluator::compose_dir`] has placed so far, in the directory it
-/// is composing.
+/// is composing, or a sandbox's copy has (see [Directories](#directories)).
 pub(super) struct Composer<'a> {
     /// The directory, as the host's file system has it.
-    pub(super) root: PathBuf,
+    root: PathBuf,
     /// The paths of what has been placed in it, relative, but directories.
-    pub(super) placed: HashSet<String>,
-    /// The paths of the directories made in it, relative: a tree's, and
-    /// those a file is placed in.
-    pub(super) dirs: HashSet<String>,
+    placed: HashSet<String>,
+    /// The paths of the directories made in it, relative: a tree's, those a
+    /// file is placed in, and those deferred.
+    dirs: HashSet<String>,
+    /// The directories deferred, each where it is on the host and its path
+    /// relative to the root, in the order they were placed.
+    deferred: VecDeque<(PathBuf, String)>,
+    /// The paths of the directories deferred.
+    deferring: HashSet<String>,
+    /// Whether it is a sandbox's copy, every file a copy and no directory
+    /// deferred, rather than a composition.
+    copying: bool,
     /// The effect context, which says where the entries placed are (see
     /// [Effects](crate::eval::effects#effects)).
-    pub(super) effects: &'a dyn Effects,
+    effects: &'a dyn Effects,
 }
 
-impl Composer<'_> {
+impl<'a> Composer<'a> {
+    /// A composition of the directory at `root` on the host.
+    pub(super) fn composing(root: PathBuf, effects: &'a dyn Effects) -> Self {
+        Self {
+            root,
+            placed: HashSet::new(),
+            dirs: HashSet::new(),
+            deferred: VecDeque::new(),
+            deferring: HashSet::new(),
+            copying: false,
+            effects,
+        }
+    }
+
+    /// A sandbox's copy into the directory at `root` on the host.
+    pub(super) fn copying(root: PathBuf, effects: &'a dyn Effects) -> Self {
+        Self {
+            copying: true,
+            ..Self::composing(root, effects)
+        }
+    }
+
     /// The path of the host's file system that `path`, as GCSL code names
     /// it, is.
     fn host(&self, path: &str) -> Result<PathBuf, String> {
@@ -483,7 +524,10 @@ impl Composer<'_> {
     /// path, or a copy fails.
     fn place(&mut self, at: &str, value: &Value) -> Result<(), String> {
         match value {
-            Value::Dir(dir) => self.tree_at(&dir.path, at),
+            Value::Dir(dir) => {
+                let source = self.host(&dir.path)?;
+                self.place_dir(source, at)
+            }
             Value::File(file) if at.is_empty() => Err(format!(
                 "a file cannot be the directory itself, as `{}` is",
                 file.path
@@ -510,9 +554,72 @@ impl Composer<'_> {
         }
     }
 
+    /// Places the tree of the directory at `source` on the host at `at`:
+    /// deferred if nothing is placed at or under `at`, and it is a
+    /// composition's, else at once ([`Composer::tree`]).
+    fn place_dir(&mut self, source: PathBuf, at: &str) -> Result<(), String> {
+        self.expand_around(at)?;
+        if self.copying || at.is_empty() || self.dirs.contains(at) || self.placed.contains(at) {
+            return self.tree(&source, at);
+        }
+        self.made(at);
+        self.deferring.insert(at.to_owned());
+        self.deferred.push_back((source, at.to_owned()));
+        Ok(())
+    }
+
+    /// Places what each deferred directory at `at`, or a directory it is in,
+    /// holds, so that something else can be placed there.
+    fn expand_around(&mut self, at: &str) -> Result<(), String> {
+        if self.deferring.is_empty() {
+            return Ok(());
+        }
+        // Each directory `at` is in, from the root, and it.
+        let mut end = 0;
+        loop {
+            let next = at[end..].find('/').map_or(at.len(), |found| end + found);
+            let dir = &at[..next];
+            if self.deferring.remove(dir) {
+                let position = self
+                    .deferred
+                    .iter()
+                    .position(|(_, deferred)| deferred == dir);
+                if let Some((source, dir)) = position.and_then(|at| self.deferred.remove(at)) {
+                    self.tree(&source, &dir)?;
+                }
+            }
+            if next == at.len() {
+                return Ok(());
+            }
+            end = next + 1;
+        }
+    }
+
+    /// Offers each deferred directory to the host whole, in order, and
+    /// places what each it does not take holds ([`Effects::place_tree`]).
+    fn finish(&mut self) -> Result<(), String> {
+        while let Some((source, at)) = self.deferred.pop_front() {
+            self.deferring.remove(&at);
+            let target = self.root.join(&at);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("could not create `{}`: {error}", parent.display()))?;
+            }
+            match self.effects.place_tree(&source, &target) {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    return Err(format!("could not copy `{}`: {error}", source.display()));
+                }
+                None => self.tree(&source, &at)?,
+            }
+        }
+        Ok(())
+    }
+
     /// Copies the tree at `source` under `at`, its directories merged with
-    /// any already there, its symbolic links copied as links, and none the
-    /// effect context hides ([`Effects::hides`]).
+    /// any already there, each of its own deferred ([`Composer::place_dir`]),
+    /// its symbolic links copied as links, and none the effect context hides
+    /// ([`Effects::hides`]).
     pub(super) fn tree(&mut self, source: &Path, at: &str) -> Result<(), String> {
         let target = self.root.join(at);
         fs::create_dir_all(&target).map_err(|error| format!("could not create `{at}`: {error}"))?;
@@ -532,8 +639,10 @@ impl Composer<'_> {
                 .map_err(|error| format!("could not read `{}`: {error}", entry.path().display()))?;
             let inner = join(at, name);
             if kind.is_dir() {
-                if !self.effects.hides(&entry.path()) {
-                    self.tree(&entry.path(), &inner)?;
+                let path = entry.path();
+                if !self.effects.hides(&path) {
+                    let contents = self.effects.contents(&path).unwrap_or(path);
+                    self.place_dir(contents, &inner)?;
                 }
             } else {
                 // Its directory is made: the tree's own.
@@ -547,6 +656,7 @@ impl Composer<'_> {
     /// permissions kept, a symbolic link as a link; an error if something
     /// is placed there already.
     fn file(&mut self, source: &Path, at: &str) -> Result<(), String> {
+        self.expand_around(at)?;
         let target = self.root.join(at);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
@@ -584,6 +694,8 @@ impl Composer<'_> {
         let target = self.root.join(at);
         let copied = if link {
             fs::read_link(source).and_then(|link| std::os::unix::fs::symlink(link, &target))
+        } else if self.copying {
+            fs::copy(source, &target).map(|_| ())
         } else {
             self.effects.place_file(source, &target)
         };

@@ -778,17 +778,24 @@ pub(super) fn file_system(
         }
     }
     // Where each path is on the host's file system (see
-    // [Effects](crate::eval::effects#effects)).
-    let host = |path: &str| {
-        effects
-            .host_path(path)
-            .map_err(|reason| format!("`{name}` cannot use `{path}`: {reason}"))
+    // [Effects](crate::eval::effects#effects)), for what is done there.
+    let host = |path: &str, writes: bool| {
+        let found = if writes {
+            effects.write_path(path)
+        } else {
+            effects.host_path(path)
+        };
+        found.map_err(|reason| format!("`{name}` cannot use `{path}`: {reason}"))
     };
-    let (p_shown, p) = match host(p) {
+    let writes = matches!(builtin, Builtin::FsMkdir | Builtin::FsSetExecutable);
+    let (p_shown, p) = match host(p, writes) {
         Ok(found) => (p, found),
         Err(message) => return fail(message),
     };
-    let to = match to.map(|to| host(to).map(|found| (to, found))).transpose() {
+    let to = match to
+        .map(|to| host(to, true).map(|found| (to, found)))
+        .transpose()
+    {
         Ok(to) => to,
         Err(message) => return fail(message),
     };
@@ -869,7 +876,7 @@ pub(super) fn write_file(
     if !Path::new(p).is_absolute() {
         return fail(format!("`{name}` needs an absolute path, found `{p}`"));
     }
-    let path = match effects.host_path(p) {
+    let path = match effects.write_path(p) {
         Ok(path) => path,
         Err(reason) => return fail(format!("`{name}` cannot use `{p}`: {reason}")),
     };
