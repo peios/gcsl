@@ -429,6 +429,7 @@ impl Evaluator<'_> {
         let mut composer = Composer {
             root: host_root,
             placed: HashSet::new(),
+            dirs: HashSet::new(),
             effects,
         };
         for (key, value) in pairs {
@@ -451,6 +452,9 @@ pub(super) struct Composer<'a> {
     pub(super) root: PathBuf,
     /// The paths of what has been placed in it, relative, but directories.
     pub(super) placed: HashSet<String>,
+    /// The paths of the directories made in it, relative: a tree's, and
+    /// those a file is placed in.
+    pub(super) dirs: HashSet<String>,
     /// The effect context, which says where the entries placed are (see
     /// [Effects](crate::eval::effects#effects)).
     pub(super) effects: &'a dyn Effects,
@@ -512,6 +516,7 @@ impl Composer<'_> {
     pub(super) fn tree(&mut self, source: &Path, at: &str) -> Result<(), String> {
         let target = self.root.join(at);
         fs::create_dir_all(&target).map_err(|error| format!("could not create `{at}`: {error}"))?;
+        self.made(at);
         let mut entries: Vec<_> = fs::read_dir(source)
             .map_err(|error| format!("could not list `{}`: {error}", source.display()))?
             .collect::<Result<_, _>>()
@@ -531,7 +536,8 @@ impl Composer<'_> {
                     self.tree(&entry.path(), &inner)?;
                 }
             } else {
-                self.file(&entry.path(), &inner)?;
+                // Its directory is made: the tree's own.
+                self.put(&entry.path(), &inner, kind.is_symlink())?;
             }
         }
         Ok(())
@@ -541,20 +547,45 @@ impl Composer<'_> {
     /// permissions kept, a symbolic link as a link; an error if something
     /// is placed there already.
     fn file(&mut self, source: &Path, at: &str) -> Result<(), String> {
-        if !self.placed.insert(at.to_owned()) || self.root.join(at).is_dir() {
-            return Err(format!("two entries place `{at}`"));
-        }
         let target = self.root.join(at);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("could not create `{}`: {error}", parent.display()))?;
         }
-        let copied = match fs::symlink_metadata(source) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                fs::read_link(source).and_then(|link| std::os::unix::fs::symlink(link, &target))
-            }
-            Ok(_) => self.effects.place_file(source, &target),
-            Err(error) => Err(error),
+        if let Some((parent, _)) = at.rsplit_once('/') {
+            self.made(parent);
+        }
+        let link = fs::symlink_metadata(source)
+            .map_err(|error| format!("could not copy `{}`: {error}", source.display()))?
+            .file_type()
+            .is_symlink();
+        self.put(source, at, link)
+    }
+
+    /// Notes the directory `at` made, and every directory it is in.
+    fn made(&mut self, at: &str) {
+        let mut dir = at;
+        while self.dirs.insert(dir.to_owned()) {
+            let Some((parent, _)) = dir.rsplit_once('/') else {
+                return;
+            };
+            dir = parent;
+        }
+    }
+
+    /// Copies the file at `source`, a symbolic link if `link`, to `at`,
+    /// whose directory is made, as [`Composer::file`] does.
+    fn put(&mut self, source: &Path, at: &str, link: bool) -> Result<(), String> {
+        // No file can be where a directory was made, a tree's or one a file
+        // was placed in.
+        if self.dirs.contains(at) || !self.placed.insert(at.to_owned()) {
+            return Err(format!("two entries place `{at}`"));
+        }
+        let target = self.root.join(at);
+        let copied = if link {
+            fs::read_link(source).and_then(|link| std::os::unix::fs::symlink(link, &target))
+        } else {
+            self.effects.place_file(source, &target)
         };
         copied.map_err(|error| format!("could not copy `{}`: {error}", source.display()))
     }

@@ -89,6 +89,7 @@ impl Evaluator<'_> {
                 let mut copier = Composer {
                     root: host_root.clone(),
                     placed: HashSet::new(),
+                    dirs: HashSet::new(),
                     effects,
                 };
                 if let Err(message) = copier.tree_at(&dir.path, "") {

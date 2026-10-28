@@ -290,6 +290,18 @@ fn compose_dir_copies_each_entry_to_its_place() {
             "`fs.compose_dir`: two entries place `x/a.txt`",
         ),
         (
+            format!("\"x/y/a.txt\" = file(\"{root}/a.txt\"); \"x/y\" = file(\"{root}/a.txt\")"),
+            "`fs.compose_dir`: two entries place `x/y`",
+        ),
+        (
+            format!("\"x\" = dir(\"{root}\"); \"x/sub\" = file(\"{root}/a.txt\")"),
+            "`fs.compose_dir`: two entries place `x/sub`",
+        ),
+        (
+            format!("\"x/y\" = dir(\"{root}\"); \"x\" = file(\"{root}/a.txt\")"),
+            "`fs.compose_dir`: two entries place `x`",
+        ),
+        (
             format!("\"../up\" = file(\"{root}/a.txt\")"),
             "`fs.compose_dir`: `../up` is outside the directory",
         ),
