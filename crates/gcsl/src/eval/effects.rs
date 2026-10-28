@@ -97,6 +97,16 @@ pub trait Effects: std::fmt::Debug {
         Ok(PathBuf::from(path))
     }
 
+    /// Whether the directory at `host`, a path of the host's file system
+    /// met inside a directory GCSL lists or copies, is the host's own and
+    /// no part of the directory, as pekit's outputs are no part of its
+    /// workspace: left out of `d.files()` and of a copy, as if it were not
+    /// there. By default, none is.
+    fn hides(&self, host: &Path) -> bool {
+        let _ = host;
+        false
+    }
+
     /// The working directory, as GCSL code names paths: where a program
     /// given no `cwd` runs, which `working_dir()` names, and what a relative
     /// path is against in a run with no table of directories (see [Where a
