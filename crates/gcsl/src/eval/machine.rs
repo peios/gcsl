@@ -398,13 +398,14 @@ impl<'r> Machine<'r> {
     }
 
     /// A machine over `stack` and `memo`, sharing `shared`, taking up
-    /// `parked`, where an earlier one stopped.
+    /// `parked`, where an earlier one stopped, whose run's profiled calls
+    /// are those running from the `profiled_base`th on.
     pub(super) fn parked(
         (stack, memo): (&'r mut Vec<Value>, &'r mut MemoTables),
         shared: &'r Shared<'r>,
         parked: Parked,
+        profiled_base: usize,
     ) -> Self {
-        let profiled_base = shared.profile.map_or(0, profile::Profile::running);
         let (tasks, meta, status) = parked.tasks;
         Self {
             stack,

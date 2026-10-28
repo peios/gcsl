@@ -162,7 +162,8 @@ pub(in crate::eval) fn run_machine(
     let resumed = graph.and_then(GraphRun::take_suspended);
     let (start, ran, parked) = if let Some(suspended) = resumed {
         let (start, parked) = take_up(suspended, (stack, memo), shared, own);
-        let mut machine = Machine::parked((stack, memo), shared, parked);
+        // Its profiled calls are back above where its run started.
+        let mut machine = Machine::parked((stack, memo), shared, parked, start.profiled);
         let next = machine.take_up_tasks();
         let ran = machine.run_from(next);
         (start, ran, machine.into_parked())
