@@ -227,7 +227,7 @@
           "@@//crates/gcsl-cli/Cargo.toml": "15714a0d1d07385c98d17a1d82a7063adf22ca2d2727299ee873ef460706ce2e",
           "@@//crates/gcsl-disk/Cargo.toml": "ca49251a9f30f54f4330694a3b75872f3248e857044a36c460b08e07904ebea2",
           "@@//crates/gcsl-lsp/Cargo.toml": "2178a3ce95bb31e4c46ff90e642045a4d48dd8a6cb887f4f8a4d0586b6c267cd",
-          "@@//crates/gcsl/Cargo.toml": "7a1638f5c9285cdeb45f06ad5883285d1204e7d0c57f0e60e8dcfa47d99c8285",
+          "@@//crates/gcsl/Cargo.toml": "f6f5646d083bf09892b144e2825a86c2b2285be542ce75f014f1588f494b2daf",
           "@@//vendor/ppk/Cargo.lock": "37ce055775ce3cfe233565c48b8dc130a8b8815db2ff1e1f94739a961e9a96b0",
           "@@//vendor/ppk/Cargo.toml": "88b1d931ae1f24be6048d859b3444c03dcd29fa89e2ea2d19989d783c2bf6bf8"
         },
