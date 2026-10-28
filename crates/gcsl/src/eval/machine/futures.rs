@@ -14,7 +14,7 @@ use crate::value::{Begin, Future, FutureState, Value};
 use super::super::graph::{NodeId, Wait};
 use super::super::kinds::of_kind;
 use super::super::{depends_on_itself, nested_too_deeply};
-use super::tasks::{Status, Wound};
+use super::tasks::{Abandoned, Status, Wound};
 use super::{Activation, Frame, Machine, Next, Outcome, Resume, fail, give};
 
 /// An await running in the machine: of an `Await` node, or of a step of an
@@ -182,7 +182,7 @@ impl Machine<'_> {
                 // Another task of the unit runs it: waited for, and awaited
                 // again; a later task's run of it is abandoned for this one.
                 self.wound(Wound::Future(Rc::as_ptr(&future)));
-                let waiting = Status::Waiting(resumed(state, future, then));
+                let waiting = Status::Sibling(resumed(state, future, then));
                 return Err(Next::Park(Box::new(waiting)));
             }
             Some(Begin::Running) => return Err(fail(depends_on_itself(&site))),
@@ -265,22 +265,22 @@ impl Machine<'_> {
                 }
             }
             // Its run abandoned for an earlier task's (see
-            // [Wound-wait](super::tasks#wound-wait)): left unrun, for that
-            // task to run, and awaited again.
+            // [Wound-wait](super::tasks#wound-wait)): left unrun, for the
+            // earliest task that waits for it to run, and awaited again.
             Err(error)
-                if self
-                    .meta
-                    .wound
-                    .is_some_and(|(wound, _)| wound == Wound::Future(Rc::as_ptr(&future)))
+                if self.meta.wound == Some(Wound::Future(Rc::as_ptr(&future)))
                     && error.mark == crate::diagnostic::Mark::CANCELLED =>
             {
                 if !future.finish(FutureState::Pending(captures)) {
                     return self.mistyped(state.node, "a future's state is in use");
                 }
-                if let Some((_, wounder)) = self.meta.wound.take() {
-                    self.wake_task(wounder);
+                self.meta.wound = None;
+                if self.abandoned_too_often(Abandoned::Future(Rc::as_ptr(&future))) {
+                    let span = state.site(&self.running().ir).span;
+                    return fail(super::tasks::handed_back(span));
                 }
-                Next::Park(Box::new(Status::Waiting(resumed(state, future, then))))
+                self.wake_siblings();
+                Next::Park(Box::new(Status::Sibling(resumed(state, future, then))))
             }
             Err(error) => {
                 // Left unrun, so that a later await runs it again.

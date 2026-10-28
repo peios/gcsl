@@ -760,3 +760,53 @@ fn a_task_cancelled_by_an_earlier_failure_releases_the_memoised_call_it_ran() {
         Ok(Progress::Paused(_))
     ));
 }
+
+#[test]
+fn a_call_abandoned_for_an_earlier_task_is_run_by_the_earliest_that_waits() {
+    // The first iteration needs `ws` only once its read is given; the
+    // others begin it first, and one runs it. The first then wounds that
+    // one, which abandons its run. Each later iteration that waits for
+    // `ws` is woken too, and if one of them began it again, the first
+    // would wound it again, and so on without end, each run met in a scope
+    // of its own. The first, the earliest that waits, runs it instead.
+    let (mut workspace, file) = super::graph::lone_workspace(
+        r#"import fs
+fn inner() ->> String { = "{fs.read("/i1")}{fs.read("/i2")}" }
+fn ws() ->> String {
+    let x = inner()
+    let y = [fs.read(x), fs.read("/q")]
+    = "{y[0]}{fs.read(y[1])}"
+}
+fn given() ->> String {
+    let x = ws()
+    = "{x}{fs.read("/g")}"
+}
+fn late(z: String) -> String { = "{z}{ws()}{given()}" }
+fn f() -> List<String> {
+    = for each in ["/0", "/1", "/2", "/3"] {
+        = if each == "/0" { late(fs.read("/z")) } else { "{ws()}{given()}" }
+    }
+}
+= f()"#,
+    );
+    let mut graph = Graph::new();
+    let value = loop {
+        match workspace.run_graph(file, &mut graph, isolating()).unwrap() {
+            Progress::Paused(nodes) => {
+                for node in nodes {
+                    let Value::Str(path) = graph.node(node).unwrap().args()[0].clone() else {
+                        panic!("a read of no path");
+                    };
+                    let upper = path.trim_start_matches('/').to_uppercase();
+                    assert!(graph.resolve(node, Ok(text(&upper))));
+                }
+            }
+            Progress::Waiting(unit) => panic!("waits for unit {unit}"),
+            Progress::Done(value) => break value,
+        }
+    };
+    let rest = "I1I2QI1I2QG";
+    assert_eq!(value, texts(&[&format!("Z{rest}"), rest, rest, rest]));
+    // Each read once: `/z`, `inner`'s two, `ws`'s three and `given`'s.
+    assert_eq!(graph.len(), 7);
+}
