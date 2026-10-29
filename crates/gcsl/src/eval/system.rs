@@ -44,8 +44,8 @@ use super::{Flow, mistyped};
 /// and its status 0. An `interactive` one has this process's standard
 /// input, output and error, and its result's output is empty. With
 /// `panic`, a status other than 0 is a failure of the call, "`cc` exited
-/// with status 1", noted with its standard error unless `exec_live`
-/// showed it already.
+/// with status 1", noted with its standard output and its standard error,
+/// each that is not blank, unless `exec_live` showed them already.
 ///
 /// Fails with "`exec` needs a program to run" for an empty `argv`
 /// (`exec_live` naming itself), with "cannot run `name`", noting the OS's
@@ -186,8 +186,13 @@ impl Program<'_> {
             }
             let mut failed =
                 Diagnostic::error(format!("`{shown}` exited with status {status}"), node.span);
-            if !live && !stderr.trim().is_empty() {
-                failed = failed.with_note(format!("its standard error: {}", stderr.trim()));
+            if !live {
+                for (stream, text) in [("output", &stdout), ("error", &stderr)] {
+                    if !text.trim().is_empty() {
+                        failed =
+                            failed.with_note(format!("its standard {stream}: {}", text.trim()));
+                    }
+                }
             }
             return Err(failed.into());
         }

@@ -83,6 +83,7 @@ use crate::diagnostic::Mark;
 use crate::source::Span;
 use crate::value::{ContextFrame, List, Value};
 
+use super::super::failure::Caught;
 use super::super::graph::{GraphRun, NodeId, RunState, Wait};
 use super::super::memo::Running;
 use super::super::profile;
@@ -130,7 +131,7 @@ pub(in crate::eval) struct Own {
     /// Its deadlines.
     deadlines: Vec<Deadline>,
     /// The failures its `recover`s caught.
-    failures: Vec<Rc<str>>,
+    failures: Vec<Rc<Caught>>,
     /// Its secrets' identities.
     identities: Vec<Rc<str>>,
     /// Whether its innermost operation on secrets has an operand's failure.

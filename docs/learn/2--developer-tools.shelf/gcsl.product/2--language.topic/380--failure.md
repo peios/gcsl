@@ -46,8 +46,10 @@ odd = recover { half(7) } else { -1 }
 message = recover { "half is {half(7)}" } else (failure) { failure.message }
 ```
 
-The failure is a record, `{message: String}`. The two blocks join as an
-`if`'s branches do, so they normally have one type.
+The failure is a record, `{message: String, notes: List<String>}`. The
+notes add detail to the message. A program that fails, for example, notes
+its standard output and standard error. The two blocks join as an `if`'s
+branches do, so they normally have one type.
 
 `recover` catches what `#[retry]` would retry, and nothing else. A bug in
 GCSL itself is never caught. Neither is a timeout of a call that encloses

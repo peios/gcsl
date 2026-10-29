@@ -1,7 +1,7 @@
 //! Lowering `recover`.
 
 use crate::ast::RecoverId;
-use crate::check::FAILURE_MESSAGE;
+use crate::check::{FAILURE_MESSAGE, FAILURE_NOTES};
 use crate::diagnostic::InternalError;
 use crate::ir::IrKind;
 use crate::value::ValueKind;
@@ -36,15 +36,15 @@ impl Lowerer<'_> {
         let mut fallback = self.lower_operand(decl.fallback, kind)?;
         if let Some(slot) = self.resolution.recover_slot(recover) {
             let span = self.ast.get(decl.fallback).span;
-            let message = self
-                .ast
-                .names()
+            let names = self.ast.names();
+            let fields = names
                 .lookup(FAILURE_MESSAGE)
+                .zip(names.lookup(FAILURE_NOTES))
                 .ok_or(InternalError {
-                    message: "a failure's field is not interned",
+                    message: "a failure's fields are not interned",
                     span,
                 })?;
-            let layout = self.layout_of(&[message]);
+            let layout = self.layout_of(&[fields.0, fields.1]);
             let failure = self.builder.alloc(IrKind::Failure(layout), span);
             let store = self.builder.alloc(IrKind::Store(slot, failure), span);
             let items = self.builder.push_item_list(&[store]);

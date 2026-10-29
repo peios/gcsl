@@ -33,6 +33,7 @@ use crate::ir::{Ir, IrId};
 use crate::source::Span;
 use crate::value::{Caller, ContextFrame, Future, Value};
 
+use super::super::failure::Caught;
 use super::super::graph::{GraphRun, NodeId, RunState, StepCall, Wait, pending};
 use super::super::memo::{MemoTables, Running};
 use super::super::profile;
@@ -108,7 +109,7 @@ struct Task {
     /// The number of the last deadline made.
     made: u32,
     /// The failures its `recover`s running their fallbacks caught.
-    failures: Vec<Rc<str>>,
+    failures: Vec<Rc<Caught>>,
     /// The identities its operations on secrets have computed on.
     identities: Vec<Rc<str>>,
     /// Whether the failure unwinding to its innermost operation on secrets

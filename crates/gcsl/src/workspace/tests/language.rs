@@ -757,12 +757,16 @@ fn a_recover_catches_what_retry_would_retry_and_an_assertion_shows_its_operands(
                 \x20   }\n\
                 \x20   0\n\
                 }\n\
-                h = leave()";
+                h = leave()\n\
+                k = recover { let r = exec([\"sh\", \"-c\", \"echo said; echo bad >&2; exit 2\"]); [r.stdout] } \
+                else (e) { e.notes }\n\
+                m = recover { panic(\"boom\") } else (e) { e.notes }";
     let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
     assert_eq!(
         rooted_text(&files, "app.gcsl"),
         "{a = 6; b = \"assertion failed: x must be positive\"; c = \"caught boom\"; d = -1; \
-         f = \"re: inner\"; g = \"assertion failed: `s == \\\"hullo\\\"`\"; h = 20}"
+         f = \"re: inner\"; g = \"assertion failed: `s == \\\"hullo\\\"`\"; h = 20; \
+         k = [\"its standard output: said\", \"its standard error: bad\"]; m = []}"
     );
     // A failed assertion labels each side of its comparison with its value.
     let files = [
@@ -807,7 +811,7 @@ fn assertion_and_recover_errors() {
         ("assert true, 1", "mismatched types"),
         (
             "r = recover { 1 } else (e) { e.nope }",
-            "no field `nope` in `{message: String}`",
+            "no field `nope` in `{message: String, notes: List<String>}`",
         ),
         (
             "fn imp() -> Int { 1 }\nfn p(): Int { recover { imp() } else { 0 } }",

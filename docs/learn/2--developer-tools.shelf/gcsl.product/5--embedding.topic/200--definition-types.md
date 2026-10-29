@@ -196,7 +196,9 @@ result = test adds()
 ```
 
 `test adds()` is a `TestResult`, `{name = "adds"; passed = true; message
-= ""}`, and never itself a failure. `test` is `#[hermetic]`, so a build
+= ""}`, and never itself a failure. A failing test's message holds the
+failure's message, then each of its notes on a line of its own, such as a
+failing program's output. `test` is `#[hermetic]`, so a build
 tool such as pekit runs each test's body as a step, given what its
 parameters' defaults build, and doesn't run a test that passed again for
 the same inputs.

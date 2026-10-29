@@ -526,7 +526,13 @@ fn exec_fails_unless_its_program_succeeds() {
     assert_eq!(error.message, "`sh` exited with status 3");
     assert_eq!(error.notes, ["its standard error: bad"]);
     assert_eq!(error.span, Span::new(4, u32::try_from(text.len()).unwrap()));
-    // Without standard error, no note; `exec_live` has shown it already.
+    // Its standard output too, first, as a test runner reports there.
+    let error = lone_error("r = exec([\"sh\", \"-c\", \"echo said; echo bad >&2; exit 3\"])");
+    assert_eq!(
+        error.notes,
+        ["its standard output: said", "its standard error: bad"]
+    );
+    // Without output, no note; `exec_live` has shown it already.
     assert!(
         lone_error("r = exec([\"false\"], panic = true)")
             .notes
