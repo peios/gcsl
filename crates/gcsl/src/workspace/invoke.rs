@@ -24,6 +24,7 @@ use super::{
     INVOKED_DEF_TYPE, Invocable, InvokeError, Referenced, RequestError, ResolvedDefinition, Scalar,
     SeenContext, Workspace, count, merge_files,
 };
+use super::parse::is_foreign_path;
 
 impl Workspace {
     /// Every def-type of the workspace's own files, and each of the
@@ -1519,10 +1520,16 @@ pub(super) fn overlaps(listed: &DefType) -> Vec<Diagnostic> {
 
 /// Whether the directories of root-relative paths `a` and `b` see each
 /// other's definitions, one through another: whether they are one, or one
-/// is above the other (the root, `""`, is above every directory). Two
-/// directories neither of which is above the other, siblings or cousins,
-/// see nothing of each other's.
+/// is above the other (the root, `""`, is above every directory of the
+/// workspace). Two directories neither of which is above the other,
+/// siblings or cousins, see nothing of each other's. A library's directory,
+/// or the standard library's, is a root of its own, apart from the
+/// workspace's tree and every other's (see `parse::intern_dir`), so it sees only
+/// itself.
 pub(super) fn sees(a: &str, b: &str) -> bool {
+    if is_foreign_path(a) || is_foreign_path(b) {
+        return a == b;
+    }
     let above = |upper: &str, lower: &str| {
         upper.is_empty()
             || lower
