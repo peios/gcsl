@@ -464,9 +464,17 @@ fn a_sandbox_runs_its_commands_with_its_copy_as_their_root() {
          f = s.file(\"out.txt\").read()\n\
          g = s.file(\"/work/out.txt\") == s.dir(\"/work\").file(\"out.txt\")"
     );
+    // Its `/` holds what the copy does, which follows the host's layout of
+    // its libraries, and what the sandbox mounts.
+    let mut top: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .chain(["dev", "proc", "tmp", "work"].map(str::to_owned))
+        .collect();
+    top.sort();
     let shown = lone(&text).unwrap();
     assert!(
-        shown.starts_with("{a = \"bin dev lib64 proc tmp usr work\\n/\\nhi x\\n\"; "),
+        shown.starts_with(&format!("{{a = \"{}\\n/\\nhi x\\n\"; ", top.join(" "))),
         "{shown}"
     );
     assert!(
