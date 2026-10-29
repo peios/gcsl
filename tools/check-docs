@@ -1,5 +1,6 @@
 #!/bin/sh
-# Check the authored Learn contribution with a caller-selected Trail build.
+# Check the authored Learn contribution, its GCSL examples and the man
+# pages, with a caller-selected Trail build.
 set -eu
 
 repo=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)
@@ -10,3 +11,11 @@ output=$(mktemp -d "${TMPDIR:-/tmp}/gcsl-learn.XXXXXXXX")
 trap 'rm -rf -- "$output"' EXIT HUP INT TERM
 "$trail" build docs/learn --strict --no-cache --out "$output"
 python3 tools/check-doc-examples.py
+for page in docs/man/*.[1-9]; do
+    [ -e "$page" ] || continue
+    warnings=$(groff -man -ww -z "$page" 2>&1)
+    if [ -n "$warnings" ]; then
+        printf '%s: %s\n' "$page" "$warnings" >&2
+        exit 1
+    fi
+done

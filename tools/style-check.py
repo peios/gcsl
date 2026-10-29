@@ -7,8 +7,8 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RUST_ROOTS = ("crates", "packages")
-SHELL_SOURCES = ("bazel", "tools/check", "tools/check-docs", "tools/offline-build")
+RUST_ROOTS = ("crates",)
+SHELL_SOURCES = ("tools/check", "tools/check-docs")
 
 
 def tool(name: str, version: str) -> str:
@@ -38,11 +38,7 @@ def main() -> None:
     rust = sorted(
         str(path.relative_to(ROOT)) for name in RUST_ROOTS for path in (ROOT / name).rglob("*.rs")
     )
-    python = sorted(
-        str(path.relative_to(ROOT))
-        for name in ("tools", "packages")
-        for path in (ROOT / name).rglob("*.py")
-    )
+    python = sorted(str(path.relative_to(ROOT)) for path in (ROOT / "tools").rglob("*.py"))
     run(
         [
             "rustup",
