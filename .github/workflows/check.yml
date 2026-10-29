@@ -23,27 +23,26 @@ jobs:
             - name: Install Linux development tools
               run: |
                   sudo apt-get update
-                  sudo apt-get install -y build-essential python3 python3-venv binutils groff
+                  sudo apt-get install -y build-essential python3 python3-venv groff
                   rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
             - name: Prepare pinned PSC style tools
               run: python3 tools/prepare-style-tools.py "$RUNNER_TEMP/gcsl-style"
-            - name: Check style, build, tests and packages
+            - name: Check style, lints and tests
               env:
                   PEIOS_STYLE_BIN: ${{ runner.temp }}/gcsl-style/bin
                   CARGO_TARGET_DIR: ${{ runner.temp }}/gcsl-cargo-checks
               run: tools/check
-            - name: Check out the documentation compiler
-              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-              with:
-                  repository: peios/trail
-                  ref: 1d662e98cbcbdd5c51c01533afcab7f5723a2eff
-                  path: .ci-tools/trail
-                  persist-credentials: false
-            - name: Build the pinned documentation compiler
-              working-directory: .ci-tools/trail
-              run: tools/bazel build //:trail
-            - name: Check documentation
+            - name: Build gcsl
               env:
-                  TRAIL: ${{ github.workspace }}/.ci-tools/trail/bazel-bin/trail
-                  GCSL: ${{ github.workspace }}/bazel-bin/crates/gcsl-cli/gcsl
-              run: tools/check-docs
+                  CARGO_TARGET_DIR: ${{ runner.temp }}/gcsl-cargo-checks
+              run: cargo +1.98.1 build --release --locked -p gcsl-cli
+            - name: Build the pinned documentation compiler
+              run: >-
+                  cargo +1.98.1 install --locked --root "$RUNNER_TEMP/trail"
+                  --git https://github.com/peios/trail
+                  --rev 64517260afd150283bc1e2309d7c745f2728d467 trail
+            - name: Check documentation
+              run: >-
+                  TRAIL="$RUNNER_TEMP/trail/bin/trail"
+                  GCSL="$RUNNER_TEMP/gcsl-cargo-checks/release/gcsl"
+                  tools/check-docs
