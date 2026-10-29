@@ -37,7 +37,8 @@
 //! instead, "name one of `pkgs/a/main`, `pkgs/b/main`".
 //!
 //! Within directories that see each other, one or one above another, a name
-//! must still mean one thing, so the listing fails, and every invocation
+//! must still mean one thing (a library's directory, a root of its own, sees
+//! none of the workspace's, nor another library's), so the listing fails, and every invocation
 //! with it, if a def-type has two definitions of one path in such
 //! directories, "`package dev.peios.x` is defined 2 times in directories
 //! that see each other", as a `#[shadowable]` one and the one that shadows

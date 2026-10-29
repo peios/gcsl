@@ -369,6 +369,52 @@ fn one_path_in_directories_apart_is_named_with_its_directory() {
 }
 
 #[test]
+fn a_library_s_definition_of_a_path_of_the_workspace_s_is_no_duplicate() {
+    // A library's directory is a root of its own, apart from the
+    // workspace's tree and every other library's: the workspace and the
+    // libraries it imports each define `build dup`, `test dup` say, and
+    // the listing has all three, each in its own directory.
+    let files = [
+        (
+            "workspace.gcsl",
+            "import \"github.com/x/one\"\n\
+                 import \"github.com/x/two\"\n\
+                 def build dup() { \"own\" }\n\
+                 y = [one.x, two.x]",
+        ),
+        (
+            "<lib>/github.com/x/one/one.gcsl",
+            "def build dup() { \"one\" }\nx = 1",
+        ),
+        (
+            "<lib>/github.com/x/two/two.gcsl",
+            "def build dup() { \"two\" }\nx = 2",
+        ),
+    ];
+    let sources: Vec<SourceFile> = files
+        .iter()
+        .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+        .collect();
+    let (_, checked) = check_with_standard(&sources, &[], SCRATCH);
+    let listed = checked.unwrap().def_types().unwrap();
+    let build = listed
+        .iter()
+        .find(|def_type| def_type.path == "build")
+        .unwrap();
+    let mut dirs: Vec<&str> = build
+        .definitions
+        .iter()
+        .filter(|definition| definition.path == "dup")
+        .map(|definition| definition.dir.as_str())
+        .collect();
+    dirs.sort_unstable();
+    assert_eq!(
+        dirs,
+        ["", "<lib>/github.com/x/one", "<lib>/github.com/x/two"]
+    );
+}
+
+#[test]
 fn one_path_in_directories_that_see_each_other_fails_every_invocation() {
     // A `#[shadowable]` one of the root, shadowed in a directory below:
     // both are found, the first in path order first.
