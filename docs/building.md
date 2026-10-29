@@ -1,7 +1,8 @@
 # Building and Checking GCSL
 
-Build on x86-64 Linux with Python 3.11 or newer, a C compiler, Git, and Rust
-1.98.1 with rustfmt and Clippy. Cargo builds the crates from the locked
+Build on x86-64 Linux with Python 3.11 or newer, a C compiler, Git, Rust
+1.98.1 with rustfmt and Clippy, and bubblewrap (`bwrap`), which the sandbox
+tests run sandboxes with. Cargo builds the crates from the locked
 dependencies. GCSL does not need a Peios development SDK or private
 repository credentials.
 

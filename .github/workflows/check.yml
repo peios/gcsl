@@ -23,7 +23,10 @@ jobs:
             - name: Install Linux development tools
               run: |
                   sudo apt-get update
-                  sudo apt-get install -y build-essential python3 python3-venv groff
+                  sudo apt-get install -y build-essential python3 python3-venv groff bubblewrap
+                  # Ubuntu restricts unprivileged user namespaces, which
+                  # bubblewrap makes the sandbox tests' sandboxes with.
+                  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
                   rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
             - name: Prepare pinned PSC style tools
               run: python3 tools/prepare-style-tools.py "$RUNNER_TEMP/gcsl-style"
