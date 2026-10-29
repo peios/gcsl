@@ -323,9 +323,12 @@ pub type ImportedRecord = (Slot, Vec<(Name, Slot, TyId)>);
 /// its fields, in the view's order.
 pub type ViewRecord = (Slot, usize, Vec<(Name, Slot, TyId)>);
 
-/// The field of a `recover`'s failure, `{message: String}` (see
-/// [Failure](crate::check::failure#failure)).
+/// The fields of a `recover`'s failure, `{message: String, notes:
+/// List<String>}` (see [Failure](crate::check::failure#failure)).
 pub(crate) const FAILURE_MESSAGE: &str = "message";
+
+/// See [`FAILURE_MESSAGE`].
+pub(crate) const FAILURE_NOTES: &str = "notes";
 
 /// A variable, field or callee in scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -12,8 +12,9 @@
 //! body; a failure of it that `#[retry]` would retry, an error with no
 //! mark, being neither a bug in GCSL nor the passing of an enclosing call's
 //! deadline (see [Retry and timeout](crate::eval::retry#retry-and-timeout)), is caught: its
-//! message is pushed onto a stack in the run's shared state, which the
-//! fallback's `Failure` reads as the record `{message}`, and popped once the
+//! message and its notes, a failing program's output say, are pushed onto
+//! a stack in the run's shared state ([`Caught`]), which the fallback's
+//! `Failure` reads as the record `{message, notes}`, and popped once the
 //! fallback has run. A deadline a call inside the body set is cleared by
 //! that call, its own failure, so it is caught; `break`, `continue` and
 //! `return` are no failures, and pass through. What the body ran stays run.
@@ -22,7 +23,7 @@ use std::rc::Rc;
 
 use crate::diagnostic::{Diagnostic, Mark as ErrorMark};
 use crate::ir::{IrId, IrKind, IrNode, LayoutId};
-use crate::value::{Record, Value};
+use crate::value::{List, Record, Value};
 
 use super::{Evaluator, Flow, Unwind, comparison_operands, mistyped, record_eq_shaped, source_of};
 
@@ -111,10 +112,7 @@ impl Evaluator<'_> {
     pub(super) fn recover(&mut self, body: IrId, fallback: IrId) -> Flow<Value> {
         match self.value(body) {
             Err(Unwind::Error(error)) if error.mark == ErrorMark::NONE => {
-                self.shared
-                    .failures
-                    .borrow_mut()
-                    .push(Rc::from(error.message));
+                self.shared.failures.borrow_mut().push(Caught::of(error));
                 let result = self.value(fallback);
                 self.shared.failures.borrow_mut().pop();
                 result
@@ -124,14 +122,40 @@ impl Evaluator<'_> {
     }
 
     /// The failure the innermost `recover` running its fallback caught, a
-    /// record of the layout `layout`, its one field its message.
+    /// record of the layout `layout`, its fields its message and its notes.
     pub(super) fn failure(&self, layout: LayoutId, node: &IrNode) -> Flow<Value> {
-        let Some(message) = self.shared.failures.borrow().last().cloned() else {
+        let Some(caught) = self.shared.failures.borrow().last().cloned() else {
             return mistyped(node, "a failure read outside a `recover`'s fallback");
         };
         Ok(Value::Record(Rc::new(Record {
             layout: Rc::clone(self.ir.layout(layout)),
-            values: Box::new([Value::Str(message)]),
+            values: Box::new([
+                Value::Str(Rc::clone(&caught.message)),
+                Value::List(caught.notes.clone()),
+            ]),
         })))
+    }
+}
+
+/// A failure a `recover` caught, as its fallback reads it (see
+/// [Failure](#failure)): its message, and its notes, each a `String`.
+#[derive(Debug)]
+pub(super) struct Caught {
+    message: Rc<str>,
+    notes: List,
+}
+
+impl Caught {
+    /// The failure `error` caught.
+    pub(super) fn of(error: Diagnostic) -> Rc<Self> {
+        let notes = error
+            .notes
+            .into_iter()
+            .map(|note| Value::Str(Rc::from(note)))
+            .collect();
+        Rc::new(Self {
+            message: Rc::from(error.message),
+            notes: List::from_vec(notes),
+        })
     }
 }

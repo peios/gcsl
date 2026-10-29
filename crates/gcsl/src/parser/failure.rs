@@ -148,8 +148,9 @@ impl Parser<'_> {
     /// at its `(` (see [Failure](#failure)).
     pub(super) fn parse_failure_name(&mut self) -> ParseResult<(Name, Span)> {
         self.advance();
-        // The failure's field, which the checker and lowering name it by.
+        // The failure's fields, which the checker and lowering name them by.
         self.names.intern(crate::check::FAILURE_MESSAGE);
+        self.names.intern(crate::check::FAILURE_NOTES);
         let name = self.peek();
         let TokenKind::Ident(text) = name.kind else {
             let found = self.describe(name);

@@ -232,7 +232,8 @@ is a statement that fails the run with "assertion failed: MESSAGE" when the cond
 evaluates the fallback instead of the body if the body fails, with
 .I NAME
 bound to the failure,
-.BR "{message: String}" .
+.BR "{message: String, notes: List<String>}" ,
+its notes the detail a diagnostic adds, such as a failing program's output.
 It catches what
 .B #[retry]
 would retry: never a bug in GCSL, nor the timeout of an enclosing call.

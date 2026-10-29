@@ -7,7 +7,8 @@
 //! Bool", and its message a `String` (`Checker::check_assert`). `recover { BODY
 //! } else (e) { FALLBACK }` (`Checker::check_recover`) checks its body, then
 //! its fallback in a scope of its own, where the failure, if it is named, is a
-//! variable of type `{message: String}` in a slot of its own, recorded for
+//! variable of type `{message: String, notes: List<String>}` in a slot of
+//! its own, recorded for
 //! lowering ([`Resolution::recover_slot`](super::Resolution::recover_slot));
 //! its type is the join of the two, as an `if`'s branches', warned of as theirs
 //! are when it widens to a union, "the branches of this `recover` have
@@ -18,7 +19,7 @@ use crate::ast::{ExprId, RecoverId};
 use crate::source::Span;
 use crate::types::TyId;
 
-use super::{BindingKind, Checker, FAILURE_MESSAGE};
+use super::{BindingKind, Checker, FAILURE_MESSAGE, FAILURE_NOTES};
 
 impl Checker<'_> {
     /// Types `id`, `assert COND` or `assert COND, MESSAGE` (see
@@ -52,7 +53,8 @@ impl Checker<'_> {
     /// Types `id`, the `recover` expression `recover` (see
     /// [Failure](#failure)): its body, then its fallback, in a scope where
     /// the failure, if it is named, is a variable of type `{message:
-    /// String}` in a slot of its own, recorded for lowering. Its type is
+    /// String, notes: List<String>}` in a slot of its own, recorded for
+    /// lowering. Its type is
     /// the join of the body's and the fallback's, as an `if`'s branches'.
     pub(super) fn check_recover(&mut self, recover: RecoverId) -> TyId {
         let decl = *self.ast.recover_decl(recover);
@@ -61,9 +63,14 @@ impl Checker<'_> {
         self.block_start = self.bindings.len();
         if let Some((name, span)) = decl.error {
             // Interned by the parser for a named failure.
-            let message = self.ast.names().lookup(FAILURE_MESSAGE);
-            let failure = message.map_or(TyId::ERROR, |message| {
-                self.types.record([(message, TyId::STRING)])
+            let names = self.ast.names();
+            let fields = names
+                .lookup(FAILURE_MESSAGE)
+                .zip(names.lookup(FAILURE_NOTES));
+            let failure = fields.map_or(TyId::ERROR, |(message, notes)| {
+                let notes_ty = self.types.list(TyId::STRING);
+                self.types
+                    .record([(message, TyId::STRING), (notes, notes_ty)])
             });
             let slot = self.declare_binding(name, failure, Some(span), BindingKind::Variable);
             self.lowering.recover_slots.insert(recover, slot);

@@ -170,10 +170,10 @@ fn a_step_s_failure_is_raised_where_its_result_is_needed() {
 #[test]
 fn a_def_type_s_deferring_attribute_makes_its_definitions_steps_and_not_itself() {
     // As the prelude's `test` is: the definition a step, the def-type's
-    // own body, which recovers its failure, not.
+    // own body, which recovers its failure, its message and its notes, not.
     let (mut workspace, file) = lone_workspace(
         "#[def_type] #[step] def check(name: String, f: fn() -> String) -> String {\n\
-         \x20   = recover { await f() } else (e) { \"{name} failed: {e.message}\" }\n\
+         \x20   = recover { await f() } else (e) { \"{name} failed: {e.message}; {e.notes.join(\", \")}\" }\n\
          }\n\
          def check one() { = \"one passed\" }\n\
          result = await (check one)()",
@@ -184,15 +184,18 @@ fn a_def_type_s_deferring_attribute_makes_its_definitions_steps_and_not_itself()
         Progress::Paused(vec![NodeId::of(0)])
     );
     assert_eq!(graph.len(), 1);
-    let failure = Diagnostic::error("assertion failed", Span::new(0, 0));
+    let failure = Diagnostic::error("`t` exited with status 1", Span::new(0, 0))
+        .with_note("its standard output: said")
+        .with_note("its standard error: bad");
     assert!(graph.resolve(NodeId::of(0), Err(failure)));
     let Progress::Done(value) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
         panic!("not done");
     };
     assert!(
-        value
-            .to_string()
-            .ends_with("result = \"one failed: assertion failed\"}"),
+        value.to_string().ends_with(
+            "result = \"one failed: `t` exited with status 1; its standard output: said, \
+             its standard error: bad\"}"
+        ),
         "{value}"
     );
 }

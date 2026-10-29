@@ -69,6 +69,7 @@ use memo::NO_ORIGIN;
 use kinds::{Extract, Taken, mixed};
 use unions::{other_fields, with_fields};
 use builtins::described;
+use failure::Caught;
 pub use effects::{Direct, Effects};
 pub use files::fetched_name;
 use graph::GraphRun;
@@ -379,9 +380,9 @@ struct Shared<'a> {
     /// The context the frame running is evaluated in, innermost frame first
     /// (see [Context](crate::eval::context#context)): `None`, binding nothing, at the root.
     context: RefCell<Option<Rc<ContextFrame>>>,
-    /// The message of the failure each `recover` running its fallback
-    /// caught, innermost last (see [Failure](crate::eval::failure#failure)).
-    failures: RefCell<Vec<Rc<str>>>,
+    /// The failure each `recover` running its fallback caught, innermost
+    /// last (see [Failure](crate::eval::failure#failure)).
+    failures: RefCell<Vec<Rc<Caught>>>,
     /// The identities of the secrets the operations on secrets running have
     /// computed on so far, innermost last (see [Secrets](crate::eval::secrets#secrets)).
     identities: RefCell<Vec<Rc<str>>>,

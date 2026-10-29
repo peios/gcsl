@@ -432,8 +432,9 @@ type Package = {name: String, version: String, files: {*: Dir | File | List<File
 # build, so a test that passed is not run again for the same inputs;
 # `#[hermetic(false)]` runs one that cannot be a step every time.
 # `test NAME()` is a `TestResult`, its name, whether it passed and the
-# failure's message, and never itself a failure: its body's failure, after
-# its retries, is recovered outside the step.
+# failure's message, a line of its own for each of its notes, such as a
+# failing program's output, and never itself a failure: its body's failure,
+# after its retries, is recovered outside the step.
 type TestResult = {name: String, passed: Bool, message: String}
 #[def_type] #[hermetic]
 def test(name: String, f: fn() -> {}) -> TestResult {
@@ -441,7 +442,7 @@ def test(name: String, f: fn() -> {}) -> TestResult {
         await f()
         = {passed = true; message = ""}
     } else (failure) {
-        = {passed = false; message = failure.message}
+        = {passed = false; message = [failure.message, ...failure.notes].join("\n")}
     }
     name = name
     passed = outcome.passed

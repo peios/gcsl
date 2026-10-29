@@ -44,8 +44,8 @@ file's permissions or provide a durable transaction across several files.
 `exec` accepts a list whose first element names the program. Later elements
 are passed as arguments without shell interpretation. It returns a record
 with the exit status and captured output. A nonzero exit status fails the
-call with the program's standard error; pass `panic = false` to get the
-status back as data instead:
+call, and the failure notes the program's standard output and standard
+error. Pass `panic = false` to get the status back as data instead:
 
 ```gcsl
 let probe = exec(["sh", "-c", "exit 3"], panic = false)
@@ -86,7 +86,7 @@ environment of its own instead of GCSL's.
 | --- | --- | --- |
 | `cwd` | `""` | The working directory. `""` keeps the run's own; a relative path is relative to the directory of the file it's written in. |
 | `env` | `{}` | Variables set over the environment, as a record of strings. |
-| `panic` | `true` | A nonzero exit status fails the call with its standard error. When false, the status is data. |
+| `panic` | `true` | A nonzero exit status fails the call, noting its standard output and standard error. When false, the status is data. |
 | `until` | `""` | When set, the program is stopped at the first line of output containing this text. |
 | `interactive` | `false` | When true, the program uses GCSL's terminal, and nothing is captured. |
 

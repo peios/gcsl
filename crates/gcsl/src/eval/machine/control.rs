@@ -11,6 +11,7 @@ use crate::names::Name;
 use crate::value::{Closure, ContextFrame, Value};
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
+use super::super::failure::Caught;
 use super::super::{Callee, Unwind, nested_too_deeply};
 use super::super::graph::GraphRun;
 use super::suspend::Resume;
@@ -124,16 +125,13 @@ impl Machine<'_> {
     /// Takes up a `recover` whose fallback is `fallback` with `result`,
     /// what its body came to, as
     /// [`Evaluator::recover`](super::Evaluator::recover) does: a failure
-    /// with no mark runs the fallback, with its message the innermost a
-    /// `Failure` reads.
+    /// with no mark runs the fallback, with its message and notes the
+    /// innermost a `Failure` reads.
     pub(super) fn recovered(&mut self, fallback: IrId, result: Outcome) -> Next {
         match result {
             Err(unwind) => match *unwind {
                 Unwind::Error(error) if error.mark == ErrorMark::NONE => {
-                    self.shared
-                        .failures
-                        .borrow_mut()
-                        .push(Rc::from(error.message));
+                    self.shared.failures.borrow_mut().push(Caught::of(error));
                     self.frames.push(Frame::Fallback);
                     Next::Eval(fallback)
                 }

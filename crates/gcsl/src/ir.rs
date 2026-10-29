@@ -1211,7 +1211,8 @@ pub enum IrKind {
     /// [`ValueKind::Mixed`].
     SecretWrap(IrId, bool),
     /// The failure the innermost `recover` running its fallback caught, a
-    /// record `{message: String}` of the layout it names. Of kind
+    /// record `{message: String, notes: List<String>}` of the layout it
+    /// names. Of kind
     /// [`ValueKind::Record`].
     Failure(LayoutId),
     /// One binding of an [`IrKind::With`], only ever one of its `binds`:
