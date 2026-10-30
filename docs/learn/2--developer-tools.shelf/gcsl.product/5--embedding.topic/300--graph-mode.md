@@ -122,6 +122,13 @@ that can make progress, and then run the waiting unit again. It looks
 the call up again, and finds the result once the other unit has
 finished it.
 
+To know whether units that wait for each other are stuck, compare
+`Workspace::memo_ended` before and after a round of runs. It counts the
+memoised calls that have ended. A unit that waits again after its run
+may still have ended a call that another unit waits for, so wake the
+waiting units again. Units are stuck only if a round ran nothing else
+and ended no call.
+
 A unit that waits on another never makes a node of its own for the
 shared work, so the work is done once, by whichever unit reached it
 first. If every unit you have is waiting on another, they are waiting
