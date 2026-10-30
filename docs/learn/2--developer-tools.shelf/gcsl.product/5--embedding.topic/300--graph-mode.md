@@ -125,7 +125,7 @@ finished it.
 To know whether units that wait for each other are stuck, compare
 `Workspace::memo_ended` before and after a round of runs. It counts the
 memoised calls that have ended. A unit that waits again after its run
-may still have ended a call that another unit waits for, so wake the
+might still have ended a call that another unit waits for, so wake the
 waiting units again. Units are stuck only if a round ran nothing else
 and ended no call.
 
