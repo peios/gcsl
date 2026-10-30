@@ -42,13 +42,16 @@ fn a_unit_waits_for_the_unit_running_a_memoised_call_it_needs() {
     };
     let effect = effects[0];
     // The second needs that entry: it waits for the first's unit, rather
-    // than running `shared` again or failing as if it called itself.
+    // than running `shared` again or failing as if it called itself. No
+    // call has ended.
+    let before = workspace.memo_ended();
     assert_eq!(
         workspace
             .run_prepared(&second, &mut graph, every())
             .unwrap(),
         Progress::Waiting(first.unit())
     );
+    assert_eq!(workspace.memo_ended(), before);
     let job = workspace.effect_job(&graph, effect).unwrap();
     let value = workspace.from_plain(&on_a_thread(job, None).unwrap());
     assert!(graph.resolve(effect, Ok(value)));
@@ -57,6 +60,8 @@ fn a_unit_waits_for_the_unit_running_a_memoised_call_it_needs() {
         workspace.run_prepared(&first, &mut graph, every()).unwrap(),
         done
     );
+    // The first's run ended the call the second waits on.
+    assert_eq!(workspace.memo_ended(), before + 1);
     assert_eq!(
         workspace
             .run_prepared(&second, &mut graph, every())

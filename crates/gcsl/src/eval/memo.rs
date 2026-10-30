@@ -200,6 +200,9 @@ pub struct MemoTables {
     /// The last identity given to a frame of the context (see
     /// [Context](crate::eval::context#context)): each is new.
     pub(super) context_frames: u64,
+    /// How many memoised calls have ended, returned or failed, since the
+    /// tables were made (see [`MemoTables::ended`]).
+    pub(super) ended: u64,
 }
 
 /// The origin of a caller that has none yet (see [Callers and
@@ -304,7 +307,19 @@ impl MemoTables {
             entries: 0,
             running: Vec::new(),
             context_frames: 0,
+            ended: 0,
         }
+    }
+
+    /// How many memoised calls have ended, returned or failed, or been
+    /// given up for a run elsewhere, since the tables were made. A host in
+    /// graph mode tells by it whether a unit's run moved anything on that
+    /// another unit waits for: a run that ended a call another waits on has
+    /// progressed, even if it stopped again, waiting itself, and units that
+    /// wait for each other with nothing ending are stuck.
+    #[must_use]
+    pub fn ended(&self) -> u64 {
+        self.ended
     }
 
     /// A new origin, for a caller set from its calling code's file (see
@@ -609,6 +624,7 @@ impl MemoTables {
         value: Option<&Value>,
     ) -> Option<bool> {
         let table = self.tables.get_mut(&Rc::as_ptr(closure))?;
+        self.ended = self.ended.wrapping_add(1);
         let Some(value) = value else {
             return match table.remove(mark)? {
                 EntryState::Running { reentered, .. } => Some(reentered),
