@@ -75,6 +75,17 @@ workspace is independent, not an importable child module of the outer
 workspace. Symbolic-link directory traversal is not a mechanism for
 extending the source tree.
 
+A `.gcslignore` file at the root also excludes paths from source discovery.
+Use it for GCSL files that are a tool's data, such as test fixtures. Each
+line names one file or directory, relative to the root. Blank lines and lines
+that start with `#` have no effect, and there are no wildcards. A line that
+names nothing is ignored:
+
+```text
+# Highlighting fixtures, which aren't build files.
+test/highlight
+```
+
 Dependencies determine file order; path order breaks ties. A file runs
 as a whole before a file that depends on it. Cyclic file dependencies are
 errors, including cycles introduced through function bodies or imports.
