@@ -1,5 +1,7 @@
 //! Tests of workspaces: `exec`, `panic`, `sh` and their live forms.
 
+use std::os::unix::fs::PermissionsExt;
+
 use super::*;
 
 /// The summary of slice 29, its `ls` of a directory every machine has.
@@ -134,6 +136,27 @@ fn exec_reports_what_its_program_did() {
         let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
         assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
     }
+}
+
+#[test]
+fn exec_waits_for_a_program_something_has_open_for_writing() {
+    let dir = std::env::temp_dir().join(format!("gcsl-busy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let program = dir.join("program");
+    std::fs::write(&program, "#!/bin/sh\necho ran\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&program)
+        .unwrap();
+    let closing = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(writer);
+    });
+    let text = format!("= exec([\"{}\"]).stdout", program.display());
+    assert_eq!(lone(&text).unwrap(), "ran\n");
+    closing.join().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

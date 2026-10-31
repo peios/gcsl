@@ -10,8 +10,9 @@ from depending on an evaluator run.
 ## Source discovery
 
 `gcsl-disk` finds workspace markers and returns a source collection with
-stable path and diagnostic mappings. It excludes hidden names and nested
-workspace trees when reading one workspace. The CLI and language server
+stable path and diagnostic mappings. It excludes hidden names, nested
+workspace trees, and paths the root's `.gcslignore` names when reading one
+workspace. The CLI and language server
 use this shared layer rather than implementing separate import rules.
 
 A check of a directory discovers workspaces. A format of a directory

@@ -17,7 +17,9 @@
 //! which is a workspace of its own: such directories are listed apart, so
 //! that the library can say why an import of one finds nothing. A directory
 //! that is a symbolic link, which could lead back into the tree, is
-//! skipped; a file that is one is read as any file. [`read_workspace`]
+//! skipped; a file that is one is read as any file. So is what the root's
+//! `.gcslignore` ([`IGNORE`]) names: GCSL that is a tool's data, not this
+//! workspace's source. [`read_workspace`]
 //! reads every file into two lists of sources, in path order: named by
 //! their paths relative to the root, as the library is given them, and
 //! named as they are shown to the user ([`shown`]: relative to the current
@@ -56,6 +58,7 @@
     clippy::dbg_macro
 )]
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -67,6 +70,10 @@ use gcsl::source::SourceError;
 
 /// The name of the file that makes its directory a workspace's root.
 pub const WORKSPACE: &str = "workspace.gcsl";
+
+/// The file at a workspace's root that leaves paths out of its source: one
+/// path to a file or directory, relative to the root, on each line.
+pub const IGNORE: &str = ".gcslignore";
 
 /// The root of the workspace `dir` is in: the nearest directory at or above
 /// `dir`, `dir` itself first, holding a file named `workspace.gcsl`; `None`
@@ -127,8 +134,8 @@ pub type Found = (Vec<(String, PathBuf)>, Vec<String>);
 
 /// The files of the workspace under `root`, each with its path relative to
 /// `root`, `/` separated, in path order, byte by byte: every `.gcsl` file
-/// below it, except those whose name, or a directory's on the way, starts
-/// with `.`, and those under a directory holding its own `workspace.gcsl`,
+/// below it, except those [`IGNORE`] names, those whose name, or a
+/// directory's on the way, starts with `.`, and those under a directory holding its own `workspace.gcsl`,
 /// which is a workspace of its own. Names that are not UTF-8 are skipped,
 /// and so is a directory that is a symbolic link, which could lead back
 /// into the tree; a file that is one is read as any file. With them, the
@@ -141,6 +148,7 @@ pub type Found = (Vec<(String, PathBuf)>, Vec<String>);
 /// The first directory that cannot be listed, or entry of one that cannot
 /// be read, with why.
 pub fn workspace_files(root: &Path) -> Result<Found, Unreadable> {
+    let ignored = ignored(root)?;
     let mut files = Vec::new();
     let mut nested = Vec::new();
     let mut dirs = vec![(String::new(), root.to_path_buf())];
@@ -155,6 +163,9 @@ pub fn workspace_files(root: &Path) -> Result<Found, Unreadable> {
             let Some(name) = name.to_str().filter(|name| !name.starts_with('.')) else {
                 continue;
             };
+            if ignored.contains(&format!("{prefix}{name}")) {
+                continue;
+            }
             let path = entry.path();
             if path.is_dir() {
                 let linked = entry.file_type().is_ok_and(|kind| kind.is_symlink());
@@ -174,6 +185,23 @@ pub fn workspace_files(root: &Path) -> Result<Found, Unreadable> {
     files.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     nested.sort_unstable();
     Ok((files, nested))
+}
+
+/// What the `.gcslignore` of `root` names, if it has one: each line, blanks
+/// around it left out, but an empty one or a comment, which starts with `#`.
+fn ignored(root: &Path) -> Result<HashSet<String>, Unreadable> {
+    let path = root.join(IGNORE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(Unreadable { path, error }),
+    };
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.trim_end_matches('/').to_owned())
+        .collect())
 }
 
 /// How `path`, a full path, is shown: relative to the current directory
@@ -516,6 +544,27 @@ mod tests {
         assert_eq!(names, ["lib/a.gcsl", "workspace.gcsl", "y.gcsl", "z.gcsl"]);
         assert_eq!(files[0].1, root.join("lib/a.gcsl"));
         assert_eq!(nested, ["deep/er", "vendor"]);
+    }
+
+    #[test]
+    fn what_the_ignore_file_names_is_left_out() {
+        let scratch = Scratch::new("ignored");
+        let root = &scratch.0;
+        scratch.write(WORKSPACE, "");
+        scratch.write("kept/a.gcsl", "");
+        scratch.write("kept/b.gcsl", "");
+        // A directory, a directory with its `/`, and a file.
+        scratch.write("data/nested/c.gcsl", "");
+        scratch.write("more/d.gcsl", "");
+        scratch.write("data2/workspace.gcsl", "");
+        scratch.write(
+            IGNORE,
+            "# Fixtures.\n\n  data  \nmore/\nkept/b.gcsl\ndata2\nnothing/here\n",
+        );
+        let (files, nested) = workspace_files(root).unwrap();
+        let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["kept/a.gcsl", "workspace.gcsl"]);
+        assert!(nested.is_empty());
     }
 
     #[test]

@@ -333,13 +333,58 @@ fn variables<'a>(
 /// standard error; or the error of running it.
 type Ran = io::Result<(i64, Vec<u8>, Vec<u8>)>;
 
+/// How long [`run`] first waits for a program that is busy, doubled each
+/// time, and the longest wait it makes.
+const BUSY_WAIT: Duration = Duration::from_millis(1);
+
+const BUSY_WAIT_MOST: Duration = Duration::from_millis(512);
+
+/// [`run_once`], again after a wait while the program can't start because
+/// something has it open for writing. A file just written can be: a process
+/// forked meanwhile holds a copy of the writer's descriptor until it calls
+/// `exec`, which closing on `exec` can't prevent. That lasts moments, and a
+/// program that didn't start did nothing, so starting it again is safe.
+fn run(
+    command: &mut Command,
+    (live, deadline): (bool, Option<Instant>),
+    options: &ExecOptions<'_>,
+    node: &IrNode,
+) -> Flow<Option<Ran>> {
+    let mut wait = BUSY_WAIT;
+    loop {
+        let ran = run_once(command, (live, deadline), options, node)?;
+        if wait > BUSY_WAIT_MOST || !ran.as_ref().is_some_and(busy) {
+            return Ok(ran);
+        }
+        thread::sleep(wait);
+        wait *= 2;
+    }
+}
+
+/// Whether `ran` is of a program that couldn't start because its file is
+/// busy: the error of starting it, or bubblewrap's report of that, which is
+/// all a sandbox's caller has of it.
+fn busy(ran: &Ran) -> bool {
+    match ran {
+        Ok((1, stdout, stderr)) => {
+            let report = String::from_utf8_lossy(stderr);
+            stdout.is_empty()
+                && report.starts_with("bwrap: execvp ")
+                && report.trim_end().ends_with(": Text file busy")
+                && report.trim_end().lines().count() == 1
+        }
+        Ok(_) => false,
+        Err(error) => error.kind() == io::ErrorKind::ExecutableFileBusy,
+    }
+}
+
 /// Runs `command` for [`exec`] as `options` says, copying its output if
 /// `live`, until `deadline` if there is one: what it did, or `None` if the
 /// deadline passed first. `until` with `interactive` is a runtime error at
 /// `node`. A program that may be killed, by its deadline or by `until`, and
 /// does not have the terminal, is run in a process group of its own, so
 /// that what it starts is killed with it ([`run_watched`]).
-fn run(
+fn run_once(
     command: &mut Command,
     (live, deadline): (bool, Option<Instant>),
     options: &ExecOptions<'_>,
@@ -1097,5 +1142,30 @@ impl Drop for TempDirs {
         if let Some(parent) = self.parent.get() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_program_is_busy_only_if_it_could_not_start() {
+        let ran = |status, stdout: &str, stderr: &str| -> Ran {
+            Ok((status, stdout.into(), stderr.into()))
+        };
+        let report = "bwrap: execvp /bin/tool: Text file busy\n";
+        assert!(busy(&ran(1, "", report)));
+        assert!(busy(&Err(io::ErrorKind::ExecutableFileBusy.into())));
+        // A program that ran, whatever it said.
+        assert!(!busy(&ran(1, "output", report)));
+        assert!(!busy(&ran(2, "", report)));
+        assert!(!busy(&ran(
+            1,
+            "",
+            "ld: cannot open a.out: Text file busy\n"
+        )));
+        assert!(!busy(&ran(1, "", &format!("started\n{report}"))));
+        assert!(!busy(&Err(io::ErrorKind::NotFound.into())));
     }
 }
