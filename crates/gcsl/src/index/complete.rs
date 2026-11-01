@@ -1682,6 +1682,16 @@ mod tests {
         let text = "fn g(): Int {\n    let m: {*: String} = {a = \"x\"}\n    let x = m.|\n    1\n}\nr = g()\n";
         let found = complete(&[("app.gcsl", text)], "app.gcsl");
         assert_eq!(labels(&found), [] as [&str; 0]);
+        // A rest-field of `*` loses them no more than any other, a
+        // package's among them.
+        let text = "type D = {version: String, *: *}\n\
+                    fn g(d: D, p: Package): Int {\n    let x = d.|\n    1\n}\nr = 1\n";
+        let found = complete(&[("app.gcsl", text)], "app.gcsl");
+        assert_eq!(labels(&found), ["version"]);
+        assert_eq!(named(&found, "version").detail.as_deref(), Some("String"));
+        let text = "fn g(p: Package): Int {\n    let x = p.|\n    1\n}\nr = 1\n";
+        let found = complete(&[("app.gcsl", text)], "app.gcsl");
+        assert_eq!(labels(&found), ["files", "name", "version"]);
     }
 
     #[test]

@@ -10,7 +10,7 @@ fn setup() -> (TypeTable, Names, [Name; 3]) {
 #[test]
 fn the_constants_are_pre_interned_in_order() {
     let mut table = TypeTable::new();
-    assert_eq!(table.len(), 12);
+    assert_eq!(table.len(), 13);
     assert!(!table.is_empty());
     assert_eq!(table.intern(TyKind::Int), TyId::INT);
     assert_eq!(table.intern(TyKind::Float), TyId::FLOAT);
@@ -27,8 +27,9 @@ fn the_constants_are_pre_interned_in_order() {
     assert_eq!(table.intern(TyKind::File), TyId::FILE);
     assert_eq!(table.intern(TyKind::Dir), TyId::DIR);
     assert_eq!(table.intern(TyKind::Sandbox), TyId::SANDBOX);
-    assert_eq!(table.len(), 12);
-    assert_eq!(TypeTable::default().len(), 12);
+    assert_eq!(table.intern(TyKind::Data), TyId::DATA);
+    assert_eq!(table.len(), 13);
+    assert_eq!(TypeTable::default().len(), 13);
     // Each quantity's type, and back.
     for quantity in [Quantity::Duration, Quantity::Size] {
         assert_eq!(TyId::of_quantity(quantity).quantity(), Some(quantity));
@@ -2140,6 +2141,108 @@ fn only_a_type_that_says_what_its_other_fields_are_fits_a_rest_field() {
     let only_strings = with_rest(&mut table, &[], TyId::STRING);
     assert!(table.is_subtype(b_string, only_strings));
     assert!(!table.is_subtype(b_string, ints));
+}
+
+#[test]
+fn data_is_what_holds_no_function_future_secret_or_sandbox() {
+    let (mut table, names, [a, ..]) = setup();
+    let record = table.record([(a, TyId::FILE)]);
+    let list = table.list(record);
+    let union = table.union([TyId::INT, list]);
+    for ty in [TyId::INT, TyId::STRING, TyId::DIR, record, list, union] {
+        assert!(table.is_data(ty), "{}", table.display(ty, &names));
+        assert!(table.is_subtype(ty, TyId::DATA));
+    }
+    let function = table.fn_type([], TyId::INT, Effect::Pure);
+    let secret = table.secret(TyId::STRING);
+    let holding_function = table.record([(a, function)]);
+    let list_of_secrets = table.list(secret);
+    for ty in [
+        function,
+        secret,
+        TyId::SANDBOX,
+        holding_function,
+        list_of_secrets,
+    ] {
+        assert!(!table.is_data(ty), "{}", table.display(ty, &names));
+        assert!(!table.is_subtype(ty, TyId::DATA));
+    }
+    // A future is awaited to fit, however deep it is.
+    let future = table.future(TyId::INT);
+    let holding_future = table.record([(a, future)]);
+    assert!(!table.is_subtype(future, TyId::DATA));
+    assert_eq!(
+        table.needs_await(future, TyId::DATA),
+        Some(AwaitKind::Top)
+    );
+    assert_eq!(
+        table.needs_await(holding_future, TyId::DATA),
+        Some(AwaitKind::Deep)
+    );
+    // `*` is a subtype of nothing else, and joins as any supertype does.
+    assert!(!table.is_subtype(TyId::DATA, TyId::INT));
+    assert_eq!(table.join(TyId::INT, TyId::DATA), (TyId::DATA, false));
+    assert_eq!(table.display(TyId::DATA, &names).to_string(), "*");
+}
+
+#[test]
+fn a_rest_field_of_data_asks_nothing_of_what_a_type_hides() {
+    let (mut table, _, [a, b, _]) = setup();
+    let open = with_rest(&mut table, &[], TyId::DATA);
+    let a_open = with_rest(&mut table, &[(a, TyId::INT)], TyId::DATA);
+    let a_int = table.record([(a, TyId::INT)]);
+    assert!(table.is_subtype(TyId::EMPTY, open));
+    assert!(table.is_subtype(a_int, open));
+    assert!(table.is_subtype(a_int, a_open));
+    // A field it names still must fit, and be data if the type does not
+    // name it.
+    let a_string = table.record([(a, TyId::STRING)]);
+    assert!(!table.is_subtype(a_string, a_open));
+    let function = table.fn_type([], TyId::INT, Effect::Pure);
+    let b_function = table.record([(b, function)]);
+    assert!(!table.is_subtype(b_function, open));
+    // A rest-field of data fits another, and any other fits it, but it
+    // fits no other.
+    let ints = with_rest(&mut table, &[], TyId::INT);
+    assert!(table.is_subtype(ints, open));
+    assert!(!table.is_subtype(open, ints));
+    assert!(table.is_subtype(a_open, open));
+    assert!(!table.is_subtype(open, a_open));
+    // It is forgotten as any rest-field is.
+    assert!(table.is_subtype(a_open, a_int));
+}
+
+#[test]
+fn a_rest_field_of_data_overlaps_and_leaves_its_test_to_the_type_tested() {
+    let (mut table, _, [a, b, _]) = setup();
+    let open = with_rest(&mut table, &[(a, TyId::INT)], TyId::DATA);
+    let b_string = table.record([(b, TyId::STRING)]);
+    assert!(table.overlaps(open, b_string));
+    let a_string = table.record([(a, TyId::STRING)]);
+    assert!(!table.overlaps(open, a_string));
+    // The field it covers is tested whole, whatever its value's type.
+    assert_eq!(
+        table.test_plan(Some(&[open]), b_string),
+        ValueTest::Record(Box::new([(b, ValueTest::Kind(ValueKind::String))]))
+    );
+    // A test of `*` is of nothing, but a record must be a record.
+    let any = with_rest(&mut table, &[], TyId::DATA);
+    assert_eq!(table.test_plan(Some(&[open]), TyId::DATA), ValueTest::Pass);
+    assert_eq!(
+        table.test_plan(None, any),
+        ValueTest::Kind(ValueKind::Record)
+    );
+}
+
+#[test]
+fn a_host_s_value_is_of_data_if_nothing_in_it_is_a_function_or_a_future() {
+    let mut table = TypeTable::new();
+    let open = with_rest(&mut table, &[], TyId::DATA);
+    assert!(table.holds(&Value::Int(1), TyId::DATA));
+    assert!(table.holds(&Value::Str("x".into()), TyId::DATA));
+    assert!(table.holds(&Value::Empty, open));
+    assert!(!table.holds(&Value::Builtin(Builtin::Show), TyId::DATA));
+    assert!(!table.holds(&Value::Int(1), open));
 }
 
 #[test]

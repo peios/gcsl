@@ -71,6 +71,35 @@ fn jacks_package_is_defined_and_called_with_its_def_type() {
     );
 }
 
+#[test]
+fn a_package_keeps_the_fields_of_its_format() {
+    let files = [(
+        "app.gcsl",
+        "def package dev.greet() {\n\
+             \x20   version = \"1.0-1\"\n\
+             \x20   files = {}\n\
+             \x20   name = \"not this\"\n\
+             \x20   ppk = {dependencies = {\"org.gnu.glibc\" = \">= 2.44\"}; provides = {sh = \"1\"}}\n\
+             }\n\
+             def package dev.plain() {\n\
+             \x20   version = \"2.0-1\"\n\
+             \x20   files = {}\n\
+             }\n\
+             let greet = package dev.greet()\n\
+             let plain = package dev.plain()\n\
+             name = greet.name\n\
+             version = greet.version\n\
+             provides = (greet as {ppk: {provides: {*: String}}}).ppk.provides\n\
+             has = [greet is {ppk: {}}, plain is {ppk: {}}]\n\
+             plain_is = plain == ({name = \"dev.plain\"; version = \"2.0-1\"; files = {}}: Package)",
+    )];
+    assert_eq!(
+        value(&files, "app.gcsl"),
+        "{name = \"dev.greet\"; version = \"1.0-1\"; provides = {sh = \"1\"}; \
+         has = [true, false]; plain_is = true}"
+    );
+}
+
 /// A def-type of the root of a workspace, for the def-type tests:
 /// `build`, whose definitions take a target and give a string, and
 /// which takes a mode when it is invoked.

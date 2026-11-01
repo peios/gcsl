@@ -329,6 +329,7 @@ impl Ast {
             | TypeExprKind::Param(_)
             | TypeExprKind::Enum { .. }
             | TypeExprKind::Context(_)
+            | TypeExprKind::Data
             | TypeExprKind::Invalid => {}
         }
         first

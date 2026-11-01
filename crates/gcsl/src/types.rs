@@ -95,6 +95,40 @@
 //! a rest-field but no field `x` is an error, as for any type without the
 //! field.
 //!
+//! # Open records
+//!
+//! A rest-field's type may be `*`, [`TyKind::Data`], [`TyId::DATA`], any
+//! data, so that `{version: String, *: *}` is the type of a record with a
+//! `String` `version` and whatever else its writer gave it. No other type
+//! can be one: `*` is a rest-field's alone, so no expression has it, and it
+//! is present and a leaf to everything that walks a type.
+//!
+//! *Data* is what [`TypeTable::is_data`] says: a value of a type with no
+//! function, future, secret or sandbox in it. So every present type a value
+//! could be read back as is a subtype of `*`, and each of the walks that
+//! ask whether a type holds a future, a function or a secret may answer no
+//! for it: a field that may be a future is awaited to fit, deeply if it has
+//! one inside it ([`TypeTable::needs_await`]), as a field is to fit any
+//! present type, so that a test that looks inside the value finds it
+//! present. A secret, a function or a sandbox is a type error.
+//!
+//! Since a record may hold fields its type hides, and `*` has nothing to
+//! say of them that a test of a value relies on, a record type with no
+//! rest-field is a subtype of a type whose rest-field is `*`, where it
+//! would not be for any other: `{a: Int}` fits `{*: *}`. It is the one
+//! rest-field that asks nothing of what a type does not say. The fields a
+//! type names still must be data; a field a type hides is not looked at,
+//! as it is not by `==` or `show` of the type that hides it.
+//!
+//! What `*` covers is read out by a test of the type it is expected to be,
+//! `r as {x: T}` or `r is {x: T}`, as a union's member is, not by a read:
+//! `r.x` is an error, as for any rest-field. The test looks at the value,
+//! whatever its type says, so a value of a type with `*` in it is never
+//! taken for what it is not; it is why `*` itself tests nothing
+//! ([`TypeTable::test_plan`]): `r is {*: *}` asks that `r` be a record.
+//! `json.decode` takes no `*`: a document does not say what type its values
+//! are to be read as.
+//!
 //! # Lists
 //!
 //! `List<T>`, [`TyKind::List`], is the type of every list whose elements
@@ -427,6 +461,8 @@ impl TyId {
     /// A sandbox, `Sandbox`: a live copy of a directory that commands run
     /// in, its `/` (see [Files](crate::check::files#files)).
     pub const SANDBOX: TyId = TyId(11);
+    /// `*`, any data (see [Open records](#open-records)).
+    pub const DATA: TyId = TyId(12);
 
     /// The type of `quantity`: [`TyId::DURATION`] or [`TyId::SIZE`].
     #[must_use]
@@ -563,6 +599,9 @@ pub enum TyKind {
     /// commands run in, its `/`, a type of its own (see
     /// [Files](crate::check::files#files)).
     Sandbox,
+    /// `*`, [`TyId::DATA`], any data, which only a rest-field's type can be
+    /// (see [Open records](#open-records)).
+    Data,
 }
 
 /// What a generic function's type parameters belong to: one of its own,
@@ -885,6 +924,7 @@ impl TypeTable {
             TyKind::File,
             TyKind::Dir,
             TyKind::Sandbox,
+            TyKind::Data,
         ] {
             table.intern(kind);
         }
@@ -953,6 +993,7 @@ impl TypeTable {
             | TyKind::File
             | TyKind::Dir
             | TyKind::Sandbox
+            | TyKind::Data
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -1038,6 +1079,7 @@ impl TypeTable {
             | TyKind::File
             | TyKind::Dir
             | TyKind::Sandbox
+            | TyKind::Data
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -1306,6 +1348,7 @@ impl TypeTable {
             | TyKind::File
             | TyKind::Dir
             | TyKind::Sandbox
+            | TyKind::Data
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -1655,6 +1698,28 @@ impl TypeTable {
                 matches!(self.kind(*of), TyKind::Enum { key, .. } if *key == tag.of)
                     && self.variant_payload(tag.key) == Some(*payload)
             }
+            (
+                TyKind::Data,
+                Value::Int(_)
+                | Value::Float(_)
+                | Value::Bool(_)
+                | Value::Str(_)
+                | Value::Quantity(..)
+                | Value::File(_)
+                | Value::Dir(_)
+                | Value::Empty,
+            ) => true,
+            (TyKind::Data, Value::Record(fields)) => fields
+                .values
+                .iter()
+                .all(|found| self.holds_within(found, TyId::DATA, depth)),
+            (TyKind::Data, Value::List(list)) => list
+                .values()
+                .iter()
+                .all(|found| self.holds_within(found, TyId::DATA, depth)),
+            (TyKind::Data, Value::Variant(variant)) => {
+                self.holds_within(&variant.payload, TyId::DATA, depth)
+            }
             (TyKind::Partial(full), Value::Empty) => self.is_record(*full),
             (TyKind::Partial(full), Value::Record(fields)) => fields
                 .layout
@@ -1665,6 +1730,39 @@ impl TypeTable {
                     self.field(*full, *name)
                         .is_some_and(|field| self.holds_within(found, field, depth))
                 }),
+            _ => false,
+        }
+    }
+
+    /// Whether a value of the present type `id` is data, as `*` holds (see
+    /// [Open records](#open-records)): a scalar, a file, a directory, or a
+    /// record, list or union of data, or a value of an enum whose bound is
+    /// data. A function, a variant, a secret, a sandbox, a type parameter
+    /// and an enum with no bound, whose payload may be any of them, are
+    /// not; nor is a future, or a type that may be one, which is awaited
+    /// to fit.
+    ///
+    /// Recurses once per level of record, list, union or bound nesting.
+    #[must_use]
+    pub fn is_data(&self, id: TyId) -> bool {
+        match self.kinds.get(id.index()) {
+            Some(
+                TyKind::Int
+                | TyKind::Float
+                | TyKind::Bool
+                | TyKind::String
+                | TyKind::Quantity(_)
+                | TyKind::File
+                | TyKind::Dir
+                | TyKind::Data
+                | TyKind::Never,
+            ) => true,
+            Some(TyKind::Record(record)) => record.types().all(|ty| self.is_data(ty)),
+            Some(&TyKind::List(inner) | &TyKind::Partial(inner)) => self.is_data(inner),
+            Some(TyKind::Union(members)) => members.iter().all(|&member| self.is_data(member)),
+            Some(&TyKind::Enum { key, .. }) => self
+                .enum_bound(key)
+                .is_some_and(|bound| self.is_data(bound)),
             _ => false,
         }
     }
@@ -2150,6 +2248,7 @@ impl TypeTable {
             | TyKind::File
             | TyKind::Dir
             | TyKind::Sandbox
+            | TyKind::Data
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -2779,6 +2878,9 @@ impl TypeTable {
         if self.laziness(sub) != Laziness::Present {
             return false;
         }
+        if sup == TyId::DATA {
+            return self.is_data(sub);
+        }
         if let Some(members) = self.union_members(sub) {
             return members.iter().all(|&member| self.is_subtype(member, sup));
         }
@@ -2826,13 +2928,15 @@ impl TypeTable {
         // A rest-field required covers every field the required type does
         // not name, so the offered type must say what all of those are: by
         // a rest-field of its own, and by each named field it has beyond
-        // the required ones (see [Rest-fields](#rest-fields)).
+        // the required ones (see [Rest-fields](#rest-fields)). Of a rest-field
+        // of `*`, the type may say nothing (see [Open records](#open-records)).
         if let Some(required_rest) = self.record_rest(sup) {
-            let Some(offered_rest) = self.record_rest(sub) else {
-                return false;
-            };
-            if !self.is_subtype(offered_rest, required_rest) {
-                return false;
+            match self.record_rest(sub) {
+                Some(offered_rest) if !self.is_subtype(offered_rest, required_rest) => {
+                    return false;
+                }
+                None if required_rest != TyId::DATA => return false,
+                _ => {}
             }
             let beyond_fit = offered.iter().all(|&(name, offered_ty)| {
                 required
@@ -3005,7 +3109,11 @@ impl TypeTable {
             let (joined, widened) = self.join(a_present, b_present);
             return (self.deferrable(joined), widened);
         }
-        if self.union_members(a).is_some() || self.union_members(b).is_some() {
+        if self.union_members(a).is_some()
+            || self.union_members(b).is_some()
+            || a == TyId::DATA
+            || b == TyId::DATA
+        {
             return if self.is_subtype(a, b) {
                 (b, false)
             } else if self.is_subtype(b, a) {
@@ -3187,6 +3295,7 @@ impl TypeTable {
             | TyKind::File
             | TyKind::Dir
             | TyKind::Sandbox
+            | TyKind::Data
             | TyKind::Enum { .. } => Some(ValueKind::Mixed),
             // TEMPORARY (alias rule): a special built-in's opaque type is a function's kind (see
             // the [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
@@ -3233,6 +3342,8 @@ impl TypeTable {
             return members.iter().any(|&member| self.overlaps(a, member));
         }
         match (self.kind(a), self.kind(b)) {
+            // Only a test of the value can say what `*` holds.
+            (TyKind::Data, _) | (_, TyKind::Data) => true,
             (TyKind::Record(a_record), TyKind::Record(b_record)) => {
                 // A field one side names is held, on the other, to the field
                 // of its name, or else to its rest-field, if it has one.
@@ -3306,11 +3417,15 @@ impl TypeTable {
     /// `ty`, each against what the record types of `value` say of the field
     /// (nothing, if one lacks it), or of the list's elements, against the
     /// element types of its list types, leaving out a field whose test is
-    /// `Pass`.
+    /// `Pass`. A test of `*` passes whatever the value is (see [Open
+    /// records](#open-records)).
     ///
     /// Recurses once per level of record, list or union nesting in `ty`.
     #[must_use]
     pub fn test_plan(&self, value: Option<&[TyId]>, ty: TyId) -> ValueTest {
+        if ty == TyId::DATA {
+            return ValueTest::Pass;
+        }
         if let Some(value) = value
             && value.iter().all(|&member| self.is_subtype(member, ty))
         {

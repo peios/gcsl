@@ -28,7 +28,8 @@
 //! `Float` share numbers, an integer going to the `Int`. Nothing else
 //! decodes: not a `Duration` or `Size`, whose JSON form is no standard, a
 //! file or directory, which a document can only name, an enum, a secret, a
-//! function or `Never`.
+//! function, `Never` or a rest-field's `*`, of which the plan would have to
+//! guess each value's type.
 
 use crate::check::Constant;
 use crate::names::{Name, Names};
@@ -169,6 +170,7 @@ impl TypeTable {
             }
             TyKind::Secret(..) => undecodable("a secret cannot come from a document"),
             TyKind::Fn(_) | TyKind::Builtin(_) => undecodable("a function has no JSON form"),
+            TyKind::Data => undecodable("a document cannot say what type `*` is to hold"),
             TyKind::Never => undecodable("no value is a `Never`"),
             TyKind::Partial(_) => undecodable("a `Partial` record has no JSON form"),
             TyKind::Future(_)

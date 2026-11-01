@@ -306,6 +306,7 @@ impl Checker<'_> {
                 self.resolve_applied((name, span), args, mode)
             }
             TypeExprKind::Union { bar, .. } => self.resolve_union(id, bar, mode),
+            TypeExprKind::Data => TyId::DATA,
             TypeExprKind::Record(range) => self.resolve_record(id, range, mode),
             TypeExprKind::Fn {
                 params,
@@ -660,6 +661,7 @@ impl Checker<'_> {
             | TypeExprKind::Instance { .. }
             | TypeExprKind::Param(_)
             | TypeExprKind::Context(_)
+            | TypeExprKind::Data
             | TypeExprKind::Invalid => false,
         }
     }

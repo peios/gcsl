@@ -114,6 +114,43 @@ fn a_deep_await_awaits_the_fields_a_rest_field_covers() {
 }
 
 #[test]
+fn a_rest_field_of_data_keeps_what_a_test_reads_back() {
+    let open = "type Ppk = {dependencies: {*: String}, provides: {*: String}}\n\
+                let o: {name: String, *: *} = {\n\
+                name = \"n\"\n\
+                ppk = {dependencies = {\"org.gnu.glibc\" = \">= 2.44\"}; provides = {sh = \"1\"}}\n\
+                }\n";
+    assert_eq!(
+        string(&format!("{open}show((o as {{ppk: Ppk}}).ppk.dependencies)")),
+        "{\"org.gnu.glibc\" = \">= 2.44\"}"
+    );
+    booleans(&[
+        (&format!("{open}o is {{ppk: Ppk}}"), true),
+        // A field that is not there, or not what is asked for.
+        (&format!("{open}o is {{other: Ppk}}"), false),
+        (&format!("{open}o is {{ppk: {{dependencies: String}}}}"), false),
+        // `{}` asks only that it be a record, `{*: *}` the same.
+        (&format!("{open}o is {{ppk: {{}}}}"), true),
+        (&format!("{open}o is {{ppk: {{*: *}}}}"), true),
+        (&format!("{open}o is {{other: {{*: *}}}}"), false),
+    ]);
+    // A field of the wrong type fails where it is read, naming it.
+    let diagnostic = run(&format!("{open}o as {{ppk: {{dependencies: String}}}}")).unwrap_err();
+    assert_eq!(
+        diagnostic.label.as_deref(),
+        Some("it is a record, and its field `ppk` is a record")
+    );
+}
+
+#[test]
+fn a_future_a_rest_field_of_data_covers_is_awaited_to_fit() {
+    // Each is awaited as the record is made, so a test finds it present.
+    let text = "let o: {*: *} = {a = lazy 1; b = {c = lazy \"x\"}; d = [lazy 2]}\n\
+                show(o as {a: Int, b: {c: String}, d: List<Int>})";
+    assert_eq!(string(text), "{a = 1; b = {c = \"x\"}; d = [2]}");
+}
+
+#[test]
 fn as_tests_each_field_a_rest_field_covers() {
     let text = "let x = {a = 1; b = 2}\nlet y: {} = x\ny as {*: Int}";
     assert_eq!(run(text).unwrap().to_string(), "{a = 1; b = 2}");

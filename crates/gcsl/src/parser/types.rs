@@ -17,6 +17,8 @@
 //! TYPE`, `NAME: TYPE = DEFAULT`, a spread, `...TYPE`, whose fields join
 //! the record type, or a rest-field, `*: TYPE`, the type of every field the
 //! record type does not name, with an optional trailing `,`, then `}`. A
+//! rest-field's type may be `*` too, any data, [`TypeExprKind::Data`], which
+//! no other type may be. A
 //! rest-field has no default: an `=` after its type is "a rest-field cannot
 //! have a default"; how many a record type has is the checker's business.
 //! A field's
@@ -796,7 +798,17 @@ impl Parser<'_> {
                 FieldTyKind::Field(name)
             }
         };
-        let (ty, height) = self.parse_type()?;
+        let star = self.peek();
+        let (ty, height) = if kind == FieldTyKind::Rest && star.kind == TokenKind::Star {
+            self.advance();
+            let ty = self.builder.alloc_type(TypeExpr {
+                kind: TypeExprKind::Data,
+                span: star.span,
+            });
+            (ty, 1)
+        } else {
+            self.parse_type()?
+        };
         *tallest = (*tallest).max(height);
         self.skip_newlines();
         // A field's default; a spread has none, nor may a rest-field.

@@ -56,6 +56,7 @@ impl Checker<'_> {
                 self.settle(expr, found);
             }
             (TyId::UNTYPED_INT, TyId::INT | TyId::FLOAT) => self.coerce(expr, expected),
+            (TyId::UNTYPED_INT, TyId::DATA) => self.coerce(expr, TyId::INT),
             (TyId::UNTYPED_INT, _) if self.untyped_fits(expected) => {
                 let present = self.numeric_target(expected);
                 self.coerce(expr, present);

@@ -2791,6 +2791,7 @@ impl<'a> Checker<'a> {
             | TyKind::Variant { .. }
             | TyKind::Partial(_)
             | TyKind::Secret(..)
+            | TyKind::Data
             // TEMPORARY (alias rule): see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/).
             | TyKind::Builtin(_) => {

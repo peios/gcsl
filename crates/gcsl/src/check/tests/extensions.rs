@@ -142,6 +142,96 @@ fn a_rest_field_s_fields_are_tested_by_is_and_as() {
 }
 
 #[test]
+fn a_rest_field_of_data_takes_any_data_a_literal_gives_it() {
+    let text = "type D = {version: String, *: *}\n\
+                let d: D = {version = \"1\"; n = 1; f = 1.5; \"a.b\" = true; \
+                l = [1, 2]; r = {s = \"x\"; n = 1}}\nd";
+    assert_eq!(warnings(text), []);
+    assert_eq!(shown_result(text), "{version: String, *: *}");
+    // No integer in it is left untyped.
+    assert!(!all_types(text).contains(&TyId::UNTYPED_INT));
+    assert_eq!(shown_result("let e: {*: *} = {}\ne"), "{*: *}");
+    // Named fields are held to their types as ever.
+    assert_eq!(
+        messages("let d: {version: String, *: *} = {version = 1}"),
+        vec!["mismatched types"]
+    );
+    assert_eq!(
+        messages("let d: {version: String, *: *} = {n = 1}"),
+        vec!["missing field `version` in record"]
+    );
+}
+
+#[test]
+fn a_value_whose_type_hides_fields_fits_a_rest_field_of_data() {
+    // What it hides, `*` asks nothing of.
+    assert_eq!(
+        shown_result("let x = {a = 1}\nlet m: {*: *} = x\nm"),
+        "{*: *}"
+    );
+    assert_eq!(
+        warnings("fn f(r: {a: Int, *: *}): Int { 1 }\nlet x = {a = 1}\nf(x)"),
+        []
+    );
+}
+
+#[test]
+fn what_is_no_data_does_not_fit_a_rest_field_of_data() {
+    for text in [
+        "fn f(): Int { 1 }\nlet m: {*: *} = {f = f}",
+        "fn f(): Int { 1 }\nlet m: {*: *} = {a = {b = [f]}}",
+        "let s = secret(\"pw\", \"id\")\nlet m: {*: *} = {s = s}",
+        "fn f(s: Sandbox): {*: *} { x = s }",
+        "fn f<T>(t: T): {*: *} { x = t }",
+    ] {
+        assert_eq!(messages(text), vec!["mismatched types"], "{text}");
+    }
+}
+
+#[test]
+fn a_rest_field_of_data_is_read_through_a_test() {
+    let open = "let o: {name: String, *: *} = {name = \"n\"; a = 1}\n";
+    // A read by name is no more allowed than of any rest-field.
+    assert_eq!(
+        messages(&format!("{open}o.a")),
+        vec!["no field `a` in `{name: String, *: *}`"]
+    );
+    // `as` and `is` say what it is expected to be.
+    assert_eq!(shown_result(&format!("{open}(o as {{a: Int}}).a")), "Int");
+    assert_eq!(
+        shown_result(&format!(
+            "{open}if o is {{a: Int}} {{ = o.a }} else {{ = 0 }}"
+        )),
+        "Int"
+    );
+    // The `else` keeps the type that was tested.
+    assert_eq!(
+        shown_result(&format!(
+            "{open}if o is {{a: Int}} {{ = \"x\" }} else {{ = o.name }}"
+        )),
+        "String"
+    );
+    // Its named fields are held to their types by a test too.
+    assert_eq!(
+        messages(&format!("{open}o is {{name: Int}}")),
+        vec!["`o` is never a `{name: Int}`"]
+    );
+    // A function type cannot be tested for, there as anywhere.
+    assert_eq!(
+        messages(&format!("{open}o is {{a: fn(): Int}}")),
+        vec!["`is` cannot test a function type"]
+    );
+}
+
+#[test]
+fn a_document_cannot_be_decoded_as_a_rest_field_of_data() {
+    assert_eq!(
+        messages("import json\nlet j: {a: Int, *: *} = json.decode(\"1\")"),
+        vec!["cannot decode JSON as a `*`"]
+    );
+}
+
+#[test]
 fn quantities_have_their_own_arithmetic() {
     let cases = [
         ("30s", "Duration"),

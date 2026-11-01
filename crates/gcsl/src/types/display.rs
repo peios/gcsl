@@ -117,6 +117,7 @@ impl fmt::Display for Display<'_> {
             TyKind::File => f.write_str("File"),
             TyKind::Dir => f.write_str("Dir"),
             TyKind::Sandbox => f.write_str("Sandbox"),
+            TyKind::Data => f.write_str("*"),
             TyKind::Error => f.write_str("<error>"),
             TyKind::Never => f.write_str("Never"),
             &TyKind::Param { generic, index } => {

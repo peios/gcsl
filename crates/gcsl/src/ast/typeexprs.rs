@@ -344,6 +344,7 @@ impl TypeArena {
                 | TypeExprKind::Param(_)
                 | TypeExprKind::Enum { .. }
                 | TypeExprKind::Context(_)
+                | TypeExprKind::Data
                 | TypeExprKind::Invalid) => kind,
             },
         };
@@ -478,6 +479,7 @@ impl TypeArena {
             | TypeExprKind::Ref(_)
             | TypeExprKind::Enum { .. }
             | TypeExprKind::Context(_)
+            | TypeExprKind::Data
             | TypeExprKind::Invalid => None,
         };
         let done = match kind {
@@ -558,6 +560,7 @@ impl TypeArena {
             | TypeExprKind::Param(_)
             | TypeExprKind::Enum { .. }
             | TypeExprKind::Context(_)
+            | TypeExprKind::Data
             | TypeExprKind::Invalid => Vec::new(),
         }
     }

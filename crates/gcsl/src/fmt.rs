@@ -287,7 +287,8 @@ struct Facts {
     verbatim: Vec<(usize, usize)>,
     /// The last token of each def-type's path.
     path_ends: HashSet<usize>,
-    /// The `*` of every rest-field, which is no operator.
+    /// The `*` of every rest-field, and of its type if it is `*`, which are
+    /// no operators.
     rests: HashSet<usize>,
     /// The keyword of every method, `fn` or `def`, spaced from its
     /// receiver's `(` as no function expression's `fn` is.
@@ -357,6 +358,11 @@ impl Facts {
                                 .extend(input.token_at(field.span.start, TokenKind::Star));
                         }
                     }
+                }
+                TypeExprKind::Data => {
+                    facts
+                        .rests
+                        .extend(input.token_at(ty.span.start, TokenKind::Star));
                 }
                 TypeExprKind::Fn { .. } => {
                     let at = input
@@ -1394,6 +1400,16 @@ mod tests {
             (
                 "type T = {a:Int,*:  String}\n",
                 "type T = {a: Int, *: String}\n",
+            ),
+            // Nor is a `*` that is its type, which continues its field's
+            // line as any type does.
+            (
+                "type T = {a:Int,*:  *}\n",
+                "type T = {a: Int, *: *}\n",
+            ),
+            (
+                "type T = {\n*:\n*,\n}\n",
+                "type T = {\n    *:\n        *,\n}\n",
             ),
             // An operator still continues its line.
             ("x = (2\n* 3)\n", "x = (2\n        * 3)\n"),
