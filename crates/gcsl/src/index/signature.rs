@@ -197,6 +197,9 @@ impl Index {
             TyKind::Builtin(Builtin::Record) => {
                 generic("entries", "List<{key: String, value: T}>", "{*: T}")
             }
+            TyKind::Builtin(Builtin::Entries) => {
+                generic("r", "{*: T}", "List<{key: String, value: T}>")
+            }
             _ => {
                 let sig = self.types.fn_sig(self.types.strip(ty))?;
                 let written = self.written_params(symbol);

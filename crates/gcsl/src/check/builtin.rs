@@ -239,6 +239,11 @@ pub enum Builtin {
     /// `working_dir()` (see [Where a path
     /// is](crate::eval::files#where-a-path-is)). Impure.
     WorkingDir,
+    /// `entries<T>(r: {*: T}): List<{key: String, value: T}>`: an entry for
+    /// each field of `r`, sorted by its name, `record`'s inverse. Its typing
+    /// is special: `T` covers every field of `r`'s type, named or not (see
+    /// [Entries of a record](crate::check::entries#entries-of-a-record)).
+    Entries,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -262,7 +267,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 58] = [
+    pub const ALL: [Builtin; 59] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -321,6 +326,7 @@ impl Builtin {
         Builtin::JsonDecode,
         Builtin::Record,
         Builtin::WorkingDir,
+        Builtin::Entries,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -395,6 +401,7 @@ impl Builtin {
             Builtin::ExecSecret => "exec_secret",
             Builtin::Dir => "dir",
             Builtin::WorkingDir => "working_dir",
+            Builtin::Entries => "entries",
             Builtin::DirFiles => "dir_files",
             Builtin::DirFile => "dir_file",
             Builtin::DirDir => "dir_dir",
@@ -447,6 +454,7 @@ impl Builtin {
             | Builtin::Show
             | Builtin::JsonDecode
             | Builtin::Record
+            | Builtin::Entries
             | Builtin::ExecLive
             | Builtin::VariantMatches
             | Builtin::VariantPayload
@@ -528,6 +536,7 @@ impl Builtin {
             Builtin::DirFiles => &["d"],
             Builtin::DirFile | Builtin::DirDir => &["d", "path"],
             Builtin::FsComposeDir | Builtin::FsCompose | Builtin::Record => &["entries"],
+            Builtin::Entries => &["r"],
             Builtin::DirSandbox => &["d", "options"],
             Builtin::SandboxExec => &["s", "request"],
             Builtin::SandboxFile | Builtin::SandboxDir => &["s", "path"],
@@ -622,6 +631,7 @@ impl Builtin {
             | Builtin::Show
             | Builtin::JsonDecode
             | Builtin::Record
+            | Builtin::Entries
             | Builtin::VariantMatches
             | Builtin::VariantPayload
             | Builtin::PartialMatches
@@ -642,7 +652,11 @@ impl Builtin {
     #[must_use]
     pub const fn typing(self) -> Typing {
         match self {
-            Builtin::Len | Builtin::Show | Builtin::JsonDecode | Builtin::Record => Typing::Special,
+            Builtin::Len
+            | Builtin::Show
+            | Builtin::JsonDecode
+            | Builtin::Record
+            | Builtin::Entries => Typing::Special,
             Builtin::Int
             | Builtin::Float
             | Builtin::Exec
@@ -712,6 +726,7 @@ impl Builtin {
             Builtin::Show => "builtin show",
             Builtin::JsonDecode => "builtin json_decode",
             Builtin::Record => "builtin record",
+            Builtin::Entries => "builtin entries",
             Builtin::Int => "fn(x: Float): Int",
             Builtin::Float => "fn(x: Int): Float",
             Builtin::Exec | Builtin::ExecLive => {
@@ -858,6 +873,13 @@ impl Builtin {
             // TEMPORARY (alias rule): the opaque type, until a polymorphic one (see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/)).
             Builtin::Len | Builtin::Show | Builtin::JsonDecode | Builtin::Record => {
+                return types.builtin(self);
+            }
+            // The fields of the entries it makes, which a program need not
+            // name itself.
+            Builtin::Entries => {
+                names.intern("key");
+                names.intern("value");
                 return types.builtin(self);
             }
             Builtin::VariantMatches

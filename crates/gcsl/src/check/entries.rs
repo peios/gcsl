@@ -1,4 +1,4 @@
-//! Checking `record`.
+//! Checking `record`, and `entries`, its inverse.
 //!
 //! # Records of any names
 //!
@@ -20,9 +20,33 @@
 //! The builtin is pure. It names each field as the program's own names
 //! name it, so that a record it makes equals one written with the same
 //! fields.
+//!
+//! # Entries of a record
+//!
+//! `entries(r)` is the list of an entry, `{key: String, value: T}`, for each
+//! field of the record `r`, sorted by the field's name: what `record` takes
+//! to make `r` again. The record's type must have a rest-field, since a
+//! record keeps fields its type hides, of any type (see
+//! [`crate::types`]): a type without one says nothing of them, and a field
+//! it names is read by name instead. `T` covers every field the type says
+//! is there: it is the join of the rest-field's type and of each named
+//! field's ([`TypeTable::join`](crate::types::TypeTable::join)), so a
+//! `{*: String}` gives `List<{key: String, value: String}>`, and a `{to:
+//! String, *: Int}` gives entries whose value is an `Int | String`, which
+//! is no warning, since the type says the fields may be either.
+//!
+//! A rest-field of `*`, any data, gives entries of the type `{key: String,
+//! *: *}`: no expression has the type `*`, so each entry's value is a field
+//! the entry's own rest-field covers, which a test reads, `e as {value:
+//! T}`, as it reads any field `*` covers. Every field the type names must
+//! then be data too.
+//!
+//! The record is awaited deeply, as `record`'s entries are, so that each
+//! value is present. The builtin is pure.
 
 use crate::ast::ExprId;
 use crate::diagnostic::Diagnostic;
+use crate::names::Name;
 use crate::types::TyId;
 
 use super::{Builtin, Checker};
@@ -92,5 +116,96 @@ impl Checker<'_> {
             self.types
                 .fn_type([(None, measured)], result, Builtin::Record.effect());
         result
+    }
+
+    /// Types the call of `entries`, the callee `callee`, whose argument is
+    /// `record` (see [Entries of a record](#entries-of-a-record)): a list of
+    /// `{key: String, value: T}`, or of `{key: String, *: *}`; `Error` if the
+    /// record is erroneous or its type has no rest-field.
+    pub(super) fn check_entries(&mut self, callee: ExprId, record: ExprId) -> TyId {
+        let names = self.ast.names();
+        let (key, value) = (names.lookup("key"), names.lookup("value"));
+        let found = self.check_expr(record);
+        let found = self.settle(record, found);
+        let measured = self.measure_deep(record, found);
+        if measured == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        // A record of type `Never` is never there to list.
+        if measured == self.never {
+            self.expr_types[callee.index()] =
+                self.types
+                    .fn_type([(None, measured)], self.never, Builtin::Entries.effect());
+            return self.never;
+        }
+        let (Some(key), Some(value)) = (key, value) else {
+            return TyId::ERROR;
+        };
+        let Some(value_ty) = self.entry_value(record, measured) else {
+            return TyId::ERROR;
+        };
+        let entry = if value_ty == TyId::DATA {
+            self.types
+                .record_with_rest([(key, TyId::STRING)], Some(TyId::DATA), Vec::new())
+        } else {
+            self.types.record([(key, TyId::STRING), (value, value_ty)])
+        };
+        let result = self.types.list(entry);
+        self.expr_types[callee.index()] =
+            self.types
+                .fn_type([(None, measured)], result, Builtin::Entries.effect());
+        result
+    }
+
+    /// The type of the value of each entry of `record`, the argument of
+    /// `entries`, of type `ty`: the join of its type's rest-field and named
+    /// fields, `*` if its rest-field is (see [Entries of a
+    /// record](#entries-of-a-record)); `None`, the error reported, if `ty`
+    /// is no record type with a rest-field, or one of `*` names a field
+    /// that is not data.
+    fn entry_value(&mut self, record: ExprId, ty: TyId) -> Option<TyId> {
+        let span = self.ast.get(record).span;
+        let rest = self.types.record_rest(ty);
+        let fields: Option<Vec<(Name, TyId)>> = self.types.record_fields(ty).map(<[_]>::to_vec);
+        let (Some(rest), Some(fields)) = (rest, fields) else {
+            let shown = self.in_message(ty);
+            let note = if self.types.is_record(ty) {
+                "a record may hold fields its type does not name, so only a type with a \
+                 rest-field, `*: T`, says what each field is; read a named field by its name"
+            } else {
+                "each entry is a field's name and its value"
+            };
+            self.errors.push(
+                Diagnostic::error(
+                    format!("`entries` takes a record whose type has a rest-field, found {shown}"),
+                    span,
+                )
+                .with_note(note),
+            );
+            return None;
+        };
+        if rest == TyId::DATA {
+            let not_data = fields
+                .iter()
+                .find(|&&(_, field)| !self.types.is_data(field));
+            if let Some(&(name, field)) = not_data {
+                let shown = self.in_message(field);
+                let name = self.ast.names().get(name).to_owned();
+                self.errors.push(
+                    Diagnostic::error(
+                        format!("`entries` lists data, but the field `{name}` is {shown}"),
+                        span,
+                    )
+                    .with_note("the entries of a record whose rest-field is `*` are data"),
+                );
+                return None;
+            }
+            return Some(TyId::DATA);
+        }
+        Some(
+            fields
+                .into_iter()
+                .fold(rest, |joined, (_, field)| self.types.join(joined, field).0),
+        )
     }
 }

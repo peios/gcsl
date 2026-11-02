@@ -1492,6 +1492,7 @@ impl Index {
                 Builtin::Show => "fn<T>(value: T): String",
                 Builtin::JsonDecode => "fn<T>(text: String): T",
                 Builtin::Record => "fn<T>(entries: List<{key: String, value: T}>): {*: T}",
+                Builtin::Entries => "fn<T>(r: {*: T}): List<{key: String, value: T}>",
                 _ => builtin.display(),
             }
             .to_owned(),

@@ -76,6 +76,7 @@ impl Machine<'_> {
                 | IrKind::Is { .. }
                 | IrKind::As { .. }
                 | IrKind::RecordOf { .. }
+                | IrKind::EntriesOf { .. }
                 | IrKind::IntNeg(_)
                 | IrKind::Quantity(..)
                 | IrKind::Show(_)
@@ -280,6 +281,9 @@ fn apply(walker: &mut Evaluator<'_>, id: IrId, values: Vec<Value>) -> Flow<Value
         }
         (IrKind::Is { .. } | IrKind::As { .. } | IrKind::RecordOf { .. } | IrKind::Meta(_), _) => {
             narrowed(walker, node, values)
+        }
+        (IrKind::EntriesOf { key, value, .. }, [record]) => {
+            Evaluator::entries_of_record(node, record, (key, value))
         }
         (IrKind::IntNeg(operand), [Value::Int(value)]) => {
             walker.int_neg_of(node, operand, *value).map(Value::Int)

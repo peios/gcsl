@@ -822,6 +822,18 @@ pub enum IrKind {
         /// The name `value`.
         value: Name,
     },
+    /// A call of `entries`: a list of an entry for each field of the record
+    /// `record`, sorted by name, each a record of the field's name, `key`,
+    /// and of its value, `value` (see [Entries of a
+    /// record](crate::check::entries#entries-of-a-record)).
+    EntriesOf {
+        /// The record.
+        record: IrId,
+        /// The name `key`.
+        key: Name,
+        /// The name `value`.
+        value: Name,
+    },
     /// A call of `json.decode`: the JSON document `text`, a `String`,
     /// decoded by a plan the checker made (see [JSON
     /// decoding](crate::check::json#json-decoding)).
@@ -1361,6 +1373,10 @@ impl IrKind {
     /// the one before the list, and those after it, in order. Its match is
     /// exhaustive: a kind of node with a list has none here but what is
     /// outside it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive table of every kind, which splitting would make non-exhaustive"
+    )]
     const fn operands(self) -> (Option<IrId>, [Option<IrId>; 3]) {
         const NONE: [Option<IrId>; 3] = [None; 3];
         match self {
@@ -1408,6 +1424,7 @@ impl IrKind {
             | IrKind::As { value: child, .. }
             | IrKind::JsonDecode { text: child, .. }
             | IrKind::RecordOf { entries: child, .. }
+            | IrKind::EntriesOf { record: child, .. }
             | IrKind::Await { value: child, .. }
             | IrKind::Catch { body: child, .. }
             | IrKind::ContextBind { value: child, .. }
@@ -1538,6 +1555,7 @@ impl IrKind {
             | IrKind::IntRem(_)
             | IrKind::ListLen(_) => KindStep::Own(ValueKind::Int),
             IrKind::MakeList { .. }
+            | IrKind::EntriesOf { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
             | IrKind::For { collect: true, .. }
@@ -1632,6 +1650,7 @@ impl IrKind {
             | IrKind::Block { .. }
             | IrKind::MakeRecord { .. }
             | IrKind::RecordOf { .. }
+            | IrKind::EntriesOf { .. }
             | IrKind::Field { .. }
             | IrKind::UpdateField { .. }
             | IrKind::Update { .. }
@@ -1694,6 +1713,7 @@ impl IrKind {
             IrKind::As { .. } => "as",
             IrKind::JsonDecode { .. } => "json-decode",
             IrKind::RecordOf { .. } => "record-of",
+            IrKind::EntriesOf { .. } => "entries-of",
             IrKind::MakeList { .. } => "make-list",
             IrKind::Spread(_) => "spread",
             IrKind::Index { .. } => "index",
@@ -1852,6 +1872,7 @@ impl IrNode {
             | IrKind::Block { .. }
             | IrKind::MakeRecord { .. }
             | IrKind::RecordOf { .. }
+            | IrKind::EntriesOf { .. }
             | IrKind::Field { .. }
             | IrKind::UpdateField { .. }
             | IrKind::Update { .. }
