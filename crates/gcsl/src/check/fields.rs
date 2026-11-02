@@ -9,7 +9,7 @@ use crate::strings::FieldName;
 use crate::suggest;
 use crate::types::{TyId, TyKind};
 
-use super::{Checker, REST_READ_NOTE};
+use super::{Checker, DATA_READ_NOTE, REST_READ_NOTE};
 
 impl Checker<'_> {
     /// Types the field access `id`, reading field `name` of `record`, of
@@ -62,6 +62,9 @@ impl Checker<'_> {
             }
             if rest {
                 error = error.with_note(REST_READ_NOTE);
+            }
+            if self.types.record_rest(record_ty) == Some(TyId::DATA) {
+                error = error.with_note(DATA_READ_NOTE);
             }
             // A path of the view's names nothing then: its field may be
             // declared in source that could not be parsed.

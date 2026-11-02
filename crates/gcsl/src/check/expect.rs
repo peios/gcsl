@@ -8,7 +8,7 @@ use crate::source::Span;
 use crate::types::{AwaitKind, Laziness, TyId, TyKind};
 use crate::value::ValueKind;
 
-use super::{AwaitSite, BodyValue, Branch, Checker, Expecting, NarrowingBlock, Reach};
+use super::{AwaitSite, BodyValue, Branch, Checker, DATA_NOTE, Expecting, NarrowingBlock, Reach};
 
 impl Checker<'_> {
     /// Checks that `expr`, of type `found`, can have type `expected`: an
@@ -261,6 +261,9 @@ impl Checker<'_> {
         }
         if let Some(note) = self.needs_note(found, expected) {
             error = error.with_note(note);
+        }
+        if expected == TyId::DATA {
+            error = error.with_note(DATA_NOTE);
         }
         if self.types.laziness(expected) == Laziness::Future {
             let shown = self.in_message(expected);

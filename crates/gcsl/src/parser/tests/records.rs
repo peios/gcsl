@@ -494,9 +494,18 @@ fn a_record_type_may_have_a_rest_field() {
     assert_eq!(ast.type_expr(fields[1].ty).span, Span::new(16, 18));
     // Its type may be `*`, as no other type may.
     assert!(parse_text("1 : {a: Int, *: *}").is_ok());
-    assert_eq!(error("1 : {a: *}"), ("expected a type".to_owned(), Span::new(8, 9)));
-    assert_eq!(error("1 : List<*>"), ("expected a type".to_owned(), Span::new(9, 10)));
-    assert_eq!(error("1 : *"), ("expected a type".to_owned(), Span::new(4, 5)));
+    assert_eq!(
+        error("1 : {a: *}"),
+        ("expected a type".to_owned(), Span::new(8, 9))
+    );
+    assert_eq!(
+        error("1 : List<*>"),
+        ("expected a type".to_owned(), Span::new(9, 10))
+    );
+    assert_eq!(
+        error("1 : *"),
+        ("expected a type".to_owned(), Span::new(4, 5))
+    );
     assert_eq!(
         error("1 : {*: * = 1}"),
         (

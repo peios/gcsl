@@ -2171,10 +2171,7 @@ fn data_is_what_holds_no_function_future_secret_or_sandbox() {
     let future = table.future(TyId::INT);
     let holding_future = table.record([(a, future)]);
     assert!(!table.is_subtype(future, TyId::DATA));
-    assert_eq!(
-        table.needs_await(future, TyId::DATA),
-        Some(AwaitKind::Top)
-    );
+    assert_eq!(table.needs_await(future, TyId::DATA), Some(AwaitKind::Top));
     assert_eq!(
         table.needs_await(holding_future, TyId::DATA),
         Some(AwaitKind::Deep)

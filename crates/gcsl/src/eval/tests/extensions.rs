@@ -128,7 +128,10 @@ fn a_rest_field_of_data_keeps_what_a_test_reads_back() {
         (&format!("{open}o is {{ppk: Ppk}}"), true),
         // A field that is not there, or not what is asked for.
         (&format!("{open}o is {{other: Ppk}}"), false),
-        (&format!("{open}o is {{ppk: {{dependencies: String}}}}"), false),
+        (
+            &format!("{open}o is {{ppk: {{dependencies: String}}}}"),
+            false,
+        ),
         // `{}` asks only that it be a record, `{*: *}` the same.
         (&format!("{open}o is {{ppk: {{}}}}"), true),
         (&format!("{open}o is {{ppk: {{*: *}}}}"), true),

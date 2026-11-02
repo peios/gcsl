@@ -114,7 +114,8 @@ Write the record literal where the type is expected: in an annotation,
 an argument or a definition's result. There, each field that the type
 doesn't name is checked against the rest-field. A value whose own type
 has no rest-field doesn't fit one, because a record keeps fields that its
-static type hides, and they could be of any type.
+static type hides, and they could be of any type. `*: *` is the exception,
+as [Open records](#open-records) describes.
 
 Read a named field as usual. A field that only the rest-field covers
 can't be read by name, and a record whose type has a rest-field can't be
@@ -135,6 +136,54 @@ env == ({LANG = "C"; TZ = "UTC"}: {*: String})
 Each field is named as the program names it, so the record equals one
 written with the same fields, in any order. A key given twice is an error
 when the program runs.
+
+## Open records
+
+A rest-field whose type is `*` holds any data. An open record type names
+the fields it knows about and accepts others, so the LSP still completes
+the known fields:
+
+```gcsl
+type Service = {name: String, *: *}
+let web: Service = {name = "web"; limits = {cpu = 2}}
+(web as {limits: {cpu: Int}}).limits.cpu
+```
+
+Data is a scalar, a `File`, a `Dir`, or a record or list of data, or a
+value of an enum whose bound is data. A function, a secret or a `Sandbox`
+doesn't fit `*`, and neither does a type parameter. A value that might
+still be a future is awaited where it is given, at any depth, so that `is`
+and `as` find it present. `*` is written only as a rest-field's type:
+`{a: *}` and `List<*>` are errors.
+
+Any record type fits `*: *` if its named fields are data, with or without a
+rest-field of its own, so `{version: String, *: *}` accepts a value of type
+`{version: String}`.
+
+A field that `*` covers can't be read by name, because nothing says what
+type it has. Say what you expect with `as`, which fails when the program
+runs, naming the field, if the value isn't that type. `is` asks the same
+question as a `Bool`:
+
+```text
+fn dependencies(pkg: Package) -> {*: String} {
+    if pkg is {ppk: {dependencies: {}}} {
+        = (pkg as {ppk: {dependencies: {*: String}}}).ppk.dependencies
+    } else {
+        = {}
+    }
+}
+```
+
+The `is` here tests only that the field is a record, so that a field of the
+wrong shape fails at the `as`, and isn't taken for a missing one. Every
+field of the type tested must be present: a field's default doesn't apply
+to a test. An `is` that narrows a variable narrows it to the type tested,
+so read the fields you know from outside the branch. In the `else` branch,
+the variable keeps its type.
+
+`json.decode` can't decode into `*`, because a document doesn't say what
+type each value should be.
 
 ## Combining fields
 

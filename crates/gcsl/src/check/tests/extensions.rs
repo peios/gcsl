@@ -184,7 +184,13 @@ fn what_is_no_data_does_not_fit_a_rest_field_of_data() {
         "fn f(s: Sandbox): {*: *} { x = s }",
         "fn f<T>(t: T): {*: *} { x = t }",
     ] {
-        assert_eq!(messages(text), vec!["mismatched types"], "{text}");
+        let found = diagnostics(text);
+        assert_eq!(found[0].message, "mismatched types", "{text}");
+        assert_eq!(
+            found[0].notes.last().map(String::as_str),
+            Some("`*` holds data: no function, secret, sandbox or type parameter"),
+            "{text}"
+        );
     }
 }
 
@@ -192,9 +198,11 @@ fn what_is_no_data_does_not_fit_a_rest_field_of_data() {
 fn a_rest_field_of_data_is_read_through_a_test() {
     let open = "let o: {name: String, *: *} = {name = \"n\"; a = 1}\n";
     // A read by name is no more allowed than of any rest-field.
+    let found = diagnostics(&format!("{open}o.a"));
+    assert_eq!(found[0].message, "no field `a` in `{name: String, *: *}`");
     assert_eq!(
-        messages(&format!("{open}o.a")),
-        vec!["no field `a` in `{name: String, *: *}`"]
+        found[0].notes.last().map(String::as_str),
+        Some("say what it should be, and test for it: `(r as {x: T}).x`")
     );
     // `as` and `is` say what it is expected to be.
     assert_eq!(shown_result(&format!("{open}(o as {{a: Int}}).a")), "Int");

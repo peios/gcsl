@@ -353,17 +353,11 @@ impl Facts {
                         .extend(input.token_at(ty.span.start, TokenKind::LBrace));
                     for field in ast.field_tys(range) {
                         if field.kind == FieldTyKind::Rest {
-                            facts
-                                .rests
-                                .extend(input.token_at(field.span.start, TokenKind::Star));
+                            facts.star(input, field.span.start);
                         }
                     }
                 }
-                TypeExprKind::Data => {
-                    facts
-                        .rests
-                        .extend(input.token_at(ty.span.start, TokenKind::Star));
-                }
+                TypeExprKind::Data => facts.star(input, ty.span.start),
                 TypeExprKind::Fn { .. } => {
                     let at = input
                         .token_at(ty.span.start, TokenKind::Fn)
@@ -409,6 +403,11 @@ impl Facts {
         }
         facts.items_kept(ast);
         facts
+    }
+
+    /// Records the `*` at `offset` of `input`, which is no operator.
+    fn star(&mut self, input: &Input<'_>, offset: u32) {
+        self.rests.extend(input.token_at(offset, TokenKind::Star));
     }
 
     /// Records what items of `ast` keep as written: an import's module path,
@@ -1403,10 +1402,7 @@ mod tests {
             ),
             // Nor is a `*` that is its type, which continues its field's
             // line as any type does.
-            (
-                "type T = {a:Int,*:  *}\n",
-                "type T = {a: Int, *: *}\n",
-            ),
+            ("type T = {a:Int,*:  *}\n", "type T = {a: Int, *: *}\n"),
             (
                 "type T = {\n*:\n*,\n}\n",
                 "type T = {\n    *:\n        *,\n}\n",

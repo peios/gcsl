@@ -1659,7 +1659,18 @@ impl TypeTable {
             | (TyKind::String, Value::Str(_))
             | (TyKind::File, Value::File(_))
             | (TyKind::Dir, Value::Dir(_))
-            | (TyKind::Sandbox, Value::Sandbox(_)) => true,
+            | (TyKind::Sandbox, Value::Sandbox(_))
+            | (
+                TyKind::Data,
+                Value::Int(_)
+                | Value::Float(_)
+                | Value::Bool(_)
+                | Value::Str(_)
+                | Value::Quantity(..)
+                | Value::File(_)
+                | Value::Dir(_)
+                | Value::Empty,
+            ) => true,
             (TyKind::Quantity(wanted), Value::Quantity(quantity, _)) => wanted == quantity,
             (TyKind::Record(record), Value::Empty) => record.fields.is_empty(),
             (TyKind::Record(record), Value::Record(fields)) => {
@@ -1698,17 +1709,6 @@ impl TypeTable {
                 matches!(self.kind(*of), TyKind::Enum { key, .. } if *key == tag.of)
                     && self.variant_payload(tag.key) == Some(*payload)
             }
-            (
-                TyKind::Data,
-                Value::Int(_)
-                | Value::Float(_)
-                | Value::Bool(_)
-                | Value::Str(_)
-                | Value::Quantity(..)
-                | Value::File(_)
-                | Value::Dir(_)
-                | Value::Empty,
-            ) => true,
             (TyKind::Data, Value::Record(fields)) => fields
                 .values
                 .iter()
@@ -3342,8 +3342,6 @@ impl TypeTable {
             return members.iter().any(|&member| self.overlaps(a, member));
         }
         match (self.kind(a), self.kind(b)) {
-            // Only a test of the value can say what `*` holds.
-            (TyKind::Data, _) | (_, TyKind::Data) => true,
             (TyKind::Record(a_record), TyKind::Record(b_record)) => {
                 // A field one side names is held, on the other, to the field
                 // of its name, or else to its rest-field, if it has one.
@@ -3364,9 +3362,10 @@ impl TypeTable {
             (TyKind::List(a_element), TyKind::List(b_element)) => {
                 self.overlaps(*a_element, *b_element)
             }
-            (TyKind::Fn(_) | TyKind::Variant { .. }, TyKind::Fn(_) | TyKind::Variant { .. }) => {
-                true
-            }
+            // Only a test of the value can say what `*` holds.
+            (TyKind::Fn(_) | TyKind::Variant { .. }, TyKind::Fn(_) | TyKind::Variant { .. })
+            | (TyKind::Data, _)
+            | (_, TyKind::Data) => true,
             // A partial record is a record whose fields may be absent.
             (&TyKind::Partial(record) | &TyKind::Secret(record, _), _) => self.overlaps(record, b),
             (_, &TyKind::Partial(record) | &TyKind::Secret(record, _)) => self.overlaps(a, record),
