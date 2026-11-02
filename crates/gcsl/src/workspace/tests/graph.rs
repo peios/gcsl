@@ -914,6 +914,13 @@ fn a_root_context_is_set_from_a_field_its_target_never_reads() {
     assert!(!workspace.top_level_has(root, "conf", &["keys"]));
     assert!(!workspace.top_level_has(root, "conf", &["label", "deeper"]));
     assert!(!workspace.top_level_has(root, "nope", &[]));
+    // The names of a record's fields, sorted, and none for what is no record.
+    assert_eq!(
+        workspace.top_level_fields(root, "conf", &[]),
+        Some(vec!["label".to_owned(), "n".to_owned()])
+    );
+    assert_eq!(workspace.top_level_fields(root, "conf", &["label"]), None);
+    assert_eq!(workspace.top_level_fields(root, "nope", &[]), None);
     // A field of another type is the `with`'s own error.
     let wrong = crate::workspace::graph::RootField {
         path: &["n"],
@@ -942,6 +949,18 @@ fn a_root_context_is_set_from_a_field_its_target_never_reads() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn a_record_with_a_rest_field_names_no_fields() {
+    let files = [
+        ("workspace.gcsl", "open: {*: Int} = {a = 1}"),
+        ("app/build.gcsl", "def build x() { = 1 }"),
+    ];
+    let workspace = rooted(&files).unwrap();
+    let root = workspace.file("workspace.gcsl").unwrap();
+    assert!(workspace.top_level_has(root, "open", &[]));
+    assert_eq!(workspace.top_level_fields(root, "open", &[]), None);
 }
 
 #[test]

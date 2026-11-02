@@ -459,20 +459,41 @@ impl Workspace {
     /// field.
     #[must_use]
     pub fn top_level_has(&self, file: u32, name: &str, path: &[&str]) -> bool {
-        let Some((_, ((_, ty), _))) = self.top_level_cell(file, name) else {
-            return false;
-        };
-        let mut ty = ty;
-        for part in path {
-            let Some(key) = self.scan.names.lookup(part) else {
-                return false;
-            };
-            match self.types.field(self.types.strip(ty), key) {
-                Some(field) => ty = field,
-                None => return false,
-            }
+        self.top_level_type_at(file, name, path).is_some()
+    }
+
+    /// The names of the fields of the record at `path` of the top-level
+    /// field of file `file` named `name`, as [`Workspace::top_level_has`]
+    /// finds it, sorted: what a host reads to set a root context from each
+    /// field of a record, as pekit sets each of `pekitconf.contexts`. `None`
+    /// if the file declares no such field, its type there is no record type,
+    /// or the record type has a rest-field, whose names no type says.
+    #[must_use]
+    pub fn top_level_fields(&self, file: u32, name: &str, path: &[&str]) -> Option<Vec<String>> {
+        let ty = self.types.strip(self.top_level_type_at(file, name, path)?);
+        if self.types.record_rest(ty).is_some() {
+            return None;
         }
-        true
+        let mut fields: Vec<String> = self
+            .types
+            .record_fields(ty)?
+            .iter()
+            .map(|&(field, _)| self.scan.names.get(field).to_owned())
+            .collect();
+        // A record type's fields are in the order of their names' numbers.
+        fields.sort();
+        Some(fields)
+    }
+
+    /// The type of the field at `path` of the top-level field of file `file`
+    /// named `name`, as [`Workspace::top_level_has`] says, or `None`.
+    fn top_level_type_at(&self, file: u32, name: &str, path: &[&str]) -> Option<TyId> {
+        let (_, ((_, mut ty), _)) = self.top_level_cell(file, name)?;
+        for part in path {
+            let key = self.scan.names.lookup(part)?;
+            ty = self.types.field(self.types.strip(ty), key)?;
+        }
+        Some(ty)
     }
 
     /// Whether the top-level function of file `file` named `name`, as
