@@ -40,6 +40,14 @@ Each field is named as the program names it, so the record equals one written wi
 A key given twice is a runtime error.
 This operation has special typing and is not a general first-class polymorphic function.
 .TP
+.B entries(r: {*: T}): List<Entry<T>>
+List a record's fields as entries, the inverse of record, sorted by key in byte order, so equal records give equal lists; record(entries(r)) equals r.
+The type of r must have a rest-field, because a record keeps fields that its type hides; a record type without one is a checking error.
+T covers every field, so the entries of a {to: String, *: Int} are Entry<Int | String>.
+Of a rest-field of *, each entry is a {key: String, *: *}, its value read with as or is; every field the record holds is listed, including any its type hid, and the fields its type names must be data.
+Futures in r are awaited.
+This pure operation has special typing and is not a general first-class polymorphic function.
+.TP
 .B int(x: Float): Int
 Truncate toward zero.
 NaN, infinity, and values outside the Int range fail.
