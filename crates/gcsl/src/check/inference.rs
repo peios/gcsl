@@ -560,6 +560,7 @@ impl Checker<'_> {
             | TypeExprKind::Instance { .. }
             | TypeExprKind::Param(_)
             | TypeExprKind::Context(_)
+            | TypeExprKind::Data
             | TypeExprKind::Invalid => {
                 return declared;
             }

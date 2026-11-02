@@ -100,6 +100,13 @@ A value fits a rest-field only if its own type has one that fits, because a reco
 A field that only the rest-field covers cannot be read by name, and a value whose type has a rest-field cannot be spread.
 Typed equality, is, and as compare and test the fields a rest-field covers.
 .PP
+A rest-field's type may be *, any data: {version: String, *: *} is an open record.
+Data is a scalar, a File, a Dir, a record or list of data, or a value of an enum whose bound is data; a function, a secret, a Sandbox and a type parameter are not.
+A value that may be a future is awaited to fit, at any depth.
+* is written only as a rest-field's type.
+Any record type fits a rest-field of * if its named fields are data, with or without a rest-field of its own.
+What * covers is read by testing for the type expected, as in (r as {x: Int}).x or r is {x: Int}.
+.PP
 An empty list needs an expected element type.
 Function signatures declare parameter and result types.
 A type may declare type parameters, as in type Pair<A, B> = {first: A, second: B}; each use gives as many type arguments, as in Pair<Int, String>, and is the definition with them in place of the parameters.

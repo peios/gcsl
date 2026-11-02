@@ -344,6 +344,7 @@ fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
     match ast.type_expr(id).kind {
         TypeExprKind::Named(name) => out.push_str(ast.names().get(name)),
         TypeExprKind::Context(name) => write!(out, "^{}", ast.names().get(name)).unwrap(),
+        TypeExprKind::Data => out.push('*'),
         TypeExprKind::Path(path) => out.push_str(&ast.show_path(ast.path(path)).to_string()),
         TypeExprKind::Record(fields) => {
             out.push('{');

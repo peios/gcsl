@@ -2791,6 +2791,7 @@ impl<'a> Checker<'a> {
             | TyKind::Variant { .. }
             | TyKind::Partial(_)
             | TyKind::Secret(..)
+            | TyKind::Data
             // TEMPORARY (alias rule): see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/).
             | TyKind::Builtin(_) => {
@@ -3115,6 +3116,12 @@ const EXTRA_FIELD_NOTE: &str = "it is allowed, but nothing with this type can se
 /// The note on a read of a field that a record type's rest-field covers.
 const REST_READ_NOTE: &str =
     "a field that only the rest-field `*: ...` covers cannot be read by name";
+
+/// The note on a read of a field a rest-field of `*` covers.
+const DATA_READ_NOTE: &str = "say what it should be, and test for it: `(r as {x: T}).x`";
+
+/// The note on a value that does not fit `*`.
+const DATA_NOTE: &str = "`*` holds data: no function, secret, sandbox or type parameter";
 
 /// The note on a spread of a value whose type has a rest-field.
 const SPREAD_REST_NOTE: &str = "a spread defines the fields its operand's type names, and the fields a rest-field covers are known only when it runs";

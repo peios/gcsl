@@ -548,6 +548,7 @@ impl WrittenType<'_> {
                 f.write_str(names.get(name))
             }
             TypeExprKind::Context(name) => write!(f, "^{}", self.names.get(name)),
+            TypeExprKind::Data => f.write_str("*"),
             TypeExprKind::Path(path) => self.path(f, path),
             TypeExprKind::Record(fields) => {
                 f.write_str("{")?;

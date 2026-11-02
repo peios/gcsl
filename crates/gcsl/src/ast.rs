@@ -2054,6 +2054,9 @@ pub enum TypeExprKind {
     /// A qualified type name, `t.PackageDef`: two or more names separated by
     /// `.`, in the path pool (see [Types](crate::ast::typeexprs#types)).
     Path(PathRange),
+    /// The `*` of a rest-field `*: *`, which holds any data. A rest-field's
+    /// type alone may be one.
+    Data,
     /// A record type, `{x: Int, "a b": String}` or `{...T, x: Int}`: its
     /// fields and spreads in source order. Repeated names are allowed here
     /// and reported by the checker.

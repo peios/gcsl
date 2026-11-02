@@ -209,7 +209,7 @@ Each field of a record comes from the key of its name; a missing key or null giv
 Keys the type does not name are ignored.
 A union decodes as the member that takes the value's kind; no two members may take the same kind, except Int and Float, where an integer goes to the Int.
 A record type with a rest-field takes each key it does not name as a field of that name, decoded as the rest-field says; a null value is left out.
-Duration, Size, File, Dir, Sandbox, enums, secrets, functions, Partial, and Never cannot be decoded; naming one is a checking error.
+Duration, Size, File, Dir, Sandbox, enums, secrets, functions, Partial, Never, and a rest-field of * cannot be decoded; naming one is a checking error.
 The parser follows RFC 8259 strictly and also rejects an object with a duplicate key.
 Text that is not JSON, or a document that does not fit the type, is a runtime error at the call that names the line and column, or the path to the value that does not fit, such as units[3].kind.
 This pure operation can be called from a pure function.

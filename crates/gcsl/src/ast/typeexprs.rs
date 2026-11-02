@@ -272,17 +272,9 @@ impl TypeArena {
                         .fields(range)
                         .iter()
                         .map(|field| {
-                            let default = field.default.map(|default| {
-                                let copied = match default {
-                                    FieldDefault::Expr(expr) => constant(expr),
-                                    FieldDefault::Copied(at) => {
-                                        from.constants.get(at as usize).cloned().flatten()
-                                    }
-                                };
-                                let at = next_id(self.constants.len());
-                                self.constants.push(copied);
-                                FieldDefault::Copied(at)
-                            });
+                            let default = field
+                                .default
+                                .map(|default| self.copy_default(from, default, constant));
                             FieldTy {
                                 ty: self.copy(from, field.ty, memo, (replace, constant)),
                                 default,
@@ -344,12 +336,30 @@ impl TypeArena {
                 | TypeExprKind::Param(_)
                 | TypeExprKind::Enum { .. }
                 | TypeExprKind::Context(_)
+                | TypeExprKind::Data
                 | TypeExprKind::Invalid) => kind,
             },
         };
         let id = self.alloc(TypeExpr { kind, span });
         memo.insert(root, id);
         id
+    }
+
+    /// The field default `default` of `from`, copied into this arena's pool
+    /// of constants, as [`TypeArena::copy`] copies one.
+    fn copy_default(
+        &mut self,
+        from: &TypeArena,
+        default: FieldDefault,
+        constant: ToConstant<'_>,
+    ) -> FieldDefault {
+        let copied = match default {
+            FieldDefault::Expr(expr) => constant(expr),
+            FieldDefault::Copied(at) => from.constants.get(at as usize).cloned().flatten(),
+        };
+        let at = next_id(self.constants.len());
+        self.constants.push(copied);
+        FieldDefault::Copied(at)
     }
 
     /// The function type of the parameters, needs, return type, effect and
@@ -478,6 +488,7 @@ impl TypeArena {
             | TypeExprKind::Ref(_)
             | TypeExprKind::Enum { .. }
             | TypeExprKind::Context(_)
+            | TypeExprKind::Data
             | TypeExprKind::Invalid => None,
         };
         let done = match kind {
@@ -558,6 +569,7 @@ impl TypeArena {
             | TypeExprKind::Param(_)
             | TypeExprKind::Enum { .. }
             | TypeExprKind::Context(_)
+            | TypeExprKind::Data
             | TypeExprKind::Invalid => Vec::new(),
         }
     }

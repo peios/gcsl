@@ -184,6 +184,24 @@ def package dev.example.greet() {
 version, and the files, which a packager library, such as gcslib's `ppk`,
 packs.
 
+`PackageDef` and `Package` are [open
+records](~gcsl/records-and-types#open-records), so a body can give any other
+data, for the packager of its format:
+
+```text
+def package dev.example.greet() {
+    version = "1.0-1"
+    files = {"bin/greet" = build app()}
+    ppk = {dependencies = {"org.gnu.glibc" = ">= 2.44"}}
+}
+```
+
+`Package` keeps those fields, and a packager reads them with `is` and `as`.
+A `name` in the body is replaced by the definition's path. The format's data
+is checked when a packager reads it, not when the package is defined. A step
+that takes a package is keyed by those fields too, so changing one packs
+the package again.
+
 The prelude's `test` is another. A test passes if its body succeeds and
 fails if it fails, by an `assert`, a program exiting with an error, or
 any other failure:

@@ -287,7 +287,8 @@ struct Facts {
     verbatim: Vec<(usize, usize)>,
     /// The last token of each def-type's path.
     path_ends: HashSet<usize>,
-    /// The `*` of every rest-field, which is no operator.
+    /// The `*` of every rest-field, and of its type if it is `*`, which are
+    /// no operators.
     rests: HashSet<usize>,
     /// The keyword of every method, `fn` or `def`, spaced from its
     /// receiver's `(` as no function expression's `fn` is.
@@ -352,12 +353,11 @@ impl Facts {
                         .extend(input.token_at(ty.span.start, TokenKind::LBrace));
                     for field in ast.field_tys(range) {
                         if field.kind == FieldTyKind::Rest {
-                            facts
-                                .rests
-                                .extend(input.token_at(field.span.start, TokenKind::Star));
+                            facts.star(input, field.span.start);
                         }
                     }
                 }
+                TypeExprKind::Data => facts.star(input, ty.span.start),
                 TypeExprKind::Fn { .. } => {
                     let at = input
                         .token_at(ty.span.start, TokenKind::Fn)
@@ -403,6 +403,11 @@ impl Facts {
         }
         facts.items_kept(ast);
         facts
+    }
+
+    /// Records the `*` at `offset` of `input`, which is no operator.
+    fn star(&mut self, input: &Input<'_>, offset: u32) {
+        self.rests.extend(input.token_at(offset, TokenKind::Star));
     }
 
     /// Records what items of `ast` keep as written: an import's module path,
@@ -1394,6 +1399,13 @@ mod tests {
             (
                 "type T = {a:Int,*:  String}\n",
                 "type T = {a: Int, *: String}\n",
+            ),
+            // Nor is a `*` that is its type, which continues its field's
+            // line as any type does.
+            ("type T = {a:Int,*:  *}\n", "type T = {a: Int, *: *}\n"),
+            (
+                "type T = {\n*:\n*,\n}\n",
+                "type T = {\n    *:\n        *,\n}\n",
             ),
             // An operator still continues its line.
             ("x = (2\n* 3)\n", "x = (2\n        * 3)\n"),
