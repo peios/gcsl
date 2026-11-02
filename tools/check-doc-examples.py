@@ -21,8 +21,11 @@ EXPECTED = {
     ("200--records-and-types.md", 4): "{fits = true}\n",
     ("200--records-and-types.md", 5): '{"bin/*" = "bin/*"; "sbin/*" = "sbin/*"}\n',
     ("200--records-and-types.md", 6): "true\n",
-    ("200--records-and-types.md", 7): "2\n",
-    ("200--records-and-types.md", 9): "8080\n",
+    ("200--records-and-types.md", 7): (
+        '[{key = "org.gnu.bash"; value = ""}, {key = "org.gnu.glibc"; value = ">= 2.44"}]\n'
+    ),
+    ("200--records-and-types.md", 8): "2\n",
+    ("200--records-and-types.md", 10): "8080\n",
     ("300--functions-and-effects.md", 0): "42\n",
     ("400--deferred-work.md", 0): "42\n",
     ("500--lists-and-control-flow.md", 0): "8\n",

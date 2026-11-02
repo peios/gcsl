@@ -570,6 +570,7 @@ impl Evaluator<'_> {
             IrKind::JsonDecode { .. } => self.decode_node(node),
             IrKind::Arg { .. } => mistyped(node, "an argument outside a call"),
             IrKind::MakeList { items, spreads } => self.make_list(items, spreads),
+            IrKind::EntriesOf { .. } => self.entries_of(node),
             IrKind::Range(inclusive, operands) => self.range(operands, inclusive, node),
             IrKind::For { .. } | IrKind::Loop { .. } => self.looped(node),
             IrKind::Break { .. } | IrKind::Continue { .. } | IrKind::Return { .. } => {

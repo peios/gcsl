@@ -50,6 +50,11 @@ impl Lowerer<'_> {
                 message: "a call of `record` typed as something other than a record",
                 span,
             }),
+            Builtin::Entries if kind == ValueKind::List => self.lower_entries(args, span),
+            Builtin::Entries => Err(InternalError {
+                message: "a call of `entries` typed as something other than a list",
+                span,
+            }),
             Builtin::JsonDecode => self.lower_json_decode(id, args, kind),
             // An ordinary built-in is called as any function value is.
             Builtin::Int
@@ -132,6 +137,25 @@ impl Lowerer<'_> {
             key,
             value,
         })
+    }
+
+    /// Lowers the call spanning `span` of `entries` with the arguments
+    /// `args`: an `EntriesOf` of its record, with the names of the fields of
+    /// the entries it makes (see [Entries of a
+    /// record](crate::check::entries#entries-of-a-record)).
+    fn lower_entries(&mut self, args: ArgRange, span: Span) -> Result<IrKind, InternalError> {
+        let names = self.ast.names();
+        let (Some(key), Some(value)) = (names.lookup("key"), names.lookup("value")) else {
+            return Err(InternalError {
+                message: "a call of `entries` with no names `key` and `value` to make",
+                span,
+            });
+        };
+        self.builder.add_name_text(key, "key");
+        self.builder.add_name_text(value, "value");
+        let record = self.builtin_argument(args, 0, span)?;
+        let record = self.lower_operand(record, ValueKind::Record)?;
+        Ok(IrKind::EntriesOf { record, key, value })
     }
 
     /// Lowers the call `id` of `json.decode` with the arguments `args`, of

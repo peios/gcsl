@@ -166,6 +166,7 @@ impl Evaluator<'_> {
             | IrKind::Return { .. }
             | IrKind::Catch { .. } => self.stopping(node, into_record),
             IrKind::MakeList { .. }
+            | IrKind::EntriesOf { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
             | IrKind::Update { .. } => mistyped(node, "list node where a record was expected"),

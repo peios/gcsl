@@ -105,9 +105,10 @@ impl Evaluator<'_> {
             | IrKind::Catch { .. }
             | IrKind::For { .. }
             | IrKind::Loop { .. } => self.stopping(node, into_int),
-            IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
-                mistyped(node, "list node where an Int was expected")
-            }
+            IrKind::MakeList { .. }
+            | IrKind::EntriesOf { .. }
+            | IrKind::Spread(_)
+            | IrKind::Range(..) => mistyped(node, "list node where an Int was expected"),
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
             | IrKind::Tag { .. }
@@ -337,9 +338,10 @@ impl Evaluator<'_> {
             | IrKind::Catch { .. }
             | IrKind::For { .. }
             | IrKind::Loop { .. } => self.stopping(node, Value::into_float),
-            IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
-                mistyped(node, "list node where a Float was expected")
-            }
+            IrKind::MakeList { .. }
+            | IrKind::EntriesOf { .. }
+            | IrKind::Spread(_)
+            | IrKind::Range(..) => mistyped(node, "list node where a Float was expected"),
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
             | IrKind::Tag { .. }
@@ -449,9 +451,10 @@ impl Evaluator<'_> {
             | IrKind::Catch { .. }
             | IrKind::For { .. }
             | IrKind::Loop { .. } => self.stopping(node, Value::into_bool),
-            IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
-                mistyped(node, "list node where a Bool was expected")
-            }
+            IrKind::MakeList { .. }
+            | IrKind::EntriesOf { .. }
+            | IrKind::Spread(_)
+            | IrKind::Range(..) => mistyped(node, "list node where a Bool was expected"),
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
             | IrKind::Tag { .. }
@@ -586,9 +589,10 @@ impl Evaluator<'_> {
             | IrKind::Catch { .. }
             | IrKind::For { .. }
             | IrKind::Loop { .. } => self.stopping(node, Value::into_string),
-            IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
-                mistyped(node, "list node where a String was expected")
-            }
+            IrKind::MakeList { .. }
+            | IrKind::EntriesOf { .. }
+            | IrKind::Spread(_)
+            | IrKind::Range(..) => mistyped(node, "list node where a String was expected"),
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
             | IrKind::Tag { .. }

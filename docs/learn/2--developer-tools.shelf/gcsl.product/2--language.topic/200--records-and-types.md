@@ -137,6 +137,21 @@ Each field is named as the program names it, so the record equals one
 written with the same fields, in any order. A key given twice is an error
 when the program runs.
 
+`entries` does the reverse. It lists a record's fields as entries, sorted
+by key, so two equal records always give the same list:
+
+```gcsl
+let deps: {*: String} = {"org.gnu.glibc" = ">= 2.44"; "org.gnu.bash" = ""}
+entries(deps)
+```
+
+The record's type must have a rest-field, because a record can hold
+fields that its type hides. Without one, the type doesn't say what those
+fields are, so read the fields it names by name instead. An entry's value
+has a type that covers every field, named or not: the entries of a `{to:
+String, *: Int}` have values of type `Int | String`. `record(entries(r))`
+equals `r`.
+
 ## Open records
 
 A rest-field whose type is `*` holds any data. An open record type names
@@ -181,6 +196,17 @@ field of the type tested must be present: a field's default doesn't apply
 to a test. An `is` that narrows a variable narrows it to the type tested,
 so read the fields you know from outside the branch. In the `else` branch,
 the variable keeps its type.
+
+`entries` lists an open record too. Each entry is a `{key: String, *: *}`,
+so read its value with `as` or `is`, as you would any field that `*`
+covers. This lists every field the record holds, including any field its
+type hid. A test of a hidden field that isn't data, such as a function,
+is false, and `as` fails.
+
+A record type with no rest-field already fits `{*: *}`, so `as {*: *}`
+tests nothing and leaves the type as it was. To list a field you only
+know is a record, such as `ppk` after `if pkg is {ppk: {}}`, give it the
+type instead: `let meta: {*: *} = pkg.ppk`, then `entries(meta)`.
 
 `json.decode` can't decode into `*`, because a document doesn't say what
 type each value should be.

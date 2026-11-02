@@ -249,6 +249,9 @@ impl Checker<'_> {
             (Typing::Special, &[entries]) if builtin == Builtin::Record && !erroneous => {
                 self.check_record(id, callee, entries)
             }
+            (Typing::Special, &[record]) if builtin == Builtin::Entries && !erroneous => {
+                self.check_entries(callee, record)
+            }
             _ => {
                 // Every argument is checked, whatever goes wrong.
                 for &arg in &bound {
@@ -506,6 +509,7 @@ impl Checker<'_> {
         let any = match builtin {
             Builtin::Show => "value",
             Builtin::JsonDecode | Builtin::Record => "result",
+            Builtin::Entries => "record",
             _ => "list",
         };
         self.errors.push(

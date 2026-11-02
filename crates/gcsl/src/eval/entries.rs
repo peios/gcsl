@@ -1,6 +1,7 @@
 //! Evaluating `record`: a record of a field for each entry of a list, named
 //! as the program runs (see [Records of any
-//! names](crate::check::entries#records-of-any-names)).
+//! names](crate::check::entries#records-of-any-names)); and `entries`, its
+//! inverse (see [Entries of a record](#entries-of-a-record)).
 //!
 //! # Records of any names
 //!
@@ -10,6 +11,16 @@
 //! text, and a record it makes equals one written with the same fields. A
 //! key two entries give is the runtime error "the key `x` is in the
 //! entries twice", at the call. The fields are in the entries' order.
+//!
+//! # Entries of a record
+//!
+//! `entries(r)` is a list of an entry, `{key = name; value = v}`, for each
+//! field of the record `r`, every field the value has, sorted by the bytes
+//! of its name, so that two equal records give equal lists whatever order
+//! their fields were made in. The empty record gives the empty list. Every
+//! entry shares one layout, of the names `key` and `value`, which the
+//! checker interned in the run's names (see [Entries of a
+//! record](crate::check::entries#entries-of-a-record)).
 
 use std::rc::Rc;
 
@@ -76,6 +87,53 @@ impl Evaluator<'_> {
             }),
             values: values.into_boxed_slice(),
         })))
+    }
+
+    /// Evaluates the `EntriesOf` `node`: the entries of its record.
+    pub(super) fn entries_of(&mut self, node: &IrNode) -> Flow<Value> {
+        let IrKind::EntriesOf { record, key, value } = node.kind else {
+            return mistyped(node, "a node that is not an `entries` listed entries");
+        };
+        let record = self.value(record)?;
+        Self::entries_of_record(node, &record, (key, value))
+    }
+
+    /// The `EntriesOf` `node` of `record`, its record's value, evaluated
+    /// already, each entry's fields `key` and `value`, as
+    /// [`Evaluator::entries_of`] makes it (see [Entries of a
+    /// record](#entries-of-a-record)).
+    pub(super) fn entries_of_record(
+        node: &IrNode,
+        record: &Value,
+        (key, value): (Name, Name),
+    ) -> Flow<Value> {
+        let record = match record {
+            Value::Empty => return Ok(Value::List(List::from_vec(Vec::new()))),
+            Value::Record(record) => record,
+            _ => return mistyped(node, "the entries of a value that is no record"),
+        };
+        let layout = Rc::new(Layout {
+            names: Box::new([key, value]),
+            texts: Box::new([Box::from("key"), Box::from("value")]),
+        });
+        let mut fields: Vec<(&str, &Value)> = record
+            .layout
+            .texts
+            .iter()
+            .map(|text| &**text)
+            .zip(record.values.iter())
+            .collect();
+        fields.sort_unstable_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+        let entries = fields
+            .into_iter()
+            .map(|(text, given)| {
+                Value::Record(Rc::new(Record {
+                    layout: Rc::clone(&layout),
+                    values: Box::new([Value::Str(Rc::from(text)), given.clone()]),
+                }))
+            })
+            .collect();
+        Ok(Value::List(List::from_vec(entries)))
     }
 
     /// The name of `text` in the names of the run's owner, interned there

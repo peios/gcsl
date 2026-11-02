@@ -28,6 +28,12 @@ record = builtins.record
 
 # An entry of a record `record` makes: a field's name and its value.
 type Entry<T> = {key: String, value: T}
+# `entries(r)`, `record`'s inverse, is an `Entry` for each field of `r`,
+# sorted by key, so that equal records give equal lists. `r`'s type must
+# have a rest-field, as a `{*: T}` has; each value's type covers its named
+# fields too. Of a `*: *` each entry is a `{key: String, *: *}`, its value
+# read with `as` or `is`, as any field `*` covers is.
+entries = builtins.entries
 int = builtins.int
 float = builtins.float
 def half(n: Int): Float { float(n) / 2.0 }
