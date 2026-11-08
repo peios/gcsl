@@ -139,6 +139,7 @@
 //! it has unpacked the same archive before.
 
 use std::collections::{HashSet, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::process::Command;
 use std::io;
@@ -343,30 +344,47 @@ pub(super) fn dir_files(dir: &File, effects: &dyn Effects, node: &IrNode) -> Flo
 /// directory, `under` so far. It descends into directories but never
 /// through a symbolic link, nor into one `effects` hides. A name that is not
 /// UTF-8 is an error.
+///
+/// It holds one directory open at a time, reading each whole and closing it
+/// before going down, and keeps the directories still to read on a list
+/// rather than the stack, so a tree's depth costs neither descriptors nor
+/// stack.
 fn walk(
     host: &Path,
     (root, under): (&str, &str),
     (effects, found): (&dyn Effects, &mut Vec<String>),
 ) -> io::Result<()> {
-    for entry in fs::read_dir(host)? {
-        let entry = entry?;
-        let name = entry.file_name().into_string().map_err(|name| {
-            io::Error::other(format!("`{}` is not a UTF-8 path", name.display()))
-        })?;
-        let inner = join(under, &name);
-        if entry.file_type()?.is_dir() {
-            let path = entry.path();
-            if !effects.hides(&path) {
-                let contents = effects.contents(&path).unwrap_or(path);
-                walk(&contents, (root, &inner), (effects, &mut *found))?;
+    let mut pending = vec![(host.to_path_buf(), under.to_owned())];
+    while let Some((host, under)) = pending.pop() {
+        for (name, is_dir, path) in listing(&host)? {
+            let name = name.into_string().map_err(|name| {
+                io::Error::other(format!("`{}` is not a UTF-8 path", name.display()))
+            })?;
+            let inner = join(&under, &name);
+            if is_dir {
+                if !effects.hides(&path) {
+                    pending.push((effects.contents(&path).unwrap_or(path), inner));
+                }
+            } else if root == "/" {
+                found.push(format!("/{inner}"));
+            } else {
+                found.push(format!("{root}/{inner}"));
             }
-        } else if root == "/" {
-            found.push(format!("/{inner}"));
-        } else {
-            found.push(format!("{root}/{inner}"));
         }
     }
     Ok(())
+}
+
+/// The entries of the directory at `host`, each its name, whether it is a
+/// directory (a symbolic link to one is not) and its path, read whole and
+/// the directory closed. A `DirEntry` kept would keep its directory open.
+fn listing(host: &Path) -> io::Result<Vec<(OsString, bool, PathBuf)>> {
+    fs::read_dir(host)?
+        .map(|entry| {
+            let entry = entry?;
+            Ok((entry.file_name(), entry.file_type()?.is_dir(), entry.path()))
+        })
+        .collect()
 }
 
 impl Evaluator<'_> {

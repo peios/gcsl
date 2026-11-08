@@ -12,6 +12,10 @@ annotate-snippets = "0.12"
 # Killing a program's process group, which std cannot do safely yet.
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
+[dev-dependencies]
+# Lowering the open-files limit, in the deep-tree test.
+nix = { version = "0.31", default-features = false, features = ["resource"] }
+
 [features]
 # Runs plain evaluation on the machine too, as graph mode runs, so that the
 # test suite checks the machine against the recursive walkers. For tests
