@@ -278,7 +278,19 @@ nothing changes for a workspace that never starts profiling.
 
 A target's unit carries on from where it stopped after each pause, so a
 profile counts each call it makes once, however often it stops. Time a
-unit spends stopped isn't counted. When the same expensive work, such as
+unit spends stopped isn't counted.
+
+When the iterations of a loop wait apart (see [Code that
+waits](#code-that-waits)), each runs as a task of its own, and every
+moment is counted once, to the calls of the task that was running then.
+An iteration's calls keep the time they ran before it was set aside, and
+the call that runs the loop doesn't count that time as its own. A call
+that waits for another task's memoised call isn't charged for the wait.
+The evaluator's own work in setting tasks aside and choosing which runs
+next counts toward no function: it's part of the difference between
+your runs' time and `outermost`.
+
+When the same expensive work, such as
 parsing a lock file, shows up thousands of times, it's being done by
 that many calls: memoise the function that does it with `->>`, and
 later calls find its entry instead of doing the work again.

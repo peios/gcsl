@@ -135,3 +135,33 @@ fn a_profile_of_graph_mode_counts_each_call_once_however_often_its_unit_stops() 
     let own: std::time::Duration = report.rows.iter().map(|row| row.own).sum();
     assert_eq!(own, report.outermost);
 }
+
+#[test]
+fn a_profile_of_iterations_split_into_tasks_counts_each_moment_once() {
+    // Each iteration waits for its step's result, so the run splits it off
+    // as a task, taking the calls it is in; once given the result, it calls
+    // the memoised `shared`, which its first caller runs while the others
+    // wait for it. Their time belongs to the calls they were in, which
+    // went on in other tasks, never also to `all`, which made them.
+    let (mut workspace, file) = super::graph::lone_workspace(
+        "fn shared() ->> String { = exec([\"echo\", \"s\"]).stdout.trim() }\n\
+         fn checked(n: Int) -> String {\n\
+             let made = \"{compile(\"c{n}\")}!\"\n\
+             = \"{made}{shared()}\"\n\
+         }\n\
+         fn all() -> List<String> { = for n in 0..16 { checked(n) } }\n\
+         = all()",
+    );
+    workspace.start_profiling();
+    let (value, _) = super::graph::drive(&mut workspace, file);
+    assert_eq!(value.to_string().matches("!s").count(), 16, "{value}");
+    let report = workspace.profile_report().unwrap();
+    assert_eq!(function_row(&report, "checked"), (16, 0, FnKind::Function));
+    assert_eq!(function_row(&report, "shared"), (16, 15, FnKind::Memo));
+    let own: std::time::Duration = report.rows.iter().map(|row| row.own).sum();
+    assert_eq!(own, report.outermost);
+    for row in &report.rows {
+        assert!(row.total >= row.own, "{row:?}");
+        assert!(row.total <= report.outermost, "{row:?}");
+    }
+}

@@ -502,14 +502,26 @@ impl<'r> Machine<'r> {
                     None => return Ran::Done(result.map_err(|unwind| *unwind)),
                 },
                 // A task that would wait splits, if it can, and goes on.
-                Next::Block(wait, resume) => match self.fork(Status::Blocked(wait, resume)) {
-                    Ok(next) => next,
-                    Err(status) => self.park(status).unwrap_or(Next::Stop),
-                },
-                Next::Park(status) => match self.fork(*status) {
-                    Ok(next) => next,
-                    Err(status) => self.park(status).unwrap_or(Next::Stop),
-                },
+                Next::Block(wait, resume) => {
+                    self.pause_profile();
+                    match self.fork(Status::Blocked(wait, resume)) {
+                        Ok(next) => {
+                            self.unpause_profile();
+                            next
+                        }
+                        Err(status) => self.park(status).unwrap_or(Next::Stop),
+                    }
+                }
+                Next::Park(status) => {
+                    self.pause_profile();
+                    match self.fork(*status) {
+                        Ok(next) => {
+                            self.unpause_profile();
+                            next
+                        }
+                        Err(status) => self.park(status).unwrap_or(Next::Stop),
+                    }
+                }
                 Next::Stop => return self.stopped(),
             };
         }

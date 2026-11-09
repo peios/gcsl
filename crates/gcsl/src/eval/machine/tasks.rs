@@ -399,8 +399,10 @@ impl Machine<'_> {
     /// run: what it does next, or `None` if every task waits, the one that
     /// ran left running with `status`.
     pub(super) fn park(&mut self, status: Status) -> Option<Next> {
+        self.pause_profile();
         let Some(ready) = self.next_ready() else {
             self.status = Some(status);
+            self.unpause_profile();
             return None;
         };
         let mut task = self.tasks.swap_remove(ready);
@@ -408,7 +410,24 @@ impl Machine<'_> {
         let parked = self.exchange(task);
         self.tasks.push(parked);
         self.status = None;
+        self.unpause_profile();
         Some(self.start(start))
+    }
+
+    /// Notes, if the run is profiled, that the machine begins work of its
+    /// own, which no call's time counts (see
+    /// [Profiling](crate::eval::profile#profiling), "Tasks").
+    pub(super) fn pause_profile(&self) {
+        if let Some(profile) = self.shared.profile {
+            profile.pause();
+        }
+    }
+
+    /// Notes, if the run is profiled, that the machine's own work is done.
+    pub(super) fn unpause_profile(&self) {
+        if let Some(profile) = self.shared.profile {
+            profile.unpause();
+        }
     }
 
     /// What the task now running, which was set aside with `status`, does
@@ -512,6 +531,15 @@ impl Machine<'_> {
     /// Ends the task running, which delivered what it came to: another that
     /// may run runs, or `None` if every task waits.
     pub(super) fn finished(&mut self) -> Option<Next> {
+        self.pause_profile();
+        let next = self.next_after_end();
+        self.unpause_profile();
+        Some(self.start(next?))
+    }
+
+    /// The status of the task that runs once the task running has ended,
+    /// made the task running; or `None` if every other task waits.
+    fn next_after_end(&mut self) -> Option<Status> {
         self.wake_waiting(false);
         let Some(ready) = self.next_ready() else {
             // Every other task waits: the one that ended is not set aside,
@@ -528,7 +556,7 @@ impl Machine<'_> {
         let start = std::mem::replace(&mut task.status, Status::Joining);
         let _ended = self.exchange(task);
         self.status = None;
-        Some(self.start(start))
+        Some(start)
     }
 
     /// Delivers `result`, what the child running came to, to `join` as its
@@ -804,7 +832,7 @@ impl Machine<'_> {
             }),
             profile: shared
                 .profile
-                .map(|profile| profile.suspend(marks.profiled)),
+                .map(|profile| profile.split_off(marks.profiled)),
             since: Instant::now(),
         };
         shared.earliest.set(
