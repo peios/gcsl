@@ -35,7 +35,8 @@
 //!   *infix* operator (`+`, `-`, `*`, `/`, `//`, `%`, a comparison, `and`,
 //!   `or`, `..`, `..=`, `|`, `is`, `as`), `=`, `:=`, `:`, `->`, `->>`,
 //!   `let`, `mut`, `...` or a `for` header's `;`, but the `>` that closes a
-//!   type argument; or when it starts with an infix operator or a `.`, as a
+//!   type argument and the `*` that ends an import's glob (`import package *
+//!   from pkgs/*`); or when it starts with an infix operator or a `.`, as a
 //!   line inside brackets may. So brackets opened on one line indent the
 //!   lines after it by one level however many they are, as in `f({` ...
 //!   `})`; and a line in brackets that continues an element is a level more
@@ -287,8 +288,8 @@ struct Facts {
     verbatim: Vec<(usize, usize)>,
     /// The last token of each def-type's path.
     path_ends: HashSet<usize>,
-    /// The `*` of every rest-field, and of its type if it is `*`, which are
-    /// no operators.
+    /// The `*`s that are no operators: of every rest-field, of its type if it
+    /// is `*`, and of every import's glob.
     rests: HashSet<usize>,
     /// The keyword of every method, `fn` or `def`, spaced from its
     /// receiver's `(` as no function expression's `fn` is.
@@ -401,7 +402,7 @@ impl Facts {
                     .extend(input.token_at(used.span.start, TokenKind::LParen));
             }
         }
-        facts.items_kept(ast);
+        facts.items_kept(input);
         facts
     }
 
@@ -410,15 +411,20 @@ impl Facts {
         self.rests.extend(input.token_at(offset, TokenKind::Star));
     }
 
-    /// Records what items of `ast` keep as written: an import's module path,
-    /// whose glued tokens make its segments, and the position of each index
-    /// segment of a `:=` path.
-    fn items_kept(&mut self, ast: &Ast) {
+    /// Records what items of `input` keep as written: an import's module
+    /// path, whose glued tokens make its segments, and the position of each
+    /// index segment of a `:=` path. A glob's `*`s, as in `pkgs/*` or `*`
+    /// alone, are no operators either.
+    fn items_kept(&mut self, input: &Input<'_>) {
+        let ast = &input.ast;
         for item in ast.item_arena() {
             match item.kind {
                 ItemKind::Import(id) => {
                     let path = ast.import_decl(id).path_at;
                     self.verbatim.push((path.start as usize, path.end as usize));
+                    let tokens = input.first_from(path.start)..input.first_from(path.end);
+                    self.rests
+                        .extend(tokens.filter(|&at| input.kind(at) == TokenKind::Star));
                 }
                 ItemKind::Rebind { path, .. } => {
                     for segment in ast.path(path) {
@@ -820,6 +826,9 @@ impl<'a> Printer<'a> {
         };
         let kind = self.input.kind(last);
         if kind == TokenKind::Gt && self.facts.angles.contains(&last) {
+            return false;
+        }
+        if kind == TokenKind::Star && self.facts.rests.contains(&last) {
             return false;
         }
         if kind == TokenKind::Semi {
@@ -1443,6 +1452,20 @@ mod tests {
             ),
             // Not after the `>` of a type argument, nor an opening bracket.
             ("x: List<Int>\n= []\n", "x: List<Int>\n= []\n"),
+            // Nor after the `*` that ends an import's glob, which is no
+            // operator.
+            (
+                "import package dash from *\n\ndef x() -> String {\n= \"a\"\n}\n",
+                "import package dash from *\n\ndef x() -> String {\n    = \"a\"\n}\n",
+            ),
+            (
+                "import package * from pkgs/*\nx = 1\n",
+                "import package * from pkgs/*\nx = 1\n",
+            ),
+            (
+                "import package dash from **\nx = 1\n",
+                "import package dash from **\nx = 1\n",
+            ),
             // A `for` header's parts after a `;`; its body is opened on the
             // last, so is a level more.
             (
