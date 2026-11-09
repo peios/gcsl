@@ -30,6 +30,20 @@
 //! time: a host that knows how long its runs took has the time spent
 //! outside every call, at the top level of its files, as the difference.
 //!
+//! **Tasks.** A unit's evaluation runs as tasks (see
+//! [Tasks](crate::eval::machine::tasks#tasks)), and each moment of it is
+//! counted once, to the calls of the task running then. A task set aside
+//! takes its calls off the running ones, and none of them counts the time
+//! until it runs again. An iteration split off into a task of its own takes
+//! the calls it is in with it: the time they ran before the split is
+//! counted to them, and not also to the call around them that split them
+//! off, which runs on in another task; and a call running in one task is
+//! not around a call of another, so a site's total adds each call that no
+//! call of it in the same task is running around. The machine's work in
+//! choosing the task to run next, setting one aside and splitting one off
+//! is no call's: it is time outside every call, as if the evaluation had
+//! stopped for it.
+//!
 //! Graph mode runs a unit again from its start after each pause (see
 //! [Graph mode](crate::eval::graph#graph-mode)), so a profile of a build
 //! counts every run of each unit, as the build spends its time.
@@ -88,6 +102,9 @@ struct Tallies {
     open: Vec<Open>,
     /// The time of the calls no call was running around.
     outermost: Duration,
+    /// When the machine began work of its own that no call's time counts,
+    /// if it is doing such work (see [`Profile::pause`]).
+    paused: Option<Instant>,
 }
 
 /// A site's tally (see [Profiling](#profiling)).
@@ -123,6 +140,10 @@ struct Open {
     /// Whether it is running past its arguments, which are its caller's
     /// code: only then is its time its own.
     running: bool,
+    /// The time of it that was counted to the call around it already, when
+    /// it was split off into another task: the call around it it ends in
+    /// is only given the rest.
+    passed: Duration,
 }
 
 impl Profile {
@@ -144,9 +165,50 @@ impl Profile {
     pub(crate) fn suspend(&self, from: usize) -> Suspended {
         let mut tallies = self.tallies.borrow_mut();
         let from = from.min(tallies.open.len());
-        Suspended {
-            open: tallies.open.split_off(from),
+        let mut open = tallies.open.split_off(from);
+        // Taken off while the machine works, as if when it began to.
+        let since = tallies.paused.map(|paused| paused.elapsed());
+        for call in &mut open {
+            if let Some(since) = since {
+                call.began = call.began.checked_add(since).unwrap_or(call.began);
+            }
+            if call.running
+                && let Some(tally) = tallies.sites.get_mut(&call.site)
+            {
+                tally.running = tally.running.saturating_sub(1);
+            }
         }
+        Suspended { open }
+    }
+
+    /// Takes the calls running from the `from`th on off the running calls,
+    /// as [`Profile::suspend`] does, for the task an iteration they are in
+    /// is split off into: the time they ran so far is theirs, and is
+    /// counted to the call around them as their time, not its own, now,
+    /// since they will end in another task (see [Profiling](#profiling),
+    /// "Tasks").
+    pub(crate) fn split_off(&self, from: usize) -> Suspended {
+        let mut tallies = self.tallies.borrow_mut();
+        let now = tallies.paused.unwrap_or_else(Instant::now);
+        let moved = match tallies.open.get_mut(from) {
+            // Its arguments are its caller's code, but for the calls they
+            // made.
+            Some(first) if !first.running => std::mem::take(&mut first.inner),
+            Some(first) => {
+                let elapsed = now.saturating_duration_since(first.began);
+                let moved = elapsed.saturating_sub(first.passed);
+                first.passed = elapsed;
+                moved
+            }
+            None => Duration::ZERO,
+        };
+        let around = from.checked_sub(1);
+        match around.and_then(|around| tallies.open.get_mut(around)) {
+            Some(around) => around.inner += moved,
+            None => tallies.outermost += moved,
+        }
+        drop(tallies);
+        self.suspend(from)
     }
 
     /// Puts the calls of `suspended` back as running, as if they had
@@ -154,9 +216,44 @@ impl Profile {
     /// none of theirs.
     pub(crate) fn resume(&self, suspended: Suspended, blocked: Duration) {
         let mut tallies = self.tallies.borrow_mut();
+        // The machine's work from here until it is done is none of theirs
+        // either, which [`Profile::unpause`] takes off every call running.
+        let blocked = match tallies.paused {
+            Some(paused) => blocked.saturating_sub(paused.elapsed()),
+            None => blocked,
+        };
         for mut open in suspended.open {
             open.began = open.began.checked_add(blocked).unwrap_or(open.began);
+            if open.running
+                && let Some(tally) = tallies.sites.get_mut(&open.site)
+            {
+                tally.running += 1;
+            }
             tallies.open.push(open);
+        }
+    }
+
+    /// Notes that the machine begins work of its own, choosing a task to
+    /// run, setting one aside or splitting one off, which no call's time
+    /// counts until [`Profile::unpause`]. Work begun inside such work is
+    /// part of it.
+    pub(crate) fn pause(&self) {
+        let mut tallies = self.tallies.borrow_mut();
+        if tallies.paused.is_none() {
+            tallies.paused = Some(Instant::now());
+        }
+    }
+
+    /// Notes that the machine's own work that [`Profile::pause`] began is
+    /// done: the calls running, as if they had begun that much later.
+    pub(crate) fn unpause(&self) {
+        let mut tallies = self.tallies.borrow_mut();
+        let Some(paused) = tallies.paused.take() else {
+            return;
+        };
+        let since = paused.elapsed();
+        for open in &mut tallies.open {
+            open.began = open.began.checked_add(since).unwrap_or(open.began);
         }
     }
 
@@ -181,6 +278,7 @@ impl Profile {
             began: Instant::now(),
             inner: Duration::ZERO,
             running,
+            passed: Duration::ZERO,
         });
     }
 
@@ -215,7 +313,7 @@ impl Profile {
                 tally.total += elapsed;
             }
         }
-        Self::to_outer(&mut tallies, elapsed);
+        Self::to_outer(&mut tallies, elapsed.saturating_sub(open.passed));
     }
 
     /// Begins the innermost call running, now that its arguments are
