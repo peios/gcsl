@@ -246,7 +246,7 @@ impl Machine<'_> {
                 match self.walker(|walker| walker.bool(guard)) {
                     Ok(true) => {}
                     Ok(false) => continue,
-                    Err(unwind) => return fail(unwind),
+                    Err(unwind) => return self.guard_failed(state, Box::new(unwind)),
                 }
             }
             if !self.running().ir.is_simple(state.body) {
@@ -272,8 +272,21 @@ impl Machine<'_> {
             Ok(Value::Bool(true)) => self.for_body_begin(state),
             Ok(Value::Bool(false)) => self.for_next(state),
             Ok(_) => self.mistyped(state.node, "a guard that is not a Bool"),
-            Err(unwind) => Next::Give(Err(unwind)),
+            Err(unwind) => self.guard_failed(state, unwind),
         }
+    }
+
+    /// Ends the `for` `state` with `unwind`, what its guard came to: at
+    /// once, or, if iterations were split off, as a body's failure ends it,
+    /// once they have delivered, so that an earlier iteration's failure
+    /// comes first and a cancellation stops at the loop (see
+    /// [Tasks](super::tasks#tasks)).
+    fn guard_failed(&mut self, mut state: Box<ForState>, unwind: Box<Unwind>) -> Next {
+        if state.join.is_none() {
+            return Next::Give(Err(unwind));
+        }
+        state.failure = Some((state.index.saturating_sub(1), unwind));
+        self.for_end(state)
     }
 
     /// Takes up the `for` `state` with `result`, what its body came to.
