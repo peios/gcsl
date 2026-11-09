@@ -963,3 +963,78 @@ fn a_target_whose_guard_fails_ends_the_memoised_call_an_iteration_runs() {
         Progress::Done(texts(&["S"]))
     );
 }
+
+#[test]
+fn an_iteration_split_off_while_an_inner_guard_waits_takes_the_inner_loop_s_iterations() {
+    // The inner loop splits its first iteration off at its read; then its
+    // second guard waits, which splits the outer iteration off, the inner
+    // loop with it. That child, not the outer loop's task, waits for the
+    // inner loop's iterations and is woken by the last, in whatever order
+    // the reads are given.
+    let program = format!(
+        "{KEEP}fn f() -> List<List<String>> {{\n\
+         \x20   = for outer in [\"/x\", \"/y\"] {{\n\
+         \x20       = for each in [\"/a\", \"/b\", \"/c\"] if keep(each) {{ = fs.read(\"{{outer}}{{each}}\") }}\n\
+         \x20   }}\n\
+         }}\n\
+         = f()"
+    );
+    let expected = Value::List(crate::value::List::from_vec(vec![
+        texts(&["X/A", "X/B", "X/C"]),
+        texts(&["Y/A", "Y/B", "Y/C"]),
+    ]));
+    let picks: [fn(&str) -> bool; 3] = [
+        |_| true,
+        |path| path.starts_with("/g"),
+        |path| !path.starts_with("/g"),
+    ];
+    for pick in picks {
+        let (mut workspace, file) = super::graph::lone_workspace(&program);
+        assert_eq!(run_picked(&mut workspace, file, pick).unwrap(), expected);
+    }
+}
+
+#[test]
+fn a_guard_is_later_in_program_order_than_the_iterations_before_it() {
+    // The first iteration is split off at its read; the second's guard
+    // then writes, an effect the host does not isolate. It waits for the
+    // first's write, which comes before it in program order.
+    let (mut workspace, file) = super::graph::lone_workspace(
+        "import fs\n\
+         fn keep(each: String) -> Bool {\n\
+         \x20   = if each == \"/b\" { let wrote = fs.write(\"/g\", \"x\")\n = true } else { true }\n\
+         }\n\
+         fn f() -> List<{}> {\n\
+         \x20   = for each in [\"/a\", \"/b\"] if keep(each) { let t = fs.read(each)\n = fs.write(\"/w{each}\", t) }\n\
+         }\n\
+         = f()",
+    );
+    let host = crate::eval::graph::GraphHost {
+        defers: &|_: &[crate::check::Attribute]| true,
+        effects: &ReadsIsolated,
+    };
+    let mut graph = Graph::new();
+    let mut seen = Vec::new();
+    loop {
+        match workspace.run_graph(file, &mut graph, host).unwrap() {
+            Progress::Paused(nodes) => {
+                for node in nodes {
+                    seen.push(graph.node(node).unwrap().args()[0].clone());
+                    assert!(graph.resolve(node, Ok(text("T"))));
+                }
+            }
+            Progress::Waiting(unit) => panic!("waits for unit {unit}"),
+            Progress::Done(_) => break,
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            text("/a"),
+            text("/w/a"),
+            text("/g"),
+            text("/b"),
+            text("/w/b")
+        ]
+    );
+}
