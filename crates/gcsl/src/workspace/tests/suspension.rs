@@ -963,3 +963,33 @@ fn a_target_whose_guard_fails_ends_the_memoised_call_an_iteration_runs() {
         Progress::Done(texts(&["S"]))
     );
 }
+
+#[test]
+fn an_iteration_split_off_while_an_inner_guard_waits_takes_the_inner_loop_s_iterations() {
+    // The inner loop splits its first iteration off at its read; then its
+    // second guard waits, which splits the outer iteration off, the inner
+    // loop with it. That child, not the outer loop's task, waits for the
+    // inner loop's iterations and is woken by the last, in whatever order
+    // the reads are given.
+    let program = format!(
+        "{KEEP}fn f() -> List<List<String>> {{\n\
+         \x20   = for outer in [\"/x\", \"/y\"] {{\n\
+         \x20       = for each in [\"/a\", \"/b\", \"/c\"] if keep(each) {{ = fs.read(\"{{outer}}{{each}}\") }}\n\
+         \x20   }}\n\
+         }}\n\
+         = f()"
+    );
+    let expected = Value::List(crate::value::List::from_vec(vec![
+        texts(&["X/A", "X/B", "X/C"]),
+        texts(&["Y/A", "Y/B", "Y/C"]),
+    ]));
+    let picks: [fn(&str) -> bool; 3] = [
+        |_| true,
+        |path| path.starts_with("/g"),
+        |path| !path.starts_with("/g"),
+    ];
+    for pick in picks {
+        let (mut workspace, file) = super::graph::lone_workspace(&program);
+        assert_eq!(run_picked(&mut workspace, file, pick).unwrap(), expected);
+    }
+}

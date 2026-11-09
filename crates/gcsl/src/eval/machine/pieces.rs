@@ -194,7 +194,7 @@ impl Frame {
     /// frame, if any were; a call's are its call's.
     pub(super) fn join(&self) -> Option<&Rc<RefCell<Join>>> {
         match self {
-            Self::ForBody(state) | Self::ForJoin(state) => state.join(),
+            Self::ForGuard(state) | Self::ForBody(state) | Self::ForJoin(state) => state.join(),
             Self::PiecesJoin(state) => Some(&state.join),
             frame => frame.pieces(None).and_then(|pieces| pieces.join.as_ref()),
         }
