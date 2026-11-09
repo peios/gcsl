@@ -41,8 +41,9 @@
 //! iteration or piece that each loop whose iterations may be split off,
 //! and each list, interpolation, call and block, on its frames is at,
 //! whether or not anything was split off from it, so that paths taken at
-//! different times compare as the program orders them; one waiting for
-//! its children is past every iteration or piece. An effect
+//! different times compare as the program orders them; a loop's guard is at
+//! its iteration, though it is never split off, and one waiting for its
+//! children is past every iteration or piece. An effect
 //! the host does not isolate ([`crate::eval::Effects::isolates`]) is made
 //! only when no live task's path is earlier, so that such effects reach the
 //! host in program order; and never once an iteration or piece split off
@@ -880,7 +881,7 @@ pub(super) fn path_of(meta: &Meta, frames: &[Frame], calls: &[CallState]) -> Vec
     let mut path = meta.base.clone();
     for (frame, call) in super::pieces::with_calls(frames, calls) {
         if let Some(at) = match frame {
-            Frame::ForBody(state) => ForState::split_at(state),
+            Frame::ForGuard(state) | Frame::ForBody(state) => ForState::split_at(state),
             Frame::ForJoin(_) | Frame::PiecesJoin(_) => Some(u32::MAX),
             frame => frame.piece_running(call),
         } {

@@ -993,3 +993,48 @@ fn an_iteration_split_off_while_an_inner_guard_waits_takes_the_inner_loop_s_iter
         assert_eq!(run_picked(&mut workspace, file, pick).unwrap(), expected);
     }
 }
+
+#[test]
+fn a_guard_is_later_in_program_order_than_the_iterations_before_it() {
+    // The first iteration is split off at its read; the second's guard
+    // then writes, an effect the host does not isolate. It waits for the
+    // first's write, which comes before it in program order.
+    let (mut workspace, file) = super::graph::lone_workspace(
+        "import fs\n\
+         fn keep(each: String) -> Bool {\n\
+         \x20   = if each == \"/b\" { let wrote = fs.write(\"/g\", \"x\")\n = true } else { true }\n\
+         }\n\
+         fn f() -> List<{}> {\n\
+         \x20   = for each in [\"/a\", \"/b\"] if keep(each) { let t = fs.read(each)\n = fs.write(\"/w{each}\", t) }\n\
+         }\n\
+         = f()",
+    );
+    let host = crate::eval::graph::GraphHost {
+        defers: &|_: &[crate::check::Attribute]| true,
+        effects: &ReadsIsolated,
+    };
+    let mut graph = Graph::new();
+    let mut seen = Vec::new();
+    loop {
+        match workspace.run_graph(file, &mut graph, host).unwrap() {
+            Progress::Paused(nodes) => {
+                for node in nodes {
+                    seen.push(graph.node(node).unwrap().args()[0].clone());
+                    assert!(graph.resolve(node, Ok(text("T"))));
+                }
+            }
+            Progress::Waiting(unit) => panic!("waits for unit {unit}"),
+            Progress::Done(_) => break,
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            text("/a"),
+            text("/w/a"),
+            text("/g"),
+            text("/b"),
+            text("/w/b")
+        ]
+    );
+}
