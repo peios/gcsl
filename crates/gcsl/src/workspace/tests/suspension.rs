@@ -815,3 +815,151 @@ fn f() -> List<String> {
     // Each read once: `/z`, `inner`'s two, `ws`'s three and `given`'s.
     assert_eq!(graph.len(), 7);
 }
+
+/// A guard that reads only for `/b`, and so waits only there; a guard is
+/// never split off, so the task that runs it waits.
+const KEEP: &str = "import fs\n\
+                    fn keep(each: String) -> Bool {\n\
+                    \x20   = if each == \"/b\" { fs.read(\"/g{each}\") != \"\" } else { true }\n\
+                    }\n";
+
+/// Runs `file` of `workspace` in graph mode, giving each read the text of
+/// its path, in upper case, or failing it if the path ends in `!`: only
+/// the reads `pick` chooses of each stop's, the rest at a later one. What
+/// it came to.
+fn run_picked(
+    workspace: &mut Workspace,
+    file: u32,
+    pick: impl Fn(&str) -> bool,
+) -> Result<Value, Vec<Diagnostic>> {
+    let mut graph = Graph::new();
+    loop {
+        let nodes = match workspace.run_graph(file, &mut graph, isolating())? {
+            Progress::Paused(nodes) => nodes,
+            Progress::Waiting(unit) => panic!("waits for unit {unit}"),
+            Progress::Done(value) => return Ok(value),
+        };
+        let paths: Vec<(NodeId, String)> = nodes
+            .iter()
+            .map(|&node| match graph.node(node).unwrap().args()[0].clone() {
+                Value::Str(path) => (node, path.to_string()),
+                _ => panic!("a read of no path"),
+            })
+            .collect();
+        let picked = paths.iter().any(|(_, path)| pick(path));
+        for (node, path) in paths {
+            if picked && !pick(&path) {
+                continue;
+            }
+            let given = if path.ends_with('!') {
+                Err(Diagnostic::error(
+                    format!("unreadable {path}"),
+                    crate::source::Span::new(0, 0),
+                ))
+            } else {
+                Ok(text(&path.trim_start_matches('/').to_uppercase()))
+            };
+            assert!(graph.resolve(node, given));
+        }
+    }
+}
+
+#[test]
+fn a_loop_whose_guard_waits_reports_an_earlier_iteration_s_failure() {
+    // The first iteration is split off at its read; the second's guard
+    // waits. The first's read fails first, which cancels what the loop's
+    // task does after it: its guard. The cancellation stops at the loop,
+    // which reports the first's failure, as a run in order would.
+    let program = format!(
+        "{KEEP}fn f() -> List<String> {{ = for each in [\"/a!\", \"/b\", \"/c\"] if keep(each) {{ = fs.read(each) }} }}\n\
+         = f()"
+    );
+    for failing_first in [true, false] {
+        let (mut workspace, file) = super::graph::lone_workspace(&program);
+        let errors = run_picked(&mut workspace, file, |path| {
+            path.ends_with('!') == failing_first
+        })
+        .unwrap_err();
+        assert_eq!(errors[0].message, "unreadable /a!", "{errors:?}");
+    }
+}
+
+#[test]
+fn a_guard_s_failure_comes_after_the_iterations_before_it() {
+    // The second iteration's guard fails while the first's read, split
+    // off, still waits: the first's failure is the loop's, which a run in
+    // order meets first. With no earlier failure, the guard's is.
+    for (first, reported) in [("/a!", "unreadable /a!"), ("/a", "unreadable /g/b!")] {
+        let program = format!(
+            "import fs\n\
+             fn keep(each: String) -> Bool {{\n\
+             \x20   = if each == \"/b\" {{ fs.read(\"/g/b!\") != \"\" }} else {{ true }}\n\
+             }}\n\
+             fn f() -> List<String> {{ = for each in [\"{first}\", \"/b\"] if keep(each) {{ = fs.read(each) }} }}\n\
+             = f()"
+        );
+        let (mut workspace, file) = super::graph::lone_workspace(&program);
+        let errors = run_picked(&mut workspace, file, |path| path == "/g/b!").unwrap_err();
+        assert_eq!(errors[0].message, reported, "{errors:?}");
+    }
+}
+
+#[test]
+fn a_target_whose_guard_fails_ends_the_memoised_call_an_iteration_runs() {
+    // The first target's loop splits its first iteration off inside
+    // `shared`; then its second guard fails. The target fails only once
+    // that iteration has ended `shared`, so the second target finds its
+    // value, rather than waiting without end for a unit that has ended.
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "app.gcsl",
+            "import fs\n\
+             #[def_type]\n\
+             def build(name: String, f: fn() -> List<String>) -> List<String> { f() }\n\
+             fn shared() ->> String { = fs.read(\"/s\") }\n\
+             fn keep(each: String) -> Bool { = if each == \"/b\" { fs.read(\"/g!\") != \"\" } else { true } }\n\
+             def build first() { = for each in [\"/a\", \"/b\"] if keep(each) { = shared() } }\n\
+             def build second() { = [shared()] }",
+        ),
+    ];
+    let mut workspace = rooted(&files).unwrap();
+    let first = workspace
+        .prepare_call(("build", "first"), &[], &[])
+        .unwrap();
+    let second = workspace
+        .prepare_call(("build", "second"), &[], &[])
+        .unwrap();
+    let mut graph = Graph::new();
+    let Progress::Paused(nodes) = workspace
+        .run_prepared(&first, &mut graph, isolating())
+        .unwrap()
+    else {
+        panic!("the first target did not stop for its reads");
+    };
+    let [shared, guard] = nodes[..] else {
+        panic!("the first target stopped for {nodes:?}");
+    };
+    let failure = Diagnostic::error("unreadable", crate::source::Span::new(0, 0));
+    assert!(graph.resolve(guard, Err(failure)));
+    // The guard's failure waits for the first iteration.
+    assert_eq!(
+        workspace
+            .run_prepared(&first, &mut graph, isolating())
+            .unwrap(),
+        Progress::Paused(vec![shared])
+    );
+    assert!(graph.resolve(shared, Ok(text("S"))));
+    let Err(crate::workspace::InvokeError::Diagnostics(errors)) =
+        workspace.run_prepared(&first, &mut graph, isolating())
+    else {
+        panic!("the first target did not fail");
+    };
+    assert_eq!(errors[0].message, "unreadable", "{errors:?}");
+    assert_eq!(
+        workspace
+            .run_prepared(&second, &mut graph, isolating())
+            .unwrap(),
+        Progress::Done(texts(&["S"]))
+    );
+}
