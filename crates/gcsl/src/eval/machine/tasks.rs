@@ -60,7 +60,9 @@
 //! a circle that a run in order never meets: a later task begins a call
 //! that an earlier one needs, and then, inside it, waits for its turn
 //! behind the earlier task. So a task never waits for a later one's run:
-//! it *wounds* it ([`Machine::wound`]). The later task is cancelled as far
+//! it *wounds* it ([`Machine::wound`]). A task is later, for this, if it
+//! began the call or `lazy` later, however far into it it has gone since.
+//! The later task is cancelled as far
 //! as the call or `lazy` it was running ([`Meta::wound`]), whose frame
 //! catches the cancellation: the entry goes, or the `lazy` is left unrun,
 //! every task that waits for a sibling's call or `lazy` is woken, and the
@@ -625,24 +627,20 @@ impl Machine<'_> {
     /// Wounds the task that runs `target`, if it is later in program order
     /// than the task running, which needs it: it abandons its run, so that
     /// the task running can run it, as a run in order would (see
-    /// [Wound-wait](#wound-wait)).
+    /// [Wound-wait](#wound-wait)). Where a task is in program order is where
+    /// it began the call or `lazy`, where it will be once it has abandoned
+    /// it, not how far into it it has gone: one that began it earlier
+    /// would begin it again first, and be wounded again, without end.
     pub(super) fn wound(&mut self, target: Wound) {
         let mine = self.path();
         for task in &mut self.tasks {
-            let runs = match target {
-                Wound::Entry(entry) => task
-                    .calls
-                    .iter()
-                    .any(|call| matches!(call.memo, Some((Some(mark), _)) if mark.entry == entry)),
-                Wound::Future(future) => task
-                    .frames
-                    .iter()
-                    .any(|frame| matches!(frame, Frame::Future(run) if run.runs(future))),
+            let site = match target {
+                Wound::Entry(entry) => call_site(task, entry),
+                Wound::Future(future) => await_site(task, future),
             };
-            if runs
-                && task.meta.wound.is_none()
+            if task.meta.wound.is_none()
                 && !matches!(task.status, Status::Cancel(_))
-                && path_of(&task.meta, &task.frames, &task.calls) > mine
+                && site.is_some_and(|site| site > mine)
             {
                 task.meta.wound = Some(target);
                 task.status = Status::Cancel(looks_up(&task.status));
@@ -889,6 +887,35 @@ fn split_kept<T: Clone>(values: &mut Vec<T>, kept: usize) -> Vec<T> {
     let whole = values.clone();
     values.truncate(kept);
     whole
+}
+
+/// The path of `task` where it began the memoised call whose entry is
+/// `entry`, if it runs it: of its frames below the call's body, and the
+/// calls they take (see [Tasks](#tasks)).
+fn call_site(task: &Task, entry: u64) -> Option<Vec<u32>> {
+    let call = task
+        .calls
+        .iter()
+        .position(|call| matches!(call.memo, Some((Some(mark), _)) if mark.entry == entry))?;
+    let mut taken = 0;
+    let body = task.frames.iter().position(|frame| {
+        taken += usize::from(frame.takes_call());
+        frame.takes_call() && taken == call + 1
+    })?;
+    let (frames, calls) = (task.frames.get(..body)?, task.calls.get(..call)?);
+    Some(path_of(&task.meta, frames, calls))
+}
+
+/// The path of `task` where it began running `future`'s body, if it runs
+/// it: of its frames below the body, and the calls they take.
+fn await_site(task: &Task, future: *const crate::value::Future) -> Option<Vec<u32>> {
+    let body = task
+        .frames
+        .iter()
+        .position(|frame| matches!(frame, Frame::Future(run) if run.runs(future)))?;
+    let frames = task.frames.get(..body)?;
+    let calls = frames.iter().filter(|frame| frame.takes_call()).count();
+    Some(path_of(&task.meta, frames, task.calls.get(..calls)?))
 }
 
 /// Whether a task waiting as `status` says has a call on top of its calls,

@@ -816,6 +816,66 @@ fn f() -> List<String> {
     assert_eq!(graph.len(), 7);
 }
 
+#[test]
+fn a_task_deep_inside_a_call_is_later_where_it_began_the_call() {
+    // The second element begins `shared` or the `lazy`, and inside it
+    // splits pieces off, two deep, before its write waits its turn. The
+    // first then needs it. The task running it is judged where it began
+    // it, after the first, not where it has got to inside it: it abandons
+    // its run, and the first runs it, its write made once.
+    let inside = "let r = [\"{fs.read(\"/i\")}{fs.read(\"/j\")}\", fs.read(\"/k\")].join(\"\")\n\
+                  let w = fs.write(\"/w\", \"x\")\n\
+                  = r";
+    let programs = [
+        format!(
+            "fn shared() ->> String {{\n{inside}\n}}\n\
+             fn g(t: String) -> String {{ = \"{{t}}{{shared()}}\" }}\n\
+             fn f() -> List<String> {{ = [g(fs.read(\"/a\")), shared()] }}"
+        ),
+        format!(
+            "fn g(t: String, s: Future<String>) -> String {{ = \"{{t}}{{await s}}\" }}\n\
+             fn f() -> List<String> {{\n\
+             \x20   let s = lazy {{\n{inside}\n}}\n\
+             \x20   = [g(fs.read(\"/a\"), s), await s]\n\
+             }}"
+        ),
+    ];
+    let host = crate::eval::graph::GraphHost {
+        defers: &|_: &[crate::check::Attribute]| true,
+        effects: &ReadsIsolated,
+    };
+    for program in programs {
+        let (mut workspace, file) =
+            super::graph::lone_workspace(&format!("import fs\n{program}\n= f()"));
+        let mut graph = Graph::new();
+        let value = loop {
+            match workspace.run_graph(file, &mut graph, host).unwrap() {
+                Progress::Paused(nodes) => {
+                    for node in nodes {
+                        let given = match graph.node(node).unwrap().args()[0].clone() {
+                            Value::Str(path) if path.len() == 2 => {
+                                text(&path.trim_start_matches('/').to_uppercase())
+                            }
+                            _ => Value::Empty,
+                        };
+                        assert!(graph.resolve(node, Ok(given)));
+                    }
+                }
+                Progress::Waiting(unit) => panic!("waits for unit {unit}"),
+                Progress::Done(value) => break value,
+            }
+        };
+        assert_eq!(value, texts(&["AIJK", "IJK"]), "{program}");
+        // The write, which the host does not isolate, is made once. The
+        // reads the abandoned run met are met again by the first's.
+        let writes = (0..graph.len())
+            .filter_map(|number| graph.node(NodeId::of(u32::try_from(number).unwrap())))
+            .filter(|node| node.args()[0] == text("/w"))
+            .count();
+        assert_eq!(writes, 1, "{program}");
+    }
+}
+
 /// A guard that reads only for `/b`, and so waits only there; a guard is
 /// never split off, so the task that runs it waits.
 const KEEP: &str = "import fs\n\
