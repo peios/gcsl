@@ -358,9 +358,11 @@ impl Workspace {
         self.memo.ended().wrapping_add(self.memo.demanded())
     }
 
-    /// Gives up the unit `unit`, a file's or a prepared call's or a step's,
-    /// which a host will not run again though it has not ended: a target
-    /// the host fails for a reason of its own while its unit waits, say.
+    /// Gives up the unit `unit`, a prepared call's or a step's, which a host
+    /// will not run again though it has not ended: a target the host fails
+    /// for a reason of its own while its unit waits, say. Not a file's: a
+    /// file runs at most once, and one given up would run again from its
+    /// start, its effects with it.
     /// Its evaluation, suspended where it stopped, goes, and what it was
     /// running is released: the entries of its memoised calls go, as a
     /// failed call's do, and its `lazy`s are left unrun. A unit waiting for

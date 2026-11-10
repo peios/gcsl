@@ -146,7 +146,8 @@ a round ran nothing else and `Workspace::memo_progress` didn't change.
 
 If you stop running a unit before it finishes, for example because you
 fail its target for a reason of your own while it waits, call
-`Workspace::give_up` with its unit. Otherwise the memoised calls and
+`Workspace::give_up` with its unit. This is for a target's or a step's
+unit, not a file's. Otherwise the memoised calls and
 `lazy` values it's in the middle of stay its own, and any unit that waits
 for them waits for ever. Given up, they're released, and a waiting unit
 computes them itself when it runs again, making the effects inside them
