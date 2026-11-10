@@ -1145,3 +1145,85 @@ fn a_guard_is_later_in_program_order_than_the_iterations_before_it() {
         ]
     );
 }
+
+/// How long a unit takes to run to its end when `waiters` of its tasks
+/// wait for one memoised call, whose read is given last, while `others`
+/// reads are given one per run (PEI-1660): every read is isolated. Run with
+/// `cargo test --release -- --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark, not a test"]
+fn benchmark_tasks_waiting_while_results_come_one_per_run() {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+    let mut report = String::new();
+    for (waiters, others) in [
+        (0, 400),
+        (50, 50),
+        (400, 50),
+        (200, 200),
+        (400, 400),
+        (400, 800),
+    ] {
+        let list = |prefix: &str, count: usize| {
+            let paths: Vec<String> = (0..count).map(|at| format!("\"/{prefix}{at}\"")).collect();
+            format!("[{}]", paths.join(", "))
+        };
+        let (mut workspace, file) = super::graph::lone_workspace(&format!(
+            "import fs\n\
+             fn shared() ->> String {{ = fs.read(\"/s\") }}\n\
+             fn waiter(path: String) -> String {{\n\
+             \x20   let read = fs.read(path)\n\
+             \x20   = \"{{read}}{{shared()}}\"\n\
+             }}\n\
+             fn f(ws: List<String>, es: List<String>) -> List<List<String>> {{\n\
+             \x20   = [for path in ws {{ = waiter(path) }}, for path in es {{ = fs.read(path) }}]\n\
+             }}\n\
+             = f({}, {})",
+            list("w", waiters),
+            list("e", others)
+        ));
+        let mut graph = Graph::new();
+        let give = |graph: &mut Graph, node: NodeId| {
+            assert!(graph.resolve(node, Ok(text("x"))));
+        };
+        let path = |graph: &Graph, node: NodeId| match graph.node(node).unwrap().args()[0].clone() {
+            Value::Str(path) => path.to_string(),
+            _ => panic!("a read of no path"),
+        };
+        // The waiters' own reads, given at once.
+        let Progress::Paused(nodes) = workspace.run_graph(file, &mut graph, isolating()).unwrap()
+        else {
+            panic!("the run did not stop for its reads");
+        };
+        for node in nodes {
+            if path(&graph, node).starts_with("/w") {
+                give(&mut graph, node);
+            }
+        }
+        let start = std::time::Instant::now();
+        let mut runs = 0;
+        loop {
+            runs += 1;
+            match workspace.run_graph(file, &mut graph, isolating()).unwrap() {
+                Progress::Paused(nodes) => {
+                    // One result a run, the shared call's last.
+                    let next = nodes
+                        .iter()
+                        .copied()
+                        .find(|&node| path(&graph, node) != "/s")
+                        .or_else(|| nodes.first().copied());
+                    give(&mut graph, next.unwrap());
+                }
+                Progress::Waiting(unit) => panic!("waits for unit {unit}"),
+                Progress::Done(_) => break,
+            }
+        }
+        writeln!(
+            report,
+            "{waiters} waiters, {others} others: {runs} runs in {:?}",
+            start.elapsed()
+        )
+        .unwrap();
+    }
+    std::io::stdout().write_all(report.as_bytes()).unwrap();
+}

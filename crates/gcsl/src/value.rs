@@ -687,6 +687,14 @@ impl Future {
         )
     }
 
+    /// Whether its body is running.
+    pub(crate) fn is_running(&self) -> bool {
+        matches!(
+            self.state.try_borrow().as_deref(),
+            Ok(FutureState::Running(..))
+        )
+    }
+
     /// Whether its body is running in the run of the unit `unit`.
     pub(crate) fn is_running_in(&self, unit: u32) -> bool {
         matches!(

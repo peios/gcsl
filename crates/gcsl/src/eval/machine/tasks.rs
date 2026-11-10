@@ -51,9 +51,13 @@
 //! stopped there.
 //!
 //! A task that needs a memoised call or a `lazy` another task of the unit
-//! is running waits for it; one that waits for its turn or for a sibling
-//! is woken whenever a task ends, and one that waits for a sibling also
-//! whenever a demanded run ends (see [Across units](#across-units)).
+//! is running waits for it, and is woken only when that run ends or is
+//! abandoned ([`Machine::run_ended`]): the machine keeps the runs tasks
+//! wait for, so that a run nothing waits for ends without looking at the
+//! tasks, and a unit's run wakes no task whose run goes on. One that waits
+//! for its turn is woken whenever a task ends, and whenever the unit runs
+//! again, since a run it is in may have become demanded meanwhile (see
+//! [Across units](#across-units)).
 //!
 //! # Wound-wait
 //!
@@ -66,8 +70,8 @@
 //! The later task is cancelled as far
 //! as the call or `lazy` it was running ([`Meta::wound`]), whose frame
 //! catches the cancellation: the entry goes, or the `lazy` is left unrun,
-//! every task that waits for a sibling's call or `lazy` is woken, and the
-//! later one waits to look it up or await it again. Of the tasks woken to
+//! every task that waits for it is woken, and the later one looks it up or
+//! awaits it again once they have had their turn. Of the tasks woken to
 //! look again, the earliest in program order runs first, so that the
 //! earliest task that needs the call begins it again: were a later one to,
 //! the earlier would only wound it again, and so on without end. That task
@@ -190,7 +194,7 @@ pub(in crate::eval) enum Run {
 /// A run of a memoised call, by its entry's identity, or of a `lazy`'s
 /// body, that a task holds (see [Across units](#across-units)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Held {
+pub(in crate::eval) enum Held {
     /// A memoised call, by its entry's identity.
     Entry(u64),
     /// A `lazy`'s body.
@@ -568,23 +572,52 @@ impl Machine<'_> {
         waits
     }
 
-    /// Wakes every task that waits for its turn or for a sibling: a task
-    /// has ended, or the unit runs again.
-    pub(super) fn wake_waiting(&mut self, blocked_too: bool) {
+    /// Wakes every task that waits for its turn: a task has ended.
+    fn wake_turns_after_end(&mut self) {
         for task in &mut self.tasks {
-            let woken = match std::mem::replace(&mut task.status, Status::Joining) {
-                Status::Waiting(resume) => Status::Wake(resume),
-                Status::Sibling(resume) => Status::Again(resume),
-                Status::Blocked(_, resume) if blocked_too => Status::Wake(resume),
-                status => status,
-            };
-            task.status = woken;
+            if let Status::Waiting(_) = task.status {
+                let Status::Waiting(resume) = std::mem::replace(&mut task.status, Status::Joining)
+                else {
+                    continue;
+                };
+                task.status = Status::Wake(resume);
+            }
         }
     }
 
-    /// Wakes every task, as the unit runs again, but those still waiting for
-    /// a node whose result the host has yet to give, which would only stop
-    /// again.
+    /// Notes that a task is about to wait for the run `run` of another
+    /// task, so that its end wakes it ([`Machine::run_ended`]).
+    pub(super) fn wait_for_run(&mut self, run: Held) {
+        if !self.waited.contains(&run) {
+            self.waited.push(run);
+        }
+    }
+
+    /// Wakes every task that waits for the run `run`, to look it up or
+    /// await it again: it has ended, or been abandoned. Only a run tasks
+    /// wait for costs a look at the tasks.
+    pub(super) fn run_ended(&mut self, run: Held) {
+        let Some(at) = self.waited.iter().position(|waited| *waited == run) else {
+            return;
+        };
+        self.waited.swap_remove(at);
+        for task in &mut self.tasks {
+            let waits = matches!(&task.status, Status::Sibling(resume)
+                if resume.waits_for().is_some_and(|waited| held(&waited) == run));
+            if waits {
+                let Status::Sibling(resume) = std::mem::replace(&mut task.status, Status::Joining)
+                else {
+                    continue;
+                };
+                task.status = Status::Again(resume);
+            }
+        }
+    }
+
+    /// Wakes every task that waits for a node, a unit or its turn, as the
+    /// unit runs again, but those still waiting for a node whose result the
+    /// host has yet to give, which would only stop again. One that waits
+    /// for another task's run waits on: that run ending wakes it.
     fn wake_given(&mut self) {
         let graph = self.shared.graph;
         let waiting = |id: NodeId| graph.is_some_and(|graph| graph.is_waiting(id));
@@ -594,7 +627,6 @@ impl Machine<'_> {
                     Status::Blocked(Wait::Node(id), resume)
                 }
                 Status::Waiting(resume) | Status::Blocked(_, resume) => Status::Wake(resume),
-                Status::Sibling(resume) => Status::Again(resume),
                 status => status,
             };
             task.status = woken;
@@ -613,7 +645,7 @@ impl Machine<'_> {
     /// The status of the task that runs once the task running has ended,
     /// made the task running; or `None` if every other task waits.
     fn next_after_end(&mut self) -> Option<Status> {
-        self.wake_waiting(false);
+        self.wake_turns_after_end();
         let Some(ready) = self.next_ready() else {
             // Every other task waits: the one that ended is not set aside,
             // the root's frames being run next by whoever wakes it.
@@ -754,21 +786,6 @@ impl Machine<'_> {
                 1
             };
         count > limit
-    }
-
-    /// Wakes every task that waits for a sibling's memoised call or
-    /// `lazy`, to look again: a run of one was abandoned, which the
-    /// earliest of them runs (see [Wound-wait](#wound-wait)). The task that
-    /// wounded the one that abandoned it may have been split since, its
-    /// wait taken by a child, so it is not woken by its number.
-    pub(super) fn wake_siblings(&mut self) {
-        for task in &mut self.tasks {
-            let status = std::mem::replace(&mut task.status, Status::Joining);
-            task.status = match status {
-                Status::Sibling(resume) => Status::Again(resume),
-                status => status,
-            };
-        }
     }
 
     /// The place among the tasks set aside of the one to run next: the
@@ -922,6 +939,24 @@ impl Machine<'_> {
     pub(super) fn unstick(&mut self) -> Option<Next> {
         if !self.waits().is_empty() {
             return None;
+        }
+        // A task waiting for a run that is no longer running, which its end
+        // should have woken, looks again.
+        let mut woken = false;
+        for task in &mut self.tasks {
+            let ended = matches!(&task.status, Status::Sibling(resume)
+                if resume.waits_for().is_some_and(|run| !is_running(self.memo, &run)));
+            if ended
+                && let Status::Sibling(resume) =
+                    std::mem::replace(&mut task.status, Status::Joining)
+            {
+                task.status = Status::Again(resume);
+                woken = true;
+            }
+        }
+        if woken {
+            let status = self.status.take()?;
+            return self.park(status);
         }
         let target = |run: &Run| match run {
             Run::Entry(at) => Wound::Entry(at.2),
@@ -1205,6 +1240,22 @@ pub(super) fn release_futures(
     }
 }
 
+/// Whether `run` is running, as `memo` and the future say.
+fn is_running(memo: &super::super::memo::MemoTables, run: &Run) -> bool {
+    match run {
+        Run::Entry(at) => memo.is_running(*at),
+        Run::Future(future) => future.is_running(),
+    }
+}
+
+/// The run `run` is, by its identity.
+fn held(run: &Run) -> Held {
+    match run {
+        Run::Entry(at) => Held::Entry(at.2),
+        Run::Future(future) => Held::Future(Rc::as_ptr(future)),
+    }
+}
+
 /// Whether `task` holds every run of `held`.
 fn holds(task: &Task, held: &[Held]) -> bool {
     held.iter().all(|&held| match held {
@@ -1251,8 +1302,8 @@ pub(super) fn path_of(meta: &Meta, frames: &[Frame], calls: &[CallState]) -> Vec
 
 impl Machine<'_> {
     /// What the unit's evaluation, taken up, does first: every task that
-    /// waited for a node, a unit, its turn or a sibling is woken, to look
-    /// again, and the root, running, takes up as its status says.
+    /// waited for a node, a unit or its turn is woken, to look again, and
+    /// the root, running, takes up as its status says.
     pub(super) fn take_up_tasks(&mut self) -> Next {
         // Other units may have marked runs demanded while it was stopped.
         self.propagate_demand();

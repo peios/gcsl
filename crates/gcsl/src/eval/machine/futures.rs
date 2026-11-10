@@ -14,7 +14,7 @@ use crate::value::{Begin, Future, FutureState, Value};
 use super::super::graph::{NodeId, Wait};
 use super::super::kinds::of_kind;
 use super::super::{depends_on_itself, nested_too_deeply};
-use super::tasks::{Abandoned, Run, Status, Wound};
+use super::tasks::{Abandoned, Held, Run, Status, Wound};
 use super::{Activation, Frame, Machine, Next, Outcome, Resume, fail, give};
 
 /// An await running in the machine: of an `Await` node, or of a step of an
@@ -198,6 +198,7 @@ impl Machine<'_> {
                 if !future.is_demanded() {
                     self.wound(Wound::Future(Rc::as_ptr(&future)));
                 }
+                self.wait_for_run(Held::Future(Rc::as_ptr(&future)));
                 let waiting = Status::Sibling(resumed(state, future, then));
                 return Err(Next::Park(Box::new(waiting)));
             }
@@ -267,11 +268,7 @@ impl Machine<'_> {
         self.shared.futures.borrow_mut().pop();
         self.shared.context.replace(outer);
         self.stack.truncate(base);
-        // Tasks that wait for a demanded run look again as it ends (see
-        // [Across units](super::tasks#across-units)).
-        if future.is_demanded() {
-            self.wake_siblings();
-        }
+        self.run_ended(Held::Future(Rc::as_ptr(&future)));
         self.memo.future_ended();
         match result.or_else(|unwind| unwind.returned(state.span)) {
             Ok(value) => {
@@ -302,8 +299,10 @@ impl Machine<'_> {
                     let span = state.site(&self.running().ir).span;
                     return fail(super::tasks::handed_back(span));
                 }
-                self.wake_siblings();
-                Next::Park(Box::new(Status::Sibling(resumed(state, future, then))))
+                // The earliest task that waits for it runs it, before this
+                // one awaits it again (see
+                // [Wound-wait](super::tasks#wound-wait)).
+                Next::Park(Box::new(Status::Again(resumed(state, future, then))))
             }
             Err(error) => {
                 // Left unrun, so that a later await runs it again.
