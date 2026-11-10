@@ -372,7 +372,47 @@ fn operator(walker: &Evaluator<'_>, node: &crate::ir::IrNode, values: &[Value]) 
         }
         (IrKind::FloatNeg(_), [Value::Float(operand)]) => Ok(Value::Float(-operand)),
         (IrKind::IntToFloat(_), [Value::Int(operand)]) => Ok(Value::Float(int_to_float(*operand))),
-        _ => mistyped(node, "operands of another kind than their node's"),
+        _ => Err(operands_mistyped(node, values).into()),
+    }
+}
+
+/// The internal error of the node `node` applied to `values`, operands of
+/// another kind than it takes: which node, and what it was given, so that
+/// the report of a fault that is hard to reproduce says where to look.
+#[cold]
+fn operands_mistyped(node: &crate::ir::IrNode, values: &[Value]) -> crate::diagnostic::Diagnostic {
+    let given: Vec<&str> = values.iter().map(variant_name).collect();
+    internal("operands of another kind than their node's", node.span).with_note(format!(
+        "a `{}` node was given {}",
+        node.kind.name(),
+        if given.is_empty() {
+            "no operands".to_owned()
+        } else {
+            given.join(", ")
+        }
+    ))
+}
+
+/// What `value` is, by its variant, for an internal error.
+const fn variant_name(value: &Value) -> &'static str {
+    match value {
+        Value::Int(_) => "an Int",
+        Value::Float(_) => "a Float",
+        Value::Bool(_) => "a Bool",
+        Value::Str(_) => "a String",
+        Value::Quantity(..) => "a Duration or Size",
+        Value::Empty => "`{}`",
+        Value::Record(_) => "a record",
+        Value::List(_) => "a list",
+        Value::Fn(_) => "a function",
+        Value::Future(_) => "a future",
+        Value::Builtin(_) => "a built-in",
+        Value::Tag(_) => "an enum's variant",
+        Value::Variant(_) => "a value of an enum",
+        Value::Secret(_) => "a secret",
+        Value::File(_) => "a File",
+        Value::Dir(_) => "a Dir",
+        Value::Sandbox(_) => "a Sandbox",
     }
 }
 
@@ -498,4 +538,34 @@ fn interpolated(
         }
     }
     Ok(Value::Str(Rc::from(text)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::ir::{IrKind, IrNode};
+    use crate::source::Span;
+    use crate::value::Value;
+
+    #[test]
+    fn a_node_given_operands_of_another_kind_says_what_it_was_given() {
+        let node = IrNode {
+            kind: IrKind::Caller,
+            span: Span::new(3, 12),
+        };
+        let error = super::operands_mistyped(&node, &[Value::Str(Rc::from("/a")), Value::Empty]);
+        assert_eq!(
+            error.message,
+            "internal error: operands of another kind than their node's"
+        );
+        assert_eq!(error.span, Span::new(3, 12));
+        assert!(
+            error
+                .notes
+                .contains(&"a `caller` node was given a String, `{}`".to_owned()),
+            "{:?}",
+            error.notes
+        );
+    }
 }
