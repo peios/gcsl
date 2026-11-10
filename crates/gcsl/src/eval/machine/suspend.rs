@@ -92,6 +92,23 @@ pub(crate) struct Suspended {
     since: Instant,
 }
 
+/// Releases what the unit `unit`, which ended or was given up without
+/// ending them, was running: its memoised calls' entries go, as a failed
+/// call's do, and its `lazy`s are left unrun, so that a unit waiting for
+/// one runs it itself (see [Across
+/// units](super::tasks#across-units)). `parked` holds its frames.
+fn release(parked: &mut Parked, memo: &mut MemoTables, unit: u32) {
+    super::tasks::release_futures(parked, memo, unit);
+    memo.release(unit);
+}
+
+/// Gives up the unit `unit`, whose evaluation is `suspended`: what it was
+/// running is released (see [`release`]).
+pub(crate) fn give_up(suspended: Suspended, memo: &mut MemoTables, unit: u32) {
+    let mut parked = suspended.parked;
+    release(&mut parked, memo, unit);
+}
+
 impl Suspended {
     /// What its tasks are: the machine's frames, activations and calls,
     /// the root's place and status and the other tasks, and the root's
@@ -204,6 +221,15 @@ pub(in crate::eval) fn run_machine(
         (Ran::Done(Err(Unwind::Error(error))), Some(_)) if error.mark == Mark::PENDING => Err(
             super::super::internal("a unit stopped where the machine could not", error.span).into(),
         ),
+        // A failure that left frames, an internal error, did not unwind
+        // them: what the unit was running, which another unit may wait
+        // for, is released.
+        (Ran::Done(flow), Some(run)) if flow.is_err() && !parked.is_empty() => {
+            let mut parked = parked;
+            release(&mut parked, memo, run.unit());
+            memo.running.truncate(start.memo.min(memo.running.len()));
+            flow
+        }
         (Ran::Done(flow), _) => flow,
         (Ran::Blocked(waits), Some(run)) => {
             let suspended = set_aside(parked, start, (stack, memo), shared);

@@ -56,6 +56,7 @@ mod pieces;
 mod suspend;
 mod tasks;
 
+pub(crate) use suspend::give_up;
 pub(crate) use tasks::{Need, Needed, circle};
 
 use std::rc::Rc;
@@ -329,6 +330,14 @@ pub(super) struct Parked {
     tasks: (Vec<Task>, Meta, Option<Status>),
     /// The number of the next task split off.
     next_task: u32,
+}
+
+impl Parked {
+    /// Whether it keeps nothing: no frame of the root's, and no other
+    /// task.
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty() && self.tasks.0.is_empty()
+    }
 }
 
 /// Gives the frame on top `flow`, a walker's result.

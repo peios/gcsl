@@ -668,6 +668,11 @@ impl<'g> GraphRun<'g> {
             .is_some_and(|node| node.state == NodeState::Waiting)
     }
 
+    /// The unit whose run it is.
+    pub(crate) const fn unit(&self) -> u32 {
+        self.unit
+    }
+
     /// Whether the node `id` is an effect of a built-in the host does not
     /// isolate, waiting for its result: one at a time per unit (see
     /// [Across units](crate::eval::machine::tasks#across-units)).

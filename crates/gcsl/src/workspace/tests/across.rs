@@ -233,16 +233,24 @@ struct Driven {
 }
 
 /// Gives the effect node `node` of `graph` what a host would: a read of
-/// `/word` is `WORD`.
+/// `/word` is `WORD`, and one of a path ending in `!` fails.
 fn give(graph: &mut Graph, node: NodeId) {
     let found = graph.node(node).unwrap();
     let value = match (found.kind(), found.args().first()) {
-        (NodeKind::Effect(crate::check::Builtin::FsRead), Some(Value::Str(path))) => {
-            Value::Str(Rc::from(path.trim_start_matches('/').to_uppercase()))
+        (NodeKind::Effect(crate::check::Builtin::FsRead), Some(Value::Str(path)))
+            if path.ends_with('!') =>
+        {
+            Err(Diagnostic::error(
+                format!("unreadable {path}"),
+                crate::source::Span::new(0, 0),
+            ))
         }
-        _ => Value::Empty,
+        (NodeKind::Effect(crate::check::Builtin::FsRead), Some(Value::Str(path))) => Ok(
+            Value::Str(Rc::from(path.trim_start_matches('/').to_uppercase())),
+        ),
+        _ => Ok(Value::Empty),
     };
-    assert!(graph.resolve(node, Ok(value)));
+    assert!(graph.resolve(node, value));
 }
 
 /// Runs `calls` of `workspace` as a host does, until each is done: in
@@ -627,5 +635,88 @@ fn fuzz(seeds: u64) {
                 ),
             }
         }
+    }
+}
+
+/// [`CROSSED`], `inner`'s read failing: whichever unit runs `inner`, the
+/// other waits for it, its run of it ended by the failure.
+const FAILING: Fixture = Fixture {
+    name: "failing",
+    program: "fn inner() ->> String { = said(\"b!\") }\n\
+              fn outer() ->> String {\n\
+              \x20   let a = said(\"a\")\n\
+              \x20   = \"{a}{inner()}\"\n\
+              }\n\
+              def build first() { = outer() }\n\
+              def build second() { = both(outer(), inner()) }",
+    targets: &["first", "second"],
+    values: &[],
+    effects: 0,
+};
+
+#[test]
+fn a_unit_whose_shared_run_fails_lets_the_units_waiting_for_it_fail_too() {
+    // Each unit fails with the read's failure, rather than one waiting for
+    // ever for a run the other has given up, in whatever order they run.
+    for seed in 0..=100u64 {
+        let (mut workspace, calls) = prepared(&FAILING);
+        let order: Vec<&PreparedCall> = calls.iter().collect();
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let driven = drive(&mut workspace, &order, (seed > 0).then_some(&mut rng))
+            .unwrap_or_else(|error| panic!("seed {seed}: {error}"));
+        let failed = Err("unreadable /b!".to_owned());
+        assert_eq!(driven.values, [failed.clone(), failed], "seed {seed}");
+        assert!(workspace.suspended.is_empty(), "seed {seed}");
+    }
+}
+
+#[test]
+fn a_unit_a_host_gives_up_releases_the_runs_other_units_wait_for() {
+    // The first target stops inside `outer`, or inside a top-level `lazy`,
+    // at its read; the second waits for that run. The host gives the first
+    // up: the second, rather than waiting for ever, runs it itself.
+    let lazy = Fixture {
+        name: "lazy given up",
+        program: "let inner = lazy { = said(\"b\") }\n\
+                  def build first() { = await inner }\n\
+                  def build second() { = both(\"a\", await inner) }",
+        targets: &["first", "second"],
+        values: &["a+B"],
+        effects: 0,
+    };
+    let memoised = Fixture {
+        values: &["AB+B"],
+        ..CROSSED
+    };
+    for fixture in [&memoised, &lazy] {
+        let (mut workspace, calls) = prepared(fixture);
+        let (first, second) = (&calls[0], &calls[1]);
+        let mut graph = Graph::new();
+        assert!(
+            matches!(
+                workspace.run_prepared(first, &mut graph, every()),
+                Ok(Progress::Paused(_))
+            ),
+            "{}",
+            fixture.name
+        );
+        assert_eq!(
+            workspace.run_prepared(second, &mut graph, every()).unwrap(),
+            Progress::Waiting(first.unit()),
+            "{}",
+            fixture.name
+        );
+        let ended = workspace.memo_ended();
+        workspace.give_up(first.unit());
+        assert!(!workspace.suspended.contains_key(&first.unit()));
+        assert!(workspace.memo_ended() > ended, "{}", fixture.name);
+        let driven = drive(&mut workspace, &[second], None)
+            .unwrap_or_else(|error| panic!("{}: {error}", fixture.name));
+        let values: Vec<Result<Value, String>> = fixture
+            .values
+            .iter()
+            .map(|value| Ok(Value::Str(Rc::from(*value))))
+            .collect();
+        assert_eq!(driven.values, values, "{}", fixture.name);
     }
 }

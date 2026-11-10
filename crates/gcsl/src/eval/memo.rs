@@ -372,6 +372,29 @@ impl MemoTables {
         newly
     }
 
+    /// Removes every running entry of the unit `unit`, as a failed call's
+    /// entry goes, and counts each as ended: the unit ended, or was given
+    /// up, without ending them, and a unit waiting for one then runs it
+    /// itself (see [Across units](crate::eval::machine::tasks#across-units)).
+    /// Visits every entry.
+    pub(super) fn release(&mut self, unit: u32) {
+        let mut released = 0u64;
+        for table in self.tables.values_mut() {
+            table.buckets.retain(|_, bucket| {
+                bucket.retain(|entry| {
+                    let held = matches!(
+                        entry.state,
+                        EntryState::Running { owner: Some(owner), .. } if owner == unit
+                    );
+                    released += u64::from(held);
+                    !held
+                })
+            });
+        }
+        self.tables.retain(|_, table| !table.buckets.is_empty());
+        self.ended = self.ended.wrapping_add(released);
+    }
+
     /// Counts a run of a `lazy`'s body ended, run or left unrun (see
     /// [`MemoTables::ended`]).
     pub(super) fn future_ended(&mut self) {
@@ -790,7 +813,7 @@ impl Bucket {
 
     /// Keeps only the entries `keep` accepts, and returns whether any is
     /// left.
-    pub(super) fn retain(&mut self, keep: impl Fn(&Entry) -> bool) -> bool {
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&Entry) -> bool) -> bool {
         match self {
             Bucket::One(entry) => keep(entry),
             Bucket::Many(entries) => {

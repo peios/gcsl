@@ -1167,6 +1167,44 @@ fn site_of(
     }
 }
 
+/// Leaves unrun, with their captures, the `lazy`s that the unit `unit`,
+/// which ended or was given up without ending them, was running in the
+/// tasks of `parked`: a unit waiting for one then runs it itself (see
+/// [Across units](#across-units)). The captures are those its body's
+/// activation took out of the future. Each counts as ended.
+pub(super) fn release_futures(
+    parked: &mut super::Parked,
+    memo: &mut super::super::memo::MemoTables,
+    unit: u32,
+) {
+    let (tasks, _, _) = &mut parked.tasks;
+    let sets = std::iter::once((&parked.frames, &mut parked.activations)).chain(
+        tasks
+            .iter_mut()
+            .map(|task| (&task.frames, &mut task.activations)),
+    );
+    for (frames, activations) in sets {
+        for frame in frames {
+            let Frame::Future(run) = frame else {
+                continue;
+            };
+            let (future, base) = run.future();
+            if !future.is_running_in(unit) {
+                continue;
+            }
+            let captures = activations
+                .iter_mut()
+                .find(|activation| activation.base == base && activation.owned.is_some())
+                .and_then(|activation| activation.owned.take());
+            if let Some(captures) = captures
+                && future.finish(crate::value::FutureState::Pending(captures))
+            {
+                memo.future_ended();
+            }
+        }
+    }
+}
+
 /// Whether `task` holds every run of `held`.
 fn holds(task: &Task, held: &[Held]) -> bool {
     held.iter().all(|&held| match held {

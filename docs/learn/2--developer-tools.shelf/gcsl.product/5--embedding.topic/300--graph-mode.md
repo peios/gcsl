@@ -144,6 +144,14 @@ that waits again after its run might still have moved on what another
 unit waits for, so wake the waiting units again. Units are stuck only if
 a round ran nothing else and `Workspace::memo_progress` didn't change.
 
+If you stop running a unit before it finishes, for example because you
+fail its target for a reason of your own while it waits, call
+`Workspace::give_up` with its unit. Otherwise the memoised calls and
+`lazy` values it's in the middle of stay its own, and any unit that waits
+for them waits for ever. Given up, they're released, and a waiting unit
+computes them itself when it runs again, making the effects inside them
+again. A unit that fails is released the same way without your help.
+
 If every unit you have is waiting on another, they are waiting on each
 other: report that as an error rather than running them again. Call
 `Workspace::stuck` first. If the units wait in a circle through memoised

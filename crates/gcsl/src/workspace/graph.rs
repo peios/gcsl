@@ -358,6 +358,21 @@ impl Workspace {
         self.memo.ended().wrapping_add(self.memo.demanded())
     }
 
+    /// Gives up the unit `unit`, a file's or a prepared call's or a step's,
+    /// which a host will not run again though it has not ended: a target
+    /// the host fails for a reason of its own while its unit waits, say.
+    /// Its evaluation, suspended where it stopped, goes, and what it was
+    /// running is released: the entries of its memoised calls go, as a
+    /// failed call's do, and its `lazy`s are left unrun. A unit waiting for
+    /// one of them, which would otherwise wait for ever, runs it itself
+    /// when it runs again, and so makes the effects inside it again (see
+    /// [Graph mode](crate::eval::graph#graph-mode)).
+    pub fn give_up(&mut self, unit: u32) {
+        if let Some(suspended) = self.suspended.remove(&unit) {
+            crate::eval::machine::give_up(suspended, &mut self.memo, unit);
+        }
+    }
+
     /// Why the units that stopped wait for each other, if a call or
     /// `lazy` they wait for in a circle needs its own result: a host whose
     /// units are all waiting, with nothing else to run, asks it (see [Graph

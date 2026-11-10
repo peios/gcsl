@@ -101,6 +101,11 @@ pub(super) struct FutureRun {
 }
 
 impl FutureRun {
+    /// The future whose body it runs, and where the body's frame starts.
+    pub(super) const fn future(&self) -> (&Rc<Future>, usize) {
+        (&self.future, self.base)
+    }
+
     /// Whether it is a run of `future`'s body.
     pub(super) fn runs(&self, future: *const Future) -> bool {
         std::ptr::eq(Rc::as_ptr(&self.future), future)
