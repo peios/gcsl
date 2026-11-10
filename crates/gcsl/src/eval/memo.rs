@@ -339,6 +339,15 @@ impl MemoTables {
         self.demanded
     }
 
+    /// Whether the entry `at` is running.
+    pub(super) fn is_running(&self, (closure, hash, id): RunningAt) -> bool {
+        self.tables
+            .get(&closure)
+            .and_then(|table| table.buckets.get(&hash))
+            .and_then(|bucket| bucket.entries().iter().find(|entry| entry.id == id))
+            .is_some_and(|entry| matches!(entry.state, EntryState::Running { .. }))
+    }
+
     /// Whether the running entry `at` is demanded (see
     /// [`MemoTables::demanded`]); `false` if it is not running.
     pub(super) fn is_demanded(&self, (closure, hash, id): RunningAt) -> bool {

@@ -330,6 +330,9 @@ pub(super) struct Parked {
     tasks: (Vec<Task>, Meta, Option<Status>),
     /// The number of the next task split off.
     next_task: u32,
+    /// The runs of memoised calls and `lazy`s that tasks set aside wait
+    /// for, each once (see [Tasks](tasks#tasks)).
+    waited: Vec<tasks::Held>,
 }
 
 impl Parked {
@@ -374,6 +377,9 @@ pub(super) struct Machine<'r> {
     tasks: Vec<Task>,
     /// The number of the next task split off.
     next_task: u32,
+    /// The runs of memoised calls and `lazy`s that tasks set aside wait
+    /// for, each once (see [Tasks](tasks#tasks)).
+    waited: Vec<tasks::Held>,
     /// How many profiled calls were running when the run began, below
     /// which none is a task's.
     profiled_base: usize,
@@ -410,6 +416,7 @@ impl<'r> Machine<'r> {
             status: None,
             tasks: Vec::new(),
             next_task: 1,
+            waited: Vec::new(),
             profiled_base,
             spare: Vec::new(),
             abandons: Vec::new(),
@@ -439,6 +446,7 @@ impl<'r> Machine<'r> {
             status,
             tasks,
             next_task: parked.next_task,
+            waited: parked.waited,
             profiled_base,
             spare: Vec::new(),
             abandons: Vec::new(),
@@ -454,6 +462,7 @@ impl<'r> Machine<'r> {
             calls: self.calls,
             tasks: (self.tasks, self.meta, self.status),
             next_task: self.next_task,
+            waited: self.waited,
         }
     }
 
@@ -1257,6 +1266,7 @@ impl<'r> Machine<'r> {
                     if !self.memo.is_demanded(at) {
                         self.wound(tasks::Wound::Entry(at.2));
                     }
+                    self.wait_for_run(tasks::Held::Entry(at.2));
                     self.calls.push(state);
                     return Next::Park(Box::new(Status::Sibling(Resume::Lookup(Some(at)))));
                 }
@@ -1447,9 +1457,11 @@ impl<'r> Machine<'r> {
             let span = self.running().ir.get(state.node).span;
             return self.argument_failed(&state, tasks::handed_back(span));
         }
-        self.wake_siblings();
+        self.run_ended(tasks::Held::Entry(mark.entry));
         self.calls.push(state);
-        Next::Park(Box::new(Status::Sibling(Resume::Lookup(None))))
+        // The earliest task that waits for it begins it again, before this
+        // one looks it up again (see [Wound-wait](tasks#wound-wait)).
+        Next::Park(Box::new(Status::Again(Resume::Lookup(None))))
     }
 
     /// Ends the call `state` with `result`, what its body came to, as
@@ -1464,14 +1476,7 @@ impl<'r> Machine<'r> {
             self.stack.truncate(state.base);
             if let Some(mark) = mark {
                 self.memo.running.pop();
-                // Tasks that wait for a demanded run look again as it ends
-                // (see [Across units](tasks#across-units)).
-                if self
-                    .memo
-                    .is_demanded((Rc::as_ptr(&state.closure), mark.hash, mark.entry))
-                {
-                    self.wake_siblings();
-                }
+                self.run_ended(tasks::Held::Entry(mark.entry));
             }
             let result = result.or_else(|unwind| unwind.returned(span));
             self.walker(|walker| {
