@@ -49,6 +49,11 @@ impl AwaitState {
         Self { node, depth, span }
     }
 
+    /// Where an error of the future it runs is reported.
+    pub(super) const fn span(self) -> Span {
+        self.span
+    }
+
     /// The node, as the site where an error of its await is reported.
     fn site(self, ir: &crate::ir::Ir) -> crate::ir::IrNode {
         crate::ir::IrNode {

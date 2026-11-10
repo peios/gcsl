@@ -92,6 +92,15 @@ pub(crate) struct Suspended {
     since: Instant,
 }
 
+impl Suspended {
+    /// What its tasks are: the machine's frames, activations and calls,
+    /// the root's place and status and the other tasks, and the root's
+    /// running memoised calls and `lazy`s.
+    pub(super) fn parts(&self) -> (&Parked, &[Running], &[Rc<Future>]) {
+        (&self.parked, &self.running, &self.task.futures)
+    }
+}
+
 impl fmt::Debug for Suspended {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Suspended")
@@ -353,6 +362,14 @@ impl Parked {
 }
 
 impl Resume {
+    /// Where the await it takes up again is, if it is one's.
+    pub(super) fn await_span(&self) -> Option<Span> {
+        match self {
+            Self::Await(state, _) | Self::Deep(state, ..) => Some(state.span()),
+            _ => None,
+        }
+    }
+
     /// The run it waits for, if it looks a memoised call up or awaits a
     /// future again (see [Across units](super::tasks#across-units)).
     pub(super) fn waits_for(&self) -> Option<super::tasks::Run> {

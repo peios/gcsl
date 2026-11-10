@@ -124,6 +124,8 @@
 //! waits for is wounded after all ([`Machine::unstick`]), and the earlier
 //! task fails where a run in order fails.
 
+mod stuck;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
@@ -172,6 +174,8 @@ pub(in crate::eval) enum Abandoned {
     /// A `lazy`'s body.
     Future(*const crate::value::Future),
 }
+
+pub(crate) use stuck::{Need, Needed, circle};
 
 /// A run of a memoised call or of a `lazy`'s body that a task waits for:
 /// where the call's entry is, or the future (see [Across

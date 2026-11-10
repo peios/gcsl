@@ -318,9 +318,25 @@ fn drive(
             });
         }
         if !progressed && workspace.memo_progress() == before {
-            return Err("the units wait for each other".to_owned());
+            return Err(stuck(workspace));
         }
     }
+}
+
+/// Why the units of `workspace` wait for each other, as
+/// [`Workspace::stuck`] says, each unit named by its number: the error's
+/// message, its label, and each other label, with its line; or that they
+/// wait for each other, if it says nothing.
+fn stuck(workspace: &Workspace) -> String {
+    let Some(error) = workspace.stuck(&|unit| format!("unit {unit}")) else {
+        return "the units wait for each other".to_owned();
+    };
+    let mut said = vec![
+        error.message.clone(),
+        error.label.as_deref().unwrap_or_default().to_owned(),
+    ];
+    said.extend(error.labels.iter().map(|label| label.text.clone()));
+    said.join("; ")
 }
 
 /// The workspace of `fixture`, and its targets prepared.
@@ -483,6 +499,25 @@ const RECURSIVE: Fixture = Fixture {
     effects: 0,
 };
 
+/// Two memoised calls that need each other, each target running one: a
+/// run in order calls one, then the other, then the first again.
+const CROSSED_RECURSION: Fixture = Fixture {
+    name: "crossed recursion",
+    program: "fn e() ->> String {\n\
+              \x20   let a = said(\"e\")\n\
+              \x20   = \"{a}{f()}\"\n\
+              }\n\
+              fn f() ->> String {\n\
+              \x20   let b = said(\"f\")\n\
+              \x20   = \"{b}{e()}\"\n\
+              }\n\
+              def build first() { = e() }\n\
+              def build second() { = f() }",
+    targets: &["first", "second"],
+    values: &[],
+    effects: 0,
+};
+
 #[test]
 fn tasks_of_a_unit_that_need_each_other_s_runs_through_a_demanded_one_fail_as_in_order() {
     // The second target's `d`, which the first waits for, is never
@@ -495,4 +530,102 @@ fn tasks_of_a_unit_that_need_each_other_s_runs_through_a_demanded_one_fail_as_in
     let driven = drive(&mut workspace, &order, None).unwrap();
     let recursion = Err("this call depends on its own result".to_owned());
     assert_eq!(driven.values, [recursion.clone(), recursion]);
+}
+
+#[test]
+fn units_whose_runs_need_each_other_are_reported_as_a_call_needing_its_own_result() {
+    // [`CROSSED_RECURSION`]: each unit waits for the other's run. The host is told which call needs
+    // its own result, not only that the units wait for each other.
+    let (mut workspace, calls) = prepared(&CROSSED_RECURSION);
+    let order: Vec<&PreparedCall> = calls.iter().collect();
+    let error = drive(&mut workspace, &order, None).unwrap_err();
+    let (first, second) = (calls[0].unit(), calls[1].unit());
+    assert_eq!(
+        error,
+        format!(
+            "this call depends on its own result; \
+             unit {first} needs `f` here, which unit {second} is running; \
+             unit {second} needs `e` here, which unit {first} is running"
+        )
+    );
+    // The second target of [`RECURSIVE`] run first runs `d`, and the
+    // first's tasks then wait for it, and it for one of them.
+    let (mut workspace, calls) = prepared(&RECURSIVE);
+    let order: Vec<&PreparedCall> = calls.iter().rev().collect();
+    let error = drive(&mut workspace, &order, None).unwrap_err();
+    assert!(
+        error.starts_with("this call depends on its own result; "),
+        "{error}"
+    );
+}
+
+#[test]
+fn units_that_only_wait_for_effects_or_each_other_s_runs_are_not_stuck_in_a_circle() {
+    let (mut workspace, calls) = prepared(&CROSSED);
+    let mut graph = Graph::new();
+    assert!(matches!(
+        workspace.run_prepared(&calls[0], &mut graph, every()),
+        Ok(Progress::Paused(_))
+    ));
+    assert_eq!(
+        workspace
+            .run_prepared(&calls[1], &mut graph, every())
+            .unwrap(),
+        Progress::Waiting(calls[0].unit())
+    );
+    assert!(workspace.stuck(&|unit| unit.to_string()).is_none());
+}
+
+#[test]
+fn every_fixture_comes_to_the_same_whatever_order_its_units_run_in() {
+    fuzz(100);
+}
+
+/// [`every_fixture_comes_to_the_same_whatever_order_its_units_run_in`]
+/// with ten times the seeds, which takes minutes.
+#[test]
+#[ignore = "takes minutes: run explicitly"]
+fn every_fixture_comes_to_the_same_whatever_order_its_units_run_in_over_1000_seeds() {
+    fuzz(1000);
+}
+
+/// Runs every fixture with each of `seeds` seeds: each round, the units
+/// run in an order the seed picks, and each effect is given at a point of
+/// the round it picks. The values, and the effects made, are the same, in
+/// a bounded number of rounds; calls that need their own results fail, or
+/// the host is told so.
+fn fuzz(seeds: u64) {
+    for fixture in FIXTURES {
+        for seed in 1..=seeds {
+            let (mut workspace, calls) = prepared(fixture);
+            let order: Vec<&PreparedCall> = calls.iter().collect();
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let driven = drive(&mut workspace, &order, Some(&mut rng))
+                .unwrap_or_else(|error| panic!("{}, seed {seed}: {error}", fixture.name));
+            assert_fixture(fixture, &workspace, &driven, &format!("seed {seed}"));
+        }
+    }
+    for fixture in [&RECURSIVE, &CROSSED_RECURSION] {
+        for seed in 1..=seeds {
+            let (mut workspace, calls) = prepared(fixture);
+            let order: Vec<&PreparedCall> = calls.iter().collect();
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let recursion = "this call depends on its own result";
+            match drive(&mut workspace, &order, Some(&mut rng)) {
+                Ok(driven) => assert!(
+                    driven
+                        .values
+                        .iter()
+                        .all(|value| value == &Err(recursion.to_owned())),
+                    "{}, seed {seed}: {driven:?}",
+                    fixture.name
+                ),
+                Err(error) => assert!(
+                    error.starts_with(&format!("{recursion}; ")),
+                    "{}, seed {seed}: {error}",
+                    fixture.name
+                ),
+            }
+        }
+    }
 }

@@ -56,6 +56,8 @@ mod pieces;
 mod suspend;
 mod tasks;
 
+pub(crate) use tasks::{Need, Needed, circle};
+
 use std::rc::Rc;
 
 use crate::diagnostic::Mark as ErrorMark;

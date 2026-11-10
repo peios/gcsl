@@ -18,6 +18,7 @@ use std::mem;
 use std::rc::Rc;
 
 use crate::diagnostic::{Diagnostic, Mark};
+use crate::eval::machine::Needed;
 use crate::eval::graph::{
     EffectJob, Graph, GraphHost, GraphRun, NodeId, NodeKind, RunExtras, STEP_UNITS, StepCall,
     StepReads, run_step_call,
@@ -355,6 +356,49 @@ impl Workspace {
     #[must_use]
     pub fn memo_progress(&self) -> u64 {
         self.memo.ended().wrapping_add(self.memo.demanded())
+    }
+
+    /// Why the units that stopped wait for each other, if a call or
+    /// `lazy` they wait for in a circle needs its own result: a host whose
+    /// units are all waiting, with nothing else to run, asks it (see [Graph
+    /// mode](crate::eval::graph#graph-mode)). The error "this call depends
+    /// on its own result", at the first unit's call in the circle, with
+    /// each call round it labelled, `name` naming each unit. `None` if they
+    /// wait in no such circle: one through a step's result, which the
+    /// workspace cannot follow, is the host's to report.
+    #[must_use]
+    pub fn stuck(&self, name: &dyn Fn(u32) -> String) -> Option<Diagnostic> {
+        let needs = crate::eval::machine::circle(
+            self.suspended.iter().map(|(&unit, run)| (unit, run)),
+            &self.memo,
+        )?;
+        let said = |need: &crate::eval::machine::Need| {
+            let holder = if need.holder == need.unit {
+                format!("another part of {}", name(need.holder))
+            } else {
+                name(need.holder)
+            };
+            let what = match need.what {
+                Needed::Call(Some(function)) => format!("`{}`", self.scan.names.get(function)),
+                Needed::Call(None) => "the call".to_owned(),
+                Needed::Lazy => "a `lazy`".to_owned(),
+            };
+            format!(
+                "{} needs {what} here, which {holder} is running",
+                name(need.unit)
+            )
+        };
+        let (first, rest) = needs.split_first()?;
+        let mut error = Diagnostic::error("this call depends on its own result", first.span)
+            .in_input(first.input)
+            .with_label(said(first));
+        for need in rest {
+            error = error.with_context_in(need.input, need.span, said(need));
+        }
+        Some(error.with_note(
+            "they wait for each other's shared calls in a circle: a run in order would call one \
+             of them again while it is running, and never finish",
+        ))
     }
 
     /// Runs `call`, a prepared invocation, in graph mode, against `graph`,
