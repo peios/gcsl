@@ -1232,9 +1232,13 @@ impl<'r> Machine<'r> {
                     self.calls.push(state);
                     return Next::Block(Wait::Unit(owner), Resume::Lookup);
                 }
-                // A later task's run of it is abandoned for this one.
-                Ok(MemoBegin::Sibling((_, _, entry))) => {
-                    self.wound(tasks::Wound::Entry(entry));
+                // A later task's run of it is abandoned for this one,
+                // unless another unit waits for it (see [Across
+                // units](tasks#across-units)).
+                Ok(MemoBegin::Sibling(at)) => {
+                    if !self.memo.is_demanded(at) {
+                        self.wound(tasks::Wound::Entry(at.2));
+                    }
                     self.calls.push(state);
                     return Next::Park(Box::new(Status::Sibling(Resume::Lookup)));
                 }
@@ -1440,8 +1444,16 @@ impl<'r> Machine<'r> {
         let outcome = if let Some((mark, scoped)) = state.memo {
             self.walker(|walker| walker.leave_scope(scoped));
             self.stack.truncate(state.base);
-            if mark.is_some() {
+            if let Some(mark) = mark {
                 self.memo.running.pop();
+                // Tasks that wait for a demanded run look again as it ends
+                // (see [Across units](tasks#across-units)).
+                if self
+                    .memo
+                    .is_demanded((Rc::as_ptr(&state.closure), mark.hash, mark.entry))
+                {
+                    self.wake_siblings();
+                }
             }
             let result = result.or_else(|unwind| unwind.returned(span));
             self.walker(|walker| {

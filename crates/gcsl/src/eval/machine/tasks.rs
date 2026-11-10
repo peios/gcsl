@@ -52,7 +52,8 @@
 //!
 //! A task that needs a memoised call or a `lazy` another task of the unit
 //! is running waits for it; one that waits for its turn or for a sibling
-//! is woken whenever a task ends.
+//! is woken whenever a task ends, and one that waits for a sibling also
+//! whenever a demanded run ends (see [Across units](#across-units)).
 //!
 //! # Wound-wait
 //!
@@ -77,6 +78,35 @@
 //! effect the host does not isolate that it was waiting to make is never
 //! made. A call abandoned far more often than this allows is reported as
 //! an internal error ([`Machine::abandoned_too_often`]).
+//!
+//! # Across units
+//!
+//! Units in graph mode share their memoised calls and `lazy`s: a unit
+//! that finds another unit's run of one waits for that unit
+//! ([`Wait::Unit`]). Wound-wait keeps the waits within a unit from forming
+//! a circle, but a unit cannot wound another's tasks, and units have no
+//! common program order. A task that holds a run, and inside it waits its
+//! turn behind earlier work of its unit outside it, could close a circle
+//! through another unit that the earlier work waits for, and that needs
+//! the run.
+//!
+//! So a run another unit waits for is *demanded*: the first such wait
+//! marks it ([`MemoTables::demanded`](crate::eval::MemoTables::demanded)).
+//! An effect the host does not isolate, or a step's context read, made
+//! inside a demanded run waits only for the earlier tasks of its unit that
+//! hold every demanded run the task holds: work inside the run keeps its
+//! order, and work outside it no longer comes first. A task inside the
+//! innermost demanded run holds every run around it, since a child takes
+//! its parent's runs. Effects a host does not isolate are still made one
+//! at a time: none is made while another task of the unit waits for one's
+//! result. Nothing is abandoned, so a demanded run still runs once, and its
+//! effects with it, but they reach the host out of its unit's program
+//! order. A run of shared work is no longer ordered by the program of any
+//! one unit that needs it: which unit ran it first was chance already.
+//!
+//! A demanded run is never wounded: its effects, made out of order, would
+//! be made again. A task that needs it waits for it instead, woken when it
+//! ends.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -123,6 +153,16 @@ pub(in crate::eval) enum Wound {
 pub(in crate::eval) enum Abandoned {
     /// A memoised call of the function of the IR, its arguments' hash.
     Call(*const crate::ir::Ir, crate::ast::FnId, u64),
+    /// A `lazy`'s body.
+    Future(*const crate::value::Future),
+}
+
+/// A run of a memoised call, by its entry's identity, or of a `lazy`'s
+/// body, that a task holds (see [Across units](#across-units)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Held {
+    /// A memoised call, by its entry's identity.
+    Entry(u64),
     /// A `lazy`'s body.
     Future(*const crate::value::Future),
 }
@@ -767,15 +807,51 @@ impl Machine<'_> {
     }
 
     /// Whether a live task other than the one running is earlier in program
-    /// order (see [Tasks](#tasks)).
+    /// order (see [Tasks](#tasks)): of those that hold every demanded run
+    /// it holds, if it holds any (see [Across units](#across-units)).
     pub(super) fn earlier_live(&self) -> bool {
         if self.tasks.is_empty() {
             return false;
         }
         let mine = self.path();
-        self.tasks
+        let demanded = self.demanded_held();
+        self.tasks.iter().any(|task| {
+            holds(task, &demanded) && path_of(&task.meta, &task.frames, &task.calls) < mine
+        })
+    }
+
+    /// Whether a task other than the one running waits for the result of
+    /// an effect the host does not isolate: the unit makes such effects one
+    /// at a time (see [Across units](#across-units)).
+    pub(super) fn ordered_effect_waiting(&self) -> bool {
+        let Some(graph) = self.shared.graph else {
+            return false;
+        };
+        self.tasks.iter().any(|task| {
+            matches!(task.status, Status::Blocked(Wait::Node(id), Resume::Effect(..))
+                if graph.is_ordered_effect_waiting(id, self.shared.effects))
+        })
+    }
+
+    /// The demanded runs the task running holds (see [Across
+    /// units](#across-units)).
+    fn demanded_held(&self) -> Vec<Held> {
+        let mut held: Vec<Held> = self
+            .memo
+            .running
             .iter()
-            .any(|task| path_of(&task.meta, &task.frames, &task.calls) < mine)
+            .filter(|running| self.memo.is_demanded(running.at()))
+            .map(|running| Held::Entry(running.entry))
+            .collect();
+        held.extend(
+            self.shared
+                .futures
+                .borrow()
+                .iter()
+                .filter(|future| future.is_demanded())
+                .map(|future| Held::Future(Rc::as_ptr(future))),
+        );
+        held
     }
 
     /// Splits the task running at the marks `marks` of an iteration of a
@@ -916,6 +992,22 @@ fn await_site(task: &Task, future: *const crate::value::Future) -> Option<Vec<u3
     let frames = task.frames.get(..body)?;
     let calls = frames.iter().filter(|frame| frame.takes_call()).count();
     Some(path_of(&task.meta, frames, task.calls.get(..calls)?))
+}
+
+/// Whether `task` holds every run of `held`.
+fn holds(task: &Task, held: &[Held]) -> bool {
+    held.iter().all(|&held| match held {
+        Held::Entry(entry) => task
+            .own
+            .running
+            .iter()
+            .any(|running| running.entry == entry),
+        Held::Future(future) => task
+            .own
+            .futures
+            .iter()
+            .any(|running| std::ptr::eq(Rc::as_ptr(running), future)),
+    })
 }
 
 /// Whether a task waiting as `status` says has a call on top of its calls,

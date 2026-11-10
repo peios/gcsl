@@ -180,8 +180,12 @@ impl Machine<'_> {
                     .any(|running| Rc::ptr_eq(running, &future)) =>
             {
                 // Another task of the unit runs it: waited for, and awaited
-                // again; a later task's run of it is abandoned for this one.
-                self.wound(Wound::Future(Rc::as_ptr(&future)));
+                // again; a later task's run of it is abandoned for this one,
+                // unless another unit waits for it (see [Across
+                // units](super::tasks#across-units)).
+                if !future.is_demanded() {
+                    self.wound(Wound::Future(Rc::as_ptr(&future)));
+                }
                 let waiting = Status::Sibling(resumed(state, future, then));
                 return Err(Next::Park(Box::new(waiting)));
             }
@@ -251,6 +255,11 @@ impl Machine<'_> {
         self.shared.futures.borrow_mut().pop();
         self.shared.context.replace(outer);
         self.stack.truncate(base);
+        // Tasks that wait for a demanded run look again as it ends (see
+        // [Across units](super::tasks#across-units)).
+        if future.is_demanded() {
+            self.wake_siblings();
+        }
         match result.or_else(|unwind| unwind.returned(state.span)) {
             Ok(value) => {
                 // The captures are dropped: a future that has run holds

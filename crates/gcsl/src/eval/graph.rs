@@ -665,6 +665,20 @@ impl<'g> GraphRun<'g> {
             .is_some_and(|node| node.state == NodeState::Waiting)
     }
 
+    /// Whether the node `id` is an effect of a built-in the host does not
+    /// isolate, waiting for its result: one at a time per unit (see
+    /// [Across units](crate::eval::machine::tasks#across-units)).
+    pub(crate) fn is_ordered_effect_waiting(
+        &self,
+        id: NodeId,
+        effects: &dyn super::Effects,
+    ) -> bool {
+        self.graph.borrow().node(id).is_some_and(|node| {
+            node.state == NodeState::Waiting
+                && matches!(node.kind, NodeKind::Effect(builtin) if !effects.isolates(builtin))
+        })
+    }
+
     /// How many scopes are being run.
     pub(crate) fn scope_depth(&self) -> usize {
         self.scopes.borrow().len()

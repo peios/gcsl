@@ -678,6 +678,15 @@ impl Future {
         )
     }
 
+    /// Whether its body is running and another unit waits for it (see
+    /// [`MemoTables::demanded`](crate::eval::MemoTables::demanded)).
+    pub(crate) fn is_demanded(&self) -> bool {
+        matches!(
+            self.state.try_borrow().as_deref(),
+            Ok(FutureState::Running(_, true))
+        )
+    }
+
     /// Marks its running body demanded: whether it was running and not
     /// demanded before.
     pub(crate) fn demand(&self) -> bool {
