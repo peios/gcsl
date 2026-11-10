@@ -90,7 +90,10 @@ impl Machine<'_> {
     /// Applies the built-in of `call`, its arguments evaluated: its value,
     /// or, in graph mode, its effect's node, which it waits for. An effect
     /// the host does not isolate waits first until nothing earlier in
-    /// program order is running (see [Tasks](super::tasks#tasks)).
+    /// program order is running (see [Tasks](super::tasks#tasks)), or,
+    /// inside a run another unit waits for, nothing earlier inside it; and
+    /// until no other such effect of the unit waits for its result (see
+    /// [Across units](super::tasks#across-units)).
     pub(super) fn builtin_apply(&mut self, call: Box<BuiltinCall>) -> Next {
         if self.shared.graph.is_some()
             && effect_builtin(call.builtin)
@@ -101,7 +104,7 @@ impl Machine<'_> {
             if self.doomed() {
                 return fail(cancelled(self.running().ir.get(call.node).span));
             }
-            if self.earlier_live() {
+            if self.earlier_live() || self.ordered_effect_waiting() {
                 return Next::Park(Box::new(Status::Waiting(Resume::Builtin(call))));
             }
         }

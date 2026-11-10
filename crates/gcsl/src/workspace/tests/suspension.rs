@@ -121,6 +121,53 @@ fn a_unit_that_stopped_takes_up_where_it_stopped_after_another_ran() {
     assert!(workspace.suspended.is_empty());
 }
 
+#[test]
+fn a_run_another_unit_first_waits_for_counts_as_progress_once() {
+    // The second target finds the first's run of `shared`, or of a
+    // top-level `lazy`, and waits: the run is demanded, which a host sees
+    // as progress, though no call ended. Waiting for it again is none.
+    let lazy = [
+        ("workspace.gcsl", ""),
+        (
+            "app.gcsl",
+            "#[def_type]\n\
+             def build(name: String, f: fn() -> String) -> String { f() }\n\
+             let shared = lazy { = exec([\"echo\", \"w\"]).stdout.trim() }\n\
+             def build first() { = await shared }\n\
+             def build second() { = await shared }",
+        ),
+    ];
+    for files in [&SHARED, &lazy] {
+        let mut workspace = rooted(files).unwrap();
+        let first = workspace
+            .prepare_call(("build", "first"), &[], &[])
+            .unwrap();
+        let second = workspace
+            .prepare_call(("build", "second"), &[], &[])
+            .unwrap();
+        let mut graph = Graph::new();
+        assert!(matches!(
+            workspace.run_prepared(&first, &mut graph, every()),
+            Ok(Progress::Paused(_))
+        ));
+        let (ended, progress) = (workspace.memo_ended(), workspace.memo_progress());
+        for again in [false, true] {
+            assert_eq!(
+                workspace
+                    .run_prepared(&second, &mut graph, every())
+                    .unwrap(),
+                Progress::Waiting(first.unit())
+            );
+            assert_eq!(workspace.memo_ended(), ended);
+            assert_eq!(
+                workspace.memo_progress(),
+                progress + 1,
+                "waiting again: {again}"
+            );
+        }
+    }
+}
+
 /// Effects a host isolates, every one: they may be met in any order.
 #[derive(Debug)]
 struct Isolating;

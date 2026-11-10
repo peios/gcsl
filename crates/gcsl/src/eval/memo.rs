@@ -200,9 +200,12 @@ pub struct MemoTables {
     /// The last identity given to a frame of the context (see
     /// [Context](crate::eval::context#context)): each is new.
     pub(super) context_frames: u64,
-    /// How many memoised calls have ended, returned or failed, since the
+    /// How many memoised calls and runs of `lazy`s have ended since the
     /// tables were made (see [`MemoTables::ended`]).
     pub(super) ended: u64,
+    /// How many runs of memoised calls and `lazy`s have become demanded
+    /// since the tables were made (see [`MemoTables::demanded`]).
+    pub(super) demanded: u64,
 }
 
 /// The origin of a caller that has none yet (see [Callers and
@@ -308,18 +311,104 @@ impl MemoTables {
             running: Vec::new(),
             context_frames: 0,
             ended: 0,
+            demanded: 0,
         }
     }
 
     /// How many memoised calls have ended, returned or failed, or been
-    /// given up for a run elsewhere, since the tables were made. A host in
+    /// given up for a run elsewhere, and how many runs of `lazy`s' bodies
+    /// have ended, run or left unrun, since the tables were made. A host in
     /// graph mode tells by it whether a unit's run moved anything on that
-    /// another unit waits for: a run that ended a call another waits on has
-    /// progressed, even if it stopped again, waiting itself, and units that
-    /// wait for each other with nothing ending are stuck.
+    /// another unit waits for: a run that ended a call or `lazy` another
+    /// waits on has progressed, even if it stopped again, waiting itself,
+    /// and units that wait for each other with nothing ending are stuck.
     #[must_use]
     pub fn ended(&self) -> u64 {
         self.ended
+    }
+
+    /// How many runs of memoised calls and `lazy`s have become *demanded*
+    /// since the tables were made: another unit, in graph mode, found one
+    /// running and waits for it (see [Across
+    /// units](crate::eval::machine::tasks#across-units)). A demanded run
+    /// no longer waits for its unit's earlier work outside it, so a unit
+    /// that stopped may now go on: a host that marked one has progressed,
+    /// though nothing ended.
+    #[must_use]
+    pub fn demanded(&self) -> u64 {
+        self.demanded
+    }
+
+    /// Whether the running entry `at` is demanded (see
+    /// [`MemoTables::demanded`]); `false` if it is not running.
+    pub(super) fn is_demanded(&self, (closure, hash, id): RunningAt) -> bool {
+        self.tables
+            .get(&closure)
+            .and_then(|table| table.buckets.get(&hash))
+            .and_then(|bucket| bucket.entries().iter().find(|entry| entry.id == id))
+            .is_some_and(|entry| matches!(entry.state, EntryState::Running { demanded: true, .. }))
+    }
+
+    /// Marks the running entry `at` demanded, counting it if it was not:
+    /// whether it was not.
+    pub(super) fn demand(&mut self, (closure, hash, id): RunningAt) -> bool {
+        let entry = self
+            .tables
+            .get_mut(&closure)
+            .and_then(|table| table.buckets.get_mut(&hash))
+            .and_then(|bucket| bucket.entries_mut().iter_mut().find(|entry| entry.id == id));
+        let Some(Entry {
+            state: EntryState::Running { demanded, .. },
+            ..
+        }) = entry
+        else {
+            return false;
+        };
+        let newly = !*demanded;
+        *demanded = true;
+        if newly {
+            self.demanded = self.demanded.wrapping_add(1);
+        }
+        newly
+    }
+
+    /// Removes every running entry of the unit `unit`, as a failed call's
+    /// entry goes, and counts each as ended: the unit ended, or was given
+    /// up, without ending them, and a unit waiting for one then runs it
+    /// itself (see [Across units](crate::eval::machine::tasks#across-units)).
+    /// Visits every entry.
+    pub(super) fn release(&mut self, unit: u32) {
+        let mut released = 0u64;
+        for table in self.tables.values_mut() {
+            table.buckets.retain(|_, bucket| {
+                bucket.retain(|entry| {
+                    let held = matches!(
+                        entry.state,
+                        EntryState::Running { owner: Some(owner), .. } if owner == unit
+                    );
+                    released += u64::from(held);
+                    !held
+                })
+            });
+        }
+        self.tables.retain(|_, table| !table.buckets.is_empty());
+        self.ended = self.ended.wrapping_add(released);
+    }
+
+    /// Counts a run of a `lazy`'s body ended, run or left unrun (see
+    /// [`MemoTables::ended`]).
+    pub(super) fn future_ended(&mut self) {
+        self.ended = self.ended.wrapping_add(1);
+    }
+
+    /// Marks `future`'s running body demanded, counting it if it was not:
+    /// whether it was not.
+    pub(super) fn demand_future(&mut self, future: &crate::value::Future) -> bool {
+        let newly = future.demand();
+        if newly {
+            self.demanded = self.demanded.wrapping_add(1);
+        }
+        newly
     }
 
     /// A new origin, for a caller set from its calling code's file (see
@@ -502,7 +591,8 @@ impl MemoTables {
     /// `caller`'s origin if `inherited`, the caller passed on by a helper,
     /// as a read would, which allocates a copy of them if there are any. A
     /// running entry of another unit than `unit`, in graph mode, is
-    /// [`Lookup::Elsewhere`], and is not marked.
+    /// [`Lookup::Elsewhere`], and is marked demanded, not re-entered (see
+    /// [`MemoTables::demanded`]).
     pub(super) fn lookup(
         &mut self,
         closure: &Rc<Closure>,
@@ -523,6 +613,7 @@ impl MemoTables {
         }) else {
             return Lookup::Missing(hash);
         };
+        let at = (Rc::as_ptr(closure), hash, entry.id);
         let (value, passed) = match &mut entry.state {
             EntryState::Done(value) => {
                 // Copied only when they are passed on, which allocates: the
@@ -537,16 +628,22 @@ impl MemoTables {
                 (value.clone(), passed)
             }
             EntryState::Running {
-                owner: Some(owner), ..
+                owner: Some(owner),
+                demanded,
+                ..
             } if Some(*owner) != unit => {
-                return Lookup::Elsewhere(*owner);
+                if !*demanded {
+                    *demanded = true;
+                    self.demanded = self.demanded.wrapping_add(1);
+                }
+                return Lookup::Elsewhere(*owner, at);
             }
             // Running, but not on this task's line of control: another task
             // of the unit runs it (see [Tasks](crate::eval::machine::tasks#tasks)).
             EntryState::Running { .. }
                 if !self.running.iter().any(|running| running.entry == entry.id) =>
             {
-                return Lookup::Sibling(entry.id);
+                return Lookup::Sibling(at);
             }
             EntryState::Running { reentered, .. } => {
                 *reentered = true;
@@ -597,6 +694,7 @@ impl MemoTables {
             state: EntryState::Running {
                 reentered: false,
                 owner,
+                demanded: false,
             },
             deps: Box::default(),
             generation: self.generation,
@@ -715,7 +813,7 @@ impl Bucket {
 
     /// Keeps only the entries `keep` accepts, and returns whether any is
     /// left.
-    pub(super) fn retain(&mut self, keep: impl Fn(&Entry) -> bool) -> bool {
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&Entry) -> bool) -> bool {
         match self {
             Bucket::One(entry) => keep(entry),
             Bucket::Many(entries) => {
@@ -771,6 +869,9 @@ pub(super) enum EntryState {
         /// The unit whose run computes it, in graph mode; `None` in a plain
         /// run.
         owner: Option<u32>,
+        /// Whether another unit waits for it (see
+        /// [`MemoTables::demanded`]).
+        demanded: bool,
     },
     /// The body returned this value.
     Done(Value),
@@ -786,11 +887,12 @@ pub(super) enum Lookup {
     Running,
     /// The closure is running with equal arguments in the run of another
     /// unit, this one, in graph mode, which has stopped: the call waits for
-    /// it (see [Graph mode](crate::eval::graph#graph-mode)).
-    Elsewhere(u32),
+    /// it (see [Graph mode](crate::eval::graph#graph-mode)), its entry
+    /// this one.
+    Elsewhere(u32, RunningAt),
     /// The closure is running with equal arguments in another task of this
     /// unit, which has stopped, its entry this one: the call waits for it.
-    Sibling(u64),
+    Sibling(RunningAt),
     /// No entry: the arguments' hash, for recording them.
     Missing(u64),
 }
@@ -807,13 +909,13 @@ pub(super) enum MemoBegin {
     /// The call is running with equal arguments in the run of this unit,
     /// in graph mode, which has stopped: its frame is on the stack, with
     /// the arguments, for the call to wait for that unit and look them up
-    /// again.
-    Elsewhere(u32),
+    /// again; its entry this one.
+    Elsewhere(u32, RunningAt),
     /// The call is running with equal arguments in another task of the
     /// unit, its entry this one: its frame is on the stack, with the
     /// arguments, for the call to wait for that task and look them up
     /// again.
-    Sibling(u64),
+    Sibling(RunningAt),
 }
 
 /// A running memoised call, as [`MemoTables::start`] recorded it.

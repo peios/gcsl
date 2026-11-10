@@ -56,6 +56,9 @@ mod pieces;
 mod suspend;
 mod tasks;
 
+pub(crate) use suspend::give_up;
+pub(crate) use tasks::{Need, Needed, circle};
+
 use std::rc::Rc;
 
 use crate::diagnostic::Mark as ErrorMark;
@@ -329,6 +332,14 @@ pub(super) struct Parked {
     next_task: u32,
 }
 
+impl Parked {
+    /// Whether it keeps nothing: no frame of the root's, and no other
+    /// task.
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty() && self.tasks.0.is_empty()
+    }
+}
+
 /// Gives the frame on top `flow`, a walker's result.
 fn give(flow: Flow<Value>) -> Next {
     Next::Give(flow.map_err(Box::new))
@@ -522,7 +533,12 @@ impl<'r> Machine<'r> {
                         Err(status) => self.park(status).unwrap_or(Next::Stop),
                     }
                 }
-                Next::Stop => return self.stopped(),
+                // Unless a circle of its tasks through a demanded run can
+                // be broken (see [Across units](tasks#across-units)).
+                Next::Stop => match self.unstick() {
+                    Some(next) => next,
+                    None => return self.stopped(),
+                },
             };
         }
     }
@@ -1228,15 +1244,21 @@ impl<'r> Machine<'r> {
                 Ok(MemoBegin::Found(value)) => return self.found(&state, value),
                 // Looked up again, its arguments still in its frame, once the
                 // unit that runs it has run.
-                Ok(MemoBegin::Elsewhere(owner)) => {
+                Ok(MemoBegin::Elsewhere(owner, at)) => {
                     self.calls.push(state);
-                    return Next::Block(Wait::Unit(owner), Resume::Lookup);
+                    return Next::Block(Wait::Unit(owner), Resume::Lookup(Some(at)));
                 }
-                // A later task's run of it is abandoned for this one.
-                Ok(MemoBegin::Sibling(entry)) => {
-                    self.wound(tasks::Wound::Entry(entry));
+                // A later task's run of it is abandoned for this one,
+                // unless another unit waits for it, or this task is in a
+                // run another unit waits for, which then waits for it too
+                // (see [Across units](tasks#across-units)).
+                Ok(MemoBegin::Sibling(at)) => {
+                    self.demand_waited(&tasks::Run::Entry(at));
+                    if !self.memo.is_demanded(at) {
+                        self.wound(tasks::Wound::Entry(at.2));
+                    }
                     self.calls.push(state);
-                    return Next::Park(Box::new(Status::Sibling(Resume::Lookup)));
+                    return Next::Park(Box::new(Status::Sibling(Resume::Lookup(Some(at)))));
                 }
                 Ok(MemoBegin::Started(mark)) => {
                     let scoped = self.memo_scope(&state);
@@ -1427,7 +1449,7 @@ impl<'r> Machine<'r> {
         }
         self.wake_siblings();
         self.calls.push(state);
-        Next::Park(Box::new(Status::Sibling(Resume::Lookup)))
+        Next::Park(Box::new(Status::Sibling(Resume::Lookup(None))))
     }
 
     /// Ends the call `state` with `result`, what its body came to, as
@@ -1440,8 +1462,16 @@ impl<'r> Machine<'r> {
         let outcome = if let Some((mark, scoped)) = state.memo {
             self.walker(|walker| walker.leave_scope(scoped));
             self.stack.truncate(state.base);
-            if mark.is_some() {
+            if let Some(mark) = mark {
                 self.memo.running.pop();
+                // Tasks that wait for a demanded run look again as it ends
+                // (see [Across units](tasks#across-units)).
+                if self
+                    .memo
+                    .is_demanded((Rc::as_ptr(&state.closure), mark.hash, mark.entry))
+                {
+                    self.wake_siblings();
+                }
             }
             let result = result.or_else(|unwind| unwind.returned(span));
             self.walker(|walker| {

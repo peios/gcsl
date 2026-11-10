@@ -381,8 +381,10 @@ pub(crate) enum FutureState {
     /// succeeds.
     Pending(Box<[Value]>),
     /// Its body is running, for an await in progress, in the run of this
-    /// unit, in graph mode; `None` in a plain run.
-    Running(Option<u32>),
+    /// unit, in graph mode; `None` in a plain run. `true` once another unit
+    /// waits for it: it is demanded (see
+    /// [`MemoTables::demanded`](crate::eval::MemoTables::demanded)).
+    Running(Option<u32>, bool),
     /// Run: the value it yielded, which every later await yields.
     Done(Value),
     /// A step's result that a host has yet to give, the step its node of
@@ -401,7 +403,8 @@ pub(crate) enum Begin {
     /// await depends on itself.
     Running,
     /// The future's body is running in the run of another unit, this one,
-    /// in graph mode, which has stopped: the await waits for it.
+    /// in graph mode, which has stopped: the await waits for it, and marks
+    /// it demanded ([`Future::demand`]).
     Elsewhere(u32),
     /// The future had not run: its captured values, taken out, and it is
     /// now running. The await must end it with [`Future::finish`].
@@ -644,16 +647,16 @@ impl Future {
         match &*state {
             FutureState::Host(node) => return Some(Begin::Host(*node)),
             FutureState::Failed(error) => return Some(Begin::Failed((**error).clone())),
-            FutureState::Running(Some(owner)) if Some(*owner) != unit => {
+            FutureState::Running(Some(owner), _) if Some(*owner) != unit => {
                 return Some(Begin::Elsewhere(*owner));
             }
             _ => {}
         }
         Some(
-            match std::mem::replace(&mut *state, FutureState::Running(unit)) {
+            match std::mem::replace(&mut *state, FutureState::Running(unit, false)) {
                 FutureState::Pending(captures) => Begin::Pending(captures),
-                FutureState::Running(owner) => {
-                    *state = FutureState::Running(owner);
+                FutureState::Running(owner, demanded) => {
+                    *state = FutureState::Running(owner, demanded);
                     Begin::Running
                 }
                 // Handled above; put back unchanged if they were reached.
@@ -673,6 +676,32 @@ impl Future {
                 }
             },
         )
+    }
+
+    /// Whether its body is running and another unit waits for it (see
+    /// [`MemoTables::demanded`](crate::eval::MemoTables::demanded)).
+    pub(crate) fn is_demanded(&self) -> bool {
+        matches!(
+            self.state.try_borrow().as_deref(),
+            Ok(FutureState::Running(_, true))
+        )
+    }
+
+    /// Whether its body is running in the run of the unit `unit`.
+    pub(crate) fn is_running_in(&self, unit: u32) -> bool {
+        matches!(
+            self.state.try_borrow().as_deref(),
+            Ok(FutureState::Running(Some(owner), _)) if *owner == unit
+        )
+    }
+
+    /// Marks its running body demanded: whether it was running and not
+    /// demanded before.
+    pub(crate) fn demand(&self) -> bool {
+        match self.state.try_borrow_mut().as_deref_mut() {
+            Ok(FutureState::Running(_, demanded)) => !std::mem::replace(demanded, true),
+            _ => false,
+        }
     }
 
     /// Ends the await that [`Future::begin`] started on a pending future:
@@ -696,7 +725,7 @@ impl Future {
         match self.state.get_mut() {
             FutureState::Pending(captures) => captures,
             FutureState::Done(value) => std::slice::from_mut(value),
-            FutureState::Running(_) | FutureState::Host(_) | FutureState::Failed(_) => &mut [],
+            FutureState::Running(..) | FutureState::Host(_) | FutureState::Failed(_) => &mut [],
         }
     }
 
@@ -704,7 +733,7 @@ impl Future {
     fn state_name(&self) -> &'static str {
         match self.state.try_borrow().as_deref() {
             Ok(FutureState::Pending(_)) => "pending",
-            Ok(FutureState::Running(_)) | Err(_) => "running",
+            Ok(FutureState::Running(..)) | Err(_) => "running",
             Ok(FutureState::Done(_)) => "done",
             Ok(FutureState::Host(_)) => "waiting",
             Ok(FutureState::Failed(_)) => "failed",

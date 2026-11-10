@@ -14,7 +14,7 @@ use crate::value::{Begin, Future, FutureState, Value};
 use super::super::graph::{NodeId, Wait};
 use super::super::kinds::of_kind;
 use super::super::{depends_on_itself, nested_too_deeply};
-use super::tasks::{Abandoned, Status, Wound};
+use super::tasks::{Abandoned, Run, Status, Wound};
 use super::{Activation, Frame, Machine, Next, Outcome, Resume, fail, give};
 
 /// An await running in the machine: of an `Await` node, or of a step of an
@@ -47,6 +47,11 @@ impl AwaitState {
     /// The await at `site`, its depth and span, for the node `node`.
     pub(super) const fn at(node: IrId, (depth, span): (u16, Span)) -> Self {
         Self { node, depth, span }
+    }
+
+    /// Where an error of the future it runs is reported.
+    pub(super) const fn span(self) -> Span {
+        self.span
     }
 
     /// The node, as the site where an error of its await is reported.
@@ -96,6 +101,11 @@ pub(super) struct FutureRun {
 }
 
 impl FutureRun {
+    /// The future whose body it runs, and where the body's frame starts.
+    pub(super) const fn future(&self) -> (&Rc<Future>, usize) {
+        (&self.future, self.base)
+    }
+
     /// Whether it is a run of `future`'s body.
     pub(super) fn runs(&self, future: *const Future) -> bool {
         std::ptr::eq(Rc::as_ptr(&self.future), future)
@@ -180,8 +190,14 @@ impl Machine<'_> {
                     .any(|running| Rc::ptr_eq(running, &future)) =>
             {
                 // Another task of the unit runs it: waited for, and awaited
-                // again; a later task's run of it is abandoned for this one.
-                self.wound(Wound::Future(Rc::as_ptr(&future)));
+                // again; a later task's run of it is abandoned for this one,
+                // unless another unit waits for it, or this task is in a run
+                // another unit waits for, which then waits for it too (see
+                // [Across units](super::tasks#across-units)).
+                self.demand_waited(&Run::Future(Rc::clone(&future)));
+                if !future.is_demanded() {
+                    self.wound(Wound::Future(Rc::as_ptr(&future)));
+                }
                 let waiting = Status::Sibling(resumed(state, future, then));
                 return Err(Next::Park(Box::new(waiting)));
             }
@@ -189,6 +205,7 @@ impl Machine<'_> {
             Some(Begin::Pending(captures)) => captures,
             // Awaited again once what it waits for is there.
             Some(Begin::Elsewhere(owner)) => {
+                self.memo.demand_future(&future);
                 return Err(Next::Block(Wait::Unit(owner), resumed(state, future, then)));
             }
             Some(Begin::Host(waiting)) => {
@@ -250,6 +267,12 @@ impl Machine<'_> {
         self.shared.futures.borrow_mut().pop();
         self.shared.context.replace(outer);
         self.stack.truncate(base);
+        // Tasks that wait for a demanded run look again as it ends (see
+        // [Across units](super::tasks#across-units)).
+        if future.is_demanded() {
+            self.wake_siblings();
+        }
+        self.memo.future_ended();
         match result.or_else(|unwind| unwind.returned(state.span)) {
             Ok(value) => {
                 // The captures are dropped: a future that has run holds
@@ -359,7 +382,7 @@ impl Machine<'_> {
 fn resumed(state: AwaitState, future: Rc<Future>, then: Then) -> Resume {
     match then {
         Then::Await => Resume::Await(state, future),
-        Then::Deep(awaiting, value) => Resume::Deep(awaiting, value),
-        Then::Apply(operands) => Resume::Apply(operands),
+        Then::Deep(awaiting, value) => Resume::Deep(awaiting, value, future),
+        Then::Apply(operands) => Resume::Apply(operands, future),
     }
 }

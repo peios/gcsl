@@ -526,7 +526,7 @@ fn a_future_displays_as_its_type_and_compares_by_identity() {
     );
     // Done or not, it shows as its type.
     assert_eq!(value.to_string(), "Future<Int>");
-    assert!(pending.finish(FutureState::Running(None)));
+    assert!(pending.finish(FutureState::Running(None, false)));
     assert!(format!("{pending:?}").contains("state: \"running\""));
     // By identity: equal only to itself.
     let other = Value::Future(future(&code, vec![Value::Int(1)]));

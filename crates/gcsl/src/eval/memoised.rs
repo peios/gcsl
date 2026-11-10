@@ -34,7 +34,7 @@ impl Evaluator<'_> {
                 MemoBegin::Found(value) => return Ok(value),
                 MemoBegin::Started(mark) => (Some(mark), mark.entering, mark.caller),
                 MemoBegin::Unkeyed(entering, caller) => (None, entering, caller),
-                MemoBegin::Elsewhere(owner) => {
+                MemoBegin::Elsewhere(owner, _) => {
                     self.stack.truncate(base);
                     return self.wait_for_unit(owner, node);
                 }
@@ -170,8 +170,8 @@ impl Evaluator<'_> {
                 }
                 // The frame is left as it is, the arguments in it, for a
                 // machine to look them up again once the unit has run.
-                Lookup::Elsewhere(owner) => return Ok(MemoBegin::Elsewhere(owner)),
-                Lookup::Sibling(entry) => return Ok(MemoBegin::Sibling(entry)),
+                Lookup::Elsewhere(owner, at) => return Ok(MemoBegin::Elsewhere(owner, at)),
+                Lookup::Sibling(at) => return Ok(MemoBegin::Sibling(at)),
             };
         let entering = self.levels + usize::from(depth) + CALL_LEVELS;
         if entering + code.height as usize > MAX_DEPTH {

@@ -290,6 +290,7 @@ fn messages(files: &[(&str, &str)], path: &str) -> Vec<String> {
 
 // ----- Scan errors -----
 
+mod across;
 mod arguments;
 mod defers;
 mod deftypes;
