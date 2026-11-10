@@ -1233,7 +1233,7 @@ impl<'r> Machine<'r> {
                     return Next::Block(Wait::Unit(owner), Resume::Lookup);
                 }
                 // A later task's run of it is abandoned for this one.
-                Ok(MemoBegin::Sibling(entry)) => {
+                Ok(MemoBegin::Sibling((_, _, entry))) => {
                     self.wound(tasks::Wound::Entry(entry));
                     self.calls.push(state);
                     return Next::Park(Box::new(Status::Sibling(Resume::Lookup)));

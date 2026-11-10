@@ -345,7 +345,10 @@ impl Evaluator<'_> {
         let captures = match future.begin(self.unit()) {
             Some(Begin::Done(value)) => return Ok(value),
             Some(Begin::Running) => return Err(depends_on_itself(node).into()),
-            Some(Begin::Elsewhere(owner)) => return self.wait_for_unit(owner, node),
+            Some(Begin::Elsewhere(owner)) => {
+                self.memo.demand_future(future);
+                return self.wait_for_unit(owner, node);
+            }
             Some(Begin::Pending(captures)) => captures,
             // A step's result the host has yet to give, or its failure (see
             // [Graph mode](crate::eval::graph#graph-mode)).

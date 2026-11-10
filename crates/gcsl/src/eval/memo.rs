@@ -203,6 +203,9 @@ pub struct MemoTables {
     /// How many memoised calls have ended, returned or failed, since the
     /// tables were made (see [`MemoTables::ended`]).
     pub(super) ended: u64,
+    /// How many runs of memoised calls and `lazy`s have become demanded
+    /// since the tables were made (see [`MemoTables::demanded`]).
+    pub(super) demanded: u64,
 }
 
 /// The origin of a caller that has none yet (see [Callers and
@@ -308,6 +311,7 @@ impl MemoTables {
             running: Vec::new(),
             context_frames: 0,
             ended: 0,
+            demanded: 0,
         }
     }
 
@@ -320,6 +324,28 @@ impl MemoTables {
     #[must_use]
     pub fn ended(&self) -> u64 {
         self.ended
+    }
+
+    /// How many runs of memoised calls and `lazy`s have become *demanded*
+    /// since the tables were made: another unit, in graph mode, found one
+    /// running and waits for it (see [Across
+    /// units](crate::eval::machine::tasks#across-units)). A demanded run
+    /// no longer waits for its unit's earlier work outside it, so a unit
+    /// that stopped may now go on: a host that marked one has progressed,
+    /// though nothing ended.
+    #[must_use]
+    pub fn demanded(&self) -> u64 {
+        self.demanded
+    }
+
+    /// Marks `future`'s running body demanded, counting it if it was not:
+    /// whether it was not.
+    pub(super) fn demand_future(&mut self, future: &crate::value::Future) -> bool {
+        let newly = future.demand();
+        if newly {
+            self.demanded = self.demanded.wrapping_add(1);
+        }
+        newly
     }
 
     /// A new origin, for a caller set from its calling code's file (see
@@ -502,7 +528,8 @@ impl MemoTables {
     /// `caller`'s origin if `inherited`, the caller passed on by a helper,
     /// as a read would, which allocates a copy of them if there are any. A
     /// running entry of another unit than `unit`, in graph mode, is
-    /// [`Lookup::Elsewhere`], and is not marked.
+    /// [`Lookup::Elsewhere`], and is marked demanded, not re-entered (see
+    /// [`MemoTables::demanded`]).
     pub(super) fn lookup(
         &mut self,
         closure: &Rc<Closure>,
@@ -523,6 +550,7 @@ impl MemoTables {
         }) else {
             return Lookup::Missing(hash);
         };
+        let at = (Rc::as_ptr(closure), hash, entry.id);
         let (value, passed) = match &mut entry.state {
             EntryState::Done(value) => {
                 // Copied only when they are passed on, which allocates: the
@@ -537,8 +565,14 @@ impl MemoTables {
                 (value.clone(), passed)
             }
             EntryState::Running {
-                owner: Some(owner), ..
+                owner: Some(owner),
+                demanded,
+                ..
             } if Some(*owner) != unit => {
+                if !*demanded {
+                    *demanded = true;
+                    self.demanded = self.demanded.wrapping_add(1);
+                }
                 return Lookup::Elsewhere(*owner);
             }
             // Running, but not on this task's line of control: another task
@@ -546,7 +580,7 @@ impl MemoTables {
             EntryState::Running { .. }
                 if !self.running.iter().any(|running| running.entry == entry.id) =>
             {
-                return Lookup::Sibling(entry.id);
+                return Lookup::Sibling(at);
             }
             EntryState::Running { reentered, .. } => {
                 *reentered = true;
@@ -597,6 +631,7 @@ impl MemoTables {
             state: EntryState::Running {
                 reentered: false,
                 owner,
+                demanded: false,
             },
             deps: Box::default(),
             generation: self.generation,
@@ -771,6 +806,9 @@ pub(super) enum EntryState {
         /// The unit whose run computes it, in graph mode; `None` in a plain
         /// run.
         owner: Option<u32>,
+        /// Whether another unit waits for it (see
+        /// [`MemoTables::demanded`]).
+        demanded: bool,
     },
     /// The body returned this value.
     Done(Value),
@@ -790,7 +828,7 @@ pub(super) enum Lookup {
     Elsewhere(u32),
     /// The closure is running with equal arguments in another task of this
     /// unit, which has stopped, its entry this one: the call waits for it.
-    Sibling(u64),
+    Sibling(RunningAt),
     /// No entry: the arguments' hash, for recording them.
     Missing(u64),
 }
@@ -813,7 +851,7 @@ pub(super) enum MemoBegin {
     /// unit, its entry this one: its frame is on the stack, with the
     /// arguments, for the call to wait for that task and look them up
     /// again.
-    Sibling(u64),
+    Sibling(RunningAt),
 }
 
 /// A running memoised call, as [`MemoTables::start`] recorded it.

@@ -343,6 +343,19 @@ impl Workspace {
         self.memo.ended()
     }
 
+    /// What a host compares before and after a round of runs to tell
+    /// whether units that wait for each other moved on: it changes when a
+    /// memoised call ends, as [`Workspace::memo_ended`] counts, and when a
+    /// run of a memoised call or `lazy` becomes demanded, as
+    /// [`MemoTables::demanded`](crate::eval::MemoTables::demanded) counts.
+    /// A unit that found another's run and stopped to wait for it may so
+    /// have let that unit go on, though nothing ended (see [Graph
+    /// mode](crate::eval::graph#graph-mode)).
+    #[must_use]
+    pub fn memo_progress(&self) -> u64 {
+        self.memo.ended().wrapping_add(self.memo.demanded())
+    }
+
     /// Runs `call`, a prepared invocation, in graph mode, against `graph`,
     /// `host` saying which deferring calls are steps and how other effects
     /// reach the system (see

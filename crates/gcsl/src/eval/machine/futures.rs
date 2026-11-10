@@ -189,6 +189,7 @@ impl Machine<'_> {
             Some(Begin::Pending(captures)) => captures,
             // Awaited again once what it waits for is there.
             Some(Begin::Elsewhere(owner)) => {
+                self.memo.demand_future(&future);
                 return Err(Next::Block(Wait::Unit(owner), resumed(state, future, then)));
             }
             Some(Begin::Host(waiting)) => {
