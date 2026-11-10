@@ -107,6 +107,22 @@
 //! A demanded run is never wounded: its effects, made out of order, would
 //! be made again. A task that needs it waits for it instead, woken when it
 //! ends.
+//!
+//! The demand passes on within the unit ([`Machine::demand_waited`]): a
+//! task holding a demanded run that waits for a run another task of the
+//! unit holds marks that run demanded too, and so on, as the task parks
+//! and as the unit is taken up. Otherwise the other task, inside the run
+//! waited for, would still wait its turn behind work outside the first
+//! run, which may wait for the other unit.
+//!
+//! With these rules, a circle of waits through another unit has to go
+//! through a run inside itself, as each turn waited for stays inside the
+//! demanded run it began in: the call depends on its own result. Within a
+//! unit, a circle that wound-wait left alone, because a run in it is
+//! demanded, is that too: once every task waits, and none for a node or
+//! another unit, the task running a demanded run that an earlier task
+//! waits for is wounded after all ([`Machine::unstick`]), and the earlier
+//! task fails where a run in order fails.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -118,7 +134,7 @@ use crate::value::{ContextFrame, List, Value};
 
 use super::super::failure::Caught;
 use super::super::graph::{GraphRun, NodeId, RunState, Wait};
-use super::super::memo::Running;
+use super::super::memo::{Running, RunningAt};
 use super::super::profile;
 use super::super::{Deadline, Unwind, internal};
 use super::loops::ForState;
@@ -155,6 +171,16 @@ pub(in crate::eval) enum Abandoned {
     Call(*const crate::ir::Ir, crate::ast::FnId, u64),
     /// A `lazy`'s body.
     Future(*const crate::value::Future),
+}
+
+/// A run of a memoised call or of a `lazy`'s body that a task waits for:
+/// where the call's entry is, or the future (see [Across
+/// units](#across-units)).
+pub(in crate::eval) enum Run {
+    /// A memoised call's.
+    Entry(RunningAt),
+    /// A `lazy`'s body.
+    Future(Rc<crate::value::Future>),
 }
 
 /// A run of a memoised call, by its entry's identity, or of a `lazy`'s
@@ -674,10 +700,7 @@ impl Machine<'_> {
     pub(super) fn wound(&mut self, target: Wound) {
         let mine = self.path();
         for task in &mut self.tasks {
-            let site = match target {
-                Wound::Entry(entry) => call_site(task, entry),
-                Wound::Future(future) => await_site(task, future),
-            };
+            let site = site_of(target, (&task.meta, &task.frames, &task.calls));
             if task.meta.wound.is_none()
                 && !matches!(task.status, Status::Cancel(_))
                 && site.is_some_and(|site| site > mine)
@@ -833,6 +856,150 @@ impl Machine<'_> {
         })
     }
 
+    /// Marks `run`, which the task running waits for, demanded, if the task
+    /// holds a demanded run: the run it waits for is then as good as
+    /// waited for by the other unit; and so on, to every run that tasks
+    /// holding a run it marks wait for (see [Across units](#across-units)).
+    pub(super) fn demand_waited(&mut self, run: &Run) {
+        if !self.demanded_held().is_empty() && self.demand(run) {
+            self.propagate_demand();
+            self.wake_turns();
+        }
+    }
+
+    /// Marks demanded every run that a task set aside waits for while it
+    /// holds a demanded run, and so on, until none is left to mark; the
+    /// root's too, waiting as its status says, if it is the task running.
+    /// Whether it marked any. A run is marked as another unit waits for it,
+    /// which a task of the unit may wait for in turn, and its holder for
+    /// another run of the unit: unmarked, that run would still wait its
+    /// turn behind work outside the first, which may wait for the other
+    /// unit (see [Across units](#across-units)).
+    fn propagate_demand(&mut self) -> bool {
+        let mut marked = false;
+        loop {
+            let mut waited: Vec<Run> = self
+                .tasks
+                .iter()
+                .filter_map(|task| match &task.status {
+                    Status::Sibling(resume)
+                        if self.holds_demanded(&task.own.running, &task.own.futures) =>
+                    {
+                        resume.waits_for()
+                    }
+                    _ => None,
+                })
+                .collect();
+            if let Some(Status::Sibling(resume)) = &self.status
+                && self.holds_demanded(&self.memo.running, &self.shared.futures.borrow())
+            {
+                waited.extend(resume.waits_for());
+            }
+            let mut more = false;
+            for run in &waited {
+                more |= self.demand(run);
+            }
+            if !more {
+                return marked;
+            }
+            marked = true;
+        }
+    }
+
+    /// Breaks a circle of the unit's tasks that wait for each other's
+    /// runs, once every task waits and none for a node or another unit,
+    /// which wound-wait left because a run in it is demanded (see [Across
+    /// units](#across-units)). Such a circle is a call that depends on its
+    /// own result. The task that runs a demanded run an earlier task waits
+    /// for is wounded, as wound-wait would have wounded it, and the unit
+    /// goes on: the earlier task runs the call itself, and fails where a
+    /// run in order fails. What the machine does next; `None` if no task
+    /// runs a demanded run that an earlier one waits for.
+    pub(super) fn unstick(&mut self) -> Option<Next> {
+        if !self.waits().is_empty() {
+            return None;
+        }
+        let target = |run: &Run| match run {
+            Run::Entry(at) => Wound::Entry(at.2),
+            Run::Future(future) => Wound::Future(Rc::as_ptr(future)),
+        };
+        let mut waiting: Vec<(Vec<u32>, Wound)> = Vec::new();
+        for task in &self.tasks {
+            if let Status::Sibling(resume) = &task.status
+                && let Some(run) = resume.waits_for()
+                && self.is_demanded(&run)
+            {
+                waiting.push((path_of(&task.meta, &task.frames, &task.calls), target(&run)));
+            }
+        }
+        if let Some(Status::Sibling(resume)) = &self.status
+            && let Some(run) = resume.waits_for()
+            && self.is_demanded(&run)
+        {
+            waiting.push((self.path(), target(&run)));
+        }
+        waiting.sort_by(|one, other| one.0.cmp(&other.0));
+        for (path, target) in waiting {
+            let later = |site: Option<Vec<u32>>| site.is_some_and(|site| site > path);
+            if let Some(task) = self.tasks.iter_mut().find(|task| {
+                task.meta.wound.is_none()
+                    && !matches!(task.status, Status::Cancel(_))
+                    && later(site_of(target, (&task.meta, &task.frames, &task.calls)))
+            }) {
+                task.meta.wound = Some(target);
+                task.status = Status::Cancel(looks_up(&task.status));
+                let status = self.status.take()?;
+                return self.park(status);
+            }
+            if self.meta.wound.is_none()
+                && later(site_of(target, (&self.meta, &self.frames, &self.calls)))
+            {
+                let status = self.status.take()?;
+                self.meta.wound = Some(target);
+                return Some(self.start(Status::Cancel(looks_up(&status))));
+            }
+        }
+        None
+    }
+
+    /// Whether `run` is demanded.
+    fn is_demanded(&self, run: &Run) -> bool {
+        match run {
+            Run::Entry(at) => self.memo.is_demanded(*at),
+            Run::Future(future) => future.is_demanded(),
+        }
+    }
+
+    /// Marks `run` demanded: whether it was running and was not.
+    fn demand(&mut self, run: &Run) -> bool {
+        match run {
+            Run::Entry(at) => self.memo.demand(*at),
+            Run::Future(future) => self.memo.demand_future(future),
+        }
+    }
+
+    /// Whether a task whose running memoised calls are `running` and whose
+    /// running `lazy`s are `futures` holds a demanded run.
+    fn holds_demanded(&self, running: &[Running], futures: &[Rc<crate::value::Future>]) -> bool {
+        running
+            .iter()
+            .any(|running| self.memo.is_demanded(running.at()))
+            || futures.iter().any(|future| future.is_demanded())
+    }
+
+    /// Wakes every task set aside that waits for its turn, to look again: a
+    /// run it holds may have become demanded (see [Across
+    /// units](#across-units)).
+    fn wake_turns(&mut self) {
+        for task in &mut self.tasks {
+            let status = std::mem::replace(&mut task.status, Status::Joining);
+            task.status = match status {
+                Status::Waiting(resume) => Status::Wake(resume),
+                status => status,
+            };
+        }
+    }
+
     /// The demanded runs the task running holds (see [Across
     /// units](#across-units)).
     fn demanded_held(&self) -> Vec<Held> {
@@ -965,33 +1132,35 @@ fn split_kept<T: Clone>(values: &mut Vec<T>, kept: usize) -> Vec<T> {
     whole
 }
 
-/// The path of `task` where it began the memoised call whose entry is
-/// `entry`, if it runs it: of its frames below the call's body, and the
+/// The path where a task whose place is `meta`, whose frames are `frames`
+/// and whose calls are `calls` began `target`'s memoised call or `lazy`,
+/// if it runs it: of its frames below the call's or `lazy`'s body, and the
 /// calls they take (see [Tasks](#tasks)).
-fn call_site(task: &Task, entry: u64) -> Option<Vec<u32>> {
-    let call = task
-        .calls
-        .iter()
-        .position(|call| matches!(call.memo, Some((Some(mark), _)) if mark.entry == entry))?;
-    let mut taken = 0;
-    let body = task.frames.iter().position(|frame| {
-        taken += usize::from(frame.takes_call());
-        frame.takes_call() && taken == call + 1
-    })?;
-    let (frames, calls) = (task.frames.get(..body)?, task.calls.get(..call)?);
-    Some(path_of(&task.meta, frames, calls))
-}
-
-/// The path of `task` where it began running `future`'s body, if it runs
-/// it: of its frames below the body, and the calls they take.
-fn await_site(task: &Task, future: *const crate::value::Future) -> Option<Vec<u32>> {
-    let body = task
-        .frames
-        .iter()
-        .position(|frame| matches!(frame, Frame::Future(run) if run.runs(future)))?;
-    let frames = task.frames.get(..body)?;
-    let calls = frames.iter().filter(|frame| frame.takes_call()).count();
-    Some(path_of(&task.meta, frames, task.calls.get(..calls)?))
+fn site_of(
+    target: Wound,
+    (meta, frames, calls): (&Meta, &[Frame], &[CallState]),
+) -> Option<Vec<u32>> {
+    match target {
+        Wound::Entry(entry) => {
+            let call = calls.iter().position(
+                |call| matches!(call.memo, Some((Some(mark), _)) if mark.entry == entry),
+            )?;
+            let mut taken = 0;
+            let body = frames.iter().position(|frame| {
+                taken += usize::from(frame.takes_call());
+                frame.takes_call() && taken == call + 1
+            })?;
+            Some(path_of(meta, frames.get(..body)?, calls.get(..call)?))
+        }
+        Wound::Future(future) => {
+            let body = frames
+                .iter()
+                .position(|frame| matches!(frame, Frame::Future(run) if run.runs(future)))?;
+            let below = frames.get(..body)?;
+            let taken = below.iter().filter(|frame| frame.takes_call()).count();
+            Some(path_of(meta, below, calls.get(..taken)?))
+        }
+    }
 }
 
 /// Whether `task` holds every run of `held`.
@@ -1015,10 +1184,10 @@ fn holds(task: &Task, held: &[Held]) -> bool {
 const fn looks_up(status: &Status) -> bool {
     matches!(
         status,
-        Status::Blocked(_, Resume::Lookup)
-            | Status::Sibling(Resume::Lookup)
-            | Status::Again(Resume::Lookup)
-            | Status::Wake(Resume::Lookup)
+        Status::Blocked(_, Resume::Lookup(_))
+            | Status::Sibling(Resume::Lookup(_))
+            | Status::Again(Resume::Lookup(_))
+            | Status::Wake(Resume::Lookup(_))
     )
 }
 
@@ -1043,6 +1212,8 @@ impl Machine<'_> {
     /// waited for a node, a unit, its turn or a sibling is woken, to look
     /// again, and the root, running, takes up as its status says.
     pub(super) fn take_up_tasks(&mut self) -> Next {
+        // Other units may have marked runs demanded while it was stopped.
+        self.propagate_demand();
         self.wake_given();
         match self.status.take() {
             Some(

@@ -349,6 +349,29 @@ impl MemoTables {
             .is_some_and(|entry| matches!(entry.state, EntryState::Running { demanded: true, .. }))
     }
 
+    /// Marks the running entry `at` demanded, counting it if it was not:
+    /// whether it was not.
+    pub(super) fn demand(&mut self, (closure, hash, id): RunningAt) -> bool {
+        let entry = self
+            .tables
+            .get_mut(&closure)
+            .and_then(|table| table.buckets.get_mut(&hash))
+            .and_then(|bucket| bucket.entries_mut().iter_mut().find(|entry| entry.id == id));
+        let Some(Entry {
+            state: EntryState::Running { demanded, .. },
+            ..
+        }) = entry
+        else {
+            return false;
+        };
+        let newly = !*demanded;
+        *demanded = true;
+        if newly {
+            self.demanded = self.demanded.wrapping_add(1);
+        }
+        newly
+    }
+
     /// Counts a run of a `lazy`'s body ended, run or left unrun (see
     /// [`MemoTables::ended`]).
     pub(super) fn future_ended(&mut self) {
@@ -590,7 +613,7 @@ impl MemoTables {
                     *demanded = true;
                     self.demanded = self.demanded.wrapping_add(1);
                 }
-                return Lookup::Elsewhere(*owner);
+                return Lookup::Elsewhere(*owner, at);
             }
             // Running, but not on this task's line of control: another task
             // of the unit runs it (see [Tasks](crate::eval::machine::tasks#tasks)).
@@ -841,8 +864,9 @@ pub(super) enum Lookup {
     Running,
     /// The closure is running with equal arguments in the run of another
     /// unit, this one, in graph mode, which has stopped: the call waits for
-    /// it (see [Graph mode](crate::eval::graph#graph-mode)).
-    Elsewhere(u32),
+    /// it (see [Graph mode](crate::eval::graph#graph-mode)), its entry
+    /// this one.
+    Elsewhere(u32, RunningAt),
     /// The closure is running with equal arguments in another task of this
     /// unit, which has stopped, its entry this one: the call waits for it.
     Sibling(RunningAt),
@@ -862,8 +886,8 @@ pub(super) enum MemoBegin {
     /// The call is running with equal arguments in the run of this unit,
     /// in graph mode, which has stopped: its frame is on the stack, with
     /// the arguments, for the call to wait for that unit and look them up
-    /// again.
-    Elsewhere(u32),
+    /// again; its entry this one.
+    Elsewhere(u32, RunningAt),
     /// The call is running with equal arguments in another task of the
     /// unit, its entry this one: its frame is on the stack, with the
     /// arguments, for the call to wait for that task and look them up

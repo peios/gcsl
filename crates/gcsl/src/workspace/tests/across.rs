@@ -133,6 +133,28 @@ const LAZY: Fixture = Fixture {
     effects: 2,
 };
 
+/// A circle through tasks of one unit waiting for each other's calls,
+/// only the first of which another unit waits for. In the second target,
+/// in program order, `f` waits for the first target's run; `r`'s read
+/// waits its turn behind it; `w` waits for `r`; and `g` waits for `w`.
+/// The first target's `f` then needs `g`. A run in order of the second
+/// target has no circle.
+const PROPAGATED: Fixture = Fixture {
+    name: "propagated",
+    program: "fn r() ->> String { = said(\"r\") }\n\
+              fn w() ->> String { = r() }\n\
+              fn g() ->> String { = w() }\n\
+              fn f() ->> String {\n\
+              \x20   let x = said(\"x\")\n\
+              \x20   = \"{x}{g()}\"\n\
+              }\n\
+              def build first() { = f() }\n\
+              def build second() { = [f(), r(), w(), g()].join(\",\") }",
+    targets: &["first", "second"],
+    values: &["XR", "XR,R,R,R"],
+    effects: 2,
+};
+
 /// A task that waits for a later one's demanded run, which is not
 /// wounded: in the second target, the first piece waits for the third
 /// target's `x`, and the second begins `d`, which the first target then
@@ -159,13 +181,14 @@ const WOKEN: Fixture = Fixture {
 };
 
 /// Every fixture whose targets share runs.
-const FIXTURES: [&Fixture; 8] = [
+const FIXTURES: [&Fixture; 9] = [
     &CROSSED,
     &COMMITTED,
     &NESTED_INNER,
     &NESTED_MID,
     &THREE,
     &LAZY,
+    &PROPAGATED,
     &WOKEN,
     &UNSHARED,
 ];
@@ -437,4 +460,39 @@ fn a_demanded_run_makes_its_effect_only_once_no_other_waits() {
         text("B")
     );
     assert_eq!(graph.len(), 2);
+}
+
+/// Two memoised calls that need each other: a run in order of either
+/// target calls one, then the other inside it, then the first inside that,
+/// a call that depends on its own result. In the second target, each
+/// begins in a task of its own; the first target waits for `d`.
+const RECURSIVE: Fixture = Fixture {
+    name: "recursive",
+    program: "fn r() ->> String {\n\
+              \x20   let a = said(\"r\")\n\
+              \x20   = \"{a}{d()}\"\n\
+              }\n\
+              fn d() ->> String {\n\
+              \x20   let b = said(\"d\")\n\
+              \x20   = \"{b}{r()}\"\n\
+              }\n\
+              def build first() { = d() }\n\
+              def build second() { = both(r(), d()) }",
+    targets: &["second", "first"],
+    values: &[],
+    effects: 0,
+};
+
+#[test]
+fn tasks_of_a_unit_that_need_each_other_s_runs_through_a_demanded_one_fail_as_in_order() {
+    // The second target's `d`, which the first waits for, is never
+    // wounded for its earlier task that needs it, and its task then needs
+    // that task's `r`. The tasks wait for each other, which a run in order
+    // reports as a call that depends on its own result, not as a fault;
+    // and then so does the first target, running `d` itself.
+    let (mut workspace, calls) = prepared(&RECURSIVE);
+    let order: Vec<&PreparedCall> = calls.iter().collect();
+    let driven = drive(&mut workspace, &order, None).unwrap();
+    let recursion = Err("this call depends on its own result".to_owned());
+    assert_eq!(driven.values, [recursion.clone(), recursion]);
 }

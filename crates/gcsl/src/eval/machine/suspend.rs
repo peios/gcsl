@@ -35,7 +35,7 @@ use crate::value::{Caller, ContextFrame, Future, Value};
 
 use super::super::failure::Caught;
 use super::super::graph::{GraphRun, NodeId, RunState, StepCall, Wait, pending};
-use super::super::memo::{MemoTables, Running};
+use super::super::memo::{MemoTables, Running, RunningAt};
 use super::super::profile;
 use super::super::{Deadline, Flow, Shared, Unwind};
 use crate::diagnostic::Mark;
@@ -50,20 +50,21 @@ pub(in crate::eval) enum Resume {
     /// The application of a built-in, its arguments evaluated, again: its
     /// turn to make an effect may have come.
     Builtin(Box<super::builtins::BuiltinCall>),
-    /// The deep await `state` of the value, again: a future of one of its
+    /// The deep await `state` of the value, again: the future of one of its
     /// fields has run, or the node it stands for has its result, or not
     /// yet.
-    Deep(AwaitState, Value),
-    /// The application of a node to its operands, again: a future met on
+    Deep(AwaitState, Value, Rc<Future>),
+    /// The application of a node to its operands, again: the future met on
     /// its update's path has run, or the node it stands for has its result,
     /// or not yet.
-    Apply(Box<super::data::OperandsState>),
+    Apply(Box<super::data::OperandsState>, Rc<Future>),
     /// The outcome of the effect node `NodeId`, made by the call node
     /// `IrId`.
     Effect(IrId, NodeId),
     /// The lookup of the memoised call on top of the machine's calls,
-    /// again, its arguments still in its frame.
-    Lookup,
+    /// again, its arguments still in its frame; with the running entry it
+    /// found, another task's or another unit's, if it found one.
+    Lookup(Option<RunningAt>),
     /// The evaluation of the context read node, again: its turn to read a
     /// context the run watches may have come.
     Read(IrId),
@@ -351,14 +352,28 @@ impl Parked {
     }
 }
 
+impl Resume {
+    /// The run it waits for, if it looks a memoised call up or awaits a
+    /// future again (see [Across units](super::tasks#across-units)).
+    pub(super) fn waits_for(&self) -> Option<super::tasks::Run> {
+        match self {
+            Self::Await(_, future) | Self::Deep(_, _, future) | Self::Apply(_, future) => {
+                Some(super::tasks::Run::Future(Rc::clone(future)))
+            }
+            Self::Lookup(at) => at.map(super::tasks::Run::Entry),
+            Self::Builtin(_) | Self::Effect(..) | Self::Read(_) => None,
+        }
+    }
+}
+
 impl Machine<'_> {
     /// What the machine does first when it takes up after `resume`.
     pub(super) fn resume_next(&mut self, resume: Resume) -> Next {
         match resume {
             Resume::Await(state, future) => self.await_fully(state, Value::Future(future)),
-            Resume::Deep(state, value) => self.await_deep(state, value),
+            Resume::Deep(state, value, _) => self.await_deep(state, value),
             Resume::Builtin(call) => self.builtin_apply(call),
-            Resume::Apply(operands) => self.apply_again(operands),
+            Resume::Apply(operands, _) => self.apply_again(operands),
             Resume::Effect(node, id) => {
                 let outcome = self.walker(|walker| walker.node_outcome(id, walker.ir.get(node)));
                 match outcome {
@@ -367,7 +382,7 @@ impl Machine<'_> {
                     Err(unwind) => fail(unwind),
                 }
             }
-            Resume::Lookup => match self.calls.pop() {
+            Resume::Lookup(_) => match self.calls.pop() {
                 Some(state) => self.enter_body(state),
                 None => self.lost_call(),
             },

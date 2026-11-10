@@ -14,7 +14,7 @@ use crate::value::{Begin, Future, FutureState, Value};
 use super::super::graph::{NodeId, Wait};
 use super::super::kinds::of_kind;
 use super::super::{depends_on_itself, nested_too_deeply};
-use super::tasks::{Abandoned, Status, Wound};
+use super::tasks::{Abandoned, Run, Status, Wound};
 use super::{Activation, Frame, Machine, Next, Outcome, Resume, fail, give};
 
 /// An await running in the machine: of an `Await` node, or of a step of an
@@ -181,8 +181,10 @@ impl Machine<'_> {
             {
                 // Another task of the unit runs it: waited for, and awaited
                 // again; a later task's run of it is abandoned for this one,
-                // unless another unit waits for it (see [Across
-                // units](super::tasks#across-units)).
+                // unless another unit waits for it, or this task is in a run
+                // another unit waits for, which then waits for it too (see
+                // [Across units](super::tasks#across-units)).
+                self.demand_waited(&Run::Future(Rc::clone(&future)));
                 if !future.is_demanded() {
                     self.wound(Wound::Future(Rc::as_ptr(&future)));
                 }
@@ -370,7 +372,7 @@ impl Machine<'_> {
 fn resumed(state: AwaitState, future: Rc<Future>, then: Then) -> Resume {
     match then {
         Then::Await => Resume::Await(state, future),
-        Then::Deep(awaiting, value) => Resume::Deep(awaiting, value),
-        Then::Apply(operands) => Resume::Apply(operands),
+        Then::Deep(awaiting, value) => Resume::Deep(awaiting, value, future),
+        Then::Apply(operands) => Resume::Apply(operands, future),
     }
 }

@@ -522,7 +522,12 @@ impl<'r> Machine<'r> {
                         Err(status) => self.park(status).unwrap_or(Next::Stop),
                     }
                 }
-                Next::Stop => return self.stopped(),
+                // Unless a circle of its tasks through a demanded run can
+                // be broken (see [Across units](tasks#across-units)).
+                Next::Stop => match self.unstick() {
+                    Some(next) => next,
+                    None => return self.stopped(),
+                },
             };
         }
     }
@@ -1228,19 +1233,21 @@ impl<'r> Machine<'r> {
                 Ok(MemoBegin::Found(value)) => return self.found(&state, value),
                 // Looked up again, its arguments still in its frame, once the
                 // unit that runs it has run.
-                Ok(MemoBegin::Elsewhere(owner)) => {
+                Ok(MemoBegin::Elsewhere(owner, at)) => {
                     self.calls.push(state);
-                    return Next::Block(Wait::Unit(owner), Resume::Lookup);
+                    return Next::Block(Wait::Unit(owner), Resume::Lookup(Some(at)));
                 }
                 // A later task's run of it is abandoned for this one,
-                // unless another unit waits for it (see [Across
-                // units](tasks#across-units)).
+                // unless another unit waits for it, or this task is in a
+                // run another unit waits for, which then waits for it too
+                // (see [Across units](tasks#across-units)).
                 Ok(MemoBegin::Sibling(at)) => {
+                    self.demand_waited(&tasks::Run::Entry(at));
                     if !self.memo.is_demanded(at) {
                         self.wound(tasks::Wound::Entry(at.2));
                     }
                     self.calls.push(state);
-                    return Next::Park(Box::new(Status::Sibling(Resume::Lookup)));
+                    return Next::Park(Box::new(Status::Sibling(Resume::Lookup(Some(at)))));
                 }
                 Ok(MemoBegin::Started(mark)) => {
                     let scoped = self.memo_scope(&state);
@@ -1431,7 +1438,7 @@ impl<'r> Machine<'r> {
         }
         self.wake_siblings();
         self.calls.push(state);
-        Next::Park(Box::new(Status::Sibling(Resume::Lookup)))
+        Next::Park(Box::new(Status::Sibling(Resume::Lookup(None))))
     }
 
     /// Ends the call `state` with `result`, what its body came to, as
