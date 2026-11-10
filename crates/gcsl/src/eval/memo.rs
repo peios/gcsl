@@ -200,7 +200,7 @@ pub struct MemoTables {
     /// The last identity given to a frame of the context (see
     /// [Context](crate::eval::context#context)): each is new.
     pub(super) context_frames: u64,
-    /// How many memoised calls have ended, returned or failed, since the
+    /// How many memoised calls and runs of `lazy`s have ended since the
     /// tables were made (see [`MemoTables::ended`]).
     pub(super) ended: u64,
     /// How many runs of memoised calls and `lazy`s have become demanded
@@ -316,11 +316,12 @@ impl MemoTables {
     }
 
     /// How many memoised calls have ended, returned or failed, or been
-    /// given up for a run elsewhere, since the tables were made. A host in
+    /// given up for a run elsewhere, and how many runs of `lazy`s' bodies
+    /// have ended, run or left unrun, since the tables were made. A host in
     /// graph mode tells by it whether a unit's run moved anything on that
-    /// another unit waits for: a run that ended a call another waits on has
-    /// progressed, even if it stopped again, waiting itself, and units that
-    /// wait for each other with nothing ending are stuck.
+    /// another unit waits for: a run that ended a call or `lazy` another
+    /// waits on has progressed, even if it stopped again, waiting itself,
+    /// and units that wait for each other with nothing ending are stuck.
     #[must_use]
     pub fn ended(&self) -> u64 {
         self.ended
@@ -346,6 +347,12 @@ impl MemoTables {
             .and_then(|table| table.buckets.get(&hash))
             .and_then(|bucket| bucket.entries().iter().find(|entry| entry.id == id))
             .is_some_and(|entry| matches!(entry.state, EntryState::Running { demanded: true, .. }))
+    }
+
+    /// Counts a run of a `lazy`'s body ended, run or left unrun (see
+    /// [`MemoTables::ended`]).
+    pub(super) fn future_ended(&mut self) {
+        self.ended = self.ended.wrapping_add(1);
     }
 
     /// Marks `future`'s running body demanded, counting it if it was not:

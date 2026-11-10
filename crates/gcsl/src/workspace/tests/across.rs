@@ -118,6 +118,21 @@ const THREE: Fixture = Fixture {
     effects: 2,
 };
 
+/// [`CROSSED`] with a top-level `lazy` for `inner`.
+const LAZY: Fixture = Fixture {
+    name: "lazy",
+    program: "let inner = lazy { = said(\"b\") }\n\
+              fn outer() ->> String {\n\
+              \x20   let a = said(\"a\")\n\
+              \x20   = \"{a}{await inner}\"\n\
+              }\n\
+              def build first() { = outer() }\n\
+              def build second() { = both(outer(), await inner) }",
+    targets: &["first", "second"],
+    values: &["AB", "AB+B"],
+    effects: 2,
+};
+
 /// A task that waits for a later one's demanded run, which is not
 /// wounded: in the second target, the first piece waits for the third
 /// target's `x`, and the second begins `d`, which the first target then
@@ -144,12 +159,13 @@ const WOKEN: Fixture = Fixture {
 };
 
 /// Every fixture whose targets share runs.
-const FIXTURES: [&Fixture; 7] = [
+const FIXTURES: [&Fixture; 8] = [
     &CROSSED,
     &COMMITTED,
     &NESTED_INNER,
     &NESTED_MID,
     &THREE,
+    &LAZY,
     &WOKEN,
     &UNSHARED,
 ];

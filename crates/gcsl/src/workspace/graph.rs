@@ -333,11 +333,12 @@ impl Workspace {
     }
 
     /// How many memoised calls have ended in the workspace's runs, returned
-    /// or failed, or been given up for a run elsewhere (see
-    /// [`MemoTables::ended`](crate::eval::MemoTables::ended)): by it a host
-    /// tells a unit's run that ended a call another unit waits on, and so
-    /// progressed though it stopped again, from units stuck waiting for
-    /// each other (see [Graph mode](crate::eval::graph#graph-mode)).
+    /// or failed, or been given up for a run elsewhere, and runs of
+    /// `lazy`s (see [`MemoTables::ended`](crate::eval::MemoTables::ended)):
+    /// by it a host tells a unit's run that ended a call or `lazy` another
+    /// unit waits on, and so progressed though it stopped again, from units
+    /// stuck waiting for each other (see [Graph
+    /// mode](crate::eval::graph#graph-mode)).
     #[must_use]
     pub fn memo_ended(&self) -> u64 {
         self.memo.ended()

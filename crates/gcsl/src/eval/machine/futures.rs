@@ -260,6 +260,7 @@ impl Machine<'_> {
         if future.is_demanded() {
             self.wake_siblings();
         }
+        self.memo.future_ended();
         match result.or_else(|unwind| unwind.returned(state.span)) {
             Ok(value) => {
                 // The captures are dropped: a future that has run holds

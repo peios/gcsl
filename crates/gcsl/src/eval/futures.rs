@@ -381,6 +381,7 @@ impl Evaluator<'_> {
         self.leave_scope(scoped);
         self.shared.context.replace(outer);
         self.stack.truncate(base);
+        self.memo.future_ended();
         // A `return` for the `lazy` is its value, recorded as any is, here,
         // inside the running mark; no other stop leaves its body: the
         // checker sees to it.
