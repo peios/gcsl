@@ -98,16 +98,19 @@ is set aside only if it assigns no variable with `:=` and has no
 If two parts set aside need the same memoised call or `lazy` value, it
 runs once. Should a later part have begun it and then had to wait for an
 earlier one, the later part gives up its run and the earlier part runs
-it, as the program would in order.
+it, as the program would in order. A run that another unit is waiting
+for is never given up, so the earlier part waits for it instead (see
+[Units that share work](#units-that-share-work)).
 
 An iteration set aside can still reach effects that must happen in
 program order, such as programs that write files the next one reads.
 Your `Effects` says which effects it isolates, through
 `Effects::isolates`: an effect you don't isolate is only made once
 nothing earlier in the program is still waiting, so you still see such
-effects one at a time, in program order. Once something set aside has
-failed, nothing after it that you don't isolate is made at all, as the
-program would have stopped at the failure. By default nothing is
+effects one at a time, in program order. The exception is a run that
+another unit is waiting for, described below. Once something set aside
+has failed, nothing after it that you don't isolate is made at all, as
+the program would have stopped at the failure. By default nothing is
 isolated. Isolate an effect only if its order can't matter, such as a
 fetch pinned by its digest.
 
@@ -122,17 +125,34 @@ that can make progress, and then run the waiting unit again. It looks
 the call up again, and finds the result once the other unit has
 finished it.
 
-To know whether units that wait for each other are stuck, compare
-`Workspace::memo_ended` before and after a round of runs. It counts the
-memoised calls that have ended. A unit that waits again after its run
-might still have ended a call that another unit waits for, so wake the
-waiting units again. Units are stuck only if a round ran nothing else
-and ended no call.
-
 A unit that waits on another never makes a node of its own for the
 shared work, so the work is done once, by whichever unit reached it
-first. If every unit you have is waiting on another, they are waiting
-on each other: report that as an error rather than running them again.
+first. That unit's program order doesn't govern it, though. Once another
+unit is waiting for a memoised call or `lazy` value, the effects you
+don't isolate inside it stop waiting for the earlier work of the unit
+running it, and wait only for earlier work inside it. Otherwise that
+earlier work could itself be waiting for the other unit, and the two
+would wait for each other for ever. Such effects are still made one at
+a time per unit. Which unit runs shared work first was already a matter
+of chance, so no unit's program order could govern it.
+
+To know whether units that wait for each other are stuck, compare
+`Workspace::memo_progress` before and after a round of runs. It changes
+when a memoised call or a `lazy` value's run ends, and when a unit
+starts waiting for another unit's run, which lets that run go on. A unit
+that waits again after its run might still have moved on what another
+unit waits for, so wake the waiting units again. Units are stuck only if
+a round ran nothing else and `Workspace::memo_progress` didn't change.
+
+If every unit you have is waiting on another, they are waiting on each
+other: report that as an error rather than running them again. Call
+`Workspace::stuck` first. If the units wait in a circle through memoised
+calls or `lazy` values, some call needs its own result, and it returns
+the error "this call depends on its own result", with each call in the
+circle labeled. A run of the program in order would fail the same way.
+It names units through a function you pass, so name them as your users
+know them. It returns `None` if the circle goes through a step's result,
+which only you can follow.
 
 A step's failure is raised where its result is used, so a `recover`
 around that use catches it, as with any failure. A finished value can

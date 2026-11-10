@@ -30,7 +30,9 @@
 //! that node's result ([`Graph::resolve`]), the unit's next run takes up
 //! where it stopped: nothing before the stop runs again. A unit that needs
 //! a memoised call or a `lazy` another unit is running stops for that
-//! unit's run instead ([`Wait::Unit`]). A walker, which could only stop by
+//! unit's run instead ([`Wait::Unit`]), and that run is then *demanded*:
+//! inside it, effects keep only its own order (see [Across
+//! units](crate::eval::machine::tasks#across-units)). A walker, which could only stop by
 //! unwinding, never stops in graph mode: one that would is an internal
 //! error. A node's failure is raised where its result is needed, as any
 //! failure there, so `recover` around it catches it; a `#[retry]` around an
@@ -54,9 +56,10 @@
 //! not given, its *holes* ([`Graph::holes`]): through records, lists,
 //! variants, secrets, futures not run yet, by their captures, run ones, by
 //! their values, and closures, by their captures. Its *order edge* is the
-//! node met just before it in its unit, in program order. A host that
-//! isolates a node may drop its order edge; one that does not runs it in
-//! program order.
+//! node met just before it in its unit, in program order, but for a node
+//! met inside a demanded run, which keeps only the run's own order. A host
+//! that isolates a node may drop its order edge; one that does not runs it
+//! in the order its unit meets it.
 //!
 //! **Reads.** A run of a step's unit records what it reads of the context
 //! the step was made in ([`StepReads`], `GraphRun::watching`): each context
