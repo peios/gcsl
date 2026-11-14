@@ -84,7 +84,9 @@ def get<T>(kind: Variant<Toolchain, T>, ^toolchains, ^host_platform, ^platform) 
         if entry.kind_name != wanted {
             continue
         }
-        let registered = entry.made()
+        # What a toolchain is made from is a tool, not source of what it
+        # builds (see the prelude's `fetch`).
+        let registered = entry.made() with { making_tool = true }
         let provides: Toolchain = registered.provides
         let runs_here = registered.host_platform.matches(host_platform)
         let builds_for = registered.platform.matches(platform)

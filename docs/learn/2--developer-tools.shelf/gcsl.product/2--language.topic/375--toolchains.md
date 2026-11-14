@@ -80,3 +80,9 @@ so a toolchain built with another can be registered in any order: a
 tool compiled with the Rust toolchain doesn't make every `get` of the
 Rust toolchain wait on itself. When nothing fits, `get` fails, naming
 the kind and both platforms.
+
+`get` runs a toolchain's body with the context `making_tool` set to
+`true`. What the body fetches, a compiler's archive or the source of a
+tool it builds, is then a tool, which a build tool collecting a package's
+corresponding source leaves out (see
+[Fetching](~gcsl/file-and-process-effects#fetching)).
