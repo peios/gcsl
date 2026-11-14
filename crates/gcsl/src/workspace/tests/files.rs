@@ -584,6 +584,18 @@ fn a_pinned_fetch_gives_the_file_it_names() {
 }
 
 #[test]
+fn a_tool_s_fetch_gives_the_file_as_any_fetch_does() {
+    let Some(url) = hello_url("fetch-tool") else {
+        return;
+    };
+    let text = format!(
+        "import builtins\nlet f = fetch(\"{url}\", sha256 = \"{HELLO_SHA256}\", tool = true)\n\
+         let g = builtins.fetch_tool(\"{url}\", \"{HELLO_SHA256}\")\n= [f.read(), g.read()]"
+    );
+    assert_eq!(lone(&text).unwrap(), "[\"hello\\n\", \"hello\\n\"]");
+}
+
+#[test]
 fn a_fetch_that_is_not_what_was_pinned_fails_with_what_it_is() {
     let Some(url) = hello_url("fetch-unpinned") else {
         return;

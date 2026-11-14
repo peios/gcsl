@@ -211,9 +211,15 @@ file = builtins.file
 # it is fetched; without one it fails with the digest it found, to pin it
 # with. A build tool keeps fetched files by their digests, and fetches each
 # once. It fails at its call: it is `#[track_caller]`.
+#
+# With `tool = true`, the file is a tool the build runs, such as a compiler
+# or a build environment's programs, rather than source of what the build
+# makes. It is fetched and kept the same either way. A build tool that
+# collects what a package was built from, its corresponding source, leaves
+# tools out, so mark every fetch of one, and nothing else.
 #[track_caller]
-def fetch(url: String, sha256: String = "") -> File {
-    builtins.fetch(url, sha256)
+def fetch(url: String, sha256: String = "", tool: Bool = false) -> File {
+    if tool { builtins.fetch_tool(url, sha256) } else { builtins.fetch(url, sha256) }
 }
 # `fetch_git(url, commit)` gives the files of the git repository at `url`
 # as the commit `commit` has them, without the repository's `.git` or its

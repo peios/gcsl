@@ -50,7 +50,7 @@ out matches anything.
 
 ```text
 def Toolchain::C gcc_x86_64() {
-    let files = archive.unpack(fetch("https://example.org/gcc.tar.xz", sha256 = "..."))
+    let files = archive.unpack(fetch("https://example.org/gcc.tar.xz", sha256 = "...", tool = true))
     host_platform = {arch = "x86_64"}
     platform = {arch = "x86_64"}
     provides = {

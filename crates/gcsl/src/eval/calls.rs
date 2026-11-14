@@ -494,7 +494,7 @@ impl Evaluator<'_> {
             (Builtin::FileRead, Value::File(file), None) => {
                 read_file(&file, self.shared.effects, node)
             }
-            (Builtin::Fetch, Value::Str(url), Some(Value::Str(sha256))) => {
+            (Builtin::Fetch | Builtin::FetchTool, Value::Str(url), Some(Value::Str(sha256))) => {
                 fetch(&url, &sha256, self.shared.effects, node)
             }
             (Builtin::FetchGit, Value::Str(url), Some(Value::Str(commit))) => {
