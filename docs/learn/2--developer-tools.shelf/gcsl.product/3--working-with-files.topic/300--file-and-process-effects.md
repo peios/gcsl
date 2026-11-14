@@ -207,22 +207,27 @@ Plain GCSL runs `curl` to download and `sha256sum` to check, so both must
 be installed. A build tool such as pekit keeps fetched files by their
 digests, and downloads each one only once.
 
-Mark a file that's a tool the build runs, rather than source of what it
-builds, with `tool = true`: a compiler's release archive, say, or a build
-environment's programs.
+A file can be a tool the build runs, rather than source of what it
+builds: a compiler's release archive, say, or a build environment's
+programs. A build tool that collects what a package was built from, its
+corresponding source, leaves tools out. It's fetched and kept the same
+either way.
+
+Everything fetched while a toolchain is made counts as a tool already:
+`toolchain.get` makes each registered toolchain with the context
+`making_tool` set, which `fetch` reads. So a toolchain's definition needs
+nothing more. Mark a tool fetched anywhere else with `tool = true`:
 
 ```text
-let gcc = fetch(
-    "https://toolchains.bootlin.com/downloads/releases/toolchains/x86-64/tarballs/x86-64--glibc--stable-2026.08-1.tar.xz",
+let wheel = fetch(
+    "https://files.pythonhosted.org/packages/.../libclang-18.1.1-py2.py3-none-manylinux2010_x86_64.whl",
     sha256 = "...",
     tool = true,
 )
 ```
 
-The file is fetched and kept the same either way. A build tool that
-collects what a package was built from, its corresponding source, leaves
-tools out, so mark every fetch of a tool and nothing else. A fetch that
-isn't marked counts as source.
+Mark only tools. A fetch that isn't marked, outside a toolchain, counts as
+source.
 
 A fetched file is data, never executable. To run a downloaded program,
 copy it and make the copy executable with `fs.set_executable`:

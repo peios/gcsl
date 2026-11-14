@@ -89,7 +89,7 @@ fn run_has_the_string_built_ins_and_path() {
         "{ir}"
     );
     assert!(ir.contains("(load join#76 @32..36)"), "{ir}");
-    assert!(ir.contains("(load join#158 @153..162)"), "{ir}");
+    assert!(ir.contains("(load join#159 @153..162)"), "{ir}");
     // Nothing of `path`'s own code.
     assert!(!ir.contains("segments"), "{ir}");
     assert_eq!(output.status.code(), Some(0));

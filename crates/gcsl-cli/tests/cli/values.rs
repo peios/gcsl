@@ -52,11 +52,11 @@ fn dump_ir_shows_strings_and_ifs() {
     assert_eq!(
         stdout(&output),
         "(block @0..36\n\
-         \x20 (store who#140 @0..17\n\
+         \x20 (store who#141 @0..17\n\
          \x20   (str \"world\" @10..17))\n\
          \x20 (interp @18..36\n\
          \x20   (str \"hello,\\t\" @18..36)\n\
-         \x20   (load who#140 @28..31)\n\
+         \x20   (load who#141 @28..31)\n\
          \x20   (str \"!\\n\" @18..36)))\n"
     );
     assert_eq!(output.status.code(), Some(0));
@@ -162,9 +162,9 @@ fn dumps_show_functions_and_calls() {
     let ir = stdout(&output);
     assert!(
         ir.contains(
-            "  (store at#145 @254..301\n\
+            "  (store at#146 @254..301\n\
              \x20   (make-closure #2 @263..301\n\
-             \x20     (load base#144 @263..301)))\n"
+             \x20     (load base#145 @263..301)))\n"
         ),
         "{ir}"
     );
