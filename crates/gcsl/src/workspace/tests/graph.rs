@@ -299,6 +299,23 @@ fn a_step_s_context_is_part_of_its_key() {
 }
 
 #[test]
+fn a_step_is_keyed_by_what_its_context_binds_not_by_which_frame() {
+    let (mut workspace, file) = lone_workspace(
+        "context arch: String = \"x86_64\"\n\
+         let a = compile(\"a\") with { arch = \"riscv64\" }\n\
+         let b = compile(\"a\") with { arch = \"riscv64\" }\n\
+         let c = compile(\"a\") with { arch = \"aarch64\" }\n\
+         let d = compile(\"a\") with { arch = \"aarch64\" } with { arch = \"riscv64\" }\n\
+         = [a, b, c, d]",
+    );
+    let mut graph = Graph::new();
+    workspace.run_graph(file, &mut graph, every()).unwrap();
+    // Two frames that bind the same are one context; the nearest binding
+    // is the one that keys.
+    assert_eq!(graph.len(), 2);
+}
+
+#[test]
 fn a_unit_waiting_for_a_step_is_never_retried() {
     let (mut workspace, file) = lone_workspace(
         "#[retry(3)] fn r() -> String {\n  let o = compile(\"x\")\n  \"{o}!\"\n}\n= r()",
