@@ -38,10 +38,12 @@
 //! failure there, so `recover` around it catches it; a `#[retry]` around an
 //! await raises it again, never running the step again.
 //!
-//! **Identity.** A deferred call's node is found by its *key*, a canonical
-//! encoding of its function, by its code and captures, its arguments and
-//! the flattened current context ([`encode`]): two calls of one key in an
-//! evaluation are one node. An effect's node is found by its *position*:
+//! **Identity.** A deferred call's node is found by its *key*, the SHA-256
+//! digest of a canonical encoding of its function, by its code and
+//! captures, its arguments and the flattened current context ([`encode`]),
+//! the context by the digest of its own encoding, made once for each frame:
+//! two calls of one key in an evaluation are one node. The graph keeps the
+//! digest alone, since a large context's encoding runs to kilobytes. An effect's node is found by its *position*:
 //! the scope it is made in and its number among the nodes met in that
 //! scope so far. A scope is the unit's root, a memoised call's body or a
 //! `lazy`'s, each by its key and how many times its parent scope entered
@@ -103,6 +105,8 @@ use crate::source::Span;
 use crate::value::{Closure, ContextFrame, Future, Value};
 
 use std::time::Instant;
+
+use sha2::{Digest as _, Sha256};
 
 use crate::CALL_LEVELS;
 
@@ -276,13 +280,33 @@ pub struct Graph {
     /// Every node, by number.
     nodes: Vec<Node>,
     /// The deferred calls' nodes, by key.
-    deferred: HashMap<Box<[u8]>, NodeId>,
+    deferred: HashMap<Key, NodeId>,
     /// Every node met, by its unit and position, with the key it was met
     /// with there.
-    positions: HashMap<Position, (Box<[u8]>, NodeId)>,
+    positions: HashMap<Position, (Key, NodeId)>,
+    /// The digest of each context frame a node was made in, by its identity
+    /// and whether a deferred call's, which leaves out its definition, with
+    /// the frame, kept so that its identity is never another's (see
+    /// [`Graph::context_digest`]).
+    contexts: RefCell<ContextDigests>,
     /// Where each unit first met each node it met: the input and span of
     /// the call, which another unit's node it is need not be.
     met: HashMap<(u32, NodeId), (u32, Span)>,
+}
+
+/// A node's key: a SHA-256 digest of its canonical encoding (see [Graph
+/// mode](#graph-mode)), which is all a graph keeps of it. The encoding of a
+/// call with a large context runs to kilobytes, and a graph of a large build
+/// holds hundreds of thousands of nodes.
+type Key = [u8; 32];
+
+/// The digest of each context frame's encoding a graph has made, by the
+/// frame's identity and whether a deferred call's, with the frame.
+type ContextDigests = HashMap<(u64, bool), (Rc<ContextFrame>, Key)>;
+
+/// The key of the canonical encoding `encoded`.
+fn key_of(encoded: &[u8]) -> Key {
+    Sha256::digest(encoded).into()
 }
 
 /// Where a node is met: its unit, and a hash of its scope's path and its
@@ -856,7 +880,7 @@ impl<'g> GraphRun<'g> {
     /// not converge" if another key was met there before.
     fn meet(
         &self,
-        key: Box<[u8]>,
+        key: Key,
         (input, span): (u32, Span),
         new_node: impl FnOnce(&Graph, Option<NodeId>) -> Node,
     ) -> Result<NodeId, Diagnostic> {
@@ -884,7 +908,7 @@ impl<'g> GraphRun<'g> {
             let id = existing.unwrap_or_else(|| {
                 let id = NodeId(u32::try_from(graph.nodes.len()).unwrap_or(u32::MAX));
                 if made.kind == NodeKind::Deferred {
-                    graph.deferred.insert(key.clone(), id);
+                    graph.deferred.insert(key, id);
                 }
                 graph.nodes.push(made);
                 id
@@ -995,10 +1019,12 @@ impl Evaluator<'_> {
         for value in &given {
             encode(value, &mut key);
         }
-        encode_context(context.as_ref(), true, &mut key);
+        let context_digest = run.graph.borrow().context_digest(context.as_ref(), true);
+        key.extend_from_slice(&context_digest);
+        let key = key_of(&key);
         let made = self.callee_caller();
         let reported = self.reported();
-        let id = run.meet(key.into(), (self.ir.input(), node.span), |graph, after| {
+        let id = run.meet(key, (self.ir.input(), node.span), |graph, after| {
             let mut data = Vec::new();
             graph.holes_into(&given, &mut data);
             graph.holes_into(&closure.captures, &mut data);
@@ -1063,9 +1089,11 @@ impl Evaluator<'_> {
         for value in given {
             encode(value, &mut key);
         }
-        encode_context(context.as_ref(), false, &mut key);
+        let context_digest = run.graph.borrow().context_digest(context.as_ref(), false);
+        key.extend_from_slice(&context_digest);
+        let key = key_of(&key);
         let reported = self.reported();
-        let id = run.meet(key.into(), (self.ir.input(), node.span), |graph, after| {
+        let id = run.meet(key, (self.ir.input(), node.span), |graph, after| {
             let mut data = Vec::new();
             graph.holes_into(given, &mut data);
             Node {
@@ -1531,14 +1559,44 @@ pub(crate) fn flattened(context: Option<&Rc<ContextFrame>>) -> Vec<(crate::names
     found
 }
 
-/// Appends the flattened context `context` to the key `out`: its bindings,
-/// never a frame's identity, which is new each time a `with` runs, and, for
-/// a deferred call, never the definition it was made in, which no code
-/// reads (a relative path is where it is written, see [Where a path
-/// is](crate::eval::files#where-a-path-is)), so that the same
-/// call made for two definitions, two targets of one build say, is one
-/// node and runs once.
-fn encode_context(context: Option<&Rc<ContextFrame>>, deferred: bool, out: &mut Vec<u8>) {
+impl Graph {
+    /// The digest of the flattened context `context`'s encoding, a deferred
+    /// call's if `deferred` ([`encode_flattened`]), which a node's key holds
+    /// in place of the encoding: made once for each frame, since a context
+    /// of many bindings, made in every node's key, would cost its whole
+    /// encoding for every node.
+    fn context_digest(&self, context: Option<&Rc<ContextFrame>>, deferred: bool) -> Key {
+        let encoded = |frame: Option<&Rc<ContextFrame>>| {
+            let mut encoded = vec![b'C'];
+            encode_flattened(frame, deferred, &mut encoded);
+            key_of(&encoded)
+        };
+        let Some(frame) = context else {
+            return encoded(None);
+        };
+        let mut contexts = self.contexts.borrow_mut();
+        // A frame of the same identity is that frame, unless the graph has
+        // outlived the workspace that made it: it is encoded afresh then.
+        match contexts.get(&(frame.id, deferred)) {
+            Some((known, digest)) if Rc::ptr_eq(known, frame) => *digest,
+            _ => {
+                let digest = encoded(Some(frame));
+                contexts.insert((frame.id, deferred), (Rc::clone(frame), digest));
+                digest
+            }
+        }
+    }
+}
+
+/// Appends the flattened context `context` to `out`: its bindings, never a
+/// frame's identity, which is new each time a `with` runs, and, for a
+/// deferred call, never the definition it was made in, which no code reads
+/// (a relative path is where it is written, see [Where a path
+/// is](crate::eval::files#where-a-path-is)), so that the same call made for
+/// two definitions, two targets of one build say, is one node and runs
+/// once. A frame is encoded as it is when first met: a future it binds that
+/// is not run then keys as not run for as long as the graph has the frame.
+fn encode_flattened(context: Option<&Rc<ContextFrame>>, deferred: bool, out: &mut Vec<u8>) {
     let mut bound = flattened(context);
     if deferred {
         bound.retain(|(key, _)| *key != crate::names::DEFINITION);

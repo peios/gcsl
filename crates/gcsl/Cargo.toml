@@ -9,6 +9,8 @@ license.workspace = true
 
 [dependencies]
 annotate-snippets = "0.12"
+# Graph mode's node keys, kept as digests of their encodings.
+sha2 = "0.11"
 # Killing a program's process group, which std cannot do safely yet.
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
