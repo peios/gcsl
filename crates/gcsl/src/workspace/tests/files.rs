@@ -667,6 +667,21 @@ fn repository(name: &str) -> Option<(String, String)> {
 }
 
 #[test]
+fn a_tool_s_fetch_git_gives_the_files_as_any_fetch_git_does() {
+    let Some((url, commit)) = repository("fetch-git-tool") else {
+        return;
+    };
+    let text = format!(
+        "import builtins\n\
+         let d = fetch_git(\"{url}\", \"{commit}\", tool = true)\n\
+         let e = builtins.fetch_git_tool(\"{url}\", \"{commit}\")\n\
+         let f = fetch_git(\"{url}\", \"{commit}\") with {{ making_tool = true }}\n\
+         = [d.file(\"a.txt\").read(), e.file(\"a.txt\").read(), f.file(\"sub/b.txt\").read()]"
+    );
+    assert_eq!(lone(&text).unwrap(), "[\"a\\n\", \"a\\n\", \"b\\n\"]");
+}
+
+#[test]
 fn fetch_git_gives_a_repository_s_files_at_a_commit() {
     let Some((url, commit)) = repository("fetch-git") else {
         return;

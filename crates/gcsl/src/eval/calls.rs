@@ -497,9 +497,11 @@ impl Evaluator<'_> {
             (Builtin::Fetch | Builtin::FetchTool, Value::Str(url), Some(Value::Str(sha256))) => {
                 fetch(&url, &sha256, self.shared.effects, node)
             }
-            (Builtin::FetchGit, Value::Str(url), Some(Value::Str(commit))) => {
-                fetch_git(&url, &commit, self.shared.effects, node)
-            }
+            (
+                Builtin::FetchGit | Builtin::FetchGitTool,
+                Value::Str(url),
+                Some(Value::Str(commit)),
+            ) => fetch_git(&url, &commit, self.shared.effects, node),
             (Builtin::ArchiveUnpack, Value::File(archive), Some(Value::Int(strip))) => {
                 unpack(&archive, strip, self.shared.effects, node)
             }

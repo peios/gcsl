@@ -265,6 +265,12 @@ Plain GCSL runs `git` to fetch, so it must be installed. A build tool such
 as pekit keeps the repositories it fetches, and fetches each commit only
 once.
 
+As with `fetch`, a repository can be a tool the build runs rather than
+source of what it builds, such as the git crates of a build tool built
+from source. Mark it with `tool = true`, or fetch it while a toolchain is
+made, in `making_tool`, and a build tool that collects corresponding source
+leaves it out.
+
 ## Unpacking archives
 
 The `archive` module's `unpack(archive, strip)` makes a directory of what
