@@ -437,14 +437,31 @@ impl Graph {
         found
     }
 
-    /// Pushes the holes of `values` onto `found`, each once.
+    /// Pushes the holes of `values` onto `found`, each once: told apart by
+    /// a look along `found` while it is short, as a node's data edges are,
+    /// and by a set once it is long, as a target's holes can be.
     fn holes_into(&self, values: &[Value], found: &mut Vec<NodeId>) {
+        const SHORT: usize = 32;
+        let mut seen: Option<HashSet<NodeId>> = None;
         futures_in(values, |future| {
-            if let Some(node) = future.host_node() {
-                let id = NodeId(node);
-                if self.is_waiting(id) && !found.contains(&id) {
-                    found.push(id);
+            let Some(id) = future.host_node().map(NodeId) else {
+                return;
+            };
+            if !self.is_waiting(id) {
+                return;
+            }
+            let new = match &mut seen {
+                Some(seen) => seen.insert(id),
+                None if found.len() < SHORT => !found.contains(&id),
+                None => {
+                    let mut set: HashSet<NodeId> = found.iter().copied().collect();
+                    let new = set.insert(id);
+                    seen = Some(set);
+                    new
                 }
+            };
+            if new {
+                found.push(id);
             }
         });
     }
@@ -461,17 +478,17 @@ impl Graph {
     /// "Demand").
     #[must_use]
     pub fn needed(&self, demands: &[NodeId]) -> Vec<NodeId> {
-        let mut found: Vec<NodeId> = Vec::new();
+        let mut found: HashSet<NodeId> = HashSet::new();
         let mut pending: Vec<NodeId> = demands.to_vec();
         while let Some(id) = pending.pop() {
-            if found.contains(&id) || !self.is_waiting(id) {
+            if !self.is_waiting(id) || !found.insert(id) {
                 continue;
             }
-            found.push(id);
             if let Some(node) = self.node(id) {
                 pending.extend(node.data.iter().copied());
             }
         }
+        let mut found: Vec<NodeId> = found.into_iter().collect();
         found.sort_unstable();
         found
     }
