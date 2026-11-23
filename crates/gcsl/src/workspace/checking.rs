@@ -547,6 +547,8 @@ fn assembled(
         cell_slots,
         cell_known,
         for_later,
+        found_def_types: std::cell::OnceCell::new(),
+        def_type_duplicates: std::cell::OnceCell::new(),
         #[cfg(test)]
         view_records: Vec::new(),
     }
