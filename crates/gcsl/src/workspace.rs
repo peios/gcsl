@@ -589,6 +589,14 @@ pub struct Workspace {
     /// The methods and the contexts' defaults of the files, checked, kept for
     /// a session's inputs.
     for_later: ForLater,
+    /// Every def-type the workspace lists, with its definitions, found the
+    /// first time it is asked for ([`Workspace::found_def_types`]): the
+    /// files it is found in are the workspace's for its life.
+    found_def_types: std::cell::OnceCell<Rc<[Rc<FoundDefType>]>>,
+    /// The errors of the definitions of one path of a def-type in
+    /// directories that see each other, and of the def-types declared more
+    /// than once, of those ([`duplicates`]), found with them.
+    def_type_duplicates: std::cell::OnceCell<Vec<Diagnostic>>,
     /// Each file's records of the nodes of its view with a leaf of it under
     /// them, by input number: kept for the tests' check that each reads
     /// only cells stored before it.

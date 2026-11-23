@@ -56,12 +56,15 @@ impl Workspace {
     /// checks and runs regardless. One path in directories that see nothing
     /// of each other is no error: each is named with its directory.
     pub fn def_types(&self) -> Result<Vec<DefType>, Vec<Diagnostic>> {
-        let found = self.found_def_types();
-        let duplicates = duplicates(&found);
+        let duplicates = self.def_type_duplicates();
         if !duplicates.is_empty() {
-            return Err(merge_files(duplicates, self.warnings.clone()));
+            return Err(merge_files(duplicates.to_vec(), self.warnings.clone()));
         }
-        Ok(found.into_iter().map(|found| found.listed).collect())
+        Ok(self
+            .found_def_types()
+            .iter()
+            .map(|found| found.listed.clone())
+            .collect())
     }
 
     /// Invokes the definition of path `path` made with the def-type of path
@@ -377,7 +380,7 @@ impl Workspace {
             let held = cell.and_then(|(slot, _)| self.frame.get(slot.index()));
             matches!(held, Some(Value::Fn(held)) if Rc::ptr_eq(held, definition))
         };
-        let listed = self.found_def_types().into_iter().find_map(|found| {
+        let listed = self.found_def_types().iter().find_map(|found| {
             let (_, listed) = found
                 .items
                 .iter()
@@ -738,21 +741,21 @@ impl Workspace {
         def_type: &str,
         path: &str,
     ) -> Result<ResolvedDefinition, InvokeError> {
-        let mut found = self.found_def_types();
-        let duplicates = duplicates(&found);
+        let duplicates = self.def_type_duplicates();
         if !duplicates.is_empty() {
-            let errors = merge_files(duplicates, self.warnings.clone());
+            let errors = merge_files(duplicates.to_vec(), self.warnings.clone());
             return Err(InvokeError::Diagnostics(errors));
         }
-        let Some(at) = found.iter().position(|found| found.listed.path == def_type) else {
-            let mut def_types: Vec<String> = found.into_iter().map(|f| f.listed.path).collect();
+        let found = self.found_def_types();
+        let Some(found) = found.iter().find(|found| found.listed.path == def_type) else {
+            let mut def_types: Vec<String> = found.iter().map(|f| f.listed.path.clone()).collect();
             def_types.sort_unstable();
             return Err(InvokeError::Request(RequestError::NoDefType {
                 name: def_type.to_owned(),
                 def_types,
             }));
         };
-        let found = found.swap_remove(at);
+        let found = Rc::clone(found);
         let missing = || InvokeError::Request(missing_definition(&found.listed, path));
         let definitions = &found.listed.definitions;
         let at = chosen_definition(&found.listed, path).map_err(InvokeError::Request)?;
@@ -778,8 +781,6 @@ impl Workspace {
         })
     }
 
-    /// Every def-type of the workspace's own files, with its definitions,
-    /// as [`Workspace::def_types`] lists them, duplicates and all.
     /// The paths of the def-types the workspace's own files declare, each
     /// as its declaration writes it, `package`.
     fn own_def_type_paths(&self) -> HashSet<String> {
@@ -808,7 +809,25 @@ impl Workspace {
         paths
     }
 
-    pub(super) fn found_def_types(&self) -> Vec<FoundDefType> {
+    /// Every def-type of the workspace's own files, with its definitions,
+    /// as [`Workspace::def_types`] lists them, duplicates and all: found the
+    /// first time they are asked for, and kept.
+    pub(super) fn found_def_types(&self) -> Rc<[Rc<FoundDefType>]> {
+        Rc::clone(
+            self.found_def_types
+                .get_or_init(|| self.find_def_types().into_iter().map(Rc::new).collect()),
+        )
+    }
+
+    /// The errors [`duplicates`] finds of the workspace's def-types, found
+    /// once.
+    fn def_type_duplicates(&self) -> &[Diagnostic] {
+        self.def_type_duplicates
+            .get_or_init(|| duplicates(&self.found_def_types()))
+    }
+
+    /// [`Workspace::found_def_types`], found anew.
+    fn find_def_types(&self) -> Vec<FoundDefType> {
         let names = &self.scan.names;
         let text = |segments: &[PathSegment]| {
             segments
@@ -1447,7 +1466,7 @@ pub(super) fn missing_definition(listed: &DefType, asked: &str) -> RequestError 
 /// each other ([`sees`]), and for each definition that lies under another
 /// of its def-type in such a directory ([`overlaps`]), in path then source
 /// order of the first, or of the definition below.
-pub(super) fn duplicates(found: &[FoundDefType]) -> Vec<Diagnostic> {
+pub(super) fn duplicates(found: &[Rc<FoundDefType>]) -> Vec<Diagnostic> {
     let mut errors = Vec::new();
     let declared = found.iter().map(|found| {
         (

@@ -189,6 +189,8 @@
 //! call located in it is located at the first function's name instead, labelled
 //! "invoked here".
 
+use std::rc::Rc;
+
 use crate::ast::ItemId;
 use crate::check::Slot;
 use crate::diagnostic::Diagnostic;
@@ -822,7 +824,7 @@ pub(super) struct FoundDefType {
 /// A definition resolved for a host request, with both typed runtime cells.
 /// Named fields keep the definition's index distinct from its storage slot.
 pub(super) struct ResolvedDefinition {
-    pub(super) def_type: FoundDefType,
+    pub(super) def_type: Rc<FoundDefType>,
     pub(super) definition_index: usize,
     pub(super) def_type_cell: (Slot, TyId),
     pub(super) definition_cell: (Slot, TyId),
