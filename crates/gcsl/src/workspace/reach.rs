@@ -16,7 +16,8 @@
 //! it through its own end, so that its attributes are its own. An item
 //! declares the first segment of the path it binds, or the name of the
 //! type, enum, variant or context it declares, or the first segment of the
-//! path of what it defines with a def-type. A name an item reaches also
+//! path of what it defines with a def-type, or of a method, its method's
+//! name, which a field call spells. A name an item reaches also
 //! reaches each item that rebinds it, by `:=`, whose value it may then
 //! read; a name an import binds, each item the import's target holds; and
 //! a name a `from` import binds under another, the items of the name it
@@ -195,6 +196,11 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
         for context in ast.contexts().iter().filter(|context| context.item == id) {
             declares.push(context.name);
             declaration = true;
+        }
+        // So is a method, under a binding of its own: a field call reaches
+        // it by the method's name.
+        for method in ast.methods().iter().filter(|method| method.item == id) {
+            declares.push(method.name);
         }
         items.push(ItemReach {
             end,
