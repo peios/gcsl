@@ -2439,13 +2439,35 @@ impl Ir {
     /// Panics if `id` does not belong to this IR.
     #[must_use]
     pub fn function(&self, id: FnId) -> &FnCode {
-        &self.functions[id.index()]
+        let code = &self.functions[id.index()];
+        #[cfg(any(test, feature = "coverage"))]
+        self.used(code);
+        code
     }
 
     /// Returns function `id`, or `None` if it does not belong to this IR.
     #[must_use]
     pub fn find_function(&self, id: FnId) -> Option<&FnCode> {
-        self.functions.get(id.index())
+        let code = self.functions.get(id.index());
+        #[cfg(any(test, feature = "coverage"))]
+        if let Some(code) = code {
+            self.used(code);
+        }
+        code
+    }
+
+    /// Records that the function `code` was looked up to run (see
+    /// [`crate::coverage`]).
+    #[cfg(any(test, feature = "coverage"))]
+    fn used(&self, code: &FnCode) {
+        let at = self
+            .nodes
+            .get(code.body.index())
+            .map_or(0, |node| node.span.start);
+        crate::coverage::record(crate::coverage::Used::Function {
+            input: self.input(),
+            at,
+        });
     }
 
     /// The number of functions in the program, which bounds every [`FnId`]

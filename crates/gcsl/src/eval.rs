@@ -723,6 +723,11 @@ impl Evaluator<'_> {
     /// `{}`, that is an internal error, which the checker's schedule rules
     /// out (see [`crate::check`]).
     fn top_value(&self, slot: Slot, kind: ValueKind, node: &IrNode) -> Flow<Value> {
+        #[cfg(any(test, feature = "coverage"))]
+        crate::coverage::record(crate::coverage::Used::Top {
+            input: self.ir.input(),
+            slot: u32::try_from(slot.index()).unwrap_or(u32::MAX),
+        });
         match self.stack.get(slot.index()) {
             Some(Value::Empty)
                 if !matches!(
@@ -741,6 +746,11 @@ impl Evaluator<'_> {
     /// `Top` `node` as `extract` accepts it, as [`Evaluator::slot_as`] reads
     /// a slot of the current frame.
     fn top_as<T>(&self, slot: Slot, node: &IrNode, extract: Extract<T>) -> Flow<T> {
+        #[cfg(any(test, feature = "coverage"))]
+        crate::coverage::record(crate::coverage::Used::Top {
+            input: self.ir.input(),
+            slot: u32::try_from(slot.index()).unwrap_or(u32::MAX),
+        });
         if mixed(node) {
             return mistyped(node, MIXED);
         }
@@ -758,6 +768,11 @@ impl Evaluator<'_> {
     /// error, which the checker rules out, is out of line.
     #[inline]
     fn top_function(&self, slot: Slot, node: &IrNode) -> Flow<Callee> {
+        #[cfg(any(test, feature = "coverage"))]
+        crate::coverage::record(crate::coverage::Used::Top {
+            input: self.ir.input(),
+            slot: u32::try_from(slot.index()).unwrap_or(u32::MAX),
+        });
         match self.stack.get(slot.index()) {
             Some(Value::Fn(closure)) => Ok(Callee::Closure(Rc::clone(closure))),
             // A cell of the top level holding a built-in function: the

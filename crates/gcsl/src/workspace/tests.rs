@@ -313,6 +313,7 @@ mod metas;
 mod needs;
 mod profile;
 mod reach;
+mod coverage;
 mod shadowing;
 mod shell;
 mod standard;

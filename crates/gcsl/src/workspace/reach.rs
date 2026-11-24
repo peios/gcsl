@@ -309,19 +309,7 @@ impl super::Workspace {
         if let Some(digest) = scan.reached.borrow().digests.get(&(input, item)) {
             return Some(*digest);
         }
-        let needed = scan.needed(input);
-        let index = self.name_index(input, &needed);
-        let mut seeds = vec![(input, item)];
-        for &f in &needed {
-            let standard = f < scan.standard;
-            let items = scan.reach.get(f as usize).map_or(&[][..], |f| &f.items[..]);
-            for (i, at) in items.iter().enumerate() {
-                if at.ordered || (standard && at.declaration) {
-                    seeds.push((f, i));
-                }
-            }
-        }
-        let reached = reach(&scan.reach, &index, &seeds);
+        let reached = self.reached_from((input, item));
         let mut identities: Vec<[u8; 32]> = reached
             .iter()
             .filter(|(f, _)| *f < scan.standard)
@@ -425,19 +413,7 @@ impl super::Workspace {
         let scan = &self.scan;
         let file = scan.reach.get(input as usize)?;
         let item = file.item_at(at)?;
-        let needed = scan.needed(input);
-        let index = self.name_index(input, &needed);
-        let mut seeds = vec![(input, item)];
-        for &f in &needed {
-            let standard = f < scan.standard;
-            let items = scan.reach.get(f as usize).map_or(&[][..], |f| &f.items[..]);
-            for (i, at) in items.iter().enumerate() {
-                if at.ordered || (standard && at.declaration) {
-                    seeds.push((f, i));
-                }
-            }
-        }
-        let reached = reach(&scan.reach, &index, &seeds);
+        let reached = self.reached_from((input, item));
         Some(
             (0..scan.standard)
                 .map(|f| {
@@ -451,6 +427,144 @@ impl super::Workspace {
                 })
                 .collect(),
         )
+    }
+
+    /// The items reached from the item `item` (see [Reach](#reach)): from
+    /// it, from every item of the files its code needs that declares no
+    /// name, and from each declaration of a type, an enum, a variant or a
+    /// context of every standard file.
+    fn reached_from(&self, item: At) -> HashSet<At> {
+        let scan = &self.scan;
+        let needed = scan.needed(item.0);
+        let index = self.name_index(item.0, &needed);
+        let mut seeds = vec![item];
+        for &f in &needed {
+            let standard = f < scan.standard;
+            let items = scan.reach.get(f as usize).map_or(&[][..], |f| &f.items[..]);
+            for (i, at) in items.iter().enumerate() {
+                if at.ordered || (standard && at.declaration) {
+                    seeds.push((f, i));
+                }
+            }
+        }
+        reach(&scan.reach, &index, &seeds)
+    }
+
+    /// The standard items the code of input `input` at its offset `at`
+    /// reaches, each by its file's path and its number among the file's
+    /// items: for tests of reach.
+    #[cfg(any(test, feature = "coverage"))]
+    #[must_use]
+    pub fn standard_items_reached(&self, input: u32, at: u32) -> Option<HashSet<(String, usize)>> {
+        let scan = &self.scan;
+        let item = scan.reach.get(input as usize)?.item_at(at)?;
+        Some(
+            self.reached_from((input, item))
+                .into_iter()
+                .filter(|(f, _)| *f < scan.standard)
+                .map(|(f, i)| (scan.files[f as usize].path.clone(), i))
+                .collect(),
+        )
+    }
+
+    /// [`Workspace::standard_items_reached`] of the code of `closure`: for
+    /// tests of reach.
+    #[cfg(any(test, feature = "coverage"))]
+    #[must_use]
+    pub fn closure_items_reached(
+        &self,
+        closure: &crate::value::Closure,
+    ) -> Option<HashSet<(String, usize)>> {
+        let code = &closure.code;
+        let body = code.find_function(closure.function)?.body;
+        self.standard_items_reached(code.input(), code.get(body).span.start)
+    }
+
+    /// The standard items `used` used, each by its file's path and its
+    /// number among the file's items, and what of the standard files it
+    /// used that no item could be found for: for tests of reach (see
+    /// [`crate::coverage`]).
+    #[cfg(any(test, feature = "coverage"))]
+    #[must_use]
+    pub fn standard_items_used(
+        &self,
+        used: &[crate::coverage::Used],
+    ) -> (HashSet<(String, usize)>, Vec<crate::coverage::Used>) {
+        use crate::coverage::Used;
+        let scan = &self.scan;
+        let mut items = HashSet::new();
+        let mut unplaced = Vec::new();
+        let declaring = |file: u32, name: Name| -> Vec<usize> {
+            scan.reach.get(file as usize).map_or_else(Vec::new, |f| {
+                f.items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.declares.contains(&name))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+        };
+        for &one in used {
+            let found: Vec<(u32, usize)> = match one {
+                Used::Function { input, at } => {
+                    if input >= scan.standard {
+                        continue;
+                    }
+                    scan.reach
+                        .get(input as usize)
+                        .and_then(|f| f.item_at(at))
+                        .map(|i| (input, i))
+                        .into_iter()
+                        .collect()
+                }
+                Used::Top { input, slot } => {
+                    if let Some(node) = scan.nodes.get(slot as usize) {
+                        // A cell: of the files with a leaf under it, the
+                        // items declaring its root's name.
+                        let mut root = slot;
+                        while let Some(parent) =
+                            scan.nodes.get(root as usize).and_then(|at| at.parent)
+                        {
+                            root = parent;
+                        }
+                        let name = scan.nodes[root as usize].name;
+                        let files: Vec<u32> = node
+                            .contributors
+                            .iter()
+                            .copied()
+                            .filter(|&f| f < scan.standard)
+                            .collect();
+                        if files.is_empty() {
+                            continue;
+                        }
+                        files
+                            .into_iter()
+                            .flat_map(|f| declaring(f, name).into_iter().map(move |i| (f, i)))
+                            .collect()
+                    } else {
+                        // A slot of the reading code's own file.
+                        if input >= scan.standard {
+                            continue;
+                        }
+                        let Some(&name) = self.slot_names.get(slot as usize) else {
+                            unplaced.push(one);
+                            continue;
+                        };
+                        declaring(input, name)
+                            .into_iter()
+                            .map(|i| (input, i))
+                            .collect()
+                    }
+                }
+            };
+            if found.is_empty() {
+                unplaced.push(one);
+            }
+            for (f, i) in found {
+                items.insert((scan.files[f as usize].path.clone(), i));
+            }
+        }
+        (items, unplaced)
     }
 
     /// The name index of `needed`, the files the code of input `input`

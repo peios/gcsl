@@ -159,6 +159,8 @@
 
 pub mod ast;
 pub mod check;
+#[cfg(any(test, feature = "coverage"))]
+pub mod coverage;
 pub mod diagnostic;
 pub mod eval;
 pub mod fmt;

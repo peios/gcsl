@@ -23,6 +23,8 @@ nix = { version = "0.31", default-features = false, features = ["resource"] }
 # test suite checks the machine against the recursive walkers. For tests
 # only: plain GCSL never pauses, so the walkers run it faster.
 machine-everywhere = []
+# Records what a run's code used, for tests of what a step reaches.
+coverage = []
 
 [lints]
 workspace = true
