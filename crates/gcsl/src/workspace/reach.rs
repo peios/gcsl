@@ -361,6 +361,28 @@ impl super::Workspace {
         Some(hasher.finalize().into())
     }
 
+    /// Where the function whose body begins at the offset `at` of the
+    /// standard file `input` is, as no edit of another item changes it: the
+    /// first name the item holding it declares, else its number among the
+    /// file's items, and where its body begins in the item. `None` for a
+    /// file that is no standard file, or a function it cannot place.
+    #[must_use]
+    pub fn function_place(&self, input: u32, at: u32) -> Option<String> {
+        if !self.is_standard_file(input) {
+            return None;
+        }
+        let file = self.scan.reach.get(input as usize)?;
+        let index = file.item_at(at)?;
+        let item = file.items.get(index)?;
+        let start = index.checked_sub(1).map_or(0, |before| file.items[before].end);
+        let named = item.declares.first().map(|&name| self.scan.names.get(name).to_owned());
+        Some(format!(
+            "{}+{}",
+            named.unwrap_or_else(|| format!("#{index}")),
+            at - start.min(at)
+        ))
+    }
+
     /// [`Workspace::standard_reach`] of the code of `closure`.
     #[must_use]
     pub fn closure_reach(&self, closure: &crate::value::Closure) -> Option<[u8; 32]> {
