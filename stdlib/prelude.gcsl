@@ -233,8 +233,12 @@ context making_tool: Bool = false
 # which names its files as a digest does: a branch or a tag, which can move,
 # is an error. A build tool keeps repositories, and fetches each commit
 # once.
-def fetch_git(url: String, commit: String) -> Dir {
-    builtins.fetch_git(url, commit)
+#
+# With `tool = true`, or in `^making_tool`, the files are of a tool the build
+# runs, a compiler's or a build tool's own crates say, rather than source of
+# what the build makes, as `fetch`'s `tool` says of a file.
+def fetch_git(url: String, commit: String, tool: Bool = false, ^making_tool) -> Dir {
+    if tool or making_tool { builtins.fetch_git_tool(url, commit) } else { builtins.fetch_git(url, commit) }
 }
 
 #[track_caller]

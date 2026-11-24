@@ -151,6 +151,10 @@ pub enum Builtin {
     /// its 40 hex digits, has them, without the repository's own `.git`. A
     /// host may answer it from a cache of repositories. Impure.
     FetchGit,
+    /// `fetch_git_tool(url: String, commit: String) -> Dir`: as `fetch_git`,
+    /// but the files are of a tool the build runs rather than source of
+    /// what it builds, as `fetch_tool`'s are. Impure.
+    FetchGitTool,
     /// `archive_unpack(archive: File, strip: Int) -> Dir`: a new directory
     /// of what the tar archive `archive` holds, compressed or not, the first
     /// `strip` components of each path left off, the `archive` module's
@@ -273,7 +277,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 60] = [
+    pub const ALL: [Builtin; 61] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -312,6 +316,7 @@ impl Builtin {
         Builtin::Fetch,
         Builtin::FetchTool,
         Builtin::FetchGit,
+        Builtin::FetchGitTool,
         Builtin::ArchiveUnpack,
         Builtin::Which,
         Builtin::KeychainString,
@@ -402,6 +407,7 @@ impl Builtin {
             Builtin::Fetch => "fetch",
             Builtin::FetchTool => "fetch_tool",
             Builtin::FetchGit => "fetch_git",
+            Builtin::FetchGitTool => "fetch_git_tool",
             Builtin::ArchiveUnpack => "archive_unpack",
             Builtin::Which => "which",
             Builtin::KeychainString => "keychain_string",
@@ -475,6 +481,7 @@ impl Builtin {
             | Builtin::Fetch
             | Builtin::FetchTool
             | Builtin::FetchGit
+            | Builtin::FetchGitTool
             | Builtin::ArchiveUnpack
             | Builtin::Which
             | Builtin::KeychainString
@@ -507,6 +514,7 @@ impl Builtin {
                 | Builtin::Fetch
                 | Builtin::FetchTool
                 | Builtin::FetchGit
+                | Builtin::FetchGitTool
                 | Builtin::ArchiveUnpack
                 | Builtin::Which
                 | Builtin::KeychainString
@@ -566,7 +574,7 @@ impl Builtin {
             Builtin::File | Builtin::Dir => &["path"],
             Builtin::FileRead => &["f"],
             Builtin::Fetch | Builtin::FetchTool => &["url", "sha256"],
-            Builtin::FetchGit => &["url", "commit"],
+            Builtin::FetchGit | Builtin::FetchGitTool => &["url", "commit"],
             Builtin::ArchiveUnpack => &["archive", "strip"],
             Builtin::Which => &["name"],
             Builtin::KeychainString | Builtin::KeychainFile => &["name", "from"],
@@ -610,6 +618,7 @@ impl Builtin {
             | Builtin::Fetch
             | Builtin::FetchTool
             | Builtin::FetchGit
+            | Builtin::FetchGitTool
             | Builtin::ArchiveUnpack
             | Builtin::Which
             | Builtin::KeychainString
@@ -704,6 +713,7 @@ impl Builtin {
             | Builtin::Fetch
             | Builtin::FetchTool
             | Builtin::FetchGit
+            | Builtin::FetchGitTool
             | Builtin::ArchiveUnpack
             | Builtin::Which
             | Builtin::KeychainString
@@ -778,7 +788,7 @@ impl Builtin {
             Builtin::File => "fn(path: String) -> File",
             Builtin::FileRead => "fn(f: File) -> String",
             Builtin::Fetch | Builtin::FetchTool => "fn(url: String, sha256: String) -> File",
-            Builtin::FetchGit => "fn(url: String, commit: String) -> Dir",
+            Builtin::FetchGit | Builtin::FetchGitTool => "fn(url: String, commit: String) -> Dir",
             Builtin::ArchiveUnpack => "fn(archive: File, strip: Int) -> Dir",
             Builtin::Which => "fn(name: String) -> File",
             Builtin::KeychainString => {
@@ -848,7 +858,7 @@ impl Builtin {
             }
             Builtin::FileRead => ([TyId::FILE, UNUSED], TyId::STRING),
             Builtin::Fetch | Builtin::FetchTool => ([TyId::STRING, TyId::STRING], TyId::FILE),
-            Builtin::FetchGit => ([TyId::STRING, TyId::STRING], TyId::DIR),
+            Builtin::FetchGit | Builtin::FetchGitTool => ([TyId::STRING, TyId::STRING], TyId::DIR),
             Builtin::ArchiveUnpack => ([TyId::FILE, TyId::INT], TyId::DIR),
             Builtin::Dir => ([TyId::STRING, UNUSED], TyId::DIR),
             Builtin::WorkingDir => ([UNUSED, UNUSED], TyId::DIR),

@@ -93,6 +93,7 @@ impl Lowerer<'_> {
             | Builtin::Fetch
             | Builtin::FetchTool
             | Builtin::FetchGit
+            | Builtin::FetchGitTool
             | Builtin::ArchiveUnpack
             | Builtin::Which
             | Builtin::KeychainString
