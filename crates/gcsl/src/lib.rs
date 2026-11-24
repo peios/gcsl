@@ -275,6 +275,15 @@ pub struct Outcome {
     pub warnings: Vec<Diagnostic>,
 }
 
+/// The version of what GCSL code means, beyond its text: how the
+/// evaluator runs it, and what each built-in function does. A host keys
+/// what it caches of a run by it, with the code's text, so that a change of
+/// either is a change of every key. It is raised with any such change; a
+/// test fails while the sources of the evaluator, lowering, values and
+/// built-ins differ from those `semantics.digest` was written for, until
+/// either it is raised or the digest is written again with a reason.
+pub const SEMANTICS: u32 = 1;
+
 /// The standard library: the `.gcsl` files of the repository's `stdlib/`
 /// directory, compiled in, each with its stem, by which it is imported
 /// (`import prelude`, `import path`, `import fs`), in path order. Written

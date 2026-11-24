@@ -31,6 +31,12 @@ pub(super) struct Throughs {
 pub struct Scan {
     /// The files, in path order; a file's index is its input number.
     pub files: Vec<File>,
+    /// What reach knows of each file, by input number (see
+    /// [Reach](crate::workspace::reach#reach)).
+    pub(crate) reach: Vec<super::reach::FileReach>,
+    /// What reach has found so far (see
+    /// [Reach](crate::workspace::reach#reach)).
+    pub(crate) reached: std::cell::RefCell<super::reach::Reached>,
     /// The directories, each after the directory above it.
     pub dirs: Vec<Dir>,
     /// The nodes of every directory's merged tree; a node's index is its

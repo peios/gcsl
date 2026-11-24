@@ -201,6 +201,8 @@ pub(super) fn scan_into_with(
 ) -> Result<Scan, Vec<Diagnostic>> {
     let mut scan = Scan {
         files: Vec::with_capacity(sources.len() + library.table.len()),
+        reach: Vec::with_capacity(sources.len() + library.table.len()),
+        reached: std::cell::RefCell::default(),
         dirs: Vec::new(),
         nodes: Vec::new(),
         functions: Vec::new(),
@@ -285,6 +287,12 @@ pub(super) fn scan_files(
             parent: None,
         });
         let path = format!("{STANDARD_DIR}/{stem}.gcsl");
+        let text = library.table.get(at).map_or("", |&(_, text)| text);
+        let reach = SourceFile::new(path.clone(), text).map_or_else(
+            |_| super::reach::FileReach::default(),
+            |source| super::reach::index(&source, &ast, &mut scan.names, &path),
+        );
+        scan.reach.push(reach);
         scan.files.push(File::new(&path, dir, ast, spelled));
     }
     scan.builtins_dir = count(scan.dirs.len());
@@ -297,6 +305,8 @@ pub(super) fn scan_files(
             Placing::Workspace(_) => source.name(),
             Placing::Lone(..) => source.name().rsplit('/').next().unwrap_or(""),
         };
+        let reach = super::reach::index(source, &ast, &mut scan.names, path);
+        scan.reach.push(reach);
         scan.files.push(File::new(path, dir, ast, spelled));
     }
     // Every stage of the scan reports its errors and recovers from them,

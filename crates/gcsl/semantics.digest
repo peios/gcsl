@@ -1,0 +1,5 @@
+# The sources of what GCSL code means beyond its text, as gcsl::SEMANTICS
+# was last set or confirmed for (see tests/semantics.rs). Each line after
+# the digest says why it was written again without raising SEMANTICS.
+semantics 1
+digest 45d55da0bc9e0f20a1f963b81e7a5ff9220e495c7fd0f6aa1b97be7e182f2013

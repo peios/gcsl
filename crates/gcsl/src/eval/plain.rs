@@ -23,8 +23,10 @@
 //! and the context it runs in can hold functions: the toolchains a workspace
 //! registers are its definitions. So for a key alone ([`to_key_plain`]), a
 //! function is [`Plain::Closure`]: the input of its code's file, its number
-//! among that code's functions, and what it captures, keyed so too, which a
-//! host keys by that file's name and contents. A built-in, or a future that
+//! among that code's functions, where its body begins in that file, and
+//! what it captures, keyed so too, which a host keys by that file's name
+//! and contents, or of a standard file by what the function may reach
+//! ([`Workspace::function_identity`](crate::workspace::Workspace::function_identity)). A built-in, or a future that
 //! has not run, is still no data. A closure's key is never a step's argument
 //! or result, and is never made a value again.
 
@@ -103,6 +105,8 @@ pub enum Plain {
         input: u32,
         /// Its number among that code's functions.
         function: u32,
+        /// The offset in its file where its body begins.
+        at: u32,
         /// What it captures, as keys.
         captures: Vec<Plain>,
     },
@@ -249,6 +253,10 @@ fn plain_of(value: &Value, names: &Names, mode: Mode) -> Result<Plain, String> {
         Value::Fn(closure) if closures => Plain::Closure {
             input: closure.code.input(),
             function: u32::try_from(closure.function.index()).unwrap_or(u32::MAX),
+            at: closure
+                .code
+                .find_function(closure.function)
+                .map_or(0, |code| closure.code.get(code.body).span.start),
             captures: closure
                 .captures
                 .iter()
