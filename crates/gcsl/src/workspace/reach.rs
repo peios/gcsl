@@ -49,6 +49,8 @@ use crate::lexer::{TokenKind, lex};
 use crate::names::{Name, Names};
 use crate::source::SourceFile;
 
+use super::files::Target;
+
 /// What reach knows of one top-level item of a file (see [Reach](#reach)).
 #[derive(Clone, Debug)]
 pub(crate) struct ItemReach {
@@ -374,8 +376,13 @@ impl super::Workspace {
         let file = self.scan.reach.get(input as usize)?;
         let index = file.item_at(at)?;
         let item = file.items.get(index)?;
-        let start = index.checked_sub(1).map_or(0, |before| file.items[before].end);
-        let named = item.declares.first().map(|&name| self.scan.names.get(name).to_owned());
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |before| file.items[before].end);
+        let named = item
+            .declares
+            .first()
+            .map(|&name| self.scan.names.get(name).to_owned());
         Some(format!(
             "{}+{}",
             named.unwrap_or_else(|| format!("#{index}")),
@@ -468,11 +475,37 @@ impl super::Workspace {
                 .get(f as usize)
                 .map_or(&[][..], |f| &f.aliases[..])
             {
-                index
-                    .imported
-                    .entry(alias.name)
-                    .or_default()
-                    .extend(scan.target_files(alias.target));
+                // A declaration, by the first name of its path, which is
+                // what its item declares; anything wider, by its files.
+                let leaf = match alias.target {
+                    Target::Node(node) => scan
+                        .nodes
+                        .get(node as usize)
+                        .filter(|at| at.leaf.is_some() && at.children.is_empty())
+                        .map(|_| node),
+                    Target::Through { leaf, .. } => Some(leaf),
+                    _ => None,
+                };
+                match leaf {
+                    Some(leaf) => {
+                        let mut root = leaf;
+                        while let Some(parent) =
+                            scan.nodes.get(root as usize).and_then(|at| at.parent)
+                        {
+                            root = parent;
+                        }
+                        if let Some(at) = scan.nodes.get(root as usize)
+                            && at.name != alias.name
+                        {
+                            index.renamed.entry(alias.name).or_default().push(at.name);
+                        }
+                    }
+                    None => index
+                        .imported
+                        .entry(alias.name)
+                        .or_default()
+                        .extend(scan.target_files(alias.target)),
+                }
             }
         }
         let index = std::rc::Rc::new(index);
