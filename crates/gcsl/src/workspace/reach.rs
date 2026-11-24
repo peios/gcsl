@@ -58,6 +58,8 @@ pub(crate) struct ItemReach {
     /// The offset its own span ends at: it holds every token after the end
     /// of the item before it through this.
     pub(crate) end: u32,
+    /// The offset its first token begins at, but a line break.
+    pub(crate) first: u32,
     /// The names it declares.
     pub(crate) declares: Vec<Name>,
     /// The names it rebinds, by `:=`.
@@ -126,6 +128,7 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
         let mut idents = Vec::new();
         let mut seen = HashSet::new();
         let mut broken = false;
+        let mut begins = None;
         while let Some(token) = tokens.next_if(|token| token.span.end <= end) {
             match token.kind {
                 TokenKind::Newline => {
@@ -144,6 +147,7 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
                 _ => {}
             }
             broken = false;
+            begins.get_or_insert(token.span.start);
             let piece = text
                 .get(token.span.start as usize..token.span.end as usize)
                 .unwrap_or("");
@@ -204,6 +208,7 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
         }
         items.push(ItemReach {
             end,
+            first: begins.unwrap_or(item.span.start),
             declares,
             rebinds,
             idents,
@@ -358,10 +363,7 @@ impl super::Workspace {
         }
         let reach = self.standard_reach(input, at)?;
         let file = self.scan.reach.get(input as usize)?;
-        let item = file.item_at(at)?;
-        let start = item
-            .checked_sub(1)
-            .map_or(0, |before| file.items[before].end);
+        let start = file.items.get(file.item_at(at)?)?.first;
         let mut hasher = Sha256::new();
         hasher.update(b"gcsl-function-1\0");
         hasher.update(reach);
@@ -382,9 +384,7 @@ impl super::Workspace {
         let file = self.scan.reach.get(input as usize)?;
         let index = file.item_at(at)?;
         let item = file.items.get(index)?;
-        let start = index
-            .checked_sub(1)
-            .map_or(0, |before| file.items[before].end);
+        let start = item.first;
         let named = item
             .declares
             .first()
