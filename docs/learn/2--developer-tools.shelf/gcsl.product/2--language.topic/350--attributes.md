@@ -11,7 +11,10 @@ a build system, and GCSL itself acts on its own three, `retry`, `timeout`
 and `track_caller`. The prelude declares two for builds: `hermetic`,
 which lets a build tool such as pekit run a function's calls as cached
 steps, and `scratch`, which gives such a step a directory kept between its
-runs. Plain GCSL runs those calls at once, as any call.
+runs. `#[scratch(resumable = true)]` says the step's tool remakes anything
+that a killed run left half written, so the build tool can keep the
+directory such a run left. Plain GCSL runs those calls at once, as any
+call.
 
 ```gcsl
 #[hermetic]
