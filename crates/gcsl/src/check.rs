@@ -1969,10 +1969,6 @@ pub struct Checker<'a> {
     /// costing one test per binding and per name read, on every other path
     /// (see [Recording](#recording)).
     record: Option<Box<Record>>,
-    /// Each call of a method: where its callee is, and where the method its
-    /// receiver's type chose is declared, in another input or this one
-    /// (`None`), if that is known (see [`CheckOutput::method_targets`]).
-    method_targets: Vec<MethodTarget>,
     /// The roots of the file's view with their ranks, for suggestions (see
     /// [Suggestions](crate::check::names#suggestions)): gathered at the first undefined
     /// variable, never on valid input.
@@ -2136,7 +2132,6 @@ impl<'a> Checker<'a> {
             declared_types: Vec::new(),
             copies: HashMap::new(),
             record: None,
-            method_targets: Vec::new(),
             view_roots: None,
             errors: Vec::new(),
             warnings: Vec::new(),
@@ -2223,6 +2218,7 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|top| (top.item, top.made))
             .collect();
+        let method_targets = std::mem::take(&mut self.lowering.method_targets);
         let field_schedule = FieldSchedule {
             tree: std::mem::take(&mut self.mentions.tree),
             schedule: std::mem::take(&mut self.schedule),
@@ -2273,7 +2269,6 @@ impl<'a> Checker<'a> {
         };
         let mut warnings = self.warnings;
         warnings.sort_by_key(|warning| warning.span.start);
-        let method_targets = self.method_targets;
         let output = CheckOutput {
             checked,
             scope: Scope {

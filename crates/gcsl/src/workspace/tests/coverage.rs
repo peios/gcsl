@@ -69,7 +69,7 @@ fn drive_checked(workspace: &mut Workspace, file: u32) -> usize {
                     if let Some(reached) = workspace.closure_items_reached(closure) {
                         covered.extend(reached);
                     }
-                    for capture in closure.captures.iter() {
+                    for capture in &closure.captures {
                         reached_by_value(workspace, capture, &mut covered);
                     }
                 }

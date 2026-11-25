@@ -5,6 +5,7 @@
 //! what code means changed, or write the digest again with a line saying
 //! why it did not, as `semantics.digest` shows.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -58,11 +59,11 @@ fn digest() -> String {
         );
         hasher.update(b"\0");
     }
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut hex = String::new();
+    for byte in hasher.finalize() {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 #[test]

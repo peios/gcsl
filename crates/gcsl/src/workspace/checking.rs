@@ -457,18 +457,7 @@ pub(super) fn check_scan_recording(
             Some(Ok((ir, output))) => {
                 // The methods its calls chose, for reach (see
                 // [Reach](crate::workspace::reach#reach)).
-                edges = Some(
-                    output
-                        .method_targets
-                        .iter()
-                        .map(|target| {
-                            let declared = target
-                                .declared
-                                .map(|(file, at)| (file.unwrap_or(index), at));
-                            (target.call, declared)
-                        })
-                        .collect(),
-                );
+                edges = Some(method_edges(index, &output));
                 for_later.extend(&scan, index, &output);
                 if let Some(dir) = scopes.get_mut(file.dir as usize) {
                     dir.commit(&output.scope, start, (keep, poison));
@@ -526,6 +515,22 @@ pub(super) fn check_scan_recording(
         ..workspace
     };
     (Ok(workspace), recorded)
+}
+
+/// The methods the calls of file `index` chose, as its check `output` says,
+/// for reach (see [Reach](crate::workspace::reach#reach)): each call's
+/// offset, and the input and offset of the method's declaration, if known.
+fn method_edges(index: u32, output: &CheckOutput) -> Vec<super::reach::MethodEdge> {
+    output
+        .method_targets
+        .iter()
+        .map(|target| {
+            let declared = target
+                .declared
+                .map(|(file, at)| (file.unwrap_or(index), at));
+            (target.call, declared)
+        })
+        .collect()
 }
 
 /// Each file's run and types, and the warnings, of a check (see

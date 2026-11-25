@@ -46,6 +46,7 @@ pub fn start() {
 }
 
 /// Stops recording on this thread: what was recorded since [`start`].
+#[must_use]
 pub fn stop() -> Vec<Used> {
     ON.with(|on| on.set(false));
     USED.with(|used| std::mem::take(&mut *used.borrow_mut()))

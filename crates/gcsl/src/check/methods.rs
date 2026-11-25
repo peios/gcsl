@@ -508,7 +508,7 @@ impl Checker<'_> {
         method: MethodCandidate,
     ) -> TyId {
         let span = self.ast.get(callee).span;
-        self.method_targets.push(MethodTarget {
+        self.lowering.method_targets.push(MethodTarget {
             call: span.start,
             declared: method.declared.map(|(file, at)| (file, at.start)),
         });
