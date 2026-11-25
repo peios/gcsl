@@ -2,5 +2,5 @@
 # was last set or confirmed for (see tests/semantics.rs). Each line after
 # the digest says why it was written again without raising SEMANTICS.
 semantics 1
-digest cf248bc160a298933e08496cd73efaaf8ccd68c56bdc999fa0a96223c9bf8741
-PEI-1775: recording of what a run used, for tests only (cfg test or the coverage feature); what code means is unchanged.
+digest b303f6d0d75ef54525786236bf75249ebe9d880d3b29d8c57d506e2db3a57d66
+PEI-1775: recording of what a run used (functions, top-level cells, contexts), for tests only (cfg test or the coverage feature); what code means is unchanged.

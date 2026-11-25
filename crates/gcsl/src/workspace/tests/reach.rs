@@ -142,3 +142,60 @@ fn a_standard_function_s_identity_is_its_reach_and_place_in_its_item() {
     let edited = "def zz_used(s: String) -> String { = \"b{s}\" }";
     assert_ne!(function_of(base, marker), function_of(edited, marker));
 }
+
+/// [`reach_of`] beside the standard library of `table`, of the files
+/// `files`, the function `name` of `app/build.gcsl` among them.
+fn reach_beside(table: &[(&str, &str)], files: &[(&str, &str)], name: &str) -> [u8; 32] {
+    let (_, checked) = checked_beside(table, files);
+    let workspace = checked.unwrap_or_else(|errors| panic!("{errors:?}"));
+    let file = workspace.file("app/build.gcsl").unwrap();
+    let build = files
+        .iter()
+        .find(|(path, _)| *path == "app/build.gcsl")
+        .unwrap()
+        .1;
+    let at = build.find(&format!("fn {name}(")).unwrap();
+    workspace
+        .standard_reach(file, u32::try_from(at).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn a_member_of_an_imported_module_reaches_the_module() {
+    // `exists` follows a `.`, so it names a member; `fs` before it reaches
+    // the module, whose every item an edit of it changes.
+    let fs = crate::STANDARD
+        .iter()
+        .find(|(stem, _)| *stem == "fs")
+        .unwrap()
+        .1;
+    let edited = format!("{fs}\nzz_added = 1\n");
+    let prelude = prelude_entry().1;
+    let build = "import fs\nfn step(p: String) -> Bool { = fs.exists(p) }\n";
+    let files = [("workspace.gcsl", ""), ("app/build.gcsl", build)];
+    assert_ne!(
+        reach_beside(&[("fs", fs), ("prelude", prelude)], &files, "step"),
+        reach_beside(&[("fs", &edited), ("prelude", prelude)], &files, "step")
+    );
+}
+
+#[test]
+fn a_context_a_with_binds_reaches_its_declaration() {
+    // The step calls the library, so its file is the step's code, and only
+    // binds the library's context: the binding reaches the declaration, and
+    // what its default reads.
+    let lib = "context zz_lib: String = zz_value\n\
+               def lib_helper() -> String { = \"h\" }\n";
+    let build = "fn step() -> String { = lib_helper() with { zz_lib = \"y\" } }\n";
+    let files = [
+        ("workspace.gcsl", ""),
+        ("app/lib.gcsl", lib),
+        ("app/build.gcsl", build),
+    ];
+    let prelude = |body: &str| format!("{}\nzz_value = {body}\n", prelude_entry().1);
+    let (a, b) = (prelude("\"a\""), prelude("\"b\""));
+    assert_ne!(
+        reach_beside(&[("prelude", &a)], &files, "step"),
+        reach_beside(&[("prelude", &b)], &files, "step")
+    );
+}

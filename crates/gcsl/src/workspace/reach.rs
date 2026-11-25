@@ -11,13 +11,18 @@
 //!
 //! An item *reaches* each item whose declared name appears as an
 //! identifier in it, wherever a name of that spelling is declared: in a
-//! file its code needs, or in any standard file. Its identifiers are its
+//! file its code needs, or in any standard file. An identifier after a `.`
+//! names a member, which reaches only each method of its name, as a field
+//! call spells it: a module's members are reached through the module's
+//! name before the `.`. One before a `:` or a single `=` names a binding,
+//! a parameter, a field or a named argument, which reaches only each
+//! context of its name, as a `with` binds it. Its identifiers are its
 //! tokens', an interpolation's included, from the end of the item before
 //! it through its own end, so that its attributes are its own. An item
 //! declares the first segment of the path it binds, or the name of the
 //! type, enum, variant or context it declares, or the first segment of the
-//! path of what it defines with a def-type, or of a method, its method's
-//! name, which a field call spells. A name an item reaches also
+//! path of what it defines with a def-type; a method declares its
+//! method's name, as a member, and a context its name. A name an item reaches also
 //! reaches each item that rebinds it, by `:=`, whose value it may then
 //! read; a name an import binds, each item the import's target holds; and
 //! a name a `from` import binds under another, the items of the name it
@@ -64,8 +69,20 @@ pub(crate) struct ItemReach {
     pub(crate) declares: Vec<Name>,
     /// The names it rebinds, by `:=`.
     pub(crate) rebinds: Vec<Name>,
-    /// The identifiers of its tokens, each once.
+    /// The identifiers of its tokens that may refer to a declaration, each
+    /// once: neither a member's name after a `.` nor a binding's before a
+    /// `:` or an `=`.
     pub(crate) idents: Vec<Name>,
+    /// The names of the members its tokens read or call, after a `.`, each
+    /// once: what a field call of a method spells.
+    pub(crate) members: Vec<Name>,
+    /// The names its tokens bind, before a `:` or an `=`, each once: a
+    /// parameter, a field, a named argument, or a context `with` binds.
+    pub(crate) bindings: Vec<Name>,
+    /// The names of the methods it declares.
+    pub(crate) methods: Vec<Name>,
+    /// The names of the contexts it declares.
+    pub(crate) contexts: Vec<Name>,
     /// Whether it is reached whenever its file runs: an item that declares
     /// no name a reference could spell.
     pub(crate) ordered: bool,
@@ -125,10 +142,9 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
         hasher.update(b"gcsl-item-1\0");
         hasher.update(path.as_bytes());
         hasher.update(b"\0");
-        let mut idents = Vec::new();
-        let mut seen = HashSet::new();
         let mut broken = false;
         let mut begins = None;
+        let mut kinds: Vec<TokenKind> = Vec::new();
         while let Some(token) = tokens.next_if(|token| token.span.end <= end) {
             match token.kind {
                 TokenKind::Newline => {
@@ -139,13 +155,9 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
                     continue;
                 }
                 TokenKind::Eof => continue,
-                TokenKind::Ident(name) => {
-                    if seen.insert(name) {
-                        idents.push(name);
-                    }
-                }
                 _ => {}
             }
+            kinds.push(token.kind);
             broken = false;
             begins.get_or_insert(token.span.start);
             let piece = text
@@ -154,6 +166,7 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
             hasher.update(piece.as_bytes());
             hasher.update(b"\0");
         }
+        let (idents, members, bindings) = classify(&kinds);
         let first = |range| ast.path(range).first().and_then(|segment| segment.name());
         let (declares, rebinds, ordered, declaration) = match item.kind {
             ItemKind::Let { path, .. } | ItemKind::Field { path, .. } => {
@@ -197,21 +210,33 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
         // binding no source spells: it declares the context's name too.
         let mut declares = declares;
         let mut declaration = declaration;
+        let mut contexts = Vec::new();
         for context in ast.contexts().iter().filter(|context| context.item == id) {
             declares.push(context.name);
+            contexts.push(context.name);
             declaration = true;
+        }
+        if let ItemKind::Context { name, .. } = item.kind {
+            contexts.push(name);
         }
         // So is a method, under a binding of its own: a field call reaches
         // it by the method's name.
-        for method in ast.methods().iter().filter(|method| method.item == id) {
-            declares.push(method.name);
-        }
+        let methods: Vec<Name> = ast
+            .methods()
+            .iter()
+            .filter(|method| method.item == id)
+            .map(|method| method.name)
+            .collect();
         items.push(ItemReach {
             end,
             first: begins.unwrap_or(item.span.start),
             declares,
             rebinds,
             idents,
+            members,
+            bindings,
+            methods,
+            contexts,
             ordered,
             declaration,
             identity: hasher.finalize().into(),
@@ -223,6 +248,35 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
         whole,
         renamed,
     }
+}
+
+/// The identifiers of the tokens `kinds`, each once, in three: those that
+/// may refer to a declaration; members' names, after a `.`, which a field
+/// call of a method spells; and bindings' names, before a `:`, as a
+/// parameter's or a field's type is written, or before a single `=`, as a
+/// field, a named argument or a context a `with` binds is.
+fn classify(kinds: &[TokenKind]) -> (Vec<Name>, Vec<Name>, Vec<Name>) {
+    let mut sets: [(Vec<Name>, HashSet<Name>); 3] = Default::default();
+    for (at, kind) in kinds.iter().enumerate() {
+        let TokenKind::Ident(name) = *kind else {
+            continue;
+        };
+        let before = at.checked_sub(1).and_then(|before| kinds.get(before));
+        let after = kinds.get(at + 1);
+        let which = if matches!(before, Some(TokenKind::Dot)) {
+            1
+        } else if matches!(after, Some(TokenKind::Colon | TokenKind::Eq)) {
+            2
+        } else {
+            0
+        };
+        let (list, seen) = &mut sets[which];
+        if seen.insert(name) {
+            list.push(name);
+        }
+    }
+    let [(idents, _), (members, _), (bindings, _)] = sets;
+    (idents, members, bindings)
 }
 
 /// An item, by its file's input number and its index among the file's.
@@ -240,6 +294,10 @@ pub(crate) struct NameIndex {
     pub(crate) imported: HashMap<Name, Vec<u32>>,
     /// The names each name a `from` import binds under another binds.
     pub(crate) renamed: HashMap<Name, Vec<Name>>,
+    /// The items declaring a method of each name.
+    pub(crate) methods: HashMap<Name, Vec<At>>,
+    /// The items declaring a context of each name.
+    pub(crate) contexts: HashMap<Name, Vec<At>>,
 }
 
 /// The items reached from `seeds` among `files`, by `index`, to a fixpoint.
@@ -251,6 +309,20 @@ pub(crate) fn reach(files: &[FileReach], index: &NameIndex, seeds: &[At]) -> Has
         let Some(at) = files.get(file as usize).and_then(|f| f.items.get(item)) else {
             continue;
         };
+        for name in &at.members {
+            for &found in index.methods.get(name).into_iter().flatten() {
+                if reached.insert(found) {
+                    work.push(found);
+                }
+            }
+        }
+        for name in &at.bindings {
+            for &found in index.contexts.get(name).into_iter().flatten() {
+                if reached.insert(found) {
+                    work.push(found);
+                }
+            }
+        }
         let mut names: Vec<Name> = at.idents.clone();
         let mut name_at = 0;
         while let Some(&name) = names.get(name_at) {
@@ -517,6 +589,38 @@ impl super::Workspace {
                         .into_iter()
                         .collect()
                 }
+                Used::Context { key } => {
+                    // One of no standard file's is the workspace's own.
+                    let declared: Vec<_> = scan
+                        .contexts
+                        .iter()
+                        .filter(|context| context.key == key)
+                        .collect();
+                    if !declared.is_empty()
+                        && declared.iter().all(|context| context.file >= scan.standard)
+                    {
+                        continue;
+                    }
+                    declared
+                        .into_iter()
+                        .filter(|context| context.file < scan.standard)
+                        .flat_map(|context| {
+                            let file = context.file;
+                            scan.reach
+                                .get(file as usize)
+                                .map_or_else(Vec::new, |f| {
+                                    f.items
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, item)| item.contexts.contains(&context.name))
+                                        .map(|(i, _)| i)
+                                        .collect()
+                                })
+                                .into_iter()
+                                .map(move |i| (file, i))
+                        })
+                        .collect()
+                }
                 Used::Top { input, slot } => {
                     if let Some(node) = scan.nodes.get(slot as usize) {
                         // A cell: of the files with a leaf under it, the
@@ -585,6 +689,12 @@ impl super::Workspace {
                 }
                 for &name in &item.rebinds {
                     index.rebound.entry(name).or_default().push((f, i));
+                }
+                for &name in &item.methods {
+                    index.methods.entry(name).or_default().push((f, i));
+                }
+                for &name in &item.contexts {
+                    index.contexts.entry(name).or_default().push((f, i));
                 }
             }
             for &(alias, name) in &file.renamed {

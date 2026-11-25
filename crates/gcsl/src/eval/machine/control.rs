@@ -159,6 +159,8 @@ impl Machine<'_> {
         key: Name,
         (default, depth): (IrId, u16),
     ) -> Next {
+        #[cfg(any(test, feature = "coverage"))]
+        crate::coverage::record(crate::coverage::Used::Context { key });
         // A step's run hands the host what it reads of its context, which
         // the host then gives the step: the read keeps program order as an
         // effect the host does not isolate does.

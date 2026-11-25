@@ -1,6 +1,7 @@
 //! What a run's code used, recorded for tests of reach (see
 //! [Reach](crate::workspace::reach#reach)): each function whose code it
-//! looked up to run, and each top-level cell a function read. Built only
+//! looked up to run, each top-level cell a function read, and each context
+//! it read. Built only
 //! for tests, or with the `coverage` feature; nothing is recorded unless a
 //! thread [`start`]s recording.
 
@@ -15,6 +16,11 @@ pub enum Used {
         input: u32,
         /// Where its body begins.
         at: u32,
+    },
+    /// The context of the declaration's key `key`, read.
+    Context {
+        /// Its declaration's key.
+        key: crate::names::Name,
     },
     /// The cell `slot` of the top level's frame, read by code of input
     /// `input`.
