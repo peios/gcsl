@@ -147,6 +147,9 @@ pub(super) struct ForLowering {
     /// Each call of a method, by its id, with its receiver, its callee's
     /// parameter 0 (see [Methods](crate::check::methods#methods)).
     pub(super) method_calls: HashMap<ExprId, ExprId>,
+    /// Each call of a method, as its receiver's type chose the method, for
+    /// [`CheckOutput::method_targets`](crate::check::CheckOutput::method_targets).
+    pub(super) method_targets: Vec<crate::check::MethodTarget>,
     /// Each variant as a value, by its id (see [Enums](crate::check::enums#enums)).
     pub(super) variants: HashMap<ExprId, VariantTag>,
     /// Each read of a context, by its id, with its declaration's key (see

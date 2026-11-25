@@ -55,6 +55,8 @@ impl Evaluator<'_> {
         (default, depth): (IrId, u16),
         node: &IrNode,
     ) -> Flow<Value> {
+        #[cfg(any(test, feature = "coverage"))]
+        crate::coverage::record(crate::coverage::Used::Context { key });
         let context = self.shared.context.borrow().clone();
         self.memo.depend_context(key, context.as_ref());
         self.note_step_read(key, context.as_ref());

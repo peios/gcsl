@@ -1,0 +1,6 @@
+# The sources of what GCSL code means beyond its text, as gcsl::SEMANTICS
+# was last set or confirmed for (see tests/semantics.rs). Each line after
+# the digest says why it was written again without raising SEMANTICS.
+semantics 1
+digest b303f6d0d75ef54525786236bf75249ebe9d880d3b29d8c57d506e2db3a57d66
+PEI-1775: recording of what a run used (functions, top-level cells, contexts), for tests only (cfg test or the coverage feature); what code means is unchanged.

@@ -189,8 +189,8 @@ use crate::workspace::{Context, Target};
 pub use builtin::{Builtin, Typing};
 use builtin::builtin_types;
 pub use results::{
-    Attribute, CheckOutput, Checked, Constant, FieldSchedule, Fileroot, MadeAt, ParamDefault,
-    Place, Slot, TypeAnnotation, Types, VarRef, VariantTag, retry_of, timeout_of,
+    Attribute, CheckOutput, Checked, Constant, FieldSchedule, Fileroot, MadeAt, MethodTarget,
+    ParamDefault, Place, Slot, TypeAnnotation, Types, VarRef, VariantTag, retry_of, timeout_of,
 };
 use results::OtherTypes;
 pub use resolution::{
@@ -2218,6 +2218,7 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|top| (top.item, top.made))
             .collect();
+        let method_targets = std::mem::take(&mut self.lowering.method_targets);
         let field_schedule = FieldSchedule {
             tree: std::mem::take(&mut self.mentions.tree),
             schedule: std::mem::take(&mut self.schedule),
@@ -2278,6 +2279,7 @@ impl<'a> Checker<'a> {
             ty,
             cell_types,
             warnings,
+            method_targets,
         };
         (Ok(output), record)
     }

@@ -303,6 +303,7 @@ mod graph;
 mod imports;
 mod suspension;
 
+mod coverage;
 mod invoke;
 mod keychain;
 mod language;
@@ -312,6 +313,7 @@ mod merging;
 mod metas;
 mod needs;
 mod profile;
+mod reach;
 mod shadowing;
 mod shell;
 mod standard;

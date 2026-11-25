@@ -434,6 +434,18 @@ pub struct Checked {
     pub resolution: Resolution,
 }
 
+/// A call of a method, as a check chose its method: the offset its callee
+/// begins at, and where the method's name is declared, by the input it is
+/// declared in (`None` for the checked input itself) and the offset, if it
+/// is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MethodTarget {
+    /// The offset the call's callee begins at.
+    pub call: u32,
+    /// Where the method chosen is declared, if that is known.
+    pub declared: Option<(Option<u32>, u32)>,
+}
+
 /// Everything a successful [`Checker::check`](super::Checker::check) produces.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckOutput {
@@ -450,6 +462,10 @@ pub struct CheckOutput {
     pub cell_types: Vec<TyId>,
     /// The warnings found, in source order.
     pub warnings: Vec<Diagnostic>,
+    /// Each call of a method the check chose, by its receiver's type: what
+    /// a host's key of a step reaches of the methods it calls (see
+    /// [Reach](crate::workspace::reach#reach)).
+    pub method_targets: Vec<MethodTarget>,
 }
 
 /// The tree of an input's top-level fields and when each of its nodes is
