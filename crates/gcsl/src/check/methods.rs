@@ -106,7 +106,10 @@ use crate::strings::FieldName;
 use crate::types::{FnTy, GenericId, Meta, TyId};
 use crate::workspace::Context;
 
-use super::{Bound, Checker, KnownCallee, MethodCandidate, MethodSource, TypeBinding, argument_targets};
+use super::{
+    Bound, Checker, KnownCallee, MethodCandidate, MethodSource, MethodTarget, TypeBinding,
+    argument_targets,
+};
 
 impl Checker<'_> {
     /// Checks the input's methods as their bindings are declared (see
@@ -505,6 +508,10 @@ impl Checker<'_> {
         method: MethodCandidate,
     ) -> TyId {
         let span = self.ast.get(callee).span;
+        self.method_targets.push(MethodTarget {
+            call: span.start,
+            declared: method.declared.map(|(file, at)| (file, at.start)),
+        });
         let (method_ty, known) = match method.source {
             MethodSource::Binding(binding) => {
                 let (method_ty, _) = self.use_name(callee, binding, span);

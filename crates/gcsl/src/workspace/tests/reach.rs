@@ -92,13 +92,22 @@ fn a_method_of_the_name_a_field_call_spells_is_reached() {
         reach_of(base, build, "step"),
         reach_of(edited, build, "step")
     );
-    // A method of that name added for another type may be what the call
-    // means once types change: it is reached too, as is its removal.
-    let added = "def (s: String) zz_m() -> String { = s }\n\
+    // One of that name for another type is not what the call chose.
+    let other = "def (s: String) zz_m() -> String { = s }\n\
                  def (n: Int) zz_m() -> Int { = n }";
-    assert_ne!(
+    assert_eq!(
         reach_of(base, build, "step"),
-        reach_of(added, build, "step")
+        reach_of(other, build, "step")
+    );
+    // One added that the receiver's type chooses over the method it chose
+    // keys the step again, as its removal does.
+    let build = "fn step(xs: List<String>) -> Int { = xs.zz_n() }\n";
+    let generic = "def (xs: List<T>) zz_n<T>() -> Int { = len(xs) }";
+    let specific = "def (xs: List<T>) zz_n<T>() -> Int { = len(xs) }\n\
+                    def (xs: List<String>) zz_n() -> Int { = 0 }";
+    assert_ne!(
+        reach_of(generic, build, "step"),
+        reach_of(specific, build, "step")
     );
 }
 

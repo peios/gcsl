@@ -452,8 +452,23 @@ pub(super) fn check_scan_recording(
         let poison = |name: Name| poisoned_root(&scan, index, name);
         #[cfg(test)]
         keep_view_records(&mut view_records, index, compiled.as_ref());
+        let mut edges = None;
         let result = match compiled {
             Some(Ok((ir, output))) => {
+                // The methods its calls chose, for reach (see
+                // [Reach](crate::workspace::reach#reach)).
+                edges = Some(
+                    output
+                        .method_targets
+                        .iter()
+                        .map(|target| {
+                            let declared = target
+                                .declared
+                                .map(|(file, at)| (file.unwrap_or(index), at));
+                            (target.call, declared)
+                        })
+                        .collect(),
+                );
                 for_later.extend(&scan, index, &output);
                 if let Some(dir) = scopes.get_mut(file.dir as usize) {
                     dir.commit(&output.scope, start, (keep, poison));
@@ -472,6 +487,9 @@ pub(super) fn check_scan_recording(
         };
         if let Some(file) = scan.files.get_mut(index as usize) {
             names = file.ast.replace_names(Names::new());
+        }
+        if let Some(reach) = scan.reach.get_mut(index as usize) {
+            reach.method_edges = edges;
         }
         set_cells(&mut cell_types, &mut cell_slots, &mut cell_known, cells);
         match result {

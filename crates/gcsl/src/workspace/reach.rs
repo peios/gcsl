@@ -120,6 +120,11 @@ pub(crate) struct FileReach {
     /// Each name a `from` import binds under another, with the name it
     /// binds.
     pub(crate) renamed: Vec<(Name, Name)>,
+    /// Each call of a method in it, once it is checked, as its check chose
+    /// the method: the offset of the call's callee, and the input and offset
+    /// of the method's declaration, if known. `None` for a file not checked,
+    /// whose calls reach every method of the name they spell.
+    pub(crate) method_edges: Option<Vec<(u32, Option<(u32, u32)>)>>,
 }
 
 impl FileReach {
@@ -281,6 +286,7 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
         analysable: true,
         whole,
         renamed,
+        method_edges: None,
     }
 }
 
@@ -385,7 +391,37 @@ pub(crate) fn reach(files: &[FileReach], index: &NameIndex, seeds: &[At]) -> Has
                     .and_then(|f| f.items.get(found.1))
                     .is_some_and(|item| item.private)
         };
-        for name in &at.members {
+        // The methods its calls chose, by its receivers' types, if its file
+        // was checked and each was found; else each method of each member's
+        // name.
+        let start = item.checked_sub(1).map_or(0, |before| {
+            files[file as usize]
+                .items
+                .get(before)
+                .map_or(0, |item| item.end)
+        });
+        let edges: Option<Vec<At>> = files[file as usize]
+            .method_edges
+            .as_ref()
+            .and_then(|edges| {
+                edges
+                    .iter()
+                    .filter(|(call, _)| *call >= start && *call <= at.end)
+                    .map(|(_, declared)| {
+                        let (target, offset) = (*declared)?;
+                        let found = files.get(target as usize)?.item_at(offset)?;
+                        Some((target, found))
+                    })
+                    .collect()
+            });
+        if let Some(edges) = &edges {
+            for &found in edges {
+                if reached.insert(found) {
+                    work.push(found);
+                }
+            }
+        }
+        for name in at.members.iter().filter(|_| edges.is_none()) {
             for &found in index
                 .methods
                 .get(name)
