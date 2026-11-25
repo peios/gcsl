@@ -14,8 +14,9 @@
 //! file its code needs, or in any standard file. An identifier after a `.`
 //! names a member, which reaches only each method of its name, as a field
 //! call spells it: a module's members are reached through the module's
-//! name before the `.`. A module an import binds is reached whole where an
-//! item reads it as a value; where it reads a member of it, `mod.x`, `x` is
+//! name before the `.`. A module an import binds, a name of the importing
+//! file alone, is reached whole where an item of that file reads it as a
+//! value; where it reads a member of it, `mod.x`, `x` is
 //! reached by its name, as any declaration is, and so is each file of the
 //! module's whose path names `x`. One before a `:` or a single `=` names a binding,
 //! a parameter, a field or a named argument, which reaches only each
@@ -90,6 +91,9 @@ pub(crate) struct ItemReach {
     pub(crate) qualified: Vec<(Name, Name)>,
     /// The names of the methods it declares.
     pub(crate) methods: Vec<Name>,
+    /// Whether what it declares is its file's alone, a `let`'s or a `fn`'s,
+    /// which no other file's code can name: a `fn` method's too.
+    pub(crate) private: bool,
     /// The names of the contexts it declares.
     pub(crate) contexts: Vec<Name>,
     /// Whether it is reached whenever its file runs: an item that declares
@@ -234,12 +238,19 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
         }
         // So is a method, under a binding of its own: a field call reaches
         // it by the method's name.
-        let methods: Vec<Name> = ast
+        let declared_methods: Vec<_> = ast
             .methods()
             .iter()
             .filter(|method| method.item == id)
-            .map(|method| method.name)
             .collect();
+        let methods: Vec<Name> = declared_methods.iter().map(|method| method.name).collect();
+        // A `let` or a `fn`, and a `fn` method, are their file's alone; a
+        // context's default, which is the `let` of a binding, is not.
+        let private = if declared_methods.is_empty() {
+            matches!(item.kind, ItemKind::Let { .. }) && contexts.is_empty()
+        } else {
+            declared_methods.iter().all(|method| !method.public)
+        };
         items.push(ItemReach {
             end,
             first: begins.unwrap_or(item.span.start),
@@ -251,6 +262,7 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
             bare,
             qualified,
             methods,
+            private,
             contexts,
             ordered,
             declaration,
@@ -345,8 +357,9 @@ pub(crate) struct NameIndex {
     pub(crate) declared: HashMap<Name, Vec<At>>,
     /// The items rebinding each name.
     pub(crate) rebound: HashMap<Name, Vec<At>>,
-    /// The files each name an import binds holds.
-    pub(crate) imported: HashMap<Name, Vec<u32>>,
+    /// The files each name an import binds holds, by the importing file:
+    /// an import binds a name of its own file alone.
+    pub(crate) imported: HashMap<(u32, Name), Vec<u32>>,
     /// The names each name a `from` import binds under another binds.
     pub(crate) renamed: HashMap<Name, Vec<Name>>,
     /// The items declaring a method of each name.
@@ -359,13 +372,27 @@ pub(crate) struct NameIndex {
 pub(crate) fn reach(files: &[FileReach], index: &NameIndex, seeds: &[At]) -> HashSet<At> {
     let mut reached: HashSet<At> = seeds.iter().copied().collect();
     let mut work: Vec<At> = seeds.to_vec();
-    let mut names_seen: HashSet<Name> = HashSet::new();
+    // By the file reading it, which decides what of its file alone it sees.
+    let mut names_seen: HashSet<(u32, Name)> = HashSet::new();
     while let Some((file, item)) = work.pop() {
         let Some(at) = files.get(file as usize).and_then(|f| f.items.get(item)) else {
             continue;
         };
+        let visible = |found: &At| {
+            found.0 == file
+                || !files
+                    .get(found.0 as usize)
+                    .and_then(|f| f.items.get(found.1))
+                    .is_some_and(|item| item.private)
+        };
         for name in &at.members {
-            for &found in index.methods.get(name).into_iter().flatten() {
+            for &found in index
+                .methods
+                .get(name)
+                .into_iter()
+                .flatten()
+                .filter(|found| visible(found))
+            {
                 if reached.insert(found) {
                     work.push(found);
                 }
@@ -384,10 +411,17 @@ pub(crate) fn reach(files: &[FileReach], index: &NameIndex, seeds: &[At]) -> Has
         // and as the module's file of that name.
         let mut wholes: Vec<u32> = Vec::new();
         for name in &at.bare {
-            wholes.extend(index.imported.get(name).into_iter().flatten().copied());
+            wholes.extend(
+                index
+                    .imported
+                    .get(&(file, *name))
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
         }
         for (module, member) in &at.qualified {
-            let Some(targets) = index.imported.get(module) else {
+            let Some(targets) = index.imported.get(&(file, *module)) else {
                 continue;
             };
             names.push(*member);
@@ -408,12 +442,20 @@ pub(crate) fn reach(files: &[FileReach], index: &NameIndex, seeds: &[At]) -> Has
         let mut name_at = 0;
         while let Some(&name) = names.get(name_at) {
             name_at += 1;
-            if !names_seen.insert(name) {
+            if !names_seen.insert((file, name)) {
                 continue;
             }
             names.extend(index.renamed.get(&name).into_iter().flatten().copied());
             let mut more: Vec<At> = Vec::new();
-            more.extend(index.declared.get(&name).into_iter().flatten().copied());
+            more.extend(
+                index
+                    .declared
+                    .get(&name)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|found| visible(found)),
+            );
             more.extend(index.rebound.get(&name).into_iter().flatten().copied());
             for found in more {
                 if reached.insert(found) {
@@ -809,7 +851,7 @@ impl super::Workspace {
                     }
                     None => index
                         .imported
-                        .entry(alias.name)
+                        .entry((f, alias.name))
                         .or_default()
                         .extend(scan.target_files(alias.target)),
                 }

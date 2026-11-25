@@ -211,3 +211,24 @@ fn a_context_a_with_binds_reaches_its_declaration() {
         reach_beside(&[("prelude", &b)], &files, "step")
     );
 }
+
+#[test]
+fn a_file_s_own_helper_is_reached_through_what_of_it_is_public() {
+    // `zz_helper` is the prelude's alone; the step reaches it through
+    // `zz_used`, which the prelude calls it from.
+    let base = "def zz_used(s: String) -> String { = zz_helper(s) }\n\
+                fn zz_helper(s: String) -> String { = \"a{s}\" }";
+    let edited = "def zz_used(s: String) -> String { = zz_helper(s) }\n\
+                  fn zz_helper(s: String) -> String { = \"b{s}\" }";
+    assert_ne!(reach_of(base, USES, "step"), reach_of(edited, USES, "step"));
+    // Another file's name of that spelling is its own: the prelude's
+    // helper, which it cannot name, is not reached.
+    let own = "fn zz_helper(s: String) -> String { = s }\n\
+               fn step(s: String) -> String { = zz_helper(s) }\n";
+    let unused = "fn zz_helper(s: String) -> String { = \"a{s}\" }";
+    let unused_edited = "fn zz_helper(s: String) -> String { = \"b{s}\" }";
+    assert_eq!(
+        reach_of(unused, own, "step"),
+        reach_of(unused_edited, own, "step")
+    );
+}
