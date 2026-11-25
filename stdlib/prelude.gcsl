@@ -422,9 +422,11 @@ def (xs: List<T>) contains<T>(x: T): Bool { builtins.list_contains(xs, x) }
 # step a directory of its own kept between its runs, which plain GCSL ignores.
 # A `build` definition, `def build hello() { ... }`, is a target: its body
 # gives whatever it builds, a file or a record of them, which a build tool
-# builds when it is named.
+# builds when it is named. `#[scratch(resumable = true)]` says the step's
+# tool remakes what a run that was killed left half written, so that a
+# build tool may keep the directory such a run left.
 #[attribute] #[defers] type hermetic = {on: Bool = true}
-#[attribute] type scratch = {}
+#[attribute] type scratch = {resumable: Bool = false}
 # `#[device("kvm")]` gives a step a device of the machine it runs on, where
 # the machine has it: `kvm`, for a virtual machine to run at speed. It
 # changes how fast a step runs, never what it gives, so it keys nothing, and
