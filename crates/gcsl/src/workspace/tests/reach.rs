@@ -161,22 +161,34 @@ fn reach_beside(table: &[(&str, &str)], files: &[(&str, &str)], name: &str) -> [
 }
 
 #[test]
-fn a_member_of_an_imported_module_reaches_the_module() {
-    // `exists` follows a `.`, so it names a member; `fs` before it reaches
-    // the module, whose every item an edit of it changes.
+fn a_member_of_an_imported_module_reaches_it_by_name_and_the_module_read_whole() {
     let fs = crate::STANDARD
         .iter()
         .find(|(stem, _)| *stem == "fs")
         .unwrap()
         .1;
-    let edited = format!("{fs}\nzz_added = 1\n");
     let prelude = prelude_entry().1;
-    let build = "import fs\nfn step(p: String) -> Bool { = fs.exists(p) }\n";
-    let files = [("workspace.gcsl", ""), ("app/build.gcsl", build)];
-    assert_ne!(
-        reach_beside(&[("fs", fs), ("prelude", prelude)], &files, "step"),
-        reach_beside(&[("fs", &edited), ("prelude", prelude)], &files, "step")
+    let added = format!("{fs}\nzz_added = 1\n");
+    let edited = fs.replace(
+        "exists = builtins.fs_exists",
+        "exists = (builtins.fs_exists)",
     );
+    assert_ne!(fs, edited);
+    let reach = |fs: &str, build: &str| {
+        let files = [("workspace.gcsl", ""), ("app/build.gcsl", build)];
+        reach_beside(&[("fs", fs), ("prelude", prelude)], &files, "step")
+    };
+    // `fs.exists` reaches `exists`, by its name: its edit keys the step
+    // again, another item's added to the module does not.
+    let member = "import fs\nfn step(p: String) -> Bool { = fs.exists(p) }\n";
+    assert_ne!(reach(fs, member), reach(&edited, member));
+    assert_eq!(reach(fs, member), reach(&added, member));
+    // The module read as a value is reached whole.
+    let whole = "import fs\nfn step(p: String) -> Bool {\n\
+                 \x20   let m = fs\n\
+                 \x20   = m.exists(p)\n\
+                 }\n";
+    assert_ne!(reach(fs, whole), reach(&added, whole));
 }
 
 #[test]

@@ -14,7 +14,10 @@
 //! file its code needs, or in any standard file. An identifier after a `.`
 //! names a member, which reaches only each method of its name, as a field
 //! call spells it: a module's members are reached through the module's
-//! name before the `.`. One before a `:` or a single `=` names a binding,
+//! name before the `.`. A module an import binds is reached whole where an
+//! item reads it as a value; where it reads a member of it, `mod.x`, `x` is
+//! reached by its name, as any declaration is, and so is each file of the
+//! module's whose path names `x`. One before a `:` or a single `=` names a binding,
 //! a parameter, a field or a named argument, which reaches only each
 //! context of its name, as a `with` binds it. Its identifiers are its
 //! tokens', an interpolation's included, from the end of the item before
@@ -79,6 +82,12 @@ pub(crate) struct ItemReach {
     /// The names its tokens bind, before a `:` or an `=`, each once: a
     /// parameter, a field, a named argument, or a context `with` binds.
     pub(crate) bindings: Vec<Name>,
+    /// The names it reads as a value, not before a `.`, each once: a module
+    /// so read is reached whole.
+    pub(crate) bare: Vec<Name>,
+    /// Each name before a `.` and the member's name after it, each pair
+    /// once: a module's member, reached by its name.
+    pub(crate) qualified: Vec<(Name, Name)>,
     /// The names of the methods it declares.
     pub(crate) methods: Vec<Name>,
     /// The names of the contexts it declares.
@@ -97,6 +106,9 @@ pub(crate) struct ItemReach {
 pub(crate) struct FileReach {
     /// Its top-level items, in source order.
     pub(crate) items: Vec<ItemReach>,
+    /// The names of the directories of its path and its stem, by which a
+    /// module of a directory names it as a member.
+    pub(crate) components: Vec<Name>,
     /// Whether it could be lexed: else it is reached whole, by `whole`.
     pub(crate) analysable: bool,
     /// The digest of its whole text.
@@ -167,6 +179,7 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
             hasher.update(b"\0");
         }
         let (idents, members, bindings) = classify(&kinds);
+        let (bare, qualified) = qualify(&kinds);
         let first = |range| ast.path(range).first().and_then(|segment| segment.name());
         let (declares, rebinds, ordered, declaration) = match item.kind {
             ItemKind::Let { path, .. } | ItemKind::Field { path, .. } => {
@@ -235,6 +248,8 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
             idents,
             members,
             bindings,
+            bare,
+            qualified,
             methods,
             contexts,
             ordered,
@@ -242,8 +257,15 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
             identity: hasher.finalize().into(),
         });
     }
+    let components = path
+        .trim_end_matches(".gcsl")
+        .split('/')
+        .filter(|part| !part.is_empty() && !part.starts_with('<'))
+        .map(|part| names.intern(part))
+        .collect();
     FileReach {
         items,
+        components,
         analysable: true,
         whole,
         renamed,
@@ -277,6 +299,39 @@ fn classify(kinds: &[TokenKind]) -> (Vec<Name>, Vec<Name>, Vec<Name>) {
     }
     let [(idents, _), (members, _), (bindings, _)] = sets;
     (idents, members, bindings)
+}
+
+/// Of the tokens `kinds`, the identifiers read as a value, not before a
+/// `.`, and each identifier before a `.` with the member's name after it,
+/// each once: how an item reads a module.
+fn qualify(kinds: &[TokenKind]) -> (Vec<Name>, Vec<(Name, Name)>) {
+    let mut bare = Vec::new();
+    let mut qualified = Vec::new();
+    let (mut seen_bare, mut seen_pair) = (HashSet::new(), HashSet::new());
+    for (at, kind) in kinds.iter().enumerate() {
+        let TokenKind::Ident(name) = *kind else {
+            continue;
+        };
+        if matches!(
+            at.checked_sub(1).and_then(|before| kinds.get(before)),
+            Some(TokenKind::Dot)
+        ) {
+            continue;
+        }
+        match (kinds.get(at + 1), kinds.get(at + 2)) {
+            (Some(TokenKind::Dot), Some(&TokenKind::Ident(member))) => {
+                if seen_pair.insert((name, member)) {
+                    qualified.push((name, member));
+                }
+            }
+            _ => {
+                if seen_bare.insert(name) {
+                    bare.push(name);
+                }
+            }
+        }
+    }
+    (bare, qualified)
 }
 
 /// An item, by its file's input number and its index among the file's.
@@ -324,6 +379,32 @@ pub(crate) fn reach(files: &[FileReach], index: &NameIndex, seeds: &[At]) -> Has
             }
         }
         let mut names: Vec<Name> = at.idents.clone();
+        // A module read as a value is reached whole; a member of it, by its
+        // name, as any declaration is, which may be one the module imports,
+        // and as the module's file of that name.
+        let mut wholes: Vec<u32> = Vec::new();
+        for name in &at.bare {
+            wholes.extend(index.imported.get(name).into_iter().flatten().copied());
+        }
+        for (module, member) in &at.qualified {
+            let Some(targets) = index.imported.get(module) else {
+                continue;
+            };
+            names.push(*member);
+            wholes.extend(targets.iter().copied().filter(|&target| {
+                files
+                    .get(target as usize)
+                    .is_some_and(|f| f.components.contains(member))
+            }));
+        }
+        for whole in wholes {
+            let count = files.get(whole as usize).map_or(0, |f| f.items.len());
+            for found in (0..count).map(|item| (whole, item)) {
+                if reached.insert(found) {
+                    work.push(found);
+                }
+            }
+        }
         let mut name_at = 0;
         while let Some(&name) = names.get(name_at) {
             name_at += 1;
@@ -334,10 +415,6 @@ pub(crate) fn reach(files: &[FileReach], index: &NameIndex, seeds: &[At]) -> Has
             let mut more: Vec<At> = Vec::new();
             more.extend(index.declared.get(&name).into_iter().flatten().copied());
             more.extend(index.rebound.get(&name).into_iter().flatten().copied());
-            for &whole in index.imported.get(&name).into_iter().flatten() {
-                let count = files.get(whole as usize).map_or(0, |f| f.items.len());
-                more.extend((0..count).map(|item| (whole, item)));
-            }
             for found in more {
                 if reached.insert(found) {
                     work.push(found);
