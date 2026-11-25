@@ -205,6 +205,27 @@ first, so that its effects are made again rather than found failed.
 - the files whose sources make up its code, which you hash to identify
   the code.
 
+The standard files are among those files, and every step's code includes
+them. So an edit of the prelude would change every step's key, though a
+step uses only some of the prelude. To key a step by only the standard
+items its code can reach, hash the workspace's and libraries' files whole,
+leave the standard files out (`Workspace::is_standard_file`), and add
+`Workspace::node_standard_reach` instead: a digest of the standard items
+that the step's function can reach. A function value among a step's
+arguments, captures or contexts can be of a standard file too. Key it by
+`Workspace::function_identity`, for the place its plain form gives
+(`Plain::Closure`'s `at`), rather than by its file and number. Both are
+`None` where GCSL can't say what the code reaches, and you then hash the
+standard files whole. Fold `gcsl::SEMANTICS` into your keys too: it
+changes when what GCSL code means changes beyond its text, such as how a
+built-in behaves.
+
+What the code can reach is found by name, to a fixpoint, so it can reach
+more than it uses but never less. A method call reaches the method that
+GCSL's checker chose for its receiver's type, and the file's own `let`s
+and `fn`s are reached only from that file. An edit of a standard item that
+no step reaches, or of a comment or a space in one, changes no key.
+
 The context a step can read is every context bound where it was made
 that has a default, and each without one that its function needs (see
 [What a function needs](~gcsl/context#what-a-function-needs)). GCSL
