@@ -808,6 +808,7 @@ pub(super) fn visit_lets(ast: &Ast, id: ExprId, out: &mut Vec<ItemId>) {
             }
         }
         ExprKind::Paren(inner)
+        | ExprKind::Try(inner)
         | ExprKind::Unary { operand: inner, .. }
         | ExprKind::Field { expr: inner, .. }
         | ExprKind::Ascribe { expr: inner, .. }

@@ -294,6 +294,36 @@ fn contexts_reads_withs_and_context_parameters_parse() {
 }
 
 #[test]
+fn a_try_takes_the_longest_expression_after_it() {
+    assert_eq!(shape("try f()"), "(try f())");
+    // As a `lazy` does: the sum, not its first operand.
+    assert_eq!(shape("x = try a + f()"), "x = (try (a + f()))");
+    assert_eq!(shape("x = try a or b"), "x = (try (a or b))");
+    assert_eq!(shape("x = 1 + try f() * 2"), "x = (1 + (try (f() * 2)))");
+    assert_eq!(shape("try step(\"a\") { g() }"), "(try step(\"a\"){g()})");
+    assert_eq!(shape("x = try { 1 }"), "x = (try {1})");
+    assert_eq!(shape("x = try try f()"), "x = (try (try f()))");
+    assert_eq!(shape("x = try not ok"), "x = (try (not ok))");
+    assert_eq!(shape("x = try await f()"), "x = (try (await f()))");
+    assert_eq!(shape("x = try \"a{b}\""), "x = (try \"a<b>\")");
+    assert_eq!(
+        shape("x = try if c { 1 } else { 2 }"),
+        "x = (try (if c {1} else {2}))"
+    );
+    // `try` is a name everywhere else: before `(`, `[`, `.`, an operator
+    // and `=`, alone, and where what follows is on the next line.
+    assert_eq!(shape("x = try(1)"), "x = try(1)");
+    assert_eq!(shape("x = try[0]"), "x = (try at 0)");
+    assert_eq!(shape("x = try.a"), "x = (try . a)");
+    assert_eq!(shape("x = try - 1"), "x = (try - 1)");
+    assert_eq!(shape("x = try + f()"), "x = (try + f())");
+    assert_eq!(shape("try = 1\nx = try"), "try = 1; x = try");
+    assert_eq!(shape("let try = 1\ntry := 2"), "let try = 1; try := 2");
+    assert_eq!(shape("{ try\nf() }"), "{try; f()}");
+    assert_eq!(shape("x = f(try, try = 2)"), "x = f(try, try = 2)");
+}
+
+#[test]
 fn assertions_and_recovers_parse() {
     assert_eq!(shape("assert x == 1"), "assert (x == 1), \"`x == 1`\"");
     assert_eq!(

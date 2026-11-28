@@ -45,6 +45,7 @@ const fn treatment(kind: &ExprKind) -> Treatment {
         | ExprKind::List(_)
         | ExprKind::Variant { .. }
         | ExprKind::Recover(_)
+        | ExprKind::Try(_)
         | ExprKind::ContextRead(_)
         | ExprKind::With { .. } => Treatment::Carries,
         ExprKind::Int(_)

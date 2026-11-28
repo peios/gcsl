@@ -114,6 +114,10 @@ pub struct Diagnostic {
     /// from the workspace's own code reports at that call (see [Errors in a
     /// library](crate::eval::calls#errors-in-a-library)).
     pub(crate) foreign: bool,
+    /// Whether it is a failure that a `recover` caught and its fallback
+    /// raised again with `raise`, as the evaluator found it (see
+    /// [Failure](crate::eval::failure#failure)).
+    pub(crate) raised_again: bool,
 }
 
 /// What the evaluator knows of where a runtime error came from that its
@@ -193,6 +197,7 @@ impl Diagnostic {
             suggestion: None,
             mark: Mark::NONE,
             foreign: false,
+            raised_again: false,
         }
     }
 

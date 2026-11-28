@@ -293,6 +293,12 @@ fn type_args(ast: &Ast, args: TypeArgRange, out: &mut String) {
 }
 
 /// Writes a `recover`, `recover BODY else (NAME) FALLBACK`.
+fn try_shape(ast: &Ast, operand: ExprId, out: &mut String) {
+    out.push_str("(try ");
+    expr(ast, operand, out);
+    out.push(')');
+}
+
 fn recover_shape(ast: &Ast, id: crate::ast::RecoverId, out: &mut String) {
     let decl = ast.recover_decl(id);
     out.push_str("recover ");
@@ -552,6 +558,7 @@ fn expr(ast: &Ast, id: ExprId, out: &mut String) {
             expr(ast, message, out);
         }
         ExprKind::Recover(id) => recover_shape(ast, id, out),
+        ExprKind::Try(operand) => try_shape(ast, operand, out),
         ExprKind::With { bindings, body } => with_shape(ast, (bindings, body), out),
         ExprKind::DefTypeRef(def) => {
             let (def_type, path) = ast.show_def_type(def);

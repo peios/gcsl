@@ -1675,6 +1675,9 @@ pub enum ExprKind {
     /// `recover { BODY } else { FALLBACK }`, its details in the recover
     /// arena (see [`Ast::recover_decl`]).
     Recover(RecoverId),
+    /// `try EXPR`: the expression, or `{}` if it fails (see the parser's
+    /// [Failure](crate::parser::failure#failure)).
+    Try(ExprId),
     /// A read of a context, `^NAME`, as in `^arch` (see the parser's
     /// [Context](crate::parser::context#context)). The name ends the expression's
     /// span.
@@ -1785,6 +1788,7 @@ impl Expr {
             | ExprKind::With { .. }
             | ExprKind::Assert { .. }
             | ExprKind::Recover(_)
+            | ExprKind::Try(_)
             | ExprKind::Error
             | ExprKind::NoField(_)
             | ExprKind::Unclosed { .. } => None,

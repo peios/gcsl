@@ -18,14 +18,31 @@
 //! fallback has run. A deadline a call inside the body set is cleared by
 //! that call, its own failure, so it is caught; `break`, `continue` and
 //! `return` are no failures, and pass through. What the body ran stays run.
+//!
+//! The host is told of every failure caught, as it is caught
+//! (`Evaluator::caught`, [`Effects::caught`](super::Effects::caught)): the
+//! failure whole, as it would have been reported, with the input its spans
+//! are of, so that a host can report what the program went on from. A
+//! fallback's `raise` (`FailureOp::Raise`) fails with the failure its
+//! `recover` caught, as it was: its message, where it was raised, its
+//! labels and its notes, so that what catches or reports it next sees the
+//! failure, not the `raise`. The failure is found by its number among
+//! those of the `recover`s running their fallbacks, which the fallback
+//! stored in a slot of its frame as it began (`FailureOp::At`), since
+//! another fallback may be running by the time the `raise` is reached, in
+//! a block the fallback gives a call that recovers too. A failure raised
+//! again is marked so, which the host is told when it is caught again.
 
 use std::rc::Rc;
 
 use crate::diagnostic::{Diagnostic, Mark as ErrorMark};
-use crate::ir::{IrId, IrKind, IrNode, LayoutId};
+use crate::ir::{FailureOp, IrId, IrKind, IrNode};
 use crate::value::{List, Record, Value};
 
-use super::{Evaluator, Flow, Unwind, comparison_operands, mistyped, record_eq_shaped, source_of};
+use super::{
+    CaughtFailure, Evaluator, Flow, Unwind, comparison_operands, mistyped, record_eq_shaped,
+    source_of,
+};
 
 impl Evaluator<'_> {
     /// Evaluates the assertion `node`, of the condition `cond` and the
@@ -112,7 +129,8 @@ impl Evaluator<'_> {
     pub(super) fn recover(&mut self, body: IrId, fallback: IrId) -> Flow<Value> {
         match self.value(body) {
             Err(Unwind::Error(error)) if error.mark == ErrorMark::NONE => {
-                self.shared.failures.borrow_mut().push(Caught::of(error));
+                let caught = self.caught(error);
+                self.shared.failures.borrow_mut().push(caught);
                 let result = self.value(fallback);
                 self.shared.failures.borrow_mut().pop();
                 result
@@ -121,28 +139,77 @@ impl Evaluator<'_> {
         }
     }
 
-    /// The failure the innermost `recover` running its fallback caught, a
-    /// record of the layout `layout`, its fields its message and its notes.
-    pub(super) fn failure(&self, layout: LayoutId, node: &IrNode) -> Flow<Value> {
-        let Some(caught) = self.shared.failures.borrow().last().cloned() else {
+    /// The failure `error`, which a `recover` of this frame catches, as
+    /// its fallback holds it, the host told of it
+    /// ([`Effects::caught`](super::Effects::caught)): located in this
+    /// frame's input if it names none, since a failure that reaches a frame
+    /// with none was raised in that frame's code.
+    pub(super) fn caught(&self, mut error: Diagnostic) -> Rc<Caught> {
+        error.input.get_or_insert(self.ir.input());
+        self.shared.effects.caught(&CaughtFailure {
+            failure: &error,
+            again: error.raised_again,
+        });
+        Caught::of(error)
+    }
+
+    /// What the `Failure` `node` does, as `op` says (see
+    /// [Failure](#failure)): the failure the innermost `recover` running
+    /// its fallback caught, as a record of its message and its notes; which
+    /// of the failures caught that one is; or the failure of that number,
+    /// raised again.
+    pub(super) fn failure(&mut self, op: FailureOp, node: &IrNode) -> Flow<Value> {
+        let caught = match op {
+            FailureOp::Read(_) | FailureOp::At => self.shared.failures.borrow().last().cloned(),
+            FailureOp::Raise(at) => {
+                let at = self.int(at)?;
+                let failures = self.shared.failures.borrow();
+                usize::try_from(at)
+                    .ok()
+                    .and_then(|at| failures.get(at))
+                    .cloned()
+            }
+        };
+        let Some(caught) = caught else {
             return mistyped(node, "a failure read outside a `recover`'s fallback");
         };
-        Ok(Value::Record(Rc::new(Record {
-            layout: Rc::clone(self.ir.layout(layout)),
-            values: Box::new([
-                Value::Str(Rc::clone(&caught.message)),
-                Value::List(caught.notes.clone()),
-            ]),
-        })))
+        match op {
+            FailureOp::Read(layout) => Ok(Value::Record(Rc::new(Record {
+                layout: Rc::clone(self.ir.layout(layout)),
+                values: Box::new([
+                    Value::Str(Rc::clone(&caught.message)),
+                    Value::List(caught.notes.clone()),
+                ]),
+            }))),
+            FailureOp::At => {
+                let at = self.shared.failures.borrow().len().saturating_sub(1);
+                Ok(Value::Int(i64::try_from(at).unwrap_or(i64::MAX)))
+            }
+            FailureOp::Raise(_) => Err(self.raised(&caught).into()),
+        }
+    }
+
+    /// The failure `caught`, raised again from this frame: as it was, but
+    /// marked so, and naming no input if its input is this frame's, as a
+    /// failure raised here does.
+    fn raised(&self, caught: &Caught) -> Diagnostic {
+        let mut error = caught.error.clone();
+        error.raised_again = true;
+        if error.input == Some(self.ir.input()) {
+            error.input = None;
+        }
+        error
     }
 }
 
 /// A failure a `recover` caught, as its fallback reads it (see
-/// [Failure](#failure)): its message, and its notes, each a `String`.
+/// [Failure](#failure)): its message, and its notes, each a `String`; and
+/// the failure whole, which `raise` raises again.
 #[derive(Debug)]
 pub(super) struct Caught {
     message: Rc<str>,
     notes: List,
+    error: Diagnostic,
 }
 
 impl Caught {
@@ -150,12 +217,13 @@ impl Caught {
     pub(super) fn of(error: Diagnostic) -> Rc<Self> {
         let notes = error
             .notes
-            .into_iter()
-            .map(|note| Value::Str(Rc::from(note)))
+            .iter()
+            .map(|note| Value::Str(Rc::from(note.as_str())))
             .collect();
         Rc::new(Self {
-            message: Rc::from(error.message),
+            message: Rc::from(error.message.as_str()),
             notes: List::from_vec(notes),
+            error,
         })
     }
 }
