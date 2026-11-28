@@ -40,6 +40,17 @@
 //! wherever they were found, and shown as any file is. A library no root has
 //! is not read: the library reports it at the import.
 //!
+//! # Hosts
+//!
+//! A host's files, `.prvm` tests say, are GCSL with a prelude of their own
+//! (see the `hosts` module's documentation, and [`find_hosts`]). The
+//! `_for` forms of the calls here take the hosts, and read their files as
+//! the workspace's too, each given its host's prelude, every host's
+//! directory a library root, after `$GCSL_LIBRARY_PATH`'s and before
+//! `.gcsl/libraries`: [`workspace_files_for`], [`read_workspace_for`] and
+//! [`find_workspace_for`]. The forms without read `.gcsl` files alone, as
+//! they ever did.
+//!
 //! The root must be absolute and canonical for the library's `fileroot`
 //! module. [`find_workspace`] canonicalises the file it is given
 //! (`fs::canonicalize`), once, so the root it finds above it is canonical
@@ -67,6 +78,13 @@ use std::path::{Component, Path, PathBuf};
 
 use gcsl::SourceFile;
 use gcsl::source::SourceError;
+
+mod hosts;
+
+pub use hosts::{
+    Host, KNOWN_HOSTS, KnownHost, PRELUDE_FILE, Place, SYSTEM_HOSTS, WORKSPACE_HOSTS,
+    explain_missing_hosts, find_hosts, find_hosts_in, host_of, shown_dir, with_host_prelude,
+};
 
 /// The name of the file that makes its directory a workspace's root.
 pub const WORKSPACE: &str = "workspace.gcsl";
@@ -99,6 +117,13 @@ pub fn find_root(dir: &Path) -> Option<&Path> {
 /// file runs alone, as a file outside any workspace does.
 #[must_use]
 pub fn find_workspace(file: &Path) -> Option<(PathBuf, String)> {
+    find_workspace_for(file, &[])
+}
+
+/// [`find_workspace`], a file of one of `hosts` being a workspace's file as
+/// a `.gcsl` file is (see the module documentation, "Hosts").
+#[must_use]
+pub fn find_workspace_for(file: &Path, hosts: &[Host]) -> Option<(PathBuf, String)> {
     let file = fs::canonicalize(file).ok()?;
     let root = find_root(file.parent()?)?;
     let mut parts = Vec::new();
@@ -112,7 +137,7 @@ pub fn find_workspace(file: &Path) -> Option<(PathBuf, String)> {
         }
         parts.push(part);
     }
-    if file.extension().and_then(OsStr::to_str) != Some("gcsl") {
+    if file.extension().and_then(OsStr::to_str) != Some("gcsl") && host_of(hosts, &file).is_none() {
         return None;
     }
     Some((root.to_path_buf(), parts.join("/")))
@@ -148,6 +173,16 @@ pub type Found = (Vec<(String, PathBuf)>, Vec<String>);
 /// The first directory that cannot be listed, or entry of one that cannot
 /// be read, with why.
 pub fn workspace_files(root: &Path) -> Result<Found, Unreadable> {
+    workspace_files_for(root, &[])
+}
+
+/// [`workspace_files`], the files of `hosts` among them (see the module
+/// documentation, "Hosts").
+///
+/// # Errors
+///
+/// As [`workspace_files`].
+pub fn workspace_files_for(root: &Path, hosts: &[Host]) -> Result<Found, Unreadable> {
     let ignored = ignored(root)?;
     let mut files = Vec::new();
     let mut nested = Vec::new();
@@ -177,7 +212,9 @@ pub fn workspace_files(root: &Path) -> Result<Found, Unreadable> {
                 } else {
                     dirs.push((format!("{prefix}{name}/"), path));
                 }
-            } else if path.extension().and_then(OsStr::to_str) == Some("gcsl") {
+            } else if path.extension().and_then(OsStr::to_str) == Some("gcsl")
+                || host_of(hosts, &path).is_some()
+            {
                 files.push((format!("{prefix}{name}"), path));
             }
         }
@@ -292,10 +329,27 @@ pub fn read_workspace(
     root: &Path,
     given: Option<(&str, &SourceFile)>,
 ) -> Result<Sources, ReadError> {
+    read_workspace_for(root, given, &[])
+}
+
+/// [`read_workspace`], the files of `hosts` among them, each given its
+/// host's prelude, and their libraries looked for in the hosts'
+/// directories too (see the module documentation, "Hosts").
+///
+/// # Errors
+///
+/// As [`read_workspace`].
+pub fn read_workspace_for(
+    root: &Path,
+    given: Option<(&str, &SourceFile)>,
+    hosts: &[Host],
+) -> Result<Sources, ReadError> {
     let (paths, nested) =
-        workspace_files(root).map_err(|Unreadable { path, error }| ReadError::Unreadable {
-            path: shown(&path),
-            error,
+        workspace_files_for(root, hosts).map_err(|Unreadable { path, error }| {
+            ReadError::Unreadable {
+                path: shown(&path),
+                error,
+            }
         })?;
     let mut relative = Vec::new();
     // In path order, as the workspace numbers its files after the standard
@@ -323,7 +377,7 @@ pub fn read_workspace(
             SourceFile::new(shown_name.clone(), text),
         ) {
             (Ok(source), Ok(shown_source)) => {
-                relative.push(source);
+                relative.push(with_host_prelude(hosts, path, source));
                 shown_sources.push(shown_source);
             }
             (Err(error), _) | (_, Err(error)) => {
@@ -334,7 +388,10 @@ pub fn read_workspace(
             }
         }
     }
-    read_libraries(root, &mut relative, &mut shown_sources)?;
+    let mut roots = library_roots(root);
+    let last = roots.len().saturating_sub(1);
+    roots.splice(last..last, hosts::host_roots(hosts));
+    read_libraries(&roots, &mut relative, &mut shown_sources)?;
     let given = given.and_then(|(at, _)| relative.iter().position(|source| source.name() == at));
     Ok(Sources {
         relative,
@@ -362,16 +419,15 @@ pub fn library_roots(root: &Path) -> Vec<PathBuf> {
 
 /// Adds to `relative` and `shown_sources` the files of every library they import,
 /// and every library those import, each found in the first of the library
-/// roots of `root` that has it, and both lists put in the order the library
+/// roots `roots` that has it, and both lists put in the order the library
 /// numbers its files in, by their names relative to the root (see the module
 /// documentation, "Libraries"). A library no root has is left for the
 /// library to report at its import.
 fn read_libraries(
-    root: &Path,
+    roots: &[PathBuf],
     relative: &mut Vec<SourceFile>,
     shown_sources: &mut Vec<SourceFile>,
 ) -> Result<(), ReadError> {
-    let roots = library_roots(root);
     let mut wanted: Vec<String> = relative
         .iter()
         .flat_map(gcsl::workspace::library_imports)
@@ -618,6 +674,128 @@ mod tests {
         assert!(
             text.starts_with(&format!("cannot read {}: ", shown(&missing).display())),
             "{text}"
+        );
+    }
+
+    /// A workspace with a `.gcsl` file, a `.prvm` file and a `.txt` file,
+    /// in `scratch`, and the root.
+    fn hosted(scratch: &Scratch) -> &Path {
+        scratch.write("workspace.gcsl", "");
+        scratch.write("main.gcsl", "x = 1");
+        scratch.write("tests/boot.prvm", "def test boots() { }");
+        scratch.write("notes.txt", "not GCSL");
+        &scratch.0
+    }
+
+    #[test]
+    fn hosts_are_found_by_directory_and_known_by_name() {
+        let scratch = Scratch::new("hosts");
+        let root = hosted(&scratch);
+        scratch.write(".gcsl/hosts/prvm/prelude", "provium\n");
+        scratch.write(".gcsl/hosts/prvm/provium/core.gcsl", "");
+        scratch.write("system/prvm/prelude", "elsewhere");
+        scratch.write("system/kit/prelude", "github.com/example/kit");
+        scratch.write("system/plain/x.gcsl", "");
+        scratch.write("system/.hidden/prelude", "x");
+        let hosts = find_hosts_in(Some(&root.join(WORKSPACE_HOSTS)), &root.join("system"));
+        let shown: Vec<(&str, Place, Option<&str>)> = hosts
+            .iter()
+            .map(|host| (host.extension.as_str(), host.place, host.prelude.as_deref()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("kit", Place::System, Some("github.com/example/kit")),
+                ("pekit", Place::BuiltIn, None),
+                ("plain", Place::System, None),
+                ("prvm", Place::Workspace, Some("provium")),
+            ]
+        );
+        // With neither place, the known hosts alone.
+        let none = find_hosts_in(None, &root.join("absent"));
+        let places: Vec<(&str, Place)> = none
+            .iter()
+            .map(|host| (host.extension.as_str(), host.place))
+            .collect();
+        assert_eq!(
+            places,
+            [("pekit", Place::BuiltIn), ("prvm", Place::Missing)]
+        );
+    }
+
+    #[test]
+    fn a_host_s_files_are_read_with_their_prelude_and_its_library() {
+        let scratch = Scratch::new("hosted");
+        let root = hosted(&scratch);
+        scratch.write(".gcsl/hosts/prvm/prelude", "provium");
+        scratch.write(
+            ".gcsl/hosts/prvm/provium/core.gcsl",
+            "#[def_type]\ndef test(name: String, f: fn() -> {}) -> {} { f() }",
+        );
+        let hosts = find_hosts_in(Some(&root.join(WORKSPACE_HOSTS)), &root.join("absent"));
+        let sources = read_workspace_for(root, None, &hosts).unwrap();
+        let named: Vec<(&str, Option<&str>)> = sources
+            .relative
+            .iter()
+            .map(|source| (source.name(), source.prelude()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("<lib>/provium/core.gcsl", None),
+                ("main.gcsl", None),
+                ("tests/boot.prvm", Some("provium")),
+                ("workspace.gcsl", None),
+            ]
+        );
+        let (_, checked) = gcsl::workspace::check_with_standard(
+            &sources.relative,
+            &sources.nested,
+            &root.to_string_lossy(),
+        );
+        let workspace = checked.unwrap_or_else(|errors| panic!("{errors:?}"));
+        let listed = workspace.def_types().unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].definitions[0].path, "boots");
+        // Without the hosts, the `.gcsl` files alone, as ever.
+        let plain = read_workspace(root, None).unwrap();
+        let gcsl_only: Vec<&str> = plain.relative.iter().map(SourceFile::name).collect();
+        assert_eq!(gcsl_only, ["main.gcsl", "workspace.gcsl"]);
+        let found = find_workspace_for(&root.join("tests/boot.prvm"), &hosts);
+        assert_eq!(
+            found,
+            Some((root.to_path_buf(), "tests/boot.prvm".to_owned()))
+        );
+        assert_eq!(find_workspace(&root.join("tests/boot.prvm")), None);
+    }
+
+    #[test]
+    fn a_file_of_a_missing_host_says_so() {
+        let scratch = Scratch::new("missing-host");
+        let root = hosted(&scratch);
+        let hosts = find_hosts_in(Some(&root.join(WORKSPACE_HOSTS)), &root.join("absent"));
+        let sources = read_workspace_for(root, None, &hosts).unwrap();
+        let (_, checked) = gcsl::workspace::check_with_standard(
+            &sources.relative,
+            &sources.nested,
+            &root.to_string_lossy(),
+        );
+        let mut errors = checked.map(|_| ()).unwrap_err();
+        explain_missing_hosts(&hosts, &mut errors);
+        let errors: Vec<(&str, &[String])> = errors
+            .iter()
+            .filter(|error| error.severity == gcsl::diagnostic::Severity::Error)
+            .map(|error| (error.message.as_str(), error.notes.as_slice()))
+            .collect();
+        assert_eq!(
+            errors,
+            [(
+                "Provium is not installed, so the prelude of this `.prvm` file cannot be found",
+                &[
+                    "run `provium prelude --write` in this workspace, or install Provium"
+                        .to_owned()
+                ][..]
+            )]
         );
     }
 }
