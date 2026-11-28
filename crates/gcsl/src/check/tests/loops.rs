@@ -523,3 +523,63 @@ fn a_loop_statement_ending_with_an_impure_call_collects_nothing() {
         "List<Int | Future<Int>>"
     );
 }
+
+#[test]
+fn an_if_whose_branches_end_with_impure_calls_is_a_statement() {
+    let op = "fn op(n: Int) -> Int { n }\nfn pure_op(n: Int): Int { n }\n\
+              fn step(name: String, body: block -> {}) -> {} { body() }\n\
+              #[def_type] def check(name: String, f: fn() -> {}) -> {} { f() }\n";
+    let of = |text: &str| format!("{op}{text}\nx = 2");
+    // In a loop as a statement, a `{}` block, a definition of nothing, and
+    // as any statement; each branch an impure call, a loop or `if` that is
+    // discarded, `{}`, a jump, or no expression.
+    for text in [
+        "for i in 0..3 { if i == 1 { op(i) } else { op(0) } }",
+        "for i in 0..3 { if i == 1 { op(i) } else if i == 2 { op(2) } else { } }",
+        "for i in 0..3 { if i == 1 { for j in 0..2 { op(j) } } else { let x = 1 } }",
+        "for i in 0..3 { if i == 1 { if true { op(1) } else { op(2) } } else { continue } }",
+        "step(\"s\") { if true { op(1) } else { op(2) } }",
+        "def check t() { if true { op(1) } else { op(2) } }",
+        "if true { op(1) } else { op(2) }",
+        "(if true { op(1) } else { op(2) })",
+    ] {
+        let found = diagnostics_or_none(&of(text));
+        assert!(found.is_empty(), "{text}: {found:?}");
+    }
+    // An `if` with no `else`, or a branch ending with any other value, is
+    // as it was.
+    assert_eq!(
+        messages(&of("for i in 0..3 { if i == 1 { op(i) } }")),
+        vec!["`if` without `else` must be `{}`"]
+    );
+    for (text, shown) in [
+        (
+            "for i in 0..3 { if i == 1 { op(i) } else { 5 } }",
+            "`List<Int | Future<Int>>`",
+        ),
+        (
+            "for i in 0..3 { if i == 1 { op(i) } else { = op(1) } }",
+            "`List<Int | Future<Int>>`",
+        ),
+        (
+            "for i in 0..3 { if i == 1 { op(i) } else { pure_op(1) } }",
+            "`List<Int | Future<Int>>`",
+        ),
+        ("if true { op(1) } else { 3 }", "`Int | Future<Int>`"),
+    ] {
+        assert_eq!(
+            messages(&of(text)),
+            vec![format!("unused value of type {shown}")],
+            "{text}"
+        );
+    }
+    // In a pure function nothing is discarded.
+    assert_eq!(
+        messages(&of("fn f(): {} { if true { op(1) } else { op(2) }; = {} }")),
+        vec![
+            "unused value of type `Int | Future<Int>`",
+            "cannot call an impure function from a pure function",
+            "cannot call an impure function from a pure function"
+        ]
+    );
+}
