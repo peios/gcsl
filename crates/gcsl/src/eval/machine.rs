@@ -128,7 +128,7 @@ pub(super) use suspend::{Entry, run_machine};
 
 use builtins::BuiltinCall;
 use suspend::Resume;
-use tasks::{Join, Meta, Status, Task};
+use tasks::{Join, Meta, Status, Tasks};
 use control::{AssertState, DefaultRun, WithState};
 use data::OperandsState;
 use futures::{AwaitState, FutureRun};
@@ -417,11 +417,22 @@ pub(super) enum Ran {
 /// How a machine whose slice was spent stopped (see [Yielding](#yielding)).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Yield {
-    /// Where among the tasks set aside the root was, if the task that was
-    /// running is another: that task is then the last of them, and the
-    /// root is put back there when the unit is taken up, so that the tasks
-    /// are in the order they were in.
-    root: Option<usize>,
+    /// Where the root was: running, or set aside while another task ran,
+    /// which is then the last of those set aside not waiting for their
+    /// turn; the root is put back where it was when the unit is taken up,
+    /// so that the tasks are in the order they were in.
+    root: RootAt,
+}
+
+/// Where a unit's root was as the unit yielded ([`Yield::root`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RootAt {
+    /// It was the task running.
+    Running,
+    /// Set aside, at this place among those not waiting for their turn.
+    SetAside(usize),
+    /// Set aside, waiting for its turn.
+    Turn,
 }
 
 /// What a machine that stopped keeps of itself: its frames, activations
@@ -436,7 +447,7 @@ pub(super) struct Parked {
     calls: Vec<CallState>,
     /// The other tasks of the unit, and the running one's place and
     /// status (see [Tasks](tasks#tasks)).
-    tasks: (Vec<Task>, Meta, Option<Status>),
+    tasks: (Tasks, Meta, Option<Status>),
     /// The number of the next task split off.
     next_task: u32,
     /// The runs of memoised calls and `lazy`s that tasks set aside wait
@@ -493,7 +504,7 @@ pub(super) struct Machine<'r> {
     /// What the task running waits for, once every task waits.
     status: Option<Status>,
     /// The unit's other tasks, set aside.
-    tasks: Vec<Task>,
+    tasks: Tasks,
     /// The number of the next task split off.
     next_task: u32,
     /// The runs of memoised calls and `lazy`s that tasks set aside wait
@@ -546,7 +557,7 @@ impl<'r> Machine<'r> {
             calls: Vec::new(),
             meta: Meta::default(),
             status: None,
-            tasks: Vec::new(),
+            tasks: Tasks::default(),
             next_task: 1,
             waited: Vec::new(),
             profiled_base,
@@ -763,7 +774,15 @@ impl<'r> Machine<'r> {
     /// [Yielding](#yielding)).
     fn yielded(&mut self, next: Next) -> Ran {
         self.pause_profile();
-        let root = self.tasks.iter().position(|task| task.meta.id == 0);
+        let root = if self.meta.id == 0 {
+            RootAt::Running
+        } else {
+            self.tasks
+                .set_aside
+                .iter()
+                .position(|task| task.meta.id == 0)
+                .map_or(RootAt::Turn, RootAt::SetAside)
+        };
         self.status = Some(Status::Ready(next));
         self.root_running();
         self.unpause_profile();

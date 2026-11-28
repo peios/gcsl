@@ -140,9 +140,12 @@
 //! waits for is wounded after all ([`Machine::unstick`]), and the earlier
 //! task fails where a run in order fails.
 
+mod set;
 mod stuck;
 
-use std::cell::RefCell;
+pub(in crate::eval) use set::Tasks;
+
+use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -281,9 +284,20 @@ pub(in crate::eval) struct Task {
     own: Own,
     /// What it is doing.
     pub(super) status: Status,
+    /// Its path ([`path_of`]), found the first time it is asked for: a
+    /// task set aside does not move, so its path stays what it was when it
+    /// was set aside, and a task is set aside anew each time.
+    path: OnceCell<Vec<u32>>,
 }
 
 impl Task {
+    /// Its path (see [Tasks](self#tasks)), found once while it is set
+    /// aside.
+    fn path(&self) -> &[u32] {
+        self.path
+            .get_or_init(|| path_of(&self.meta, &self.frames, &self.calls))
+    }
+
     /// Charges it `time` of the time it has been set aside: its deadlines
     /// are moved back by it, so that, moved on by the whole time once it
     /// runs, they have passed over what was charged (see [Charged
@@ -311,6 +325,21 @@ impl Task {
     /// Whether a deadline of it has passed by what it has been charged.
     fn overdue(&self) -> bool {
         self.time_left().is_some_and(|left| left.is_zero())
+    }
+}
+
+/// Wakes `task`, which waited for its turn, to look again.
+fn wake_turn(task: &mut Task) {
+    if let Status::Waiting(resume) = std::mem::replace(&mut task.status, Status::Joining) {
+        task.status = Status::Wake(resume);
+    }
+}
+
+/// Cancels `task`, set aside, unless it is cancelled already.
+fn cancel_task(task: &mut Task) {
+    if !matches!(task.status, Status::Cancel(_)) {
+        task.status = Status::Cancel(looks_up(&task.status));
+        task.meta.wound = None;
     }
 }
 
@@ -512,6 +541,8 @@ impl Machine<'_> {
         let mine = self.take_own();
         let theirs = std::mem::replace(&mut task.own, mine);
         self.put_own(theirs);
+        // Set aside now, where it is.
+        task.path = OnceCell::new();
         task
     }
 
@@ -525,7 +556,7 @@ impl Machine<'_> {
             self.unpause_profile();
             return None;
         };
-        let mut task = self.tasks.swap_remove(ready);
+        let mut task = self.tasks.set_aside.swap_remove(ready);
         let start = std::mem::replace(&mut task.status, status);
         let parked = self.exchange(task);
         self.tasks.push(parked);
@@ -580,10 +611,9 @@ impl Machine<'_> {
         if self.meta.id == 0 {
             return;
         }
-        let Some(root) = self.tasks.iter().position(|task| task.meta.id == 0) else {
+        let Some(mut task) = self.tasks.remove_id(0) else {
             return;
         };
-        let mut task = self.tasks.swap_remove(root);
         let status = self.status.take();
         let root_status = std::mem::replace(&mut task.status, Status::Joining);
         let mut parked = self.exchange(task);
@@ -597,8 +627,10 @@ impl Machine<'_> {
     /// What the unit waits for, every task waiting: the nodes and units its
     /// tasks wait for.
     pub(super) fn waits(&self) -> Vec<Wait> {
+        // One waiting for its turn waits for no node or unit.
         let mut waits: Vec<Wait> = self
             .tasks
+            .set_aside
             .iter()
             .map(|task| &task.status)
             .chain(self.status.as_ref())
@@ -615,16 +647,42 @@ impl Machine<'_> {
         waits
     }
 
-    /// Wakes every task that waits for its turn: a task has ended.
+    /// Wakes the tasks that wait for their turn and may have it now: a task
+    /// has ended.
     fn wake_turns_after_end(&mut self) {
-        for task in &mut self.tasks {
-            if let Status::Waiting(_) = task.status {
-                let Status::Waiting(resume) = std::mem::replace(&mut task.status, Status::Joining)
-                else {
-                    continue;
-                };
-                task.status = Status::Wake(resume);
-            }
+        self.wake_turns_due(false);
+    }
+
+    /// Wakes the tasks set aside that wait for their turn and may have it
+    /// now, and with `overdue`, each whose deadline has passed by what it
+    /// was charged, to raise it. A task has its turn once no live task
+    /// earlier in program order holds every demanded run it holds (see
+    /// [Tasks](#tasks)), so of the tasks waiting for theirs, holding no
+    /// demanded run, only the earliest can have it: every later one has
+    /// that one before it. The earliest is woken, and each that holds a
+    /// demanded run, which may go before earlier tasks that hold none (see
+    /// [Across units](#across-units)); the others would only look and wait
+    /// again, which, for a loop of a thousand iterations waiting their turn,
+    /// is a look at every task by every task each time any task ends.
+    fn wake_turns_due(&mut self, overdue: bool) {
+        // No run of the unit's has ever been demanded, or no task is
+        // charged, and none of those waiting is looked at but the first.
+        let demanded = self.memo.demanded() != 0;
+        let mut woken: Vec<u32> = if demanded || overdue {
+            self.tasks.turn_ids(|task| {
+                (overdue && task.overdue())
+                    || (demanded && self.holds_demanded(&task.own.running, &task.own.futures))
+            })
+        } else {
+            Vec::new()
+        };
+        if let Some(first) = self.tasks.first_turn()
+            && !woken.contains(&first.meta.id)
+        {
+            woken.push(first.meta.id);
+        }
+        for id in woken {
+            self.tasks.take_turn(id, wake_turn);
         }
     }
 
@@ -644,7 +702,7 @@ impl Machine<'_> {
             return;
         };
         self.waited.swap_remove(at);
-        for task in &mut self.tasks {
+        for task in &mut self.tasks.set_aside {
             let waits = matches!(&task.status, Status::Sibling(resume)
                 if resume.waits_for().is_some_and(|waited| held(&waited) == run));
             if waits {
@@ -668,17 +726,18 @@ impl Machine<'_> {
         let graph = self.shared.graph;
         let charged = self.charged;
         let waiting = |id: NodeId| graph.is_some_and(|graph| graph.is_waiting(id));
-        for task in &mut self.tasks {
+        for task in &mut self.tasks.set_aside {
             let overdue = charged && task.overdue();
             let woken = match std::mem::replace(&mut task.status, Status::Joining) {
                 Status::Blocked(Wait::Node(id), resume) if waiting(id) && !overdue => {
                     Status::Blocked(Wait::Node(id), resume)
                 }
-                Status::Waiting(resume) | Status::Blocked(_, resume) => Status::Wake(resume),
+                Status::Blocked(_, resume) => Status::Wake(resume),
                 status => status,
             };
             task.status = woken;
         }
+        self.wake_turns_due(charged);
     }
 
     /// Ends the task running, which delivered what it came to: another that
@@ -697,15 +756,13 @@ impl Machine<'_> {
         let Some(ready) = self.next_ready() else {
             // Every other task waits: the one that ended is not set aside,
             // the root's frames being run next by whoever wakes it.
-            let root = self.tasks.iter().position(|task| task.meta.id == 0)?;
-            let mut task = self.tasks.swap_remove(root);
+            let mut task = self.tasks.remove_id(0)?;
             let status = std::mem::replace(&mut task.status, Status::Joining);
             let _ended = self.exchange(task);
             self.status = Some(status);
             return None;
         };
-        let task = self.tasks.swap_remove(ready);
-        let mut task = task;
+        let mut task = self.tasks.set_aside.swap_remove(ready);
         let start = std::mem::replace(&mut task.status, Status::Joining);
         let _ended = self.exchange(task);
         self.status = None;
@@ -783,7 +840,7 @@ impl Machine<'_> {
     /// would begin it again first, and be wounded again, without end.
     pub(super) fn wound(&mut self, target: Wound) {
         let mine = self.path();
-        for task in &mut self.tasks {
+        for task in self.tasks.iter_mut() {
             let site = site_of(target, (&task.meta, &task.frames, &task.calls));
             if task.meta.wound.is_none()
                 && !matches!(task.status, Status::Cancel(_))
@@ -793,6 +850,8 @@ impl Machine<'_> {
                 task.status = Status::Cancel(looks_up(&task.status));
             }
         }
+        // A task that waited for its turn and was wounded may run.
+        self.tasks.settle();
     }
 
     /// Cancels the task `id`, set aside, unless it waits for the children
@@ -801,7 +860,11 @@ impl Machine<'_> {
     /// order. Its cancellation stops at the loop, node or call that `join`
     /// is of, which waits for its children and reports the failure.
     fn halt(&mut self, id: u32, join: &Rc<RefCell<Join>>) {
-        for task in &mut self.tasks {
+        // One waiting for its turn waits for no children.
+        if self.tasks.take_turn(id, cancel_task) {
+            return;
+        }
+        for task in &mut self.tasks.set_aside {
             let waits = matches!(task.status, Status::Joining)
                 && task
                     .frames
@@ -844,7 +907,8 @@ impl Machine<'_> {
     /// it, not by a later one that the earlier wounds again, and so on
     /// without end (see [Wound-wait](#wound-wait)).
     fn next_ready(&self) -> Option<usize> {
-        let first = self.tasks.iter().position(|task| {
+        // A task waiting for its turn may not run.
+        let first = self.tasks.set_aside.iter().position(|task| {
             matches!(
                 task.status,
                 Status::Ready(_) | Status::Wake(_) | Status::Cancel(_)
@@ -852,20 +916,23 @@ impl Machine<'_> {
         });
         first.or_else(|| {
             self.tasks
+                .set_aside
                 .iter()
                 .enumerate()
                 .filter(|(_, task)| matches!(task.status, Status::Again(_)))
-                .min_by_key(|(_, task)| path_of(&task.meta, &task.frames, &task.calls))
+                .min_by_key(|(_, task)| task.path())
                 .map(|(at, _)| at)
         })
     }
 
     /// Cancels the tasks `ids` that are set aside and still waiting.
     pub(super) fn cancel(&mut self, ids: &[u32]) {
-        for task in &mut self.tasks {
+        for &id in ids {
+            self.tasks.take_turn(id, cancel_task);
+        }
+        for task in &mut self.tasks.set_aside {
             if ids.contains(&task.meta.id) && !matches!(task.status, Status::Cancel(_)) {
-                task.status = Status::Cancel(looks_up(&task.status));
-                task.meta.wound = None;
+                cancel_task(task);
             }
         }
     }
@@ -886,7 +953,7 @@ impl Machine<'_> {
             }
             return;
         }
-        for task in &mut self.tasks {
+        for task in &mut self.tasks.set_aside {
             if task.meta.id == id && matches!(task.status, Status::Joining) && waits(&task.frames) {
                 task.status = Status::Ready(Next::Give(Ok(Value::Empty)));
             }
@@ -907,9 +974,18 @@ impl Machine<'_> {
         }
         let mine = self.path();
         let demanded = self.demanded_held();
-        self.tasks.iter().any(|task| {
-            holds(task, &demanded) && path_of(&task.meta, &task.frames, &task.calls) < mine
-        })
+        // Of those waiting for their turn, the first is the earliest, and
+        // it holds every demanded run if the task running holds none.
+        let turns: Box<dyn Iterator<Item = &Task>> = if demanded.is_empty() {
+            Box::new(self.tasks.first_turn().into_iter())
+        } else {
+            Box::new(self.tasks.turns())
+        };
+        self.tasks
+            .set_aside
+            .iter()
+            .chain(turns)
+            .any(|task| holds(task, &demanded) && task.path() < mine.as_slice())
     }
 
     /// Whether a task other than the one running waits for the result of
@@ -919,7 +995,7 @@ impl Machine<'_> {
         let Some(graph) = self.shared.graph else {
             return false;
         };
-        self.tasks.iter().any(|task| {
+        self.tasks.set_aside.iter().any(|task| {
             matches!(task.status, Status::Blocked(Wait::Node(id), Resume::Effect(..))
                 if graph.is_ordered_effect_waiting(id, self.shared.effects))
         })
@@ -949,6 +1025,7 @@ impl Machine<'_> {
         loop {
             let mut waited: Vec<Run> = self
                 .tasks
+                .set_aside
                 .iter()
                 .filter_map(|task| match &task.status {
                     Status::Sibling(resume)
@@ -991,7 +1068,7 @@ impl Machine<'_> {
         // A task waiting for a run that is no longer running, which its end
         // should have woken, looks again.
         let mut woken = false;
-        for task in &mut self.tasks {
+        for task in &mut self.tasks.set_aside {
             let ended = matches!(&task.status, Status::Sibling(resume)
                 if resume.waits_for().is_some_and(|run| !is_running(self.memo, &run)));
             if ended
@@ -1011,12 +1088,12 @@ impl Machine<'_> {
             Run::Future(future) => Wound::Future(Rc::as_ptr(future)),
         };
         let mut waiting: Vec<(Vec<u32>, Wound)> = Vec::new();
-        for task in &self.tasks {
+        for task in &self.tasks.set_aside {
             if let Status::Sibling(resume) = &task.status
                 && let Some(run) = resume.waits_for()
                 && self.is_demanded(&run)
             {
-                waiting.push((path_of(&task.meta, &task.frames, &task.calls), target(&run)));
+                waiting.push((task.path().to_vec(), target(&run)));
             }
         }
         if let Some(Status::Sibling(resume)) = &self.status
@@ -1028,13 +1105,16 @@ impl Machine<'_> {
         waiting.sort_by(|one, other| one.0.cmp(&other.0));
         for (path, target) in waiting {
             let later = |site: Option<Vec<u32>>| site.is_some_and(|site| site > path);
-            if let Some(task) = self.tasks.iter_mut().find(|task| {
+            let wounded = self.tasks.iter_mut().find(|task| {
                 task.meta.wound.is_none()
                     && !matches!(task.status, Status::Cancel(_))
                     && later(site_of(target, (&task.meta, &task.frames, &task.calls)))
-            }) {
+            });
+            if let Some(task) = wounded {
                 task.meta.wound = Some(target);
                 task.status = Status::Cancel(looks_up(&task.status));
+                // It may have waited for its turn.
+                self.tasks.settle();
                 let status = self.status.take()?;
                 return self.park(status);
             }
@@ -1074,17 +1154,11 @@ impl Machine<'_> {
             || futures.iter().any(|future| future.is_demanded())
     }
 
-    /// Wakes every task set aside that waits for its turn, to look again: a
-    /// run it holds may have become demanded (see [Across
-    /// units](#across-units)).
+    /// Wakes the tasks set aside that wait for their turn and may have it
+    /// now, to look again: a run one holds may have become demanded (see
+    /// [Across units](#across-units)).
     fn wake_turns(&mut self) {
-        for task in &mut self.tasks {
-            let status = std::mem::replace(&mut task.status, Status::Joining);
-            task.status = match status {
-                Status::Waiting(resume) => Status::Wake(resume),
-                status => status,
-            };
-        }
+        self.wake_turns_due(false);
     }
 
     /// The demanded runs the task running holds (see [Across
@@ -1183,6 +1257,7 @@ impl Machine<'_> {
             stack,
             own,
             status,
+            path: OnceCell::new(),
         });
         self.most_tasks = self.most_tasks.max(self.tasks.len());
     }
@@ -1380,24 +1455,33 @@ impl Machine<'_> {
     /// are woken once every task waits, if something they wait for is
     /// there ([`Machine::wake_due`]).
     pub(super) fn take_up_yielded(&mut self, how: super::Yield) -> Next {
-        let Some(root) = how.root else {
-            return match self.status.take() {
-                Some(Status::Ready(next)) => next,
-                Some(status) => self.park(status).unwrap_or(Next::Stop),
-                None => self.nothing_to_do(),
-            };
+        let root = match how.root {
+            super::RootAt::Running => {
+                return match self.status.take() {
+                    Some(Status::Ready(next)) => next,
+                    Some(status) => self.park(status).unwrap_or(Next::Stop),
+                    None => self.nothing_to_do(),
+                };
+            }
+            super::RootAt::SetAside(at) => Some(at),
+            super::RootAt::Turn => None,
         };
         // The task that yielded was set aside last, for the root.
-        let (Some(mut task), Some(status)) = (self.tasks.pop(), self.status.take()) else {
+        let (Some(mut task), Some(status)) = (self.tasks.set_aside.pop(), self.status.take())
+        else {
             return self.nothing_to_do();
         };
         self.pause_profile();
         let start = std::mem::replace(&mut task.status, status);
         let parked = self.exchange(task);
+        // The root goes back where it was: among those waiting for their
+        // turn, by its path, or to its place among the others.
         self.tasks.push(parked);
-        let last = self.tasks.len() - 1;
-        if root < last {
-            self.tasks.swap(root, last);
+        let last = self.tasks.set_aside.len().saturating_sub(1);
+        if let Some(root) = root
+            && root < last
+        {
+            self.tasks.set_aside.swap(root, last);
         }
         self.unpause_profile();
         self.start(start)
