@@ -48,7 +48,9 @@ The standard library is embedded in the binary. Its process and file
 operations go through an effect context, `Effects`, which a host can
 replace, and by default they run with the embedding process's
 permissions and resources (see [Running steps for a
-host](~gcsl/graph-mode)). The library does not impose a wall-clock limit or turn pure
+host](~gcsl/graph-mode)). `Effects::caught` also tells a host of each
+failure a program catches with `recover` or `try`.
+The library does not impose a wall-clock limit or turn pure
 checking into an execution sandbox. A host that accepts untrusted programs
 needs an external isolation and resource policy.
 

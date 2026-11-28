@@ -27,10 +27,25 @@ EXPECTED = {
     ("200--records-and-types.md", 8): "2\n",
     ("200--records-and-types.md", 10): "8080\n",
     ("300--functions-and-effects.md", 0): "42\n",
+    ("320--block-parameters.md", 0): "192.0.2.7\n",
+    ("320--block-parameters.md", 1): "3\n",
+    ("320--block-parameters.md", 3): "...\n",
+    ("320--block-parameters.md", 4): "true\n",
+    ("320--block-parameters.md", 5): '{tag = "[release]"}\n',
+    ("320--block-parameters.md", 7): "3\n",
+    ("370--context.md", 8): '{native = "gcc-x86_64"; cross = "gcc-aarch64"}\n',
+    ("380--failure.md", 1): "{even = 5; odd = {}; sum = {}; size = 0}\n",
+    ("380--failure.md", 2): "{status = -1}\n",
+    ("380--failure.md", 3): (
+        '{first = "failed: assertion failed: the service is down"; '
+        'second = "passed"; progress = "boot, then cleanup"}\n'
+    ),
+    ("380--failure.md", 4): '["report"]\n',
     ("400--deferred-work.md", 0): "42\n",
     ("500--lists-and-control-flow.md", 0): "8\n",
     ("500--lists-and-control-flow.md", 1): "[4, 6]\n",
     ("500--lists-and-control-flow.md", 2): "[0, 2, 4]\n",
+    ("500--lists-and-control-flow.md", 3): "300\n",
     ("300--file-and-process-effects.md", 0): "GCSL\n",
 }
 
