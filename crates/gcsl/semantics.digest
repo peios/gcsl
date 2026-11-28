@@ -2,6 +2,7 @@
 # was last set or confirmed for (see tests/semantics.rs). Each line after
 # the digest says why it was written again without raising SEMANTICS.
 semantics 1
-digest 058e70c2d7213e3ef4f711fa11fbdc8d6b232ec69712e4864c2b9a7054f202d4
+digest c01e2b3abdbc45a4178c95d529b93845b147e8799b9b2a37e991c4cf54e6294e
 PEI-1775: recording of what a run used (functions, top-level cells, contexts), for tests only (cfg test or the coverage feature); what code means is unchanged.
 PEI-1786: block parameters, a new form: a trailing block where a function was expected was a check error, so what every program that checked means is unchanged.
+PEI-1786: a forced yield in graph mode and a host's say over a stopped unit's clocks, both off unless a host asks; what code means is unchanged.

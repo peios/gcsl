@@ -13,12 +13,42 @@
 //! needs, then the call, in the root context the host set: a file or the
 //! call that stops for a step's result is [`Progress::Paused`], to run
 //! again once the host has given it.
+//!
+//! # Slices
+//!
+//! A host that runs many units on one thread gives each run a slice
+//! ([`Workspace::run_prepared_for`], [`Workspace::run_step_for`]): a run
+//! that has computed for that long without ending or waiting stops where
+//! it is, [`Turn::Yielded`], and the unit's next run carries on from
+//! there, whether or not that run has a slice (see
+//! [Yielding](crate::eval::machine#yielding)). The slice is one for the
+//! whole run: the files a prepared call needs and the call share it, and
+//! a file whose slice is spent is kept as one that waits is. A yield
+//! changes nothing a program can see, and the time until the next run
+//! counts toward no `#[timeout]`. One built-in call, and one expression
+//! with no call or loop in it, is never interrupted, so a run can overrun
+//! its slice by the longest of those. [`Workspace::run_prepared`] and
+//! [`Workspace::run_step`] give no slice, and never yield.
+//!
+//! # Charged time
+//!
+//! A `#[timeout]` counts the time its unit runs. The time a unit is
+//! stopped counts only as far as its host says
+//! ([`Workspace::charge_stopped`]), before it runs the unit again: the
+//! time an operation took that the host ran for it, say, and not the time
+//! the host kept it back. [`Workspace::time_left`] gives what the nearest
+//! `#[timeout]` running in a stopped unit has left by that clock, for a
+//! host to set a timer of its own by. A timeout that has passed by what
+//! was charged is raised when the unit next runs, where it takes up, in
+//! place of the result it waited for, whether or not the host gave one
+//! (see [Charged time](crate::eval::machine::suspend#charged-time)).
 
 use std::mem;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use crate::diagnostic::{Diagnostic, Mark};
-use crate::eval::machine::Needed;
+use crate::eval::machine::{Needed, Suspended};
 use crate::eval::graph::{
     EffectJob, Graph, GraphHost, GraphRun, NodeId, NodeKind, RunExtras, STEP_UNITS, StepCall,
     StepReads, run_step_call,
@@ -29,7 +59,7 @@ use crate::session;
 use crate::value::ContextFrame;
 
 use super::invoke::{FieldCell, Invocation, invoked_here, missing_definition};
-use super::{Argument, Given, InvokeError, Progress, Workspace, count, merge_files};
+use super::{Argument, Given, InvokeError, Progress, Turn, Workspace, count, merge_files};
 
 /// A root context a host sets for a prepared call from a top-level field of
 /// the workspace ([`Workspace::prepare_call_with`]): the context `context`,
@@ -134,6 +164,40 @@ impl Workspace {
         id: NodeId,
         host: GraphHost<'_>,
     ) -> Result<(Progress, StepReads), Diagnostic> {
+        match self.run_step_until(graph, id, host, None)? {
+            (Turn::Progress(progress), reads) => Ok((progress, reads)),
+            (Turn::Yielded, _) => Err(internal("a run with no slice yielded")),
+        }
+    }
+
+    /// [`Workspace::run_step`], the step's unit yielding once it has
+    /// computed for `slice` in this run, as a prepared call's does
+    /// ([`Workspace::run_prepared_for`]): [`Turn::Yielded`] then, with what
+    /// the step has read so far, to take up where it was when it is run
+    /// again, by this or by [`Workspace::run_step`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Workspace::run_step`].
+    pub fn run_step_for(
+        &mut self,
+        graph: &mut Graph,
+        id: NodeId,
+        host: GraphHost<'_>,
+        slice: Duration,
+    ) -> Result<(Turn, StepReads), Diagnostic> {
+        self.run_step_until(graph, id, host, Instant::now().checked_add(slice))
+    }
+
+    /// [`Workspace::run_step`], the step's unit yielding once `until` has
+    /// passed, if it is an instant.
+    fn run_step_until(
+        &mut self,
+        graph: &mut Graph,
+        id: NodeId,
+        host: GraphHost<'_>,
+        until: Option<Instant>,
+    ) -> Result<(Turn, StepReads), Diagnostic> {
         let call = graph.node(id).and_then(StepCall::of);
         let Some(call) = call else {
             return Err(internal("a step that is no deferred call's"));
@@ -141,6 +205,7 @@ impl Workspace {
         let unit = STEP_UNITS.saturating_add(id.number());
         let run = GraphRun::new(mem::take(graph), unit, host.defers)
             .watching(call.context(), self.context_texts())
+            .sliced(until)
             .resuming(self.suspended.remove(&unit));
         let names = std::cell::RefCell::new(std::mem::take(&mut self.scan.names));
         let extras = RunExtras {
@@ -156,12 +221,14 @@ impl Workspace {
             self.suspended.insert(unit, suspended);
         }
         let reads = run.reads();
+        let yielded = run.yielded();
         let (left, paused) = run.finish();
         *graph = left;
         match outcome {
-            Ok(value) => Ok((Progress::Done(value), reads)),
+            Ok(value) => Ok((Turn::Progress(Progress::Done(value)), reads)),
+            Err(error) if error.mark == Mark::PENDING && yielded => Ok((Turn::Yielded, reads)),
             Err(error) if error.mark == Mark::PENDING => match Progress::stopped(&paused) {
-                Some(progress) => Ok((progress, reads)),
+                Some(progress) => Ok((Turn::Progress(progress), reads)),
                 None => Err(internal("a step stopped for no step")),
             },
             Err(error) => Err(error),
@@ -436,12 +503,85 @@ impl Workspace {
         graph: &mut Graph,
         host: GraphHost<'_>,
     ) -> Result<Progress, InvokeError> {
+        match self.run_prepared_until(call, graph, host, None)? {
+            Turn::Progress(progress) => Ok(progress),
+            Turn::Yielded => Err(InvokeError::Diagnostics(vec![internal(
+                "a run with no slice yielded",
+            )])),
+        }
+    }
+
+    /// [`Workspace::run_prepared`], for no longer than `slice` at a time
+    /// (see [Slices](#slices)): once the files `call` needs and the call
+    /// have computed for `slice` in this run, the unit running stops
+    /// between two steps of its evaluation, keeping everything, and the
+    /// run is [`Turn::Yielded`]. The next run of `call`, by this or by
+    /// [`Workspace::run_prepared`], carries on where it was. A run that
+    /// ends or stops to wait first is [`Turn::Progress`], as
+    /// [`Workspace::run_prepared`] gives it. A slice of zero yields at the
+    /// first look at the clock, after the steps taken between two looks,
+    /// so that every run moves the unit on.
+    ///
+    /// A yield is no failure: no `recover` sees it, no cleanup runs, and
+    /// no `#[timeout]` counts the time until the next run. One built-in
+    /// call, or one expression that holds no call or loop, is not
+    /// interrupted, so a slice is overrun by what the longest of those
+    /// takes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Workspace::run_prepared`].
+    pub fn run_prepared_for(
+        &mut self,
+        call: &PreparedCall,
+        graph: &mut Graph,
+        host: GraphHost<'_>,
+        slice: Duration,
+    ) -> Result<Turn, InvokeError> {
+        // A slice too long for the clock to hold never ends.
+        self.run_prepared_until(call, graph, host, Instant::now().checked_add(slice))
+    }
+
+    /// Charges the stopped unit `unit`, a prepared call's, a step's or a
+    /// file's, `time` of the time it has been stopped (see [Charged
+    /// time](#charged-time)): that much of it counts toward every
+    /// `#[timeout]` running in the unit, as if the unit had been running.
+    /// Until a host charges a unit, none of the time it is stopped counts.
+    /// Charges add up until the unit next runs, when what was charged
+    /// beyond the time it was in fact stopped is dropped. A unit that is
+    /// not stopped is charged nothing.
+    pub fn charge_stopped(&mut self, unit: u32, time: Duration) {
+        if let Some(suspended) = self.suspended.get_mut(&unit) {
+            suspended.charge(time);
+        }
+    }
+
+    /// How long the nearest `#[timeout]` running in the stopped unit
+    /// `unit` has left by the unit's own clock, which stopped when the
+    /// unit did and has since run for what the host charged it
+    /// ([`Workspace::charge_stopped`]): zero once it has passed. `None` if
+    /// no `#[timeout]` is running in the unit, or the unit is not stopped
+    /// (see [Charged time](#charged-time)).
+    #[must_use]
+    pub fn time_left(&self, unit: u32) -> Option<Duration> {
+        self.suspended.get(&unit).and_then(Suspended::time_left)
+    }
+
+    /// [`Workspace::run_prepared`], the unit running yielding once `until`
+    /// has passed, if it is an instant.
+    fn run_prepared_until(
+        &mut self,
+        call: &PreparedCall,
+        graph: &mut Graph,
+        host: GraphHost<'_>,
+        until: Option<Instant>,
+    ) -> Result<Turn, InvokeError> {
         for &file in &call.files {
-            if let Some(progress) = self
-                .run_files(file, Some((&mut *graph, host)))
+            if let Some(turn) = self
+                .run_files_until(file, Some((&mut *graph, host)), until)
                 .map_err(InvokeError::Diagnostics)?
             {
-                return Ok(progress);
+                return Ok(turn);
             }
         }
         // Its root context, its definition bound as a reference's call binds
@@ -476,18 +616,21 @@ impl Workspace {
         );
         let run = GraphRun::new(mem::take(graph), call.unit, host.defers)
             .owning(call.own)
+            .sliced(until)
             .resuming(self.suspended.remove(&call.unit));
         let outcome = session::run_input_in(&call.ir, &mut self.frame, context, (root, Some(&run)));
         self.scan.names = names.into_inner();
         if let Some(suspended) = run.take_suspended() {
             self.suspended.insert(call.unit, suspended);
         }
+        let yielded = run.yielded();
         let (left, paused) = run.finish();
         *graph = left;
         match outcome {
-            Ok(value) => Ok(Progress::Done(value)),
+            Ok(value) => Ok(Turn::Progress(Progress::Done(value))),
+            Err(error) if error.mark == Mark::PENDING && yielded => Ok(Turn::Yielded),
             Err(error) if error.mark == Mark::PENDING => match Progress::stopped(&paused) {
-                Some(progress) => Ok(progress),
+                Some(progress) => Ok(Turn::Progress(progress)),
                 None => Err(InvokeError::Diagnostics(vec![
                     crate::diagnostic::InternalError {
                         message: "a call stopped for no step",

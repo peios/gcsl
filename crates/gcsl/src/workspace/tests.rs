@@ -303,6 +303,7 @@ mod fs;
 mod graph;
 mod imports;
 mod suspension;
+mod yields;
 
 mod coverage;
 mod invoke;
