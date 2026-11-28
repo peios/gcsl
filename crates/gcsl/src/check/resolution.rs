@@ -143,6 +143,12 @@ pub(super) struct CallsChecked {
     /// The items of the trailing block about to be checked whose last
     /// expression is a statement (see [Blocks](crate::check::blocks#blocks)).
     pub(super) statements: Option<ItemRange>,
+    /// The items and the block of the body about to be checked of a
+    /// definition whose def-type's definitions return `{}`, whose last
+    /// expression is a statement if it is no `{}` (see
+    /// [Def-types](crate::check::deftypes#def-types), "A definition's last
+    /// expression").
+    pub(super) definition_end: Option<(ItemRange, ExprId)>,
     /// The `recover`s whose fallbacks are being checked, innermost last
     /// (see [Failure](crate::check::failure#failure)).
     pub(super) fallbacks: Vec<super::failure::Fallback>,
@@ -210,6 +216,11 @@ pub(super) struct ForLowering {
     /// [Blocks](crate::check::blocks#blocks)), with whether its last
     /// expression is a statement, its value discarded.
     pub(super) block_args: HashMap<ExprId, bool>,
+    /// Each body of a definition, by its block's id, whose last
+    /// expression is a statement, its value discarded (see
+    /// [Def-types](crate::check::deftypes#def-types), "A definition's last
+    /// expression").
+    pub(super) statement_bodies: HashSet<ExprId>,
     /// Each call of a block, by its id (see [Blocks](crate::check::blocks#blocks)).
     pub(super) block_calls: HashSet<ExprId>,
     /// Each `raise`, by its id, with the slot in which its `recover`'s
@@ -685,6 +696,15 @@ impl Resolution {
     #[must_use]
     pub fn is_block_arg(&self, id: ExprId) -> Option<bool> {
         self.lowered.block_args.get(&id).copied()
+    }
+
+    /// Whether `id` is the block of a definition's body whose last
+    /// expression is a statement, its value discarded (see
+    /// [Def-types](crate::check::deftypes#def-types), "A definition's last
+    /// expression").
+    #[must_use]
+    pub fn ends_as_statement(&self, id: ExprId) -> bool {
+        self.lowered.statement_bodies.contains(&id)
     }
 
     /// Whether the call `id` is of a block (see

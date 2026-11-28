@@ -957,3 +957,88 @@ fn a_deferring_function_and_a_def_type_take_no_block() {
         .is_empty()
     );
 }
+
+#[test]
+fn a_definition_of_a_def_type_of_nothing_ends_as_a_block_of_nothing_does() {
+    // Def-types whose definitions return `{}` and an `Int`, an impure
+    // function of each and a pure one.
+    let kinds = "#[def_type] def check(name: String, f: fn() -> {}) -> {} { f() }\n\
+                 #[def_type] def value(name: String, f: fn() -> Int) -> Int { f() }\n\
+                 #[def_type] def made<T>(name: String, f: fn() -> T) -> T { f() }\n\
+                 #[def_type] def pure(name: String, f: fn(): {}): {} { f() }\n\
+                 fn op() -> Int { 1 }\n\
+                 fn unit() -> {} { = {} }\n\
+                 fn pure_op(): Int { 1 }\n";
+    let of = |text: &str| format!("{kinds}{text}");
+    // A call of an impure function, with parameters of the definition's
+    // own or without, and a loop, are statements there.
+    for text in [
+        "def check t() { op() }",
+        "def check t(n = 2) { op(); op() }",
+        "def check t() { let mut n = 0; for i in [1, 2] { n := n + i } }",
+        "def check t() { let mut n = 0; for n < 3 { n := n + 1 } }",
+        "def check t() { await lazy op() }",
+        "def pure t() { for i in [1, 2] { {} } }",
+    ] {
+        let found = diagnostics_or_none(&of(text));
+        assert!(found.is_empty(), "{text}: {found:?}");
+    }
+    // Any other value there is unused, as in a block of `{}`.
+    for text in [
+        "def check t() { 1 }",
+        "def check t() { pure_op() }",
+        "def check t() { op() + 1 }",
+        "def check t(n = 2) { n + 1 }",
+    ] {
+        assert_eq!(
+            messages(&of(text)),
+            vec!["unused value of type Int"],
+            "{text}"
+        );
+    }
+    assert_eq!(
+        messages(&of("def check t() { for i in [1, 2] { op() } }")),
+        vec!["unused value of type `List<Int>`"]
+    );
+    // In a pure definition nothing is discarded.
+    assert_eq!(
+        messages(&of("def pure t() { op() }")),
+        vec![
+            "cannot call an impure function from a pure function",
+            "unused value of type Int"
+        ]
+    );
+    // A result written `= EXPR` is the body's value still, and so is a
+    // last expression that is `{}`.
+    assert_eq!(
+        messages(&of("def check t() { = op() }")),
+        vec!["mismatched types"]
+    );
+    for text in [
+        "def check t() { unit() }",
+        "def check t() { = unit() }",
+        "def check t() { {} }",
+        "def check t() { }",
+    ] {
+        let found = diagnostics_or_none(&of(text));
+        assert!(found.is_empty(), "{text}: {found:?}");
+    }
+    // Only where the def-type's definitions return `{}`: elsewhere the
+    // last expression is the definition's value, a generic one's too.
+    assert!(diagnostics_or_none(&of("def value t() { op() }\nx = value t()")).is_empty());
+    assert!(diagnostics_or_none(&of("def made t() { op() }\nx: Int = made t()")).is_empty());
+    assert_eq!(
+        messages(&of("def value t() { for i in [1, 2] { {} } }")),
+        vec!["mismatched types"]
+    );
+    // An ordinary function's body ends with its result, as ever, and so
+    // does a function expression in a definition.
+    assert_eq!(
+        messages(&of("fn f() -> {} { op() }")),
+        vec!["mismatched types"]
+    );
+    assert_eq!(
+        messages(&of("def check t() { let f = fn() -> {} { op() }; f() }")),
+        vec!["mismatched types"]
+    );
+}

@@ -319,3 +319,47 @@ fn a_block_of_a_memoised_call_s_body_is_run_once_for_two_units() {
     );
     assert_eq!(asked, ["begin build", "building", "end build"]);
 }
+
+#[test]
+fn a_definition_that_ends_with_a_call_runs_it_and_gives_nothing() {
+    // The last call of each body is a statement: it is run, in its place,
+    // and its value discarded, with parameters of the definition's own or
+    // without, and a body that ends with `{}` is as it was.
+    let mut workspace = steps(
+        "#[def_type]\n\
+         def quiet(name: String, f: fn() -> {}) -> String {\n\
+         \x20   f()\n\
+         \x20   = op(\"after {name}\")\n\
+         }\n\
+         fn unit(word: String) -> {} { op(word); = {} }\n\
+         def quiet call() { op(\"first\"); op(\"last\") }\n\
+         def quiet own(word = \"given\") { step(\"s\") { op(word) }; op(word) }\n\
+         def quiet loops() { for word in [\"a\", \"b\"] { op(word); {} } }\n\
+         def quiet same() { unit(\"same\") }",
+    );
+    for (name, expected) in [
+        ("call", &["first", "last", "after call"][..]),
+        (
+            "own",
+            &["begin s", "given", "end s", "given", "after own"][..],
+        ),
+        ("loops", &["a", "b", "after loops"][..]),
+        ("same", &["same", "after same"][..]),
+    ] {
+        let call = workspace.prepare_call(("quiet", name), &[], &[]).unwrap();
+        let mut graph = Graph::new();
+        let mut asked = Vec::new();
+        let done = loop {
+            match workspace.run_prepared(&call, &mut graph, every()).unwrap() {
+                Progress::Done(value) => break value.to_string(),
+                Progress::Paused(nodes) => {
+                    assert_eq!(nodes.len(), 1, "{nodes:?}");
+                    asked.push(answer(&mut workspace, &mut graph, nodes[0]));
+                }
+                Progress::Waiting(_) => {}
+            }
+        };
+        assert_eq!(done, format!("after {name}"), "{name}");
+        assert_eq!(asked, expected, "{name}");
+    }
+}

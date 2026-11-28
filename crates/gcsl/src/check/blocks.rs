@@ -356,7 +356,7 @@ impl Checker<'_> {
     /// list does (see [Blocks](self#blocks)): if `ret`, once awaited, is
     /// `{}`, the block is no record block, and its last item is an
     /// expression, not a result written `= EXPR`.
-    fn ends_with_statement(&mut self, value: ExprId, ret: TyId) -> Option<ItemRange> {
+    pub(super) fn ends_with_statement(&mut self, value: ExprId, ret: TyId) -> Option<ItemRange> {
         let ExprKind::Block { items, .. } = self.ast.get(value).kind else {
             return None;
         };

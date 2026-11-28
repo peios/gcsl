@@ -1148,6 +1148,7 @@ impl Checker<'_> {
         } else if let Some(found) = self.empty_body(body, ret, (context, why)) {
             self.expr_types[body.index()] = found;
         } else {
+            self.note_definition_end(body, ret);
             let expecting = self.result_expecting(ret, items, (context, why), block.span);
             // A labelled body is a labelled block like any other, whose
             // `return`s give it its value, checked as ever where only a

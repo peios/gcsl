@@ -221,6 +221,10 @@ is why the `step` in
 [Declaring and giving a block](#declaring-and-giving-a-block) ends with
 `= {}`.
 
+The body of a definition ends as a block does when its definition type's
+definitions return `{}`; see
+[Definition Types and Metadata](~gcsl/definition-types#ending-a-definition-that-returns-nothing).
+
 ## Leaving a block
 
 A block can't be left with a jump. The function that calls the block goes

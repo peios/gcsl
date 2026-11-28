@@ -29,8 +29,12 @@ impl Lowerer<'_> {
         let is_record = self.is_record_body(body)
             || block.is_some_and(|block| !self.resolution.record_fills(block).is_empty());
         // A trailing block whose last expression is a statement (see the
-        // checker's "Blocks").
-        let discards = block.is_some_and(|block| self.resolution.is_block_arg(block) == Some(true));
+        // checker's "Blocks"), or a definition's body (see its "A
+        // definition's last expression").
+        let discards = block.is_some_and(|block| {
+            self.resolution.is_block_arg(block) == Some(true)
+                || self.resolution.ends_as_statement(block)
+        });
         let base = self.item_stack.len();
         let mut result = None;
         let is_root = body == self.ast.root();

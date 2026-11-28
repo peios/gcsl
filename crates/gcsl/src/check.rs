@@ -2430,6 +2430,7 @@ impl<'a> Checker<'a> {
             )
         });
         let (mut result, statements) = (TyId::EMPTY, self.is_statements(body));
+        let definition = self.definition_end(body);
         // Whether this is the input's outermost block, whose top-level
         // functions are order-free.
         let root = body == self.ast.root() && self.functions.is_empty();
@@ -2511,7 +2512,7 @@ impl<'a> Checker<'a> {
                     // statement.
                     let is_result = next.is_none() && first_field.is_none() && !statements;
                     let ty = self.expression_item(value, is_result, result_expected);
-                    if is_result {
+                    if is_result && !self.ends_definition(definition, ty) {
                         result = ty;
                     } else {
                         self.check_statement(value, ty);

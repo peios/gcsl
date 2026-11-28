@@ -51,6 +51,21 @@
 //! step, given what its defaults came to where the def-type called the
 //! definition.
 //!
+//! **A definition's last expression.** Where F's result is `{}`, a
+//! definition's body ends as a block that fills a `block -> {}` does (see
+//! [Blocks](crate::check::blocks#blocks)), so that `def test t() {
+//! c.add(1) }` needs no `{}` after its call: its last expression, if it is
+//! no `{}`, awaited or not, is a statement
+//! (`Checker::ends_definition`), a call of an impure function, whose value
+//! is discarded, or a loop, which collects nothing, and any other value
+//! there is an unused value. One that is `{}`, or a future of it, is the
+//! body's result, as it ever was, and a result written `= EXPR` is its
+//! value still: so nothing that checked before means anything else. This
+//! is of the body a definition is written with alone, with parameters of
+//! its own or without: an ordinary function's body, a meta's, and the body
+//! of a definition of a def-type whose definitions return anything else,
+//! a generic one's among them, end with their result.
+//!
 //! When the walk reaches a definition (`Checker::place_definition`), it is
 //! placed in its namespace as the dotted field of its path under the key is
 //! placed in a record, but among the namespaces' own fields, apart from the
@@ -171,8 +186,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    DefTypeId, DefTypeRole, Effect, ExprId, ExprKind, FnId, ItemId, ItemKind, PathSegment,
-    SegmentKind, path_span,
+    DefTypeId, DefTypeRole, Effect, ExprId, ExprKind, FnId, ItemId, ItemKind, ItemRange,
+    PathSegment, SegmentKind, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::mentions::Resolve;
@@ -732,6 +747,53 @@ impl Checker<'_> {
         let allowed = self.types.need_set(sig.needs).to_vec();
         self.definition_needs(&needs, &allowed);
         ty
+    }
+
+    /// Notes that `body`, the block about to be checked of the function
+    /// being checked, against the result `ret`, is one whose last
+    /// expression may be a statement (see the module documentation, "A
+    /// definition's last expression"): the body a definition is written
+    /// with, of a def-type whose definitions return `{}`, if it ends with
+    /// an expression.
+    pub(super) fn note_definition_end(&mut self, body: ExprId, ret: TyId) {
+        let written = self.functions.last().is_some_and(|function| {
+            self.def_types.definitions.contains_key(&function.fn_id)
+                || self.def_types.bodies.contains_key(&function.fn_id)
+        });
+        if written && let Some(items) = self.ends_with_statement(body, ret) {
+            self.calls.definition_end = Some((items, body));
+        }
+    }
+
+    /// The block of the definition's body whose items `body` are about to
+    /// be checked, if its last expression may be a statement, as
+    /// [`Checker::note_definition_end`] found: asked once, as its items
+    /// are checked.
+    pub(super) fn definition_end(&mut self, body: ItemRange) -> Option<ExprId> {
+        self.calls
+            .definition_end
+            .take_if(|(items, _)| *items == body)
+            .map(|(_, block)| block)
+    }
+
+    /// Whether `value`, of type `ty`, the last expression of the body
+    /// `block` of a definition whose def-type's definitions return `{}`,
+    /// is a statement (see the module documentation, "A definition's last
+    /// expression"): if it is no `{}`, awaited or not, which is the body's
+    /// result as ever. It is then recorded for lowering, its value
+    /// discarded.
+    pub(super) fn ends_definition(&mut self, block: Option<ExprId>, ty: TyId) -> bool {
+        let Some(block) = block else {
+            return false;
+        };
+        let fits = ty == TyId::ERROR
+            || ty == self.never
+            || self.types.strip(ty) == TyId::EMPTY
+            || self.types.present(ty) == TyId::EMPTY;
+        if !fits {
+            self.lowering.statement_bodies.insert(block);
+        }
+        !fits
     }
 
     /// Records `body`, the function of the body of the definition `def`,
