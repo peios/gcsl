@@ -687,10 +687,18 @@ impl<'r> Machine<'r> {
                     Some(frame) => self.resume(frame, result),
                     None => return Ran::Done(result.map_err(|unwind| *unwind)),
                 },
-                // A task that would wait splits, if it can, and goes on.
+                // A task that would wait splits, if it can, and goes on;
+                // but not for a host operation's result (see [Tasks and
+                // operations](tasks#tasks-and-operations)).
                 Next::Block(wait, resume) => {
                     self.pause_profile();
-                    match self.fork(Status::Blocked(wait, resume)) {
+                    let status = Status::Blocked(wait, resume);
+                    let forked = if self.awaits_operation(wait) {
+                        Err(status)
+                    } else {
+                        self.fork(status)
+                    };
+                    match forked {
                         Ok(next) => {
                             self.unpause_profile();
                             next
