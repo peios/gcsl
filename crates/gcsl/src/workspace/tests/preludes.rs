@@ -229,3 +229,40 @@ fn module_paths_drop_the_last_extension_of_the_name_alone() {
         assert_eq!(module_path(path), module, "{path}");
     }
 }
+
+#[test]
+fn one_workspace_mixes_files_given_preludes_and_files_not() {
+    // A build tool's file, given no prelude, and a harness's, given its
+    // library, side by side, each with a `def test`: each names the `test`
+    // its own view sees. The library's replaces the standard one by path,
+    // so a host that lists `test` lists the harness's alone; the build
+    // tool's definition, made with the standard `test`, is listed by no
+    // `test` here, and a host that reads it reads no harness file.
+    let workspace = given(&[
+        ("workspace.gcsl", "", None),
+        ("app/build.pekit", "def test t() { }", None),
+        ("tests/boot.prvm", "def test u() { }", Some("kit")),
+    ])
+    .unwrap_or_else(|errors| panic!("{errors:?}"));
+    let listed = workspace.def_types().unwrap();
+    let tests: Vec<&DefType> = listed.iter().filter(|found| found.path == "test").collect();
+    assert_eq!(tests.len(), 1, "{listed:?}");
+    let names: Vec<&str> = tests[0]
+        .definitions
+        .iter()
+        .map(|definition| definition.path.as_str())
+        .collect();
+    assert_eq!(names, ["u"]);
+    assert_eq!(tests[0].file, workspace.file("<lib>/kit/kit.gcsl").unwrap());
+    // Without the harness's files, as a build tool reads the workspace, the
+    // standard `test` has the build tool's definition.
+    let sources = [
+        SourceFile::new("workspace.gcsl", "").unwrap(),
+        SourceFile::new("app/build.pekit", "def test t() { }").unwrap(),
+    ];
+    let alone = check_with_standard(&sources, &[], SCRATCH).1.unwrap();
+    let listed = alone.def_types().unwrap();
+    let tests: Vec<&DefType> = listed.iter().filter(|found| found.path == "test").collect();
+    assert_eq!(tests.len(), 1, "{listed:?}");
+    assert_eq!(tests[0].definitions[0].path, "t");
+}
