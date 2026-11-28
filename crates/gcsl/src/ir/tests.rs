@@ -901,3 +901,153 @@ fn a_dotted_update_is_two_levels_taller_for_each_step() {
     builder.measure(update, &mut functions);
     assert_eq!(functions[0].height, 4);
 }
+
+#[test]
+fn a_block_argument_and_a_call_of_a_block_have_kinds_children_and_print() {
+    // `run { t := 1; t }` and, as a callee's body would hold it, a call of
+    // the block in slot 2, `body()`, by hand: `run` in slot 0, `t` in
+    // slot 1.
+    let mut names = Names::new();
+    let slot_names = vec![names.intern("run"), names.intern("t"), names.intern("body")];
+    let mut builder = IrBuilder::with_capacity(10);
+    let callee = builder.alloc(IrKind::Load(Slot::new(0), ValueKind::Fn), Span::new(0, 3));
+    let one = builder.alloc(IrKind::IntConst(1), Span::new(11, 12));
+    let store = builder.alloc(IrKind::Store(Slot::new(1), one), Span::new(6, 12));
+    builder.note_assignment(store);
+    let load = builder.alloc(
+        IrKind::Load(Slot::new(1), ValueKind::Int),
+        Span::new(14, 15),
+    );
+    let items = builder.push_item_list(&[store]);
+    let body = builder.alloc(
+        IrKind::Block {
+            items,
+            result: load,
+        },
+        Span::new(4, 17),
+    );
+    let arg = builder.alloc(
+        IrKind::Arg {
+            param: 0,
+            value: ArgValue::Block { body, height: 0 },
+        },
+        Span::new(4, 17),
+    );
+    let args = builder.push_item_list(&[arg]);
+    let call = builder.alloc(
+        IrKind::Call {
+            callee,
+            args,
+            kind: ValueKind::Int,
+            depth: 0,
+        },
+        Span::new(0, 17),
+    );
+    let block = builder.alloc(IrKind::Load(Slot::new(2), ValueKind::Fn), Span::new(18, 22));
+    let call_block = builder.alloc(
+        IrKind::CallBlock {
+            block,
+            kind: ValueKind::Deferred,
+            depth: 0,
+        },
+        Span::new(18, 24),
+    );
+    let root_items = builder.push_item_list(&[call]);
+    let root = builder.alloc(
+        IrKind::Block {
+            items: root_items,
+            result: call_block,
+        },
+        Span::new(0, 24),
+    );
+    let ir = builder.finish(root, 3, slot_names);
+    // A block is given as a function is, and its call is of its result's
+    // kind.
+    assert_eq!(ir.kind_of(arg), ValueKind::Fn);
+    assert_eq!(ir.kind_of(call_block), ValueKind::Deferred);
+    assert_eq!(ir.kind_of(root), ValueKind::Deferred);
+    assert_eq!(ir.get(call_block).kind.symbol(), None);
+    assert_eq!(ir.get(call_block).operator_span(), None);
+    // The argument's child is the block's body, and the call's the read of
+    // the block.
+    assert_eq!(ir.children(arg).collect::<Vec<_>>(), vec![body]);
+    assert_eq!(ir.children(call_block).collect::<Vec<_>>(), vec![block]);
+    // Measured: the body's height, the block and what it holds, and the
+    // call's depth in its frame's body.
+    assert_eq!(
+        ir.get(arg).kind,
+        IrKind::Arg {
+            param: 0,
+            value: ArgValue::Block { body, height: 3 },
+        }
+    );
+    assert_eq!(
+        ir.get(call_block).kind,
+        IrKind::CallBlock {
+            block,
+            kind: ValueKind::Deferred,
+            depth: 1,
+        }
+    );
+    // Both are control nodes, which no simple subtree holds, and a call of
+    // a block is never independent, nor is what holds a block that
+    // assigns.
+    assert!(ir.get(arg).kind.is_control());
+    assert!(ir.get(call_block).kind.is_control());
+    for id in [arg, call, call_block, root] {
+        assert!(!ir.is_simple(id), "{:?}", ir.get(id));
+        assert!(!ir.is_independent(id), "{:?}", ir.get(id));
+    }
+    assert!(ir.is_simple(load) && ir.is_independent(load));
+    assert!(ir.is_independent(block));
+    assert_eq!(
+        ir.pretty(&names).to_string(),
+        "(block @0..24\n\
+             \x20 (call @0..17\n\
+             \x20   (load run#0 @0..3)\n\
+             \x20   (arg 0 block @4..17\n\
+             \x20     (block @4..17\n\
+             \x20       (store t#1 @6..12\n\
+             \x20         (int 1 @11..12))\n\
+             \x20       (load t#1 @14..15))))\n\
+             \x20 (call-block @18..24\n\
+             \x20   (load body#2 @18..22)))"
+    );
+}
+
+#[test]
+fn a_block_s_height_is_capped_as_a_call_s_depth_is() {
+    // A body taller than a `u16` holds is stored as `u16::MAX`, past any
+    // budget.
+    let levels = usize::from(u16::MAX) + 10;
+    let mut builder = IrBuilder::with_capacity(levels + 4);
+    let mut body = builder.alloc(IrKind::IntConst(1), Span::new(0, 1));
+    let no_items = builder.push_item_list(&[]);
+    for _ in 0..levels {
+        body = builder.alloc(
+            IrKind::Block {
+                items: no_items,
+                result: body,
+            },
+            Span::new(0, 1),
+        );
+    }
+    let arg = builder.alloc(
+        IrKind::Arg {
+            param: 0,
+            value: ArgValue::Block { body, height: 0 },
+        },
+        Span::new(0, 1),
+    );
+    let ir = builder.finish(arg, 0, Vec::new());
+    assert_eq!(
+        ir.get(arg).kind,
+        IrKind::Arg {
+            param: 0,
+            value: ArgValue::Block {
+                body,
+                height: u16::MAX,
+            },
+        }
+    );
+}

@@ -767,6 +767,7 @@ fn message(text: &str) -> String {
 // ----- Errors and recovery -----
 
 mod basics;
+mod blocks;
 mod conditions;
 mod extensions;
 mod functions;
