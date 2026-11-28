@@ -51,6 +51,11 @@ for name in ["alpha", "beta"] {
 greeted = true
 ```
 
+The body can also end with an `if` whose branches each end that way, as in
+`for name in names { if name == "root" { sh("echo skip") } else { sh("echo
+{name}") } }`. Such an `if` can stand as a statement anywhere, discarding
+its value, as long as it has an `else`.
+
 A loop whose body ends with any other value, such as `for n in [1, 2] { n
 * 2 }`, is the error "unused value of type `List<Int>`" as a statement,
 because what it collects would be lost. So is a loop that a `break` or

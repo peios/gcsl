@@ -241,7 +241,8 @@ Supported loops include:
 .fi
 .PP
 A loop in value position collects body results.
-A loop of any form standing as a statement must collect nothing that matters: its body's value must be {}, or its body must end with a call of an impure or memoized function, or with a loop that does, outside a pure function; that call is awaited deeply each time, and its value and the loop's list are discarded, as in for i in 0..3 { m.run("x") }.
+A loop of any form standing as a statement must collect nothing that matters: its body's value must be {}, or its body must end with a call of an impure or memoized function, with a loop that does, or with an if whose branches do, outside a pure function; that call is awaited deeply each time, and its value and the loop's list are discarded, as in for i in 0..3 { m.run("x") }.
+An if with an else standing as a statement, anywhere a statement can be, is discarded in the same way when each branch ends with such a call, loop or if, or with {}, a jump or nothing, as in if ready { m.run("go") } else { m.run("wait") }; an if without an else, or with a branch ending in any other value or in = EXPR, is unchanged.
 A loop whose body ends with any other value, such as for i in 0..3 { i * 2 }, or that a break or continue with a value is for, is an unused value when it stands as a statement.
 Break and continue can contribute a value before ending the loop or iteration.
 A plain header variable can be rebound by the header; use let mut when the body must update it.

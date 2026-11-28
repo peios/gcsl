@@ -111,8 +111,12 @@
 //! (`Checker::discards_loop`) if its body, no record block, ends with an
 //! expression, not a result written `= EXPR`, that could stand as a
 //! statement for its effects: a call of a function or built-in that is not
-//! pure, outside a pure function, or a loop that collects nothing by this
-//! rule. The call is awaited deeply each time, as a call statement is, so
+//! pure, outside a pure function, a loop that collects nothing by this
+//! rule, or an `if` with an `else` each of whose branches, an `else if`
+//! included, ends so, or with `{}`, a jump or no expression, but with no
+//! result written `= EXPR` or other value (`Checker::discards_if`). Such an
+//! `if` is a statement wherever a statement is, a `{}` block's or a
+//! definition's last expression among them, and its value is discarded. The call is awaited deeply each time, as a call statement is, so
 //! that nothing it defers is lost, and its value, and the loop's list, are
 //! discarded ([`LoopResolution::discards`](super::LoopResolution::discards)).
 //! So `for i in 0..3 { m.run("x") }` runs `m.run` three times and is

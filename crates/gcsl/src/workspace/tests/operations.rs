@@ -1452,6 +1452,7 @@ fn a_loop_statement_that_ends_with_an_operation_runs_it_each_time_and_collects_n
          \x20   for n < 2 { n := n + 1; say(\"while {n}\") }\n\
          \x20   do { say(\"do\") } for false\n\
          \x20   for i in 0..2 { for j in 0..2 { say(\"{i}{j}\") } }\n\
+         \x20   for i in 0..2 { if i == 0 { say(\"if\") } else { m.run(\"else\") } }\n\
          \x20   = \"done\"\n\
          }",
     );
@@ -1470,6 +1471,8 @@ fn a_loop_statement_that_ends_with_an_operation_runs_it_each_time_and_collects_n
             "say(\"01\")",
             "say(\"10\")",
             "say(\"11\")",
+            "say(\"if\")",
+            "vm.run(<vm.machine 1>, [\"else\"])",
         ]
     );
 }

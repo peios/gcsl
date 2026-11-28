@@ -366,8 +366,81 @@ impl Checker<'_> {
             // In a pure function the call is an error already.
             self.measure_deep(value, ty);
             self.discarded.insert(value);
-        } else if !self.discards_loop(value) {
+        } else if !self.discards_loop(value) && !self.discards_if(value) {
             self.unused_value(value, ty);
+        }
+    }
+
+    /// Whether `value`, the last expression of a body that is a statement,
+    /// is one whose value is discarded (see the loops' "A loop as a
+    /// statement"): a call of a function or built-in that is not pure,
+    /// outside a pure function, which is then awaited deeply, as a call
+    /// statement is; a loop that collects nothing ([`Checker::discards_loop`]);
+    /// or an `if` whose branches all end so ([`Checker::discards_if`]).
+    fn discards_value(&mut self, value: ExprId) -> bool {
+        if self.impure_calls.contains(&value) && self.pure_marker().is_none() {
+            let ty = self.expr_types[value.index()];
+            self.measure_deep(value, ty);
+            return true;
+        }
+        self.discards_loop(value) || self.discards_if(value)
+    }
+
+    /// Whether the statement `value`, whose value is no unit, is an `if`
+    /// with an `else` whose value is discarded (see the loops' "A loop as a
+    /// statement"): outside a pure function, each branch, an `else if`
+    /// included, ends with what [`Checker::discards_value`] discards, or
+    /// with `{}`, a jump, or no expression at all, but not with a result
+    /// written `= EXPR` or any other value, and is no record block. The
+    /// `if` is then recorded as a statement whose value is discarded
+    /// ([`Resolution::is_discarded`](super::Resolution::is_discarded)).
+    fn discards_if(&mut self, value: ExprId) -> bool {
+        let mut node = value;
+        let (then, else_) = loop {
+            match self.ast.get(node).kind {
+                ExprKind::Paren(inner) => node = inner,
+                ExprKind::If {
+                    then,
+                    else_,
+                    has_else: true,
+                    ..
+                } => break (then, else_),
+                _ => return false,
+            }
+        };
+        if self.pure_marker().is_some()
+            || !self.branch_discards(then)
+            || !self.branch_discards(else_)
+        {
+            return false;
+        }
+        self.discarded.insert(value);
+        true
+    }
+
+    /// Whether the branch `branch` of an `if` ends as [`Checker::discards_if`]
+    /// asks of each.
+    fn branch_discards(&mut self, branch: ExprId) -> bool {
+        let items = match self.ast.get(branch).kind {
+            ExprKind::If { .. } => return self.discards_if(branch),
+            ExprKind::Block { items, .. } => items,
+            _ => return false,
+        };
+        if self.is_record_body(items) {
+            return false;
+        }
+        match self
+            .ast
+            .items(items)
+            .last()
+            .map(|&item| self.ast.item(item).kind)
+        {
+            Some(ItemKind::Expr(last)) => {
+                let ty = self.expr_types[last.index()];
+                ty == self.never || self.types.is_unit_like(ty) || self.discards_value(last)
+            }
+            Some(ItemKind::Result(_)) => false,
+            _ => true,
         }
     }
 
@@ -376,8 +449,9 @@ impl Checker<'_> {
     /// loop of any form, outside a pure function, that no `return'L` leaves
     /// and no `break` or `continue` with a value is for, whose body is no
     /// record block and ends with an expression, not a result written `=
-    /// EXPR`, that is a call of a function or built-in that is not pure, or
-    /// a loop that collects nothing by the same rule. That call is then
+    /// EXPR`, that is discarded ([`Checker::discards_value`]): a call of a
+    /// function or built-in that is not pure, a loop that collects nothing
+    /// by the same rule, or an `if` whose branches all end so. That call is then
     /// awaited deeply each time, as a call statement is, so that no effect
     /// it defers is lost, and the loop is recorded for lowering as one that
     /// collects nothing.
@@ -416,10 +490,7 @@ impl Checker<'_> {
         else {
             return false;
         };
-        if self.impure_calls.contains(&last) {
-            let last_ty = self.expr_types[last.index()];
-            self.measure_deep(last, last_ty);
-        } else if !self.discards_loop(last) {
+        if !self.discards_value(last) {
             return false;
         }
         if let Some(resolution) = self.loop_resolutions.get_mut(for_id.index()) {

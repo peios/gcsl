@@ -216,7 +216,8 @@ step("count") {
 
 So is a loop whose body ends with a call of an impure function, such as
 `for n in [1, 2, 3] { sh("echo {n}") }`, which collects nothing as a
-statement; see
+statement, and an `if` with an `else` whose branches each end with such a
+call; see
 [Lists and Control Flow](~gcsl/lists-and-control-flow#collecting-and-repeating).
 
 A block that ends with any other value, such as a number or the result of
