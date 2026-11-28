@@ -177,6 +177,68 @@ Every run in graph mode takes a `GraphHost`: which deferred calls the
 host takes as steps, and the `Effects` the unit's own effects use, such
 as the working directory that `file("hello.c")` resolves against.
 
+## Sharing one thread between units
+
+GCSL evaluates on one thread, so a unit that computes for a long time
+without waiting keeps every other unit from running. To prevent that,
+give each run a slice with `Workspace::run_prepared_for`, or
+`Workspace::run_step_for` for a step's unit. Both return a `Turn`:
+
+- `Turn::Progress(progress)` if the run ended or stopped to wait within
+  its slice, with the same `Progress` that `Workspace::run_prepared`
+  returns.
+- `Turn::Yielded` if the slice ran out while the unit was computing. The
+  unit waits for nothing. Run it again when its turn comes, with or
+  without a slice, and it carries on from where it was.
+
+A yield changes nothing that the program can see. No `recover` catches
+it, a `#[retry]` function doesn't start another attempt, and a memoised
+call the unit is in the middle of stays its own, so another unit that
+needs it gets `Progress::Waiting`. The slice covers the whole run: the
+files a target needs and the target's call share it.
+
+GCSL looks at the clock every 1,024 steps of evaluation, so a run
+overruns its slice by tens of microseconds at most in ordinary code. One
+call of a built-in function is never interrupted, and neither is one
+expression that contains no call and no loop. A run can therefore
+overrun its slice by as long as the slowest of those takes, such as a
+sort of a large list.
+
+Every run evaluates 1,024 steps before it first looks at the clock. A
+unit therefore makes progress in every run, even with a slice of zero.
+`Workspace::run_prepared` and `Workspace::run_step` take no slice and
+never yield.
+
+## Deciding what a timeout counts
+
+A `#[timeout]` on a function measures the time its unit spends running.
+While the unit is stopped, whether it yielded or it waits for a result,
+the function's clock stands still. That suits a host that keeps units
+waiting for reasons of its own, but not an operation that the host runs
+for a unit: the time the operation takes is time the function spent.
+
+Call `Workspace::charge_stopped` with the unit and a duration before you
+run a stopped unit again. That much of the time the unit was stopped
+counts toward every `#[timeout]` running in it. Several calls add up
+until the unit next runs. A charge of more than the time the unit was
+stopped counts as that time. If you never call it, no stopped time
+counts.
+
+`Workspace::time_left` gives the time that the nearest `#[timeout]`
+running in a stopped unit has left, with your charges taken off. It
+returns `None` if no `#[timeout]` is running there, or if the unit isn't
+stopped. Use it to set a timer when you start an operation for the unit.
+
+If a timeout has passed by what you charged, the unit fails with it when
+you next run the unit, at the place where it was waiting. The error is
+the function's own, such as "`fetch` timed out after 30s", and a
+`recover` around the call catches it, as it does when the timeout passes
+while the function runs. The unit doesn't read the result you gave for
+the operation it was waiting for, whether a value or a failure, and you
+don't have to give one. That matches an `exec` that outlives its
+timeout: GCSL kills the program and reports the timeout, whatever the
+program would have printed.
+
 ## Running many steps at once
 
 GCSL evaluates on one thread, but the programs steps run can run in
