@@ -161,9 +161,14 @@ impl Checker<'_> {
                  after that `recover`'s `else`",
             );
         if let (Some(_), Some(function)) = (self.calls.fallbacks.last(), self.functions.last()) {
+            let when = if self.ast.fn_decl(function.fn_id).ret.is_none() {
+                "awaited"
+            } else {
+                "called"
+            };
             error = error.with_context(
                 function.keyword,
-                "this runs when it is called, which may be after the fallback has ended",
+                format!("this runs when it is {when}, which may be after the fallback has ended"),
             );
         }
         self.errors.push(error);

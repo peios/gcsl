@@ -1208,9 +1208,15 @@ fn raise_is_for_the_fallback_of_a_recover() {
             .collect::<Vec<_>>(),
         ["this runs when it is called, which may be after the fallback has ended"]
     );
+    let awaited = diagnostics("= recover { 1 } else { let l = lazy { raise }; 2 }");
+    assert_eq!(awaited.len(), 1);
+    assert_eq!(awaited[0].message, ONLY);
     assert_eq!(
-        messages("= recover { 1 } else { let l = lazy { raise }; 2 }"),
-        [ONLY]
+        labels(&awaited[0])
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>(),
+        ["this runs when it is awaited, which may be after the fallback has ended"]
     );
     // A variable of the name is read as it always was.
     assert_eq!(
