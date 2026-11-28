@@ -294,8 +294,11 @@ pub fn spawn(
 /// A workspace's files as read from disk.
 #[derive(Debug)]
 struct Disk {
-    /// Every file, in path order, named by its path relative to the root.
+    /// Every file, in path order, named by its path relative to the root,
+    /// a host's given its host's prelude.
     files: Vec<SourceFile>,
+    /// The hosts whose files are among them ([`gcsl_disk::find_hosts`]).
+    hosts: Vec<gcsl_disk::Host>,
     /// The directories left out as workspaces of their own.
     nested: Vec<String>,
     /// What a stat of each file found as it was read.
@@ -562,11 +565,12 @@ impl Worker {
             check.documents.get(document).map(|doc| doc.version)
         };
         let root_name = root.to_string_lossy();
-        let Some(found) = self.checked(&root_name, || {
+        let Some(mut found) = self.checked(&root_name, || {
             workspace::index_with_standard(&files, &disk.nested, &root_name)
         }) else {
             return (None, None);
         };
+        gcsl_disk::explain_missing_hosts(&disk.hosts, &mut found.diagnostics);
         let report = self.report(&found, &files, None, (&uri_at, version_at), check);
         let uris = (0..files.len()).map(uri_at).collect();
         let again = Again::Workspace {
@@ -599,7 +603,11 @@ impl Worker {
             let source = disk.files.get(at).and_then(|file| {
                 stamp.as_ref()?;
                 let text = fs::read_to_string(root.join(file.name())).ok()?;
-                SourceFile::new(file.name(), text).ok()
+                let source = SourceFile::new(file.name(), text).ok()?;
+                Some(match file.prelude() {
+                    Some(library) => source.with_prelude(library),
+                    None => source,
+                })
             });
             let (Some(source), Some(file)) = (source, disk.files.get_mut(at)) else {
                 // Gone, or not readable: as a read of the workspace finds.
@@ -1543,17 +1551,20 @@ fn symbol_kind(kind: SymbolKind) -> lsp_types::SymbolKind {
     }
 }
 
-/// Reads the files of the workspace under `root` from disk.
+/// Reads the files of the workspace under `root` from disk, its hosts'
+/// among them, each given its host's prelude.
 fn read(root: &Path) -> Result<Disk, ReadError> {
     let started = SystemTime::now();
+    let hosts = gcsl_disk::find_hosts(Some(root));
     let Sources {
         relative, nested, ..
-    } = gcsl_disk::read_workspace(root, None)?;
+    } = gcsl_disk::read_workspace_for(root, None, &hosts)?;
     // A file changed since the read started may have been read before or
     // after: its stamp says so, and the next stat pass reads it again.
     let stamps = stamps(root, &relative, Some(started));
     Ok(Disk {
         files: relative,
+        hosts,
         nested,
         stamps,
     })
@@ -1588,7 +1599,7 @@ fn merged(disk: &Disk, documents: &[Snapshot]) -> (Vec<SourceFile>, Vec<Option<u
             continue;
         };
         let source = match SourceFile::new(relative.clone(), document.text.clone()) {
-            Ok(source) => source,
+            Ok(source) => gcsl_disk::with_host_prelude(&disk.hosts, Path::new(relative), source),
             Err(error) => {
                 log(format_args!(
                     "cannot load {}: {error}",

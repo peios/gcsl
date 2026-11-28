@@ -143,6 +143,17 @@ pub fn find_workspace_for(file: &Path, hosts: &[Host]) -> Option<(PathBuf, Strin
     Some((root.to_path_buf(), parts.join("/")))
 }
 
+/// [`find_workspace_for`] the hosts of the workspace `file` is in
+/// ([`find_hosts`]), with them: what a tool that is given a file, a `.prvm`
+/// test say, finds its workspace by.
+#[must_use]
+pub fn find_hosted_workspace(file: &Path) -> Option<(PathBuf, String, Vec<Host>)> {
+    let canonical = fs::canonicalize(file).ok()?;
+    let hosts = find_hosts(find_root(canonical.parent()?));
+    let (root, relative) = find_workspace_for(&canonical, &hosts)?;
+    Some((root, relative, hosts))
+}
+
 /// A file or directory of a workspace that could not be listed or read.
 #[derive(Debug)]
 pub struct Unreadable {

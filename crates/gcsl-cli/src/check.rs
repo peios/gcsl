@@ -5,7 +5,7 @@
 //! What is checked, each workspace once however many paths reach it:
 //!
 //! - for a FILE, what `gcsl run FILE` checks: its whole workspace, if a
-//!   `workspace.gcsl` is above it ([`gcsl_disk::find_workspace`]), else the
+//!   `workspace.gcsl` is above it ([`gcsl_disk::find_hosted_workspace`]), else the
 //!   file alone, as a lone file is run; a file of a workspace that is none
 //!   of its files as they are listed (one reached through a directory that
 //!   is a symbolic link, say) is checked alone, as `gcsl run` runs it;
@@ -20,8 +20,12 @@
 //!   ([`gcsl_disk::find_root`]), its nested workspaces left out, as they are
 //!   workspaces of their own; outside any workspace that is an error.
 //!
-//! A workspace is read and checked exactly as `gcsl run` reads and checks
-//! one ([`gcsl_disk::read_workspace`],
+//! A workspace's files are its `.gcsl` files and the files of each of its
+//! hosts ([`gcsl_disk::find_hosts`]), a `.prvm` test given Provium's
+//! prelude say; a file of a known host that is not installed is one error
+//! that says so ([`gcsl_disk::explain_missing_hosts`]). A workspace is read
+//! and checked exactly as `gcsl run` reads and checks
+//! one ([`gcsl_disk::read_workspace_for`],
 //! [`gcsl::workspace::check_with_standard`]), a lone file as `gcsl run`
 //! checks one ([`gcsl::workspace::check_lone_with_standard`]), and nothing
 //! is run: no file's value, no `sh` or `exec`, no file read but the
@@ -176,8 +180,8 @@ fn units(paths: &[PathBuf]) -> Result<Vec<Unit>, ()> {
                 Err(()) => broken = true,
             }
         } else if path.is_file() {
-            units.push(match gcsl_disk::find_workspace(path) {
-                Some((root, relative)) => Unit::Workspace(root, Some((relative, path.clone()))),
+            units.push(match gcsl_disk::find_hosted_workspace(path) {
+                Some((root, relative, _)) => Unit::Workspace(root, Some((relative, path.clone()))),
                 None => Unit::Lone(path.clone()),
             });
         } else {
@@ -248,7 +252,8 @@ impl Found {
     /// shows what it finds; then, if `given`, a file given of it, is none
     /// of its files as they are listed, that file alone.
     fn workspace(&mut self, root: &Path, given: Option<&(String, PathBuf)>) {
-        let sources = match gcsl_disk::read_workspace(root, None) {
+        let hosts = gcsl_disk::find_hosts(Some(root));
+        let sources = match gcsl_disk::read_workspace_for(root, None, &hosts) {
             Ok(sources) => sources,
             Err(error) => {
                 output::error(error);
@@ -257,8 +262,11 @@ impl Found {
             }
         };
         let root_name = root.to_string_lossy();
-        let (standard, checked) =
+        let (standard, mut checked) =
             workspace::check_with_standard(&sources.relative, &sources.nested, &root_name);
+        if let Err(errors) = &mut checked {
+            gcsl_disk::explain_missing_hosts(&hosts, errors);
+        }
         let diagnostics = match &checked {
             Ok(checked) => checked.warnings(),
             Err(diagnostics) => diagnostics.as_slice(),

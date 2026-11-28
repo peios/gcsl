@@ -2,8 +2,9 @@
 //! ([`gcsl::fmt`]).
 //!
 //! What is formatted: each file given, whatever its name; every `.gcsl`
-//! file under each directory given, as [`gcsl_disk::workspace_files`] finds
-//! a workspace's (names starting with `.` left out), and those of the
+//! file under each directory given, and every file of a host's there, a
+//! `.prvm` test say, as [`gcsl_disk::workspace_files_for`] finds a
+//! workspace's (names starting with `.` left out), and those of the
 //! workspaces nested in it too; with no paths, every file of the workspace
 //! the working directory is in ([`gcsl_disk::find_root`]), its nested
 //! workspaces left out, as they are the workspace's own; or, for `-`, the
@@ -138,7 +139,8 @@ fn files(paths: &[PathBuf]) -> Result<Files, ()> {
     if broken { Err(()) } else { Ok(files) }
 }
 
-/// The `.gcsl` files under `dir`, those of the workspaces nested in it too,
+/// The `.gcsl` files and the hosts' files under `dir`, those of the
+/// workspaces nested in it too,
 /// each shown as [`gcsl_disk::shown`] shows it.
 fn under(dir: &Path) -> Result<Files, ()> {
     let (mut files, nested) = listed(dir)?;
@@ -148,11 +150,13 @@ fn under(dir: &Path) -> Result<Files, ()> {
     Ok(files)
 }
 
-/// The files of the workspace under `root` ([`gcsl_disk::workspace_files`]),
+/// The files of the workspace under `root`, its hosts' among them
+/// ([`gcsl_disk::workspace_files_for`]),
 /// each shown as [`gcsl_disk::shown`] shows it, and the directories nested
 /// in it that are workspaces of their own.
 fn listed(root: &Path) -> Result<(Files, Vec<String>), ()> {
-    let (found, nested) = gcsl_disk::workspace_files(root).map_err(|unreadable| {
+    let hosts = gcsl_disk::find_hosts(Some(root));
+    let (found, nested) = gcsl_disk::workspace_files_for(root, &hosts).map_err(|unreadable| {
         output::error(format_args!(
             "cannot read {}: {}",
             gcsl_disk::shown(&unreadable.path).display(),
