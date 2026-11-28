@@ -272,11 +272,14 @@
 //! whose parameters are written by name alone and whose result is not
 //! written, `: Int` after each parameter, and its result after its `)` as
 //! GCSL writes one after its marker, `: Int`, ` ->> Int` or ` -> Int`,
-//! as the def-type declares it. GCSL's other functions write their
+//! as the def-type declares it; and `: Int` after the name of a parameter
+//! written with no type, `m = machine()`, a function's or a definition's
+//! own, whose type is its default's. GCSL's other functions write their
 //! parameters' and results' types, as must be, so a function expression has
-//! none, and neither has a call's argument: arguments are often named
+//! no other, and neither has a call's argument: arguments are often named
 //! already. They are conservative: a field has none (a configuration is
-//! mostly fields, `version = "1"`), nor has a `let` whose value spells its
+//! mostly fields, `version = "1"`), nor has a `let`, or a parameter, whose
+//! value, or default, spells its
 //! type (a literal, a negated number among them; a list written out; a
 //! record block; a function expression; an ascription or an `as`), nor a
 //! type the check did not find or found erroneous anywhere in it, nor one

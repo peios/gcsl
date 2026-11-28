@@ -21,7 +21,7 @@
 //! - Expressions: [`expect`], [`operators`], [`names`], [`fields`],
 //!   [`lists`], [`loops`] and [`narrowing`].
 //! - Functions and calls: [`functions`], [`calls`], [`methods`],
-//!   [`inference`], [`futures`] and [`attributes`].
+//!   [`inference`], [`untyped`], [`futures`] and [`attributes`].
 //! - The rest of the language: [`enums`], [`context`], [`failure`] and
 //!   [`secrets`].
 //!
@@ -201,6 +201,7 @@ pub(crate) use resolution::KnownParams;
 use deftypes::DefTypesChecked;
 use needs::ContextsChecked;
 use resolution::{CallsChecked, DefaultFn, ForLowering, merged_defaults};
+use untyped::{DefaultType, EarlyDefaults};
 
 /// What a call of a generic function has bound of its type parameters so
 /// far, as [`Checker::instantiate`] binds them.
@@ -630,6 +631,10 @@ struct TopFn {
     blocker: Option<Blocker>,
     /// Where its closure is made.
     made: MadeAt,
+    /// Whether its signature is pending: it has a parameter written with no
+    /// type, whose type its group's check has yet to find (see [Untyped
+    /// parameters](crate::check::untyped#untyped-parameters)).
+    pending: bool,
 }
 
 /// Why a top-level function does not exist before some item: what it
@@ -3226,6 +3231,7 @@ pub(crate) mod schedule;
 pub(crate) mod scopes;
 pub(crate) mod secrets;
 pub(crate) mod toplevel;
+pub(crate) mod untyped;
 
 #[cfg(test)]
 mod tests;

@@ -20,7 +20,7 @@ const STEPS: &str = "#[def_type]\n\
      }\n";
 
 /// The workspace of one file, [`STEPS`] and then `text`.
-fn steps(text: &str) -> Workspace {
+pub(super) fn steps(text: &str) -> Workspace {
     let app = format!("{STEPS}{text}");
     rooted(&[("workspace.gcsl", ""), ("app.gcsl", &app)]).unwrap()
 }
@@ -47,7 +47,10 @@ fn answer(workspace: &mut Workspace, graph: &mut Graph, node: NodeId) -> String 
 /// Runs the units of the definitions `names` of `test` together, one
 /// operation answered at a time, the units taken in turn: what each came
 /// to, and every operation in the order the host was asked for it.
-fn drive(workspace: &mut Workspace, names: &[&str]) -> (Vec<Result<String, String>>, Vec<String>) {
+pub(super) fn drive(
+    workspace: &mut Workspace,
+    names: &[&str],
+) -> (Vec<Result<String, String>>, Vec<String>) {
     let calls: Vec<_> = names
         .iter()
         .map(|name| workspace.prepare_call(("test", name), &[], &[]).unwrap())

@@ -117,48 +117,81 @@ impl Checker<'_> {
     /// field of its name is "method `m` has the name of a field of its
     /// receiver type", and one whose receiver type is the same type as an
     /// earlier one's of its name, each fitting the other's, "method `m` is
-    /// declared twice for type T", labelled "first declared here".
+    /// declared twice for type T", labelled "first declared here". A method
+    /// whose signature is pending is checked once it is found
+    /// ([`Checker::check_method_named`]).
     pub(super) fn check_methods(&mut self) {
+        for index in 0..self.ast.methods().len() {
+            self.check_method(index, false);
+        }
+    }
+
+    /// Checks the declaration of the method whose binding is named
+    /// `binding`, if it is one's, once its signature, which was pending, is
+    /// found (see [Untyped
+    /// parameters](crate::check::untyped#untyped-parameters)): as
+    /// [`Checker::check_methods`] would have, against the methods after it
+    /// too, which were checked without it.
+    pub(super) fn check_method_named(&mut self, binding: Name) {
         let methods = self.ast.methods();
-        for (index, method) in methods.iter().enumerate() {
-            let Some((_, binding)) = self.lookup(method.binding) else {
+        if let Some(index) = methods.iter().position(|method| method.binding == binding) {
+            self.check_method(index, true);
+        }
+    }
+
+    /// Checks the declaration of the method numbered `index` among the
+    /// input's (see [`Checker::check_methods`]) against the methods of its
+    /// name before it, and, with `later`, those after it too, the error
+    /// then at whichever of the two is declared second. A method whose
+    /// receiver's type is not known, erroneous or its signature pending, is
+    /// not checked, nor checked against.
+    fn check_method(&mut self, index: usize, later: bool) {
+        let methods = self.ast.methods();
+        let Some(method) = methods.get(index) else {
+            return;
+        };
+        let Some((_, binding)) = self.lookup(method.binding) else {
+            return;
+        };
+        let receiver = self.receiver_of(binding.ty);
+        if receiver == TyId::ERROR {
+            return;
+        }
+        if self.types.is_record(receiver) && self.types.field(receiver, method.name).is_some() {
+            let text = FieldName(self.ast.names().get(method.name));
+            let shown = self.in_message(receiver);
+            self.errors.push(Diagnostic::error(
+                format!("method `{text}` has the name of a field of its receiver type {shown}"),
+                method.name_span,
+            ));
+        }
+        let others = if later { methods.len() } else { index };
+        for (at, other) in methods.iter().enumerate().take(others) {
+            if at == index || other.name != method.name {
+                continue;
+            }
+            let Some((_, other_binding)) = self.lookup(other.binding) else {
                 continue;
             };
-            let receiver = self.receiver_of(binding.ty);
-            if receiver == TyId::ERROR {
-                continue;
-            }
-            if self.types.is_record(receiver) && self.types.field(receiver, method.name).is_some() {
-                let text = FieldName(self.ast.names().get(method.name));
-                let shown = self.in_message(receiver);
-                self.errors.push(Diagnostic::error(
-                    format!("method `{text}` has the name of a field of its receiver type {shown}"),
-                    method.name_span,
-                ));
-            }
-            for earlier in methods
-                .iter()
-                .take(index)
-                .filter(|earlier| earlier.name == method.name)
+            let other_receiver = self.receiver_of(other_binding.ty);
+            if self.method_applies(receiver, other_binding.ty)
+                && self.method_applies(other_receiver, binding.ty)
             {
-                let Some((_, earlier_binding)) = self.lookup(earlier.binding) else {
-                    continue;
+                let (first, second) = if at < index {
+                    (other, method)
+                } else {
+                    (method, other)
                 };
-                let earlier_receiver = self.receiver_of(earlier_binding.ty);
-                if self.method_applies(receiver, earlier_binding.ty)
-                    && self.method_applies(earlier_receiver, binding.ty)
-                {
-                    let text = self.ast.names().get(method.name);
-                    let shown = self.in_message(receiver);
-                    self.errors.push(
-                        Diagnostic::error(
-                            format!("method `{text}` is declared twice for type {shown}"),
-                            method.name_span,
-                        )
-                        .with_context(earlier.name_span, "first declared here"),
-                    );
-                    break;
-                }
+                let text = self.ast.names().get(method.name);
+                let shown = self.in_message(receiver);
+                self.errors.push(
+                    Diagnostic::error(
+                        format!("method `{text}` is declared twice for type {shown}"),
+                        second.name_span,
+                    )
+                    .with_context(first.name_span, "first declared here"),
+                );
+                break;
             }
         }
     }
@@ -316,6 +349,13 @@ impl Checker<'_> {
             let ty = self.field_access(callee, (receiver, found), name);
             self.expr_types[callee.index()] = ty;
             return self.call_of(id, (callee, ty, None), args);
+        }
+        // A method whose signature a default being checked for its
+        // parameter's type would need.
+        if self.pending_method(name) {
+            let text = self.ast.names().get(name).to_owned();
+            self.pending_error(span, &text);
+            return self.args_alone(args);
         }
         if applicable.is_empty() {
             self.no_method(callee, (found, name), &candidates);

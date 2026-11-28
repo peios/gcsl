@@ -452,3 +452,60 @@ fn a_rest_parameter_is_the_list_of_its_arguments() {
         "{a = 7; b = \"x\"; c = 1.5}"
     );
 }
+
+#[test]
+fn a_parameter_written_with_no_type_is_called_as_any() {
+    // Left out, given by position and by name: a constant default, and one
+    // that reads the parameters before it and what the function's scope
+    // holds, evaluated for each call that leaves it out.
+    let text = "let base = 100\n\
+                fn f(a = 1, b = a * 2, c = [a + b + base]): List<Int> { [a, b, c[0]] }\n\
+                x = f()\n\
+                y = f(2)\n\
+                z = f(1, 5)\n\
+                w = f(c = [0], a = 3)";
+    let values: Vec<String> = fields(text).iter().map(ToString::to_string).collect();
+    assert_eq!(
+        values,
+        ["[1, 2, 103]", "[2, 4, 106]", "[1, 5, 106]", "[3, 6, 0]"]
+    );
+    // An impure function's, a function expression's, and a method's.
+    assert_eq!(
+        shown("fn f(n = lazy 3, o = { a = [lazy 4] }) -> Int { n + o.a[0] }\nf() + f(1)"),
+        "12"
+    );
+    assert_eq!(
+        shown(
+            "fn make(n: Int): Int {\n    let g = fn(m = n * 10): Int { m }\n    g()\n}\n\
+             make(1) + make(2)"
+        ),
+        "30"
+    );
+    assert_eq!(
+        shown("fn (x: Int) add(n = 1): Int { x + n }\n[1.add(), 1.add(5), 1.add(n = 9)]"),
+        "[2, 6, 10]"
+    );
+    // Top-level functions in any order, one's default calling another.
+    assert_eq!(
+        shown("let r = f() + g()\nfn f(n = g(2)): Int { n }\nfn g(m = 20): Int { m * 2 }\nr"),
+        "44"
+    );
+}
+
+#[test]
+fn a_memoised_function_is_keyed_by_a_parameter_written_with_no_type() {
+    // The key is the full list of arguments, a default given at the call
+    // as if written, and a future default awaited before the key is made.
+    let text = "fn f(x = 1, y = \"d\", z = lazy 2) ->> {v: Int} { v = x + z }\n\
+                a = f()\n\
+                b = f(1)\n\
+                c = f(1, \"d\", 2)\n\
+                d = f(y = \"e\")\n\
+                e = f(2)";
+    let values = fields(text);
+    assert!(same(&values[0], &values[1]));
+    assert!(same(&values[0], &values[2]));
+    assert!(!same(&values[0], &values[3]));
+    assert!(!same(&values[0], &values[4]));
+    assert_eq!(values[4].to_string(), "{v = 4}");
+}

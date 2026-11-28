@@ -7,7 +7,8 @@
 //! reference calls one (see the checker's "Def-types"):
 //!
 //! ```text
-//! DEFINITION = "def" DT VARIANT? PATH "(" (NAME ("," NAME)* ","?)? ")" BLOCK
+//! DEFINITION = "def" DT VARIANT? PATH "(" (PARAM ("," PARAM)* ","?)? ")" BLOCK
+//! PARAM      = NAME | NAME ":" TYPE "=" EXPR | NAME "=" EXPR
 //! REFERENCE  = DT VARIANT? PATH
 //! META       = "defmeta" DT VARIANT? PATH (BLOCK | "=" EXPR)
 //! DT         = IDENT ("." IDENT)*
@@ -91,11 +92,17 @@
 //! their line starts its path. Its parameters are written by name alone,
 //! each given a type expression nothing reads ([`TypeExprKind::Invalid`]),
 //! its def-type's to give; then any of its own, each `NAME: TYPE = DEFAULT`,
-//! since its def-type calls it with none: one with no default is "`x` is a
+//! or `NAME = DEFAULT`, whose type is its default's
+//! ([`TypeExprKind::Inferred`], as a function expression's parameter
+//! written so has: see [Functions and
+//! calls](crate::parser::functions#functions-and-calls); an `=` there was
+//! "expected `,` or `)`" before),
+//! since its def-type calls it with none: one with a type and no default is
+//! "`x` is a
 //! parameter of the definition's own, which `package` calls with none: give
 //! it a default, or leave its type to `package`", and one by name alone
 //! after one of its own "the parameters `package` gives a definition come
-//! before its own, which have a type and a default". A definition with any
+//! before its own, which have a default". A definition with any
 //! of its own has as its body a block whose result calls a function of
 //! them, without their defaults, whose body is the body written, with their
 //! defaults ([`DefTypeUse::body`]), so that the definition evaluates them
@@ -629,7 +636,8 @@ impl Parser<'_> {
     /// `shown`, as it is written, after their `(`, `open`, through their
     /// `)`: names alone, separated by `,`, each with a type expression of
     /// [`TypeExprKind::Invalid`] that nothing reads, the def-type's to give,
-    /// then the definition's own, each with its type and its default (see
+    /// then the definition's own, each with its default, and its type or
+    /// none (see
     /// [Def-types](#def-types)). Returns the def-type's, the definition's
     /// own, and the `)`. A
     /// parameter that fails is skipped to its `,`, and the list goes on, to
@@ -663,7 +671,7 @@ impl Parser<'_> {
             return Err(reported);
         }
         // The def-type's, written by name alone, then the definition's own,
-        // each with its type and its default.
+        // each with its default.
         let written: Vec<Param> = self.param_stack.drain(base..).collect();
         let given_count = written
             .iter()
@@ -677,7 +685,7 @@ impl Parser<'_> {
             return Err(self.error(
                 format!(
                     "the parameters `{shown}` gives a definition come before its own, which have a \
-                     type and a default"
+                     default"
                 ),
                 late.span,
             ));
@@ -752,8 +760,8 @@ impl Parser<'_> {
 
     /// Parses a parameter of a definition made with the def-type `shown`
     /// whose parameter list `open` opens, a name alone, or one of the
-    /// definition's own, `NAME: TYPE = DEFAULT`, and the `,` or the `)` after
-    /// it. Returns the `)` if it ends the list.
+    /// definition's own, `NAME: TYPE = DEFAULT` or `NAME = DEFAULT`, and the
+    /// `,` or the `)` after it. Returns the `)` if it ends the list.
     pub(super) fn parse_definition_param(
         &mut self,
         open: Token,
@@ -800,6 +808,24 @@ impl Parser<'_> {
                 span: Span::join(token.span, self.type_span(ty)),
                 ty,
                 default: Some(default),
+                default_fn: None,
+                rest: false,
+            });
+            let separator = self.peek();
+            return Ok(self.list_separator(open)?.then_some(separator));
+        }
+        if colon.kind == TokenKind::Eq {
+            // One of the definition's own, its type its default's.
+            let ty = self.builder.alloc_type(TypeExpr {
+                kind: TypeExprKind::Inferred,
+                span: token.span,
+            });
+            let default = self.parse_default()?;
+            self.param_stack.push(Param {
+                name,
+                span: token.span,
+                ty,
+                default,
                 default_fn: None,
                 rest: false,
             });

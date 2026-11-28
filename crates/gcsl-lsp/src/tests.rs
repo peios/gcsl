@@ -1188,6 +1188,87 @@ fn locations(value: &Value) -> Vec<(String, Range)> {
 }
 
 #[test]
+fn a_parameter_written_with_no_type_is_shown_with_its_default_s() {
+    let scratch = Scratch::workspace("untyped-parameter", "");
+    let text = "fn make(): Int { 1 }\nfn f(a = 2, b = make()): Int { a + b }\nr = f(3)\n";
+    let uri = scratch.write("app.gcsl", text);
+    let (mut client, _) = Client::start(&["utf-16"]);
+    client.open(&uri, text);
+    // The hover of the function and of the parameter, at its declaration
+    // and at a use.
+    let shown = |client: &mut Client, at: (u32, u32)| {
+        let hover = client.hover(&uri, at);
+        hover["contents"]["value"].as_str().unwrap().to_owned()
+    };
+    let hover = shown(&mut client, (2, 4));
+    assert!(hover.contains("fn f(a: Int, b: Int): Int"), "{hover}");
+    let hover = shown(&mut client, (1, 12));
+    assert!(hover.contains("b: Int"), "{hover}");
+    let hover = shown(&mut client, (1, 35));
+    assert!(hover.contains("b: Int"), "{hover}");
+    // Signature help, each parameter with its type and its default.
+    let help = client.ask("textDocument/signatureHelp", &uri, (2, 6));
+    assert_eq!(
+        help["signatures"][0]["label"],
+        "fn f(a: Int = 2, b: Int = make()): Int"
+    );
+    assert_eq!(
+        help["signatures"][0]["parameters"],
+        json!([{ "label": [5, 15] }, { "label": [17, 32] }])
+    );
+    assert_eq!(help["activeParameter"], 0);
+    // An inlay hint after the name, where the default does not spell its
+    // type.
+    let params = json!({ "textDocument": { "uri": uri }, "range": range((0, 0), (3, 0)) });
+    let found = client
+        .request("textDocument/inlayHint", params)
+        .response_result
+        .unwrap();
+    let found: Vec<lsp_types::InlayHint> = serde_json::from_value(found).unwrap();
+    let hints: Vec<(Position, String)> = found
+        .into_iter()
+        .map(|hint| {
+            let lsp_types::InlayHintLabel::String(label) = hint.label else {
+                panic!("{:?}", hint.label)
+            };
+            (hint.position, label)
+        })
+        .collect();
+    assert_eq!(hints, [(Position::new(1, 13), ": Int".to_owned())]);
+    // Its references, and a rename of it.
+    let params = json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": 1, "character": 35 },
+        "context": { "includeDeclaration": true },
+    });
+    let response = client.request("textDocument/references", params);
+    assert_eq!(
+        locations(&response.response_result.unwrap()),
+        [
+            (uri.as_str().to_owned(), range((1, 12), (1, 13))),
+            (uri.as_str().to_owned(), range((1, 35), (1, 36))),
+        ]
+    );
+    let position = json!({ "line": 1, "character": 12 });
+    let params = json!({ "textDocument": { "uri": uri }, "position": position, "newName": "by" });
+    let edit = client
+        .request("textDocument/rename", params)
+        .response_result
+        .unwrap();
+    let edits: Vec<lsp_types::TextEdit> =
+        serde_json::from_value(edit["changes"][uri.as_str()].clone()).unwrap();
+    let edits: Vec<(Range, String)> = edits.into_iter().map(|e| (e.range, e.new_text)).collect();
+    assert_eq!(
+        edits,
+        [
+            (range((1, 12), (1, 13)), "by".to_owned()),
+            (range((1, 35), (1, 36)), "by".to_owned()),
+        ]
+    );
+    client.shut_down().unwrap();
+}
+
+#[test]
 fn references_cover_files_not_open() {
     let scratch = Scratch::workspace("references", "");
     let text = "z = y + 1\nw = y\n";

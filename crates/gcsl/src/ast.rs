@@ -958,15 +958,17 @@ pub struct Generics {
     pub types: (u32, u32),
 }
 
-/// One parameter of a function expression, `NAME: TYPE`, or `NAME: TYPE =
-/// DEFAULT` (see [Functions](#functions)).
+/// One parameter of a function expression, `NAME: TYPE`, `NAME: TYPE =
+/// DEFAULT`, or `NAME = DEFAULT`, whose type is its default's (see
+/// [Functions](#functions)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Param {
     /// The parameter's name, always an identifier.
     pub name: Name,
-    /// Where it is written: its name through its type.
+    /// Where it is written: its name through its type, or its name alone
+    /// if it is written with no type.
     pub span: Span,
-    /// Its type.
+    /// Its type; [`TypeExprKind::Inferred`] if it is written with none.
     pub ty: TypeExprId,
     /// Its default, the expression after its `=`, if it has one.
     pub default: Option<ExprId>,
@@ -2155,6 +2157,11 @@ pub enum TypeExprKind {
     /// `(^NAME)` with no type (see the parser's
     /// [Context](crate::parser::context#context)), which the checker resolves.
     Context(Name),
+    /// The type of a parameter written with no type, `NAME = DEFAULT`: its
+    /// default's, which the checker infers (see the parser's [Functions and
+    /// calls](crate::parser::functions#functions-and-calls)). It spans the
+    /// parameter's name.
+    Inferred,
     /// A type that names nothing it can, put in place of a written one by
     /// the expansion of a tree's types ([`Ast::expand_types`]): its error,
     /// if it is this one's to report, is among the tree's problems

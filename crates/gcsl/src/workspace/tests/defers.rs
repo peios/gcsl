@@ -71,7 +71,7 @@ fn a_definition_s_own_parameters_have_types_and_defaults_and_its_effect() {
     let two = "#[def_type] def pair(name: String, f: fn(a: Int) -> Int) -> Int { f(1) }\n";
     assert_eq!(
         error(&format!("{two}def pair one(n: Int = 2, a) {{ a + n }}")),
-        "the parameters `pair` gives a definition come before its own, which have a type and a \
+        "the parameters `pair` gives a definition come before its own, which have a \
          default"
     );
     // Of a pure function type, a pure body, given what pure defaults give.
