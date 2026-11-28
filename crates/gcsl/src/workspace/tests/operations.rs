@@ -1439,3 +1439,37 @@ fn a_handle_given_to_a_step_is_not_data() {
     let held = Plain::Record(vec![("m".to_owned(), Plain::handle("Network", 2))]);
     assert_eq!(Plain::List(vec![held]).handle_within(), Some("Network"));
 }
+
+#[test]
+fn a_loop_statement_that_ends_with_an_operation_runs_it_each_time_and_collects_nothing() {
+    // Each form of loop, standing as a statement, its body ending with an
+    // operation whose value it discards, nested or not.
+    let (mut workspace, mut engine) = machines(
+        "def test one() {\n\
+         \x20   let m = boot({name = \"a\"})\n\
+         \x20   for i in 0..2 { m.run(\"each {i}\") }\n\
+         \x20   let mut n = 0\n\
+         \x20   for n < 2 { n := n + 1; say(\"while {n}\") }\n\
+         \x20   do { say(\"do\") } for false\n\
+         \x20   for i in 0..2 { for j in 0..2 { say(\"{i}{j}\") } }\n\
+         \x20   = \"done\"\n\
+         }",
+    );
+    let results = engine.drive(&mut workspace, &["one"]);
+    assert_eq!(results, [Ok("done".to_owned())]);
+    assert_eq!(
+        engine.asked,
+        [
+            "vm.boot({name = \"a\"; cpus = 1}, [])",
+            "vm.run(<vm.machine 1>, [\"each 0\"])",
+            "vm.run(<vm.machine 1>, [\"each 1\"])",
+            "say(\"while 1\")",
+            "say(\"while 2\")",
+            "say(\"do\")",
+            "say(\"00\")",
+            "say(\"01\")",
+            "say(\"10\")",
+            "say(\"11\")",
+        ]
+    );
+}

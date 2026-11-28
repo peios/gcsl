@@ -465,3 +465,61 @@ fn any_other_statement_is_still_an_unused_value() {
     let text = "for x in [1] { x }\n2";
     assert_eq!(diagnostics(text)[0].span, at(text, "for x in [1] { x }"));
 }
+
+#[test]
+fn a_loop_statement_ending_with_an_impure_call_collects_nothing() {
+    let op = "fn op(n: Int) -> Int { n }\nfn pure_op(n: Int): Int { n }\n";
+    let of = |text: &str| format!("{op}{text}\n2");
+    // Every form of loop, its body ending with a call of an impure
+    // function, or with such a loop, nested.
+    for text in [
+        "for i in 0..3 { op(i) }",
+        "for i in [1, 2] if i > 1 { op(i) }",
+        "let mut n = 0\nfor n < 3 { n := n + 1; op(n) }",
+        "do { op(1) } for false",
+        "for { op(1); break }",
+        "(for i in 0..3 { op(i) })",
+        "for i in 0..3 { for j in 0..2 { op(j) } }",
+        "fn f() -> {} { for i in 0..3 { op(i) }; = {} }",
+    ] {
+        let found = diagnostics_or_none(&of(text));
+        assert!(found.is_empty(), "{text}: {found:?}");
+    }
+    // Any other value there is still unused, and so is the loop's list
+    // where a `break` or `continue` gives it a value of its own, or a
+    // result written `= EXPR` ends its body.
+    for (text, shown) in [
+        ("for i in 0..3 { i * 2 }", "`List<Int>`"),
+        ("for i in 0..3 { pure_op(i) }", "`List<Int>`"),
+        ("for i in 0..3 { op(i) + 1 }", "`List<Int>`"),
+        ("for i in 0..3 { = op(i) }", "`List<Int | Future<Int>>`"),
+        (
+            "for i in 0..3 { if i == 1 { break 5 }; op(i) }",
+            "`List<Int | Future<Int>>`",
+        ),
+        ("for i in 0..3 { for j in 0..2 { j } }", "`List<List<Int>>`"),
+        (
+            "for i in 0..3 { { a = op(i) } }",
+            "`List<{a: Int | Future<Int>}>`",
+        ),
+    ] {
+        assert_eq!(
+            messages(&of(text)),
+            vec![format!("unused value of type {shown}")],
+            "{text}"
+        );
+    }
+    // In a pure function nothing is discarded.
+    assert_eq!(
+        messages(&of("fn f(): {} { for i in 0..3 { op(i) }; = {} }")),
+        vec![
+            "unused value of type `List<Int | Future<Int>>`",
+            "cannot call an impure function from a pure function"
+        ]
+    );
+    // A loop whose value is used collects as ever.
+    assert_eq!(
+        shown_result(&of("let r = for i in 0..3 { op(i) }\n= r").replace("\n2", "")),
+        "List<Int | Future<Int>>"
+    );
+}
