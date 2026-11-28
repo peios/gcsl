@@ -292,16 +292,19 @@ fn messages(files: &[(&str, &str)], path: &str) -> Vec<String> {
 
 mod across;
 mod arguments;
+mod blocks;
 mod defers;
 mod deftypes;
 mod effects;
 mod errors;
+mod failure;
 mod fileroot;
 mod files;
 mod fs;
 mod graph;
 mod imports;
 mod suspension;
+mod yields;
 
 mod coverage;
 mod invoke;
@@ -312,6 +315,7 @@ mod memo;
 mod merging;
 mod metas;
 mod needs;
+mod operations;
 mod profile;
 mod reach;
 mod shadowing;
@@ -321,3 +325,4 @@ mod strings;
 mod summary;
 mod toplevel;
 mod types;
+mod untyped;

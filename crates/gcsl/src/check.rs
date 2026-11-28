@@ -21,9 +21,10 @@
 //! - Expressions: [`expect`], [`operators`], [`names`], [`fields`],
 //!   [`lists`], [`loops`] and [`narrowing`].
 //! - Functions and calls: [`functions`], [`calls`], [`methods`],
-//!   [`inference`], [`futures`] and [`attributes`].
-//! - The rest of the language: [`enums`], [`context`], [`failure`] and
-//!   [`secrets`].
+//!   [`blocks`], [`inference`], [`untyped`], [`futures`] and [`attributes`].
+//! - The rest of the language: [`enums`], [`context`], [`failure`],
+//!   [`secrets`] and [`operations`], the operations and handle types a
+//!   host of the language gives a program.
 //!
 //! # Types
 //!
@@ -201,6 +202,7 @@ pub(crate) use resolution::KnownParams;
 use deftypes::DefTypesChecked;
 use needs::ContextsChecked;
 use resolution::{CallsChecked, DefaultFn, ForLowering, merged_defaults};
+use untyped::{DefaultType, EarlyDefaults};
 
 /// What a call of a generic function has bound of its type parameters so
 /// far, as [`Checker::instantiate`] binds them.
@@ -329,6 +331,17 @@ pub(crate) const FAILURE_MESSAGE: &str = "message";
 
 /// See [`FAILURE_MESSAGE`].
 pub(crate) const FAILURE_NOTES: &str = "notes";
+
+/// The name of the variable in which a `recover`'s fallback keeps which of
+/// the failures caught is its own, for `raise` (see
+/// [Failure](crate::check::failure#failure)): no program can write it, `<`
+/// being in no identifier.
+pub(crate) const FAILURE_AT: &str = "<failure>";
+
+/// The word that raises again the failure a `recover` caught, in its
+/// fallback, which is no keyword (see
+/// [Failure](crate::check::failure#failure)).
+pub(crate) const RAISE: &str = "raise";
 
 /// A variable, field or callee in scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -619,6 +632,10 @@ struct TopFn {
     blocker: Option<Blocker>,
     /// Where its closure is made.
     made: MadeAt,
+    /// Whether its signature is pending: it has a parameter written with no
+    /// type, whose type its group's check has yet to find (see [Untyped
+    /// parameters](crate::check::untyped#untyped-parameters)).
+    pending: bool,
 }
 
 /// Why a top-level function does not exist before some item: what it
@@ -1454,6 +1471,11 @@ pub(crate) fn check_enum_bounds(
         let ItemKind::Enum { bound, .. } = ast.item(item).kind else {
             continue;
         };
+        // A handle's payload is the number its host chose.
+        if ast.extern_type(item).is_some() {
+            checker.types.set_enum_bound(key, Some(TyId::INT));
+            continue;
+        }
         let bound = bound
             .map(|bound| checker.resolve_type(bound, Bareness::Present))
             .filter(|&bound| bound != TyId::ERROR);
@@ -1523,6 +1545,13 @@ pub(crate) fn check_variant_payloads(
             continue;
         };
         let names = ast.names();
+        if crate::names::extern_kind(names.get(enum_key)).is_some() {
+            checker
+                .errors
+                .push(handle_variant(ast, enum_name, name_span));
+            checker.types.set_variant_payload(key, TyId::ERROR);
+            continue;
+        }
         let shown = format!("{}::{}", names.get(enum_name), names.get(name));
         if let Some(&(_, _, first)) = declared
             .iter()
@@ -1563,6 +1592,31 @@ pub(crate) fn check_variant_payloads(
     checker.errors
 }
 
+/// The error for a variant declared, at `name_span`, for the handle type
+/// named `enum_name`, labelled at the handle type if `ast` declares it (see
+/// [Handle types](crate::check::operations#handle-types)).
+fn handle_variant(ast: &Ast, enum_name: Name, name_span: Span) -> Diagnostic {
+    let shown = ast.names().get(enum_name);
+    let error = Diagnostic::error(
+        format!("`{shown}` is a handle type: only the host makes its values"),
+        name_span,
+    )
+    .with_note("an operation of the host's gives a handle; no variant is declared for one");
+    let declared = ast
+        .extern_types()
+        .iter()
+        .find_map(|handle| match ast.item(handle.item).kind {
+            ItemKind::Enum {
+                name, name_span, ..
+            } if name == enum_name => Some(name_span),
+            _ => None,
+        });
+    match declared {
+        Some(at) => error.with_context(at, "declared `extern` here"),
+        None => error,
+    }
+}
+
 /// The names of the built-in types: those of [`BuiltinTypes`], and the
 /// type constructors, `List`, `Future` and `Present`. A `type` may not be
 /// named like one: "`Int` is a built-in type".
@@ -1598,8 +1652,14 @@ type AttributeFields = Vec<(Box<str>, TyId, Option<Constant>)>;
 /// parameter's position on and every spread the rest parameter, the
 /// trailing block the last, and named ones the parameters of their names;
 /// only the first that fills a parameter but the rest parameter, and none
-/// that fills nothing.
-fn argument_targets(args: &[Arg], sig: &FnTy) -> Vec<(ExprId, usize, bool)> {
+/// that fills nothing. `block_after_rest` is whether the last parameter is
+/// a block after a rest parameter ([`Checker::block_after_rest`]), which
+/// the trailing block then fills whatever the positional arguments are.
+fn argument_targets(
+    args: &[Arg],
+    sig: &FnTy,
+    block_after_rest: bool,
+) -> Vec<(ExprId, usize, bool)> {
     let count = sig.params.len();
     let rest = sig.rest.map(usize::from);
     let positional = args
@@ -1616,7 +1676,7 @@ fn argument_targets(args: &[Arg], sig: &FnTy) -> Vec<(ExprId, usize, bool)> {
                 sig.positional(next - 1)
             }
             ArgKind::Spread { .. } => rest,
-            ArgKind::Trailing => (positional < count).then(|| count - 1),
+            ArgKind::Trailing => (positional < count || block_after_rest).then(|| count - 1),
             ArgKind::Named { name, .. } => sig
                 .params
                 .iter()
@@ -2369,7 +2429,8 @@ impl<'a> Checker<'a> {
                 ItemKind::Field { .. } | ItemKind::Spread(_)
             )
         });
-        let mut result = TyId::EMPTY;
+        let (mut result, statements) = (TyId::EMPTY, self.is_statements(body));
+        let definition = self.definition_end(body);
         // Whether this is the input's outermost block, whose top-level
         // functions are order-free.
         let root = body == self.ast.root() && self.functions.is_empty();
@@ -2449,9 +2510,9 @@ impl<'a> Checker<'a> {
                 ItemKind::Expr(value) => {
                     // In a record block, even the final expression is a
                     // statement.
-                    let is_result = next.is_none() && first_field.is_none();
+                    let is_result = next.is_none() && first_field.is_none() && !statements;
                     let ty = self.expression_item(value, is_result, result_expected);
-                    if is_result {
+                    if is_result && !self.ends_definition(definition, ty) {
                         result = ty;
                     } else {
                         self.check_statement(value, ty);
@@ -2516,6 +2577,7 @@ impl<'a> Checker<'a> {
             ExprKind::With { bindings, body } => self.check_with(id, bindings, body),
             ExprKind::Assert { cond, message } => self.check_assert(id, cond, message),
             ExprKind::Recover(recover) => self.check_recover(recover),
+            ExprKind::Try(operand) => self.check_try(operand),
             ExprKind::Size(_) => TyId::SIZE,
             ExprKind::Bool(_) => TyId::BOOL,
             ExprKind::Str(_) => TyId::STRING,
@@ -2590,8 +2652,11 @@ impl<'a> Checker<'a> {
             ExprKind::Index { expr: list, index } => self.check_index(id, list, index),
             ExprKind::For(for_id) => self.check_for(id, for_id, (None, None)),
             ExprKind::DefTypeRef(def) => self.check_def_type_ref(id, def),
-            // What the parser could not parse, reported already.
-            ExprKind::Error => TyId::ERROR,
+            // What the parser could not parse, reported already; and what
+            // an operation's body calls, only ever a call's callee, typed
+            // with its call (see [Host
+            // operations](crate::check::operations#host-operations)).
+            ExprKind::Error | ExprKind::Operation => TyId::ERROR,
             // What the parser kept of what it could not finish, reported
             // already: checked for what it is, silently.
             ExprKind::NoField(record) => {
@@ -2710,7 +2775,9 @@ impl<'a> Checker<'a> {
             | ExprKind::For(_)
             | ExprKind::DefTypeRef(_)
             | ExprKind::ContextRead(_)
+            | ExprKind::Operation
             | ExprKind::Assert { .. }
+            | ExprKind::Try(_)
             | ExprKind::Error
             | ExprKind::NoField(_)
             | ExprKind::Unclosed { .. } => {}
@@ -2794,6 +2861,7 @@ impl<'a> Checker<'a> {
             | TyKind::Partial(_)
             | TyKind::Secret(..)
             | TyKind::Data
+            | TyKind::Block { .. }
             // TEMPORARY (alias rule): see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/).
             | TyKind::Builtin(_) => {
@@ -3179,6 +3247,7 @@ fn explicit_await_error(keyword: Span, marker: Span) -> Diagnostic {
 }
 
 pub(crate) mod attributes;
+pub(crate) mod blocks;
 pub(crate) mod builtin;
 pub(crate) mod calls;
 pub(crate) mod context;
@@ -3202,6 +3271,7 @@ pub(crate) mod mutation;
 pub(crate) mod names;
 pub(crate) mod narrowing;
 pub(crate) mod needs;
+pub(crate) mod operations;
 pub(crate) mod operators;
 pub(crate) mod records;
 pub(crate) mod resolution;
@@ -3211,6 +3281,7 @@ pub(crate) mod schedule;
 pub(crate) mod scopes;
 pub(crate) mod secrets;
 pub(crate) mod toplevel;
+pub(crate) mod untyped;
 
 #[cfg(test)]
 mod tests;

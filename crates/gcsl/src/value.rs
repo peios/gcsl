@@ -929,6 +929,50 @@ pub enum Value {
     /// given by default (see [Sandboxes](crate::eval::sandbox#sandboxes)),
     /// compared by its copy alone.
     Sandbox(Rc<Sandbox>),
+    /// A block: the trailing block of a call, as the callee's block
+    /// parameter holds it, of kind [`ValueKind::Fn`] (see
+    /// [Blocks](crate::eval::blocks#blocks)). It is only ever in that
+    /// parameter's slot, and only while the call runs.
+    Block(Rc<Block>),
+}
+
+/// A block, as a callee's block parameter holds it (see
+/// [Blocks](crate::eval::blocks#blocks)): the body of the trailing block
+/// and the frame of the call's caller, which it runs in.
+#[derive(Clone)]
+pub struct Block {
+    /// The IR the block's body belongs to, its caller's.
+    pub(crate) code: Rc<Ir>,
+    /// The block's body.
+    pub(crate) body: crate::ir::IrId,
+    /// The body's height, for the nesting budget.
+    pub(crate) height: u16,
+    /// Where the caller's frame starts on the value stack.
+    pub(crate) base: usize,
+    /// The closure the caller's frame runs; `None` at the top level and in
+    /// a `lazy`'s body.
+    pub(crate) callee: Option<Rc<Closure>>,
+    /// The captured values of the `lazy` whose body the caller's frame
+    /// runs; `None` for any other frame.
+    pub(crate) captures: Option<Rc<[Value]>>,
+    /// The caller's frame's caller.
+    pub(crate) caller: Caller,
+}
+
+/// Blocks are equal only if they are one: the same body in the same frame.
+impl PartialEq for Block {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.code, &other.code) && self.body == other.body && self.base == other.base
+    }
+}
+
+impl fmt::Debug for Block {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Block")
+            .field("body", &self.body)
+            .field("base", &self.base)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A sandbox, as values carry it (see
@@ -1008,6 +1052,16 @@ pub struct Tag {
     pub shown: Rc<str>,
 }
 
+impl Tag {
+    /// The kind of the handle the tag is the variant of, if it is a
+    /// handle's (see [`crate::names`], "Handle keys"): what it is shown
+    /// as, between angle brackets, as no variant a program declares is.
+    #[must_use]
+    pub fn handle(&self) -> Option<&str> {
+        self.shown.strip_prefix('<')?.strip_suffix('>')
+    }
+}
+
 /// A value of an enum: its variant and its payload.
 #[derive(Debug, PartialEq)]
 pub struct Variant {
@@ -1029,7 +1083,7 @@ impl Value {
             Value::Str(_) => ValueKind::String,
             Value::Empty | Value::Record(_) => ValueKind::Record,
             Value::List(_) => ValueKind::List,
-            Value::Fn(_) | Value::Builtin(_) | Value::Tag(_) => ValueKind::Fn,
+            Value::Fn(_) | Value::Builtin(_) | Value::Tag(_) | Value::Block(_) => ValueKind::Fn,
             Value::Future(_) => ValueKind::Deferred,
             // A value of an enum is of no kind of its own: present, of the
             // kind a node of an enum's type has; and so is a secret.
@@ -1226,9 +1280,10 @@ impl fmt::Display for Value {
             Value::Fn(closure) => f.write_str(closure.display()),
             Value::Builtin(builtin) => f.write_str(builtin.display()),
             Value::Tag(tag) => f.write_str(&tag.shown),
-            Value::Variant(variant) => {
-                write!(f, "{}({})", variant.tag.shown, variant.payload.repr())
-            }
+            Value::Variant(variant) => match variant.tag.handle() {
+                Some(kind) => write!(f, "<{kind} {}>", variant.payload.repr()),
+                None => write!(f, "{}({})", variant.tag.shown, variant.payload.repr()),
+            },
             // The one way a secret is shown, wherever it is.
             Value::Secret(_) => f.write_str("***"),
             // As the call that makes it, which reads back as an equal file.
@@ -1236,6 +1291,8 @@ impl fmt::Display for Value {
             Value::Dir(dir) => write!(f, "dir({})", Quoted(&dir.path)),
             // No call makes one again: it is a live directory, not data.
             Value::Sandbox(sandbox) => write!(f, "<sandbox {}>", sandbox.root),
+            // Never shown: a block is in no value a program can show.
+            Value::Block(_) => f.write_str("<block>"),
             Value::Future(future) => f.write_str(future.display()),
             Value::Record(record) => {
                 f.write_str("{")?;
@@ -1311,7 +1368,7 @@ impl fmt::Display for Derivation<'_> {
                 }
                 f.write_str("]")
             }
-            Value::Variant(variant) => {
+            Value::Variant(variant) if variant.tag.handle().is_none() => {
                 write!(f, "{}({})", variant.tag.shown, Derivation(&variant.payload))
             }
             value => value.repr().fmt(f),

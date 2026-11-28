@@ -38,15 +38,33 @@
 //! is F exactly. Parameters not as many as F's are "`package` defines
 //! functions of no parameters" ("of 1 parameter, `x`", "of 2 parameters,
 //! `a` and `b`", naming them if F names them all), at its parameter list.
-//! A definition's parameters of its own, written with a type and a default
-//! after F's (see the parser's "Def-types"), are those of its body's
+//! A definition's parameters of its own, written with a default, and a type
+//! or none, after F's (see the parser's "Def-types"), are those of its body's
 //! function, which its own function calls with their defaults, so that its
 //! type is still F's: the body's function is checked with F's result and
-//! F's effect, its parameters typed as written, and known by the
+//! F's effect, its parameters typed as written, one written with no type,
+//! `def test t(m = machine())`, by its default, the argument of that call
+//! (see [Untyped parameters](crate::check::untyped#untyped-parameters)),
+//! and known by the
 //! definition's last segment (`Checker::note_definition_body`); and it
 //! takes the definition's attributes, so that a deferring one makes it the
 //! step, given what its defaults came to where the def-type called the
 //! definition.
+//!
+//! **A definition's last expression.** Where F's result is `{}`, a
+//! definition's body ends as a block that fills a `block -> {}` does (see
+//! [Blocks](crate::check::blocks#blocks)), so that `def test t() {
+//! c.add(1) }` needs no `{}` after its call: its last expression, if it is
+//! no `{}`, awaited or not, is a statement
+//! (`Checker::ends_definition`), a call of an impure function, whose value
+//! is discarded, or a loop, which collects nothing, and any other value
+//! there is an unused value. One that is `{}`, or a future of it, is the
+//! body's result, as it ever was, and a result written `= EXPR` is its
+//! value still: so nothing that checked before means anything else. This
+//! is of the body a definition is written with alone, with parameters of
+//! its own or without: an ordinary function's body, a meta's, and the body
+//! of a definition of a def-type whose definitions return anything else,
+//! a generic one's among them, end with their result.
 //!
 //! When the walk reaches a definition (`Checker::place_definition`), it is
 //! placed in its namespace as the dotted field of its path under the key is
@@ -168,8 +186,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    DefTypeId, DefTypeRole, Effect, ExprId, ExprKind, FnId, ItemId, ItemKind, PathSegment,
-    SegmentKind, path_span,
+    DefTypeId, DefTypeRole, Effect, ExprId, ExprKind, FnId, ItemId, ItemKind, ItemRange,
+    PathSegment, SegmentKind, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::mentions::Resolve;
@@ -196,6 +214,10 @@ pub(super) struct DefTypesChecked {
     /// effect its def-type gives it and the name it is known by, its
     /// definition's.
     pub(super) bodies: HashMap<FnId, (TyId, Effect, Option<Name>)>,
+    /// The call of the function of the body of each definition with
+    /// parameters of its own, whose arguments are their defaults (see
+    /// [Untyped parameters](crate::check::untyped#untyped-parameters)).
+    pub(super) own_calls: HashMap<FnId, ExprId>,
     /// The definition's meta each function expression is, if it is one (see
     /// [Metas](crate::check::attributes#metas)).
     pub(super) metas: HashMap<FnId, DefTypeId>,
@@ -672,6 +694,7 @@ impl Checker<'_> {
         let dt_span = self.ast.get(use_.dt).span;
         if let Some(body) = use_.body {
             self.note_definition_body(body, (ret, sig.effect), def);
+            self.note_own_call(body, decl.body);
         }
         self.functions.push(Function {
             fn_id: function,
@@ -726,6 +749,53 @@ impl Checker<'_> {
         ty
     }
 
+    /// Notes that `body`, the block about to be checked of the function
+    /// being checked, against the result `ret`, is one whose last
+    /// expression may be a statement (see the module documentation, "A
+    /// definition's last expression"): the body a definition is written
+    /// with, of a def-type whose definitions return `{}`, if it ends with
+    /// an expression.
+    pub(super) fn note_definition_end(&mut self, body: ExprId, ret: TyId) {
+        let written = self.functions.last().is_some_and(|function| {
+            self.def_types.definitions.contains_key(&function.fn_id)
+                || self.def_types.bodies.contains_key(&function.fn_id)
+        });
+        if written && let Some(items) = self.ends_with_statement(body, ret) {
+            self.calls.definition_end = Some((items, body));
+        }
+    }
+
+    /// The block of the definition's body whose items `body` are about to
+    /// be checked, if its last expression may be a statement, as
+    /// [`Checker::note_definition_end`] found: asked once, as its items
+    /// are checked.
+    pub(super) fn definition_end(&mut self, body: ItemRange) -> Option<ExprId> {
+        self.calls
+            .definition_end
+            .take_if(|(items, _)| *items == body)
+            .map(|(_, block)| block)
+    }
+
+    /// Whether `value`, of type `ty`, the last expression of the body
+    /// `block` of a definition whose def-type's definitions return `{}`,
+    /// is a statement (see the module documentation, "A definition's last
+    /// expression"): if it is no `{}`, awaited or not, which is the body's
+    /// result as ever. It is then recorded for lowering, its value
+    /// discarded.
+    pub(super) fn ends_definition(&mut self, block: Option<ExprId>, ty: TyId) -> bool {
+        let Some(block) = block else {
+            return false;
+        };
+        let fits = ty == TyId::ERROR
+            || ty == self.never
+            || self.types.strip(ty) == TyId::EMPTY
+            || self.types.present(ty) == TyId::EMPTY;
+        if !fits {
+            self.lowering.statement_bodies.insert(block);
+        }
+        !fits
+    }
+
     /// Records `body`, the function of the body of the definition `def`,
     /// which has parameters of its own, as one whose result type is `ret`
     /// and whose effect is `effect`, its def-type's, and whose name is the
@@ -734,6 +804,20 @@ impl Checker<'_> {
         let use_ = *self.ast.def_type(def);
         let name = self.ast.path(use_.path).last().and_then(PathSegment::name);
         self.def_types.bodies.insert(body, (ret, effect, name));
+    }
+
+    /// Records the call of `body`, the function of the body of a definition
+    /// with parameters of its own, that the definition's body `block` is,
+    /// as the parser makes it: the result of a block of that one item.
+    fn note_own_call(&mut self, body: FnId, block: ExprId) {
+        let ExprKind::Block { items, .. } = self.ast.get(block).kind else {
+            return;
+        };
+        if let [item] = self.ast.items(items)
+            && let ItemKind::Result(call) = self.ast.item(*item).kind
+        {
+            self.def_types.own_calls.insert(body, call);
+        }
     }
 
     /// Records the definition `def`, of function `function`, whose function

@@ -20,7 +20,10 @@
 //! the input starts (`Checker::declare_top_fns`), every top-level function
 //! is declared, in source order, with the type its signature declares, so
 //! its binding comes first among the input's bindings and its slot is one
-//! of the input's first. The input's other bindings are declared after
+//! of the input's first. (One with a parameter written with no type
+//! declares none yet: its signature is pending, and found when its group's
+//! bodies are about to be checked, before any of them: see [Untyped
+//! parameters](crate::check::untyped#untyped-parameters).) The input's other bindings are declared after
 //! them as the walk reaches them, so a scope's bindings still occupy slots
 //! in order, and a session's [`Scope`](super::Scope) keeps that order. A top-level
 //! function hides a variable or field of its name from an earlier input,
@@ -318,6 +321,10 @@ impl<'a> Checker<'a> {
                     .flatten(),
                 Some(_) => None,
             };
+            // A definition's parameters are its def-type's, and a meta has
+            // none.
+            let pending = self.has_untyped(top.function);
+            self.calls.untyped.pending += usize::from(pending);
             self.top_fns.push(TopFn {
                 item: top.item,
                 expr: top.expr,
@@ -331,6 +338,7 @@ impl<'a> Checker<'a> {
                 ready: 0,
                 blocker: None,
                 made: MadeAt::Own,
+                pending,
             });
         }
         self.top_copies = vec![Vec::new(); self.top_fns.len()];
@@ -1037,7 +1045,19 @@ impl<'a> Checker<'a> {
     /// fields](#top-level-fields)). The accesses beyond that prefix are
     /// left to the caller as ordinary accesses: this answers only for the
     /// expression that names the node, recording where its value is read.
+    /// A node that is, or has under it, a function whose signature is
+    /// pending is erroneous, reported (see [Untyped
+    /// parameters](crate::check::untyped#untyped-parameters)).
     pub(super) fn field_reference(&mut self, id: ExprId) -> Option<TyId> {
+        let ty = self.field_node_reference(id)?;
+        if self.pending_reference(id) {
+            return Some(TyId::ERROR);
+        }
+        Some(ty)
+    }
+
+    /// [`Checker::field_reference`], whatever the node holds.
+    fn field_node_reference(&mut self, id: ExprId) -> Option<TyId> {
         if self.workspace.is_some_and(Context::has_poison) {
             let mut base = id;
             while let ExprKind::Field { expr, .. } = self.ast.get(base).kind {
@@ -1202,7 +1222,9 @@ impl<'a> Checker<'a> {
     /// signature is written, without inferring anything from its body:
     /// what a use of a top-level function sees before its body is checked.
     /// `Error` if the signature is erroneous, which this reports nothing
-    /// of: the function's own check does.
+    /// of: the function's own check does; and if a parameter of it written
+    /// with no type has yet to be typed (see [Untyped
+    /// parameters](crate::check::untyped#untyped-parameters)).
     pub(super) fn declared_type(&mut self, function: FnId) -> TyId {
         let (errors, warnings) = (self.errors.len(), self.warnings.len());
         let decl = *self.ast.fn_decl(function);

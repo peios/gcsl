@@ -223,6 +223,7 @@ impl Evaluator<'_> {
             | Value::File(_)
             | Value::Dir(_)
             | Value::Sandbox(_)
+            | Value::Block(_)
             | Value::Future(_) => {
                 return mistyped(node, "an update of a value that is not a record");
             }

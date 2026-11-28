@@ -184,6 +184,32 @@
 //! `fn(Int) -> Int`, whose bare parameter is the either shape, but is one of
 //! `fn(Present<Int>) -> Int`. That is the contravariance above, nothing new.
 //!
+//! # Blocks
+//!
+//! A block type, [`TyKind::Block`], `block -> T` or `block: T`, is the type
+//! of a function's block parameter (see the checker's
+//! [Blocks](crate::check::blocks#blocks)): what a call of the block gives,
+//! and its [`Effect`], what its body may do, impure (`->`) or pure (`:`),
+//! never memoised. It is made by [`TypeTable::block`] and read by
+//! [`TypeTable::block_sig`], and is a type only of a parameter, the last of
+//! a function type's: `fn(name: String, body: block -> {}) -> {}`. What its
+//! bare result means is the checker's business, as a function's is: the
+//! either shape in an impure block and present in a pure one.
+//!
+//! A block is no value, so its type takes part in little. It is a subtype
+//! only of itself: two block types of one result and one effect are one
+//! id, and no others are related, so a function type with a block is a
+//! subtype of another only if their blocks are the same type, a pure block
+//! standing in for no impure one. It is not in the function lattice, has no
+//! equality ([`TypeTable::contains_fn`]) and no JSON form, and is
+//! laziness-present. Its value kind is a function's ([`ValueKind::Fn`]),
+//! since a block is called as a function is. A generic function's block
+//! may mention its type parameters in its result, which a call binds from
+//! the type of the trailing block's value ([`TypeTable::bind`]);
+//! [`TypeTable::substitute`] and [`TypeTable::settle`] rebuild it around
+//! its result. It is shown as it is written, `block -> Int` or `block:
+//! Int`, its result as any type is shown.
+//!
 //! # Generics
 //!
 //! A generic function's type, `fn<T>(x: T): T`, is a function type whose
@@ -602,6 +628,15 @@ pub enum TyKind {
     /// `*`, [`TyId::DATA`], any data, which only a rest-field's type can be
     /// (see [Open records](#open-records)).
     Data,
+    /// `block -> T` or `block: T`, the type of a function's block parameter
+    /// (see [Blocks](#blocks)): what a call of the block gives, and what
+    /// its body may do. A subtype only of itself.
+    Block {
+        /// What a call of it gives.
+        ret: TyId,
+        /// What its body may do: [`Effect::Pure`] or [`Effect::Impure`].
+        effect: Effect,
+    },
 }
 
 /// What a generic function's type parameters belong to: one of its own,
@@ -983,7 +1018,8 @@ impl TypeTable {
             | TyKind::List(inner)
             | TyKind::Variant { payload: inner, .. }
             | TyKind::Partial(inner)
-            | TyKind::Secret(inner, _) => self.has_provisional(*inner),
+            | TyKind::Secret(inner, _)
+            | TyKind::Block { ret: inner, .. } => self.has_provisional(*inner),
             TyKind::Union(members) => members.iter().any(|&member| self.has_provisional(member)),
             TyKind::Int
             | TyKind::Float
@@ -1067,6 +1103,7 @@ impl TypeTable {
             | TyKind::Variant { payload: inner, .. }
             | TyKind::Partial(inner)
             | TyKind::Secret(inner, _)
+            | TyKind::Block { ret: inner, .. }
             | TyKind::Provisional { inner, .. } => self.special_builtin(*inner),
             TyKind::Union(members) => members
                 .iter()
@@ -1333,6 +1370,7 @@ impl TypeTable {
             | TyKind::List(inner)
             | TyKind::Partial(inner)
             | TyKind::Secret(inner, _)
+            | TyKind::Block { ret: inner, .. }
             | TyKind::Provisional { inner, .. }) => self.any_param(inner, of),
             TyKind::Union(members) => members.iter().any(|&member| self.any_param(member, of)),
             &TyKind::Variant {
@@ -1442,6 +1480,10 @@ impl TypeTable {
                 let inner = self.substitute(inner, generic, args);
                 self.secret_of(inner, revealed)
             }
+            TyKind::Block { ret, effect } => {
+                let ret = self.substitute(ret, generic, args);
+                self.block(ret, effect)
+            }
             _ => ty,
         }
     }
@@ -1532,6 +1574,8 @@ impl TypeTable {
                 let given = self.secret_value(present).unwrap_or(present);
                 self.bind(inner, given, generic, bound)
             }
+            // A block binds from its body's value.
+            TyKind::Block { ret, .. } => self.bind(ret, arg, generic, bound),
             _ => None,
         }
     }
@@ -1831,6 +1875,26 @@ impl TypeTable {
         self.intern(TyKind::Variant { of, payload, call })
     }
 
+    /// `block -> T` or `block: T`, as `effect` says, of the result `ret`,
+    /// `T` (see [Blocks](#blocks)), adding it to the table if it is new;
+    /// `Error` for an erroneous result.
+    pub fn block(&mut self, ret: TyId, effect: Effect) -> TyId {
+        if ret == TyId::ERROR {
+            return ret;
+        }
+        self.intern(TyKind::Block { ret, effect })
+    }
+
+    /// What a call of the block type `id` gives, and what its body may do,
+    /// if it is one (see [Blocks](#blocks)).
+    #[must_use]
+    pub fn block_sig(&self, id: TyId) -> Option<(TyId, Effect)> {
+        match *self.kind(id) {
+            TyKind::Block { ret, effect } => Some((ret, effect)),
+            _ => None,
+        }
+    }
+
     /// `Partial<T>` of the record type `record` (see [Partial
     /// records](#partial-records)), adding it to the table if it is new.
     pub fn partial(&mut self, record: TyId) -> TyId {
@@ -2013,7 +2077,7 @@ impl TypeTable {
         match self.kinds.get(id.index()) {
             // TEMPORARY (alias rule): a special built-in's opaque type is a function's (see the
             // [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
-            Some(TyKind::Fn(_) | TyKind::Builtin(_)) => true,
+            Some(TyKind::Fn(_) | TyKind::Builtin(_) | TyKind::Block { .. }) => true,
             Some(TyKind::Record(record)) => record
                 .fields
                 .iter()
@@ -2238,6 +2302,10 @@ impl TypeTable {
             TyKind::Secret(value, revealed) => {
                 let value = self.settle(value, function, decisions);
                 self.secret_of(value, revealed)
+            }
+            TyKind::Block { ret, effect } => {
+                let ret = self.settle(ret, function, decisions);
+                self.block(ret, effect)
             }
             TyKind::Provisional { .. }
             | TyKind::Int
@@ -3300,7 +3368,10 @@ impl TypeTable {
             // TEMPORARY (alias rule): a special built-in's opaque type is a function's kind (see
             // the [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
             // A variant is called as a function is.
-            TyKind::Fn(_) | TyKind::Builtin(_) | TyKind::Variant { .. } => Some(ValueKind::Fn),
+            // A block is called as a function is.
+            TyKind::Fn(_) | TyKind::Builtin(_) | TyKind::Variant { .. } | TyKind::Block { .. } => {
+                Some(ValueKind::Fn)
+            }
             // A type parameter's: any value at all, what a call binds it to.
             TyKind::Future(_) | TyKind::Either(_) | TyKind::Param { .. } => {
                 Some(ValueKind::Deferred)
@@ -3579,6 +3650,25 @@ impl TypeTable {
             table: self,
             names,
             id,
+            written: false,
+        }
+    }
+
+    /// Type `id` shown as [`TypeTable::display`] shows it, but as a source
+    /// writes it where a bare type means the either shape, an impure
+    /// function's parameter: an either shape, `T | Future<T>`, and a
+    /// provisional type as the `T` written, at its top and at every
+    /// position inside it, through record and list types and a union's
+    /// members, but not in a function type, which is shown as it is. So the
+    /// type of a parameter written `xs: List<Int>` there shows as
+    /// `List<Int>`.
+    #[must_use]
+    pub fn display_written<'a>(&'a self, id: TyId, names: &'a Names) -> impl fmt::Display + 'a {
+        Display {
+            table: self,
+            names,
+            id,
+            written: true,
         }
     }
 

@@ -66,6 +66,7 @@ fn compile_prelude(text: &str) -> Rc<Ir> {
 // ----- `return`, labelled blocks and loops that return -----
 
 mod arithmetic;
+mod blocks;
 mod calls;
 mod control;
 mod extensions;

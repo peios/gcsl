@@ -271,6 +271,9 @@ impl Checker<'_> {
                 Some(context) => self.types.context_type(context.key).unwrap_or(TyId::ERROR),
                 None => TyId::ERROR,
             },
+            // A parameter written with no type, as its default types it,
+            // in its own function's mode already.
+            TypeExprKind::Inferred => self.untyped_param(id, ty.span),
             // A type parameter in scope, which no bareness wraps.
             TypeExprKind::Named(name)
                 if let Some((owner, index)) = self.ast.type_param(id, name) =>
@@ -315,6 +318,12 @@ impl Checker<'_> {
                 effect,
                 meta,
             } => self.resolve_fn_type(id, (params, needs, ret), effect, meta),
+            // A block's result is written as a function's is (see
+            // [Blocks](crate::check::blocks#blocks)).
+            TypeExprKind::Block { ret, effect } => {
+                let ret = self.resolve_type(ret, bareness_of(effect).1);
+                self.types.block(ret, effect)
+            }
             // A qualified name is made what it names by the expansion of
             // the file's types; checked alone, a file names no module.
             TypeExprKind::Path(path) | TypeExprKind::PathApplied { path, .. } => {
@@ -655,8 +664,10 @@ impl Checker<'_> {
             ]
             .contains(&Some(name)),
             TypeExprKind::Union { .. } => !self.has_future_member(ty),
+            TypeExprKind::Inferred => self.untyped_is_bare(ty),
             // A context's type is what it is declared to be.
             TypeExprKind::Fn { .. }
+            | TypeExprKind::Block { .. }
             | TypeExprKind::Ref(_)
             | TypeExprKind::Instance { .. }
             | TypeExprKind::Param(_)

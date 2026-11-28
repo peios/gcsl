@@ -1,4 +1,4 @@
-.TH GCSL 5 2026-10-18 "Peios gcsl 0.1.0"
+.TH GCSL 5 2026-11-28 "Peios gcsl 0.1.0"
 .SH NAME
 gcsl \- GCSL source syntax and workspace semantics
 .SH DESCRIPTION
@@ -60,6 +60,7 @@ Let declares a private binding.
 An ordinary binding can be rebound with := in its declaring block.
 Let mut allows rebinding from nested blocks of the same function; its type remains fixed.
 Captured variables cannot be rebound by an inner function or lazy body.
+A trailing block given to a block parameter is neither: it rebinds the let mut variables of the function it is written in.
 Dotted and indexed updates replace values along the path, preserving value semantics.
 .PP
 Fields and def functions contribute to the containing record and, at file scope, the directory's public declarations.
@@ -108,7 +109,8 @@ Any record type fits a rest-field of * if its named fields are data, with or wit
 What * covers is read by testing for the type expected, as in (r as {x: Int}).x or r is {x: Int}.
 .PP
 An empty list needs an expected element type.
-Function signatures declare parameter and result types.
+A function signature declares its result type and, for each parameter, a type or a default that the type is taken from.
+A function type is written as a signature without a name, as in fn(String, Int): Bool or fn(name: String) -> {}; its last parameter can be a block, as in fn(String, block -> {}) -> {}.
 A type may declare type parameters, as in type Pair<A, B> = {first: A, second: B}; each use gives as many type arguments, as in Pair<Int, String>, and is the definition with them in place of the parameters.
 A type without parameters takes no type arguments, a generic type cannot refer to itself, and a type parameter cannot be spread.
 An extensible enum is declared as enum NAME extensible<BOUND>, and each variant as enum NAME::VARIANT<PAYLOAD>; the payload must fit the bound.
@@ -145,7 +147,7 @@ In if NAME is TYPE, the branches receive narrowed copies of NAME.
 The checker does not generalize that narrowing to arbitrary conditions, field paths, or subsequent statements.
 .PP
 Precedence from loosest to tightest is or; and; prefix not; comparisons and is; ranges; addition and subtraction; multiplication and division; ascription and as; prefix negation and await; then fields, calls, and indexes.
-Lazy takes the longest following expression.
+Lazy and try take the longest following expression.
 Comparisons and ranges cannot be chained.
 Use parentheses to make a different grouping explicit.
 .SH FUNCTIONS
@@ -158,7 +160,8 @@ Closures capture values when they are created.
 .PP
 Calls accept positional and named arguments, evaluated in source order.
 After a named argument, a name alone, as in f(x, out = 1, compiler), is shorthand for compiler = compiler.
-A trailing block supplies the final parameter.
+A trailing block, as in f(x) { ... }, supplies the final parameter, and the parentheses can be left out when it is the only argument.
+For a parameter that is not a block, the trailing block is evaluated as any argument is, and its value is the argument.
 A rest parameter,
 .IR ... name : T ,
 takes every positional argument from its place, a
@@ -175,6 +178,30 @@ A fn method is visible in its own file; a def method also in the other files of 
 Parameter defaults belong to a function declaration, not a written function type.
 A default may be any expression; it sees the parameters before it and the scope the function is written in, has the function's effect, and is evaluated for each call that leaves its parameter out, after the written arguments and before the body.
 Only a call that names the function directly gives defaults.
+A parameter written NAME = DEFAULT, with no type, has the type of its default, as let NAME = DEFAULT gives it: fn f(n = 3) has n: Int, and xs = [1, 2] is a List<Int>.
+The parameter is exactly as if annotated with the type its default has once awaited, written bare, so FUTURES applies to it as to any bare parameter type.
+A fn, a def, a method and a function expression accept one; a receiver, a rest parameter and a function type's parameter do not, and a parameter with neither a type nor a default is an error.
+A default without a type of its own, such as [], is the error it is in a let: "cannot infer the element type of `[]`".
+Such a default is checked before its function's type is known.
+A default that needs its own function's type, or the type of a function whose own untyped parameter needs it in turn, is the error "cannot infer the type of `x`: its default needs the type of `f`, which needs it"; write the parameter's type.
+.PP
+A function's last parameter can be a block, declared NAME: block -> TYPE, or NAME: block: TYPE for a pure block.
+A call gives the block as its trailing block, as in step("boot") { ... }, and in no other way: a positional or named argument for it is an error, and a call without a trailing block is the error "missing the block `body`".
+The function calls the block with no arguments, as in body(), any number of times; each call runs the trailing block and gives its value.
+The block runs in the scope it is written in, not the function's: it reads the variables there and rebinds the let mut variables with :=, and the variables it declares are its own, made afresh by each call.
+A block is not a value.
+The parameter can only be called: binding it, storing it, returning it or passing it as an argument is the error "a block can only be called", and using it in a fn or lazy written in the function is an error as well.
+To pass a block on, call it in another call's trailing block, as in inner(x) { body() }.
+The body of a pure block is pure code, whatever the code around it is.
+A pure function takes only a pure block.
+A trailing block given to a block whose result type is {} can end with what a statement can be: a call of an impure or memoized function, whose value is discarded as a call statement's is, or a value that holds nothing but {}, as a loop's list does.
+A function body cannot end that way, but the body of a definition can, where its definition type's definitions return {}.
+Only the last parameter can be a block.
+A block parameter has no default, and is neither a rest parameter nor a method's receiver.
+A memoized function, a function with a deferring attribute and a definition type cannot take a block, and a block cannot be declared with ->>.
+Methods, generic functions and function expressions can take blocks, as in fn measure<T>(name: String, body: block -> T) -> T, where each call infers T from its trailing block.
+A function that takes a block is a value like any other function.
+The word block is not reserved: it begins a block type only where a parameter's type starts with block directly followed by -> or :.
 Memoized calls cache successful results by closure and arguments within the execution context, including supported ambient inputs they read.
 External file or environment changes do not invalidate the cache.
 .SH FUTURES
@@ -222,6 +249,8 @@ Break'NAME and continue'NAME target a loop.
 Return'NAME leaves the named loop or block with a single result, not its accumulated list.
 An unlabeled return leaves a function or lazy body.
 No jump crosses a function boundary.
+No jump leaves a trailing block given to a block parameter: a return in it is an error, "`return` cannot leave a block", as is a break, continue or labeled return whose loop or block is outside it.
+Loops and labeled blocks written inside such a block are left as usual.
 .SH FAILURE
 .B assert
 .I COND
@@ -244,6 +273,46 @@ its notes the detail a diagnostic adds, such as a failing program's output.
 It catches what
 .B #[retry]
 would retry: never a bug in GCSL, nor the timeout of an enclosing call.
+A failure in a trailing block given to a block parameter is a failure of the function's call of the block, so a
+.B recover
+in the function around that call catches it; one the function lets through is reported where it was raised.
+.PP
+.B try
+.I EXPR
+gives the value of
+.IR EXPR ,
+or {} if it fails; it is
+.BR "recover { EXPR } else { {} }" ,
+and catches what
+.B recover
+catches.
+Its operand is the longest expression after it, so try a + f() covers the sum.
+Its type is the join of the operand's type and {}: {} for a call made for its effects, Int | {} for an Int, and {} for any record, because a record joined with {} keeps no field that can be read.
+Use
+.B recover
+to tell a failed record-valued expression from its value.
+The operand is awaited deeply where it is, so work that it defers fails inside the
+.BR try .
+The word try is not reserved.
+It begins this form only where an expression starts and a name, a literal, {, not, await, ^, if, do, for, fn or lazy follows it on its line.
+Before (, [ or \-, and everywhere else, try is a name: try(x) is a call, try[0] an index and try \- 1 a subtraction.
+Write the try of a parenthesized expression as try { (x) }.
+A call of a function named try with only a trailing block is written (try) { ... }.
+.PP
+.B raise
+in the fallback of a
+.B recover
+raises again the failure that the
+.B recover
+caught, as it was: its message, the place it was raised, its labels and its notes.
+What catches or reports the failure next sees the original failure, not the
+.BR raise .
+Its type is Never.
+It belongs to the innermost
+.B recover
+whose fallback it is written in, including from a trailing block that the fallback gives to a block parameter.
+Anywhere else, including in a fn or lazy written in the fallback, it is the error "`raise` is only for the fallback of a `recover`".
+The word raise is not reserved: where a variable named raise is in scope, raise reads it.
 .SH SECRETS
 .BI Secret< T >
 is a value of the present type
@@ -329,6 +398,12 @@ A definition cannot need a context.
 A
 .B lazy
 keeps the context it was made in.
+A trailing block given to a block parameter runs in the context in force where the function calls it, any
+.B with
+the function puts around that call included.
+What such a block needs is checked where it is written: a read in it of a context with no default needs a
+.B with
+around the call the block is given to, even if the function sets that context.
 .SH WORKSPACES AND IMPORTS
 The file workspace.gcsl marks a root and is ordinary source.
 Each directory shares its public fields, def functions, and types among its files.
@@ -403,7 +478,7 @@ GCSL's own attributes are retry(times: Int), timeout(limit: Duration) and track_
 A call with retry that fails, other than by an enclosing call's timeout, runs its body again with the same arguments, up to times more times; its effects repeat.
 A call with timeout that runs longer than limit fails, and a program it is running is killed; its own retry may retry it, each attempt timed afresh.
 Retry on a pure function is a warning.
-A call of a function with track_caller that fails with an error raised in the function's own body, a fn written in it included, reports the error at the call, the error's labels in the body dropped and its notes kept; an error of a function it calls without track_caller, or of a function value it is given, stays where it was raised.
+A call of a function with track_caller that fails with an error raised in the function's own body, a fn written in it included, reports the error at the call, the error's labels in the body dropped and its notes kept; an error of a function it calls without track_caller, or of a function value or a block it is given, stays where it was raised.
 .SH DEFINITION TYPES AND METADATA
 A definition-type declaration is followed by definitions of this form:
 .PP
@@ -413,6 +488,10 @@ A definition-type declaration is followed by definitions of this form:
 .fi
 .PP
 Parameter types and the result contract come from the definition type.
+After the names the definition type gives, a definition can declare parameters of its own, each NAME: TYPE = DEFAULT or NAME = DEFAULT, whose type is its default's, as in def test boots(m = machine(), retries = 3) { ... }.
+Each has a default, because the definition type calls the definition with none; the defaults are evaluated where the definition type calls it.
+A name alone after a parameter of the definition's own is an error.
+Where the definition type's definitions return {}, the body's last expression, if it is not {} itself, is a statement, as in a trailing block whose result type is {}: a call of an impure or memoized function, whose value is discarded, or a value that holds nothing but {}; any other value there is an unused value.
 Definitions occupy that type's namespace and do not bind an ordinary value of PATH.
 Declaration does not run the body.
 Definition paths support additional package-name characters and digit-starting segments after the first; ordinary identifiers retain their own rules.
@@ -421,6 +500,46 @@ A function type can append META:, META->, or META->> and a record type.
 Metadata reads follow the declared pure, impure, or memoized effect.
 Defmeta TYPE_NAME PATH supplies a definition's metadata in its directory, using a block or = EXPR.
 Metadata follows references to the definition.
+.SH HOST OPERATIONS
+An extern item declares what the host of a program supplies: an operation, or a handle type.
+The word extern is not reserved.
+It begins an item only where an item of a file's outermost body begins and it is followed on its line by fn, by def, or by type and a name; anywhere else it is an identifier.
+.PP
+.nf
+    extern type NAME = "KIND"
+    extern fn NAME(PARAMETERS) -> TYPE = "OPERATION"
+    extern fn (RECEIVER: TYPE) NAME(PARAMETERS) -> TYPE = "OPERATION"
+    extern def PATH(PARAMETERS) -> TYPE = "OPERATION"
+.fi
+.PP
+Extern type declares a handle type: a nominal type with no fields, whose values, handles, only the host makes.
+KIND is the name the host knows the type by; without = "KIND" it is NAME.
+A kind is declared once in a workspace, and a second declaration of it is an error; other files import the type.
+A handle type takes no type parameters, and no variant can be declared for one.
+No literal or conversion makes a handle, and nothing reads its number.
+A handle is data: it is held in records and lists, tested with is and as, compared with == by its kind and number, and is part of a memoized call's key.
+A handle is of one run, so it is no input of a call a host defers: a host refuses a step that is given one, or that captures or reads one.
+Show and interpolation give <KIND N>, the kind and the number, which is not source.
+.PP
+Extern fn and extern def declare an operation: a function with a signature and no body, called as any function is, and a value of its function type.
+OPERATION is the name the host knows it by; without = "OPERATION" it is the function's own name, the last name of a def's path.
+The marker must be ->, since an operation is impure and is never memoized; a memoized function can call one.
+Parameters take defaults, and one can be a rest parameter or a context parameter.
+An operation has no body, no type parameters and no block parameter, is not a definition made with a definition type, and cannot be marked #[def_type].
+KIND and OPERATION are plain strings, not empty and without interpolation.
+.PP
+Each parameter, awaited deeply before the host is asked, and the declared result must be data.
+A function, a future written in the result, a secret, a Sandbox, a variant value or an enum without a data bound, at any depth, is an error.
+A call gives the host the operation's name and its arguments in parameter order, the receiver first, defaults filled in and the rest parameter as one list.
+The call's value is what the host returns, checked against the declared result as it arrives: a value of another type fails the call with "the result of operation OPERATION is not a TYPE".
+The host returns nothing for a result of {}.
+.PP
+A failure the host reports fails the call with the host's message and notes.
+An operation reports every error raised in it at the call of the operation, as a function with track_caller does.
+Recover, try and retry treat such a failure as any other.
+.PP
+The gcsl command is a host with no operations: under gcsl run and in the REPL, a call of an operation fails with "this host has no operation OPERATION".
+Gcsl check checks declarations and calls of operations for any host.
 .SH LIMITS
 Expression depth is limited to 10,000 syntax-tree levels, with additional parser recursion accounting.
 Runtime expressions, calls, and awaits share a nesting budget; tail calls are not eliminated.

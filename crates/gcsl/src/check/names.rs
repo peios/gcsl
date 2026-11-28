@@ -122,6 +122,9 @@ impl Checker<'_> {
             return (self.builtin_use(id, ty, span), None);
         }
         if let Some((index, binding)) = found {
+            if self.block_misused(id, (index, binding), span) {
+                return (TyId::ERROR, None);
+            }
             if binding.kind == BindingKind::Mutable {
                 self.leaf_reads_mutable(index, binding.name);
             }
@@ -135,11 +138,19 @@ impl Checker<'_> {
             // A use of a function whose needs are not known yet (see
             // [Needs](crate::check::needs#needs)).
             if let VarRef::Fn(slot) = source {
+                if self.pending_use(id, slot) {
+                    return (TyId::ERROR, None);
+                }
                 self.note_member_use(id, slot);
             } else if binding.kind == BindingKind::Callee {
                 self.note_callee_use(id, (index, binding.name));
             }
             return (self.builtin_use(id, binding.ty, span), binding.callback);
+        }
+        // A name `raise` that names no variable (see
+        // [Failure](crate::check::failure#failure)).
+        if self.ast.names().get(name) == super::RAISE {
+            return (self.check_raise(id, span), None);
         }
         let suggestion = self.variable_suggestion(name, span);
         let text = self.ast.names().get(name);

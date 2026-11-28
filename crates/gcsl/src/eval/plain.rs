@@ -7,7 +7,8 @@
 //! of the evaluator's. It holds what a step can take and give: integers,
 //! floats, booleans, strings, durations and sizes, the empty record,
 //! records by field name, lists, variants and variants as values by their
-//! keys' text, secrets with their identity and their value, and files and
+//! keys' text, handles, which are variants a host makes and reads by their
+//! kind and number ([`Plain::handle`], [`Plain::as_handle`]), secrets with their identity and their value, and files and
 //! directories by path and identity, and sandboxes, which a step's body
 //! passes between its effects. A future that has run is its value. What is
 //! no data, a function, a built-in, a future that has not run or a step's
@@ -117,6 +118,72 @@ pub enum Plain {
 }
 
 impl Plain {
+    /// The handle of the kind `kind` and the number `id`, as a host makes
+    /// one to give a program (see
+    /// [Handles](crate::eval::operations#handles)): a value of the handle
+    /// type a program declares for the kind, `extern type Vm = "vm.machine"`,
+    /// whatever file declares it. The number is the host's to choose: two
+    /// handles are equal if they are of one kind and one number.
+    #[must_use]
+    pub fn handle(kind: &str, id: i64) -> Plain {
+        Plain::Variant {
+            key: crate::names::handle_key(kind),
+            of: crate::names::extern_key(kind),
+            shown: crate::names::handle_shown(kind),
+            payload: Some(Box::new(Plain::Int(id))),
+        }
+    }
+
+    /// The kind and the number of the handle the value is, if it is one,
+    /// as a host reads one a program gives it (see
+    /// [Handles](crate::eval::operations#handles)); `None` for any other
+    /// value, a variant of an enum a program declares among them.
+    #[must_use]
+    pub fn as_handle(&self) -> Option<(&str, i64)> {
+        let Plain::Variant {
+            key,
+            of,
+            payload: Some(payload),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let kind = crate::names::handle_kind(key)?;
+        let &Plain::Int(id) = &**payload else {
+            return None;
+        };
+        (crate::names::extern_kind(of) == Some(kind)).then_some((kind, id))
+    }
+
+    /// The kind of a handle the value holds, at any depth, itself if it is
+    /// one, or `None` if it holds none: a handle is the host's, of one run,
+    /// so a value that holds one is nothing to record or to key a step by
+    /// (see [Handles](crate::eval::operations#handles)).
+    #[must_use]
+    pub fn handle_within(&self) -> Option<&str> {
+        let mut pending = vec![self];
+        while let Some(plain) = pending.pop() {
+            if let Some((kind, _)) = plain.as_handle() {
+                return Some(kind);
+            }
+            match plain {
+                Plain::Record(fields) => {
+                    pending.extend(fields.iter().rev().map(|(_, value)| value));
+                }
+                Plain::List(items) => pending.extend(items.iter().rev()),
+                Plain::Variant {
+                    payload: Some(payload),
+                    ..
+                } => pending.push(payload),
+                Plain::Secret { value, .. } => pending.push(value),
+                Plain::Closure { captures, .. } => pending.extend(captures.iter().rev()),
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// Every file and directory the value holds, at any depth, each with
     /// whether it is a directory, in the order they are found: what a host
     /// stages for a step that is given the value.
@@ -264,6 +331,7 @@ fn plain_of(value: &Value, names: &Names, mode: Mode) -> Result<Plain, String> {
                 .collect::<Result<_, _>>()?,
         },
         Value::Fn(_) | Value::Builtin(_) => return refused("a function"),
+        Value::Block(_) => return refused("a block"),
         Value::Sandbox(sandbox) => Plain::Sandbox {
             root: sandbox.root.to_string(),
             cwd: sandbox.cwd.to_string(),

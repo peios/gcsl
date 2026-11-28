@@ -554,12 +554,14 @@ impl Checker<'_> {
             TypeExprKind::Applied { .. }
             | TypeExprKind::Union { .. }
             | TypeExprKind::Fn { .. }
+            | TypeExprKind::Block { .. }
             | TypeExprKind::Path(_)
             | TypeExprKind::PathApplied { .. }
             | TypeExprKind::Ref(_)
             | TypeExprKind::Instance { .. }
             | TypeExprKind::Param(_)
             | TypeExprKind::Context(_)
+            | TypeExprKind::Inferred
             | TypeExprKind::Data
             | TypeExprKind::Invalid => {
                 return declared;

@@ -65,3 +65,32 @@ target with one value; it does not append to a loop's accumulated list.
 Control flow cannot jump out through a function boundary. See `gcsl(5)`
 for label syntax and the distinction between collected and returned
 values.
+
+A block given to a [block parameter](~gcsl/block-parameters) is a boundary
+of the same kind, because the function it is given to runs it, possibly
+many times. A `return` inside such a block is an error, and so is a
+`break`, a `continue` or a labeled `return` whose loop or block is outside
+it. Loops and labeled blocks written inside the block work as usual:
+
+```gcsl
+fn step(name: String, body: block -> {}) -> {} { body() }
+
+fn first_large(sizes: List<Int>) -> Int {
+    let mut found = -1
+    step("search") {
+        for size in sizes {
+            if size > 100 {
+                found := size
+                break
+            }
+        }
+        = {}
+    }
+    = found
+}
+first_large([20, 300, 4000])
+```
+
+The `break` ends the loop inside the block, and the function returns
+`300` after the step. A block can't make `first_large` return, so the
+result goes through a `let mut` variable, as `found` does here.

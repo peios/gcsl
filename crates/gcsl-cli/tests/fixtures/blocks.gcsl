@@ -1,0 +1,14 @@
+# Functions whose last parameter is a block, called with trailing blocks
+# that rebind their caller's variables.
+fn step(name: String, body: block -> {}) -> {} {
+  body()
+  = {}
+}
+fn measure<T>(name: String, body: block -> T) -> T { body() }
+fn twice(body: block: Int): Int { body() + body() }
+let mut log = ""
+step("boot") { log := log + "booted;" }
+let word = measure("word") { log := log + "measured;"; "w" }
+done = log
+got = word
+n = twice { 21 }

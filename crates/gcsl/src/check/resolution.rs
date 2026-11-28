@@ -5,11 +5,12 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::ast::{ArgRange, ExprId, FnId, ForId, GenericOwner, ItemId, RecoverId};
+use crate::ast::{ArgRange, ExprId, FnId, ForId, GenericOwner, ItemId, ItemRange, RecoverId};
 use crate::names::Name;
 use crate::source::Span;
 use crate::types::{AwaitKind, Decode, GenericId, Need, TyId, ValueTest};
 
+use super::untyped::UntypedChecked;
 use super::{
     Attribute, Constant, FieldSchedule, ImportedRecord, ImportedRecords, MadeAt, ParamDefault,
     Place, RecordFills, SharedChildren, Slot, VarRef, VariantTag, ViewRecord,
@@ -127,12 +128,30 @@ pub(super) struct CallsChecked {
     /// type parameters, each with its type: checked once, then only
     /// expected to fit its substituted parameter.
     pub(super) prechecked: HashMap<ExprId, TyId>,
+    /// The parameters written with no type, which their defaults type (see
+    /// [Untyped parameters](crate::check::untyped#untyped-parameters)).
+    pub(super) untyped: UntypedChecked,
     /// The callee of the call being checked, through any parentheses: the
     /// one place a generic function's name may be read.
     pub(super) callee: Option<ExprId>,
     /// The methods of the earlier inputs of a session, by their names, each
     /// with its binding's.
     pub(super) earlier_methods: HashMap<Name, Vec<Name>>,
+    /// The trailing blocks that fill a block parameter whose bodies are
+    /// being checked, innermost last (see [Blocks](crate::check::blocks#blocks)).
+    pub(super) block_args: Vec<super::blocks::BlockArg>,
+    /// The items of the trailing block about to be checked whose last
+    /// expression is a statement (see [Blocks](crate::check::blocks#blocks)).
+    pub(super) statements: Option<ItemRange>,
+    /// The items and the block of the body about to be checked of a
+    /// definition whose def-type's definitions return `{}`, whose last
+    /// expression is a statement if it is no `{}` (see
+    /// [Def-types](crate::check::deftypes#def-types), "A definition's last
+    /// expression").
+    pub(super) definition_end: Option<(ItemRange, ExprId)>,
+    /// The `recover`s whose fallbacks are being checked, innermost last
+    /// (see [Failure](crate::check::failure#failure)).
+    pub(super) fallbacks: Vec<super::failure::Fallback>,
 }
 
 /// What the check gives lowering besides types and slots, as
@@ -193,6 +212,23 @@ pub(super) struct ForLowering {
     /// Each read of a file's `path`, `f.path`, by its id (see
     /// [Files](crate::check::files#files)).
     pub(super) file_paths: HashSet<ExprId>,
+    /// Each trailing block that fills a block parameter, by its id (see
+    /// [Blocks](crate::check::blocks#blocks)), with whether its last
+    /// expression is a statement, its value discarded.
+    pub(super) block_args: HashMap<ExprId, bool>,
+    /// Each body of a definition, by its block's id, whose last
+    /// expression is a statement, its value discarded (see
+    /// [Def-types](crate::check::deftypes#def-types), "A definition's last
+    /// expression").
+    pub(super) statement_bodies: HashSet<ExprId>,
+    /// Each call of a block, by its id (see [Blocks](crate::check::blocks#blocks)).
+    pub(super) block_calls: HashSet<ExprId>,
+    /// Each `raise`, by its id, with the slot in which its `recover`'s
+    /// fallback keeps which of the failures caught is its own (see
+    /// [Failure](crate::check::failure#failure)).
+    pub(super) raises: HashMap<ExprId, Slot>,
+    /// That slot, for each `recover` whose fallback has a `raise`.
+    pub(super) raise_slots: HashMap<RecoverId, Slot>,
 }
 
 /// A parameter's default function, as its check found it (see "Calls"
@@ -632,11 +668,50 @@ impl Resolution {
         self.lowered.recover_slots.get(&id).copied()
     }
 
+    /// The slot in which the fallback of the `recover` `id` keeps which of
+    /// the failures caught is its own, if it has a `raise` (see
+    /// [Failure](crate::check::failure#failure)).
+    #[must_use]
+    pub fn raise_slot(&self, id: RecoverId) -> Option<Slot> {
+        self.lowered.raise_slots.get(&id).copied()
+    }
+
+    /// The slot the `raise` `id` reads its failure's number from, if `id`
+    /// is one (see [Failure](crate::check::failure#failure)).
+    #[must_use]
+    pub fn raise_of(&self, id: ExprId) -> Option<Slot> {
+        self.lowered.raises.get(&id).copied()
+    }
+
     /// The keys of the declarations of the contexts the `with` `id` binds,
     /// one for each of its bindings, in order (see [Context](crate::check::context#context)).
     #[must_use]
     pub fn with_keys(&self, id: ExprId) -> Option<&[Name]> {
         self.lowered.withs.get(&id).map(|keys| &keys[..])
+    }
+
+    /// Whether `id` is a trailing block that fills a block parameter (see
+    /// [Blocks](crate::check::blocks#blocks)), and then whether its last
+    /// expression is a statement, its value discarded.
+    #[must_use]
+    pub fn is_block_arg(&self, id: ExprId) -> Option<bool> {
+        self.lowered.block_args.get(&id).copied()
+    }
+
+    /// Whether `id` is the block of a definition's body whose last
+    /// expression is a statement, its value discarded (see
+    /// [Def-types](crate::check::deftypes#def-types), "A definition's last
+    /// expression").
+    #[must_use]
+    pub fn ends_as_statement(&self, id: ExprId) -> bool {
+        self.lowered.statement_bodies.contains(&id)
+    }
+
+    /// Whether the call `id` is of a block (see
+    /// [Blocks](crate::check::blocks#blocks)).
+    #[must_use]
+    pub fn is_block_call(&self, id: ExprId) -> bool {
+        self.lowered.block_calls.contains(&id)
     }
 
     /// The receiver of the call `id`, if it is a method's (see

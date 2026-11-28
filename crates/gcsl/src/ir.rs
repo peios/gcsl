@@ -218,6 +218,63 @@
 //! more for each step of its path. Lowering computes them once, after
 //! building the nodes; the evaluator only adds and compares.
 //!
+//! # Blocks
+//!
+//! The trailing block that fills a function's block parameter (see the
+//! checker's [Blocks](crate::check::blocks#blocks)) is an argument that is
+//! not evaluated where its call is: an [`IrKind::Arg`] whose value is an
+//! [`ArgValue::Block`], the block's body, a [`IrKind::Block`] among the
+//! nodes of the caller's code, of the kind of the block's result. The
+//! argument itself is of kind [`ValueKind::Fn`], as the parameter that
+//! holds the block is, and is shown `(arg N block ...)`. Its body is its
+//! child, so that everything found by walking a frame's nodes is found in
+//! a block too: the loads and stores of the caller's slots, which the body
+//! reads and writes when it runs, the functions it makes closures of, and
+//! its own calls and awaits.
+//!
+//! A call of a block parameter, `body()`, is an [`IrKind::CallBlock`], of
+//! the kind of the block's result, [`ValueKind::Deferred`] where an impure
+//! block's bare result may be a future. Its one child is the read of the
+//! parameter, a [`IrKind::Load`] of kind [`ValueKind::Fn`]; it has no
+//! arguments, and is shown `(call-block ...)`. The evaluator runs the
+//! block's body in the frame of the call that gave it (see
+//! [`crate::eval`]'s [Blocks](crate::eval::blocks#blocks)), which is why a
+//! block's body is lowered in its caller's function, with its caller's
+//! slots, loops and catches, and never as a function of its own.
+//!
+//! For the nesting budget a `CallBlock` records its depth in the body of
+//! the frame it is evaluated in, as a `Call` does, and an `ArgValue::Block`
+//! the height of its body, as a function has its body's: the call of the
+//! block is charged for the body then, wherever in its caller the block
+//! was written. The depths of the calls and awaits in a block's body are
+//! counted from the body of the frame the block is written in, through the
+//! call that gives it.
+//!
+//! A call of a block may assign the variables of the frame that gave the
+//! block, which no node of the calling frame shows. So a `CallBlock` is
+//! never independent ([`Ir::is_independent`]), nor is anything it is in,
+//! and no `for` whose guard or body holds one is forkable
+//! ([`IrKind::For`]). A `CallBlock` and a block argument are control
+//! nodes, which no simple subtree holds ([`Ir::is_simple`]). A call that
+//! gives a block is independent or not as any call is: by what its
+//! subtree, the block's body included, assigns and leaves.
+//!
+//! # Host operations
+//!
+//! An operation (see the checker's [Host
+//! operations](crate::check::operations#host-operations)) is a function
+//! like any other but for its body, which is one call: an
+//! [`IrKind::Call`], of kind [`ValueKind::Mixed`] since the host may give
+//! anything, whose callee is an [`IrKind::Builtin`] of
+//! [`Builtin::Operation`], the one node that yields a built-in function
+//! with no cell to read, and whose two arguments are the operation's name,
+//! a [`IrKind::StrConst`], and an [`IrKind::MakeList`] of a read of each
+//! parameter, awaited as the checker marked it. The call is wrapped in an
+//! [`IrKind::As`] of the test of the operation's declared result, whose
+//! kind is the node's: what the host gave is of that type from there on, or
+//! the run has failed. The call is a control node, so a unit in graph mode
+//! stops at it as at any effect.
+//!
 //! # Cells
 //!
 //! Every node of the tree of an input's top-level fields has a *cell*, a
@@ -299,7 +356,7 @@ use std::mem;
 use std::rc::Rc;
 
 use crate::ast::FnId;
-use crate::check::{Attribute, Slot};
+use crate::check::{Attribute, Builtin, Slot};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::{FieldName, Quoted};
@@ -323,7 +380,7 @@ enum KindStep {
 pub struct IrId(u32);
 
 impl IrId {
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
 }
@@ -693,6 +750,37 @@ pub struct ShapedOperands {
     pub rhs: IrId,
 }
 
+/// What an [`IrKind::Failure`] does with a failure that a `recover`
+/// running its fallback caught (see [`crate::eval`], "Failure").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureOp {
+    /// The failure the innermost `recover` running its fallback caught, a
+    /// record `{message: String, notes: List<String>}` of the layout. Of
+    /// kind [`ValueKind::Record`].
+    Read(LayoutId),
+    /// Which of the failures caught the innermost `recover` running its
+    /// fallback caught: its number among those of the `recover`s running
+    /// their fallbacks, by which a [`FailureOp::Raise`] finds it. Of kind
+    /// [`ValueKind::Int`].
+    At,
+    /// `raise`: fails with the failure whose number the node gives, an
+    /// `Int` node, the read of what a [`FailureOp::At`] stored as its
+    /// `recover`'s fallback began: the failure that `recover` caught, as it
+    /// was, marked as raised again. Of kind [`ValueKind::Never`].
+    Raise(IrId),
+}
+
+impl FailureOp {
+    /// The kind of the node that does it.
+    const fn kind(self) -> ValueKind {
+        match self {
+            FailureOp::Read(_) => ValueKind::Record,
+            FailureOp::At => ValueKind::Int,
+            FailureOp::Raise(_) => ValueKind::Never,
+        }
+    }
+}
+
 /// The value of an [`IrKind::Arg`]: a node, evaluated in the caller's
 /// frame, or, for a parameter the call leaves out whose default is no
 /// constant, that default (see [Functions](#functions)).
@@ -710,6 +798,19 @@ pub enum ArgValue {
         capture: u32,
         /// The kind of the parameter's value.
         kind: ValueKind,
+    },
+    /// A block: the trailing block that fills the callee's block parameter
+    /// (see [Blocks](#blocks)). Its node is not evaluated where the call
+    /// is: the parameter is given a [`crate::value::Block`] of it, which
+    /// the callee's [`IrKind::CallBlock`]s run in the caller's frame.
+    Block {
+        /// The block's body, a node of the caller's code.
+        body: IrId,
+        /// The body's height, for the nesting budget (see
+        /// [`crate::MAX_DEPTH`]). Lowering sets it once every node is built;
+        /// a height past `u16::MAX` is stored as `u16::MAX`, as a call's
+        /// depth is.
+        height: u16,
     },
 }
 
@@ -1030,8 +1131,10 @@ pub enum IrKind {
         /// Whether its iterations are independent of one another, so that
         /// one may wait while the next runs (see
         /// [Suspension](crate::eval::machine#suspension)): its guard and
-        /// body assign no variable declared outside them, and no `break`
-        /// or `return` leaves it. Lowering finds it.
+        /// body assign no variable declared outside them, no `break` or
+        /// `return` leaves it, and they call no block, which may assign
+        /// the variables of another frame (see [Blocks](#blocks)).
+        /// Lowering finds it.
         forkable: bool,
     },
     /// A condition loop or a `do` loop: of `parts`, the condition, a `Bool`
@@ -1129,11 +1232,27 @@ pub enum IrKind {
         /// Its value.
         value: ArgValue,
     },
+    /// Calls the block `block` evaluates to, a read of the running
+    /// function's block parameter, and yields what its body gives, of kind
+    /// `kind` (see [Blocks](#blocks)).
+    CallBlock {
+        /// The read of the block parameter.
+        block: IrId,
+        /// The kind of the call's value: the block's result's.
+        kind: ValueKind,
+        /// The call's depth in the body of the frame it is evaluated in,
+        /// as a call's (see [`IrKind::Call`]).
+        depth: u16,
+    },
     /// Reads one of the values the closure being run captured, by its index
     /// in capture order. Carries the value's kind, as a `Load` does.
     LoadCapture(u32, ValueKind),
     /// Yields the closure being run: a function's reference to itself.
     LoadCallee,
+    /// Yields a built-in function as a value, of kind `Fn`: the callee of
+    /// the call that the body of an operation is, whose built-in has no
+    /// cell to read it from (see [Host operations](#host-operations)).
+    Builtin(Builtin),
     /// A variant of an enum as a value, `Toolchain::C` (see the checker's
     /// "Enums"), of kind `Fn`: its key, its enum's, and how it is shown, an
     /// index into the IR's string table.
@@ -1222,11 +1341,11 @@ pub enum IrKind {
     /// of it names none of them, and nothing recovers or retries it. Of kind
     /// [`ValueKind::Mixed`].
     SecretWrap(IrId, bool),
-    /// The failure the innermost `recover` running its fallback caught, a
-    /// record `{message: String, notes: List<String>}` of the layout it
-    /// names. Of kind
-    /// [`ValueKind::Record`].
-    Failure(LayoutId),
+    /// What a `recover`'s fallback does with the failure its `recover`
+    /// caught (see [`crate::eval`], "Failure"), as its [`FailureOp`] says:
+    /// reads it, as a record; reads which of the failures caught it is; or
+    /// raises it again.
+    Failure(FailureOp),
     /// One binding of an [`IrKind::With`], only ever one of its `binds`:
     /// the context of the declaration key `key`, bound to the value of
     /// `value`, a node of any kind.
@@ -1314,14 +1433,16 @@ const _: () = assert!(
 
 impl IrKind {
     /// Whether this is a *control* node, one that a subtree of simple nodes
-    /// may not hold (see [`Ir::is_simple`]): a call, a loop, an await, a
-    /// context read or `with`, a `recover`, a `break`, `continue` or
-    /// `return` and what catches one, and a call's argument.
+    /// may not hold (see [`Ir::is_simple`]): a call, of a function or of a
+    /// block, a loop, an await, a context read or `with`, a `recover`, a
+    /// `break`, `continue` or `return` and what catches one, and a call's
+    /// argument.
     #[must_use]
     pub(crate) const fn is_control(self) -> bool {
         matches!(
             self,
             IrKind::Call { .. }
+                | IrKind::CallBlock { .. }
                 | IrKind::Arg { .. }
                 | IrKind::For { .. }
                 | IrKind::Loop { .. }
@@ -1393,8 +1514,9 @@ impl IrKind {
             }
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Tag { .. }
-            | IrKind::Failure(_)
+            | IrKind::Failure(FailureOp::Read(_) | FailureOp::At)
             | IrKind::Caller
             | IrKind::Helper
             | IrKind::Interp(_)
@@ -1414,9 +1536,11 @@ impl IrKind {
             | IrKind::Field { record: child, .. }
             | IrKind::Store(_, child)
             | IrKind::Arg {
-                value: ArgValue::Node(child),
+                value: ArgValue::Node(child) | ArgValue::Block { body: child, .. },
                 ..
             }
+            | IrKind::CallBlock { block: child, .. }
+            | IrKind::Failure(FailureOp::Raise(child))
             | IrKind::Spread(child)
             | IrKind::ListLen(child)
             | IrKind::Show(child)
@@ -1577,7 +1701,6 @@ impl IrKind {
             | IrKind::RecordOf { .. }
             | IrKind::UpdateField { .. }
             | IrKind::Assert { .. }
-            | IrKind::Failure(_)
             | IrKind::Helper
             | IrKind::For { collect: false, .. }
             | IrKind::Loop { collect: false, .. } => KindStep::Own(ValueKind::Record),
@@ -1586,6 +1709,7 @@ impl IrKind {
             | IrKind::Update { kind, .. }
             | IrKind::Index { kind, .. }
             | IrKind::Call { kind, .. }
+            | IrKind::CallBlock { kind, .. }
             | IrKind::LoadCapture(_, kind)
             | IrKind::Arg {
                 value: ArgValue::Default { kind, .. },
@@ -1600,10 +1724,17 @@ impl IrKind {
             | IrKind::Recover { kind, .. }
             | IrKind::With { kind, .. }
             | IrKind::Top(_, kind) => KindStep::Own(kind),
+            // A block is given as a function is.
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Meta(_)
+            | IrKind::Arg {
+                value: ArgValue::Block { .. },
+                ..
+            }
             | IrKind::Tag { .. } => KindStep::Own(ValueKind::Fn),
+            IrKind::Failure(op) => KindStep::Own(op.kind()),
             IrKind::SecretWrap(..) => KindStep::Own(ValueKind::Mixed),
             IrKind::MakeFuture { .. } => KindStep::Own(ValueKind::Deferred),
         }
@@ -1657,9 +1788,11 @@ impl IrKind {
             | IrKind::MakeClosure { .. }
             | IrKind::Call { .. }
             | IrKind::Arg { .. }
+            | IrKind::CallBlock { .. }
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
@@ -1760,16 +1893,20 @@ impl IrKind {
             IrKind::Update { .. } => "update",
             IrKind::MakeClosure { .. } => "make-closure",
             IrKind::Call { .. } => "call",
+            IrKind::CallBlock { .. } => "call-block",
             IrKind::Arg { .. } => "arg",
             IrKind::LoadCapture(..) => "load-capture",
             IrKind::Top(_, ValueKind::Fn) => "fn",
             IrKind::Top(..) => "top",
             IrKind::LoadCallee => "load-callee",
+            IrKind::Builtin(_) => "builtin",
             IrKind::Tag { .. } => "tag",
             IrKind::ContextRead { .. } => "context-read",
             IrKind::Assert { .. } => "assert",
             IrKind::Recover { .. } => "recover",
-            IrKind::Failure(_) => "failure",
+            IrKind::Failure(FailureOp::Read(_)) => "failure",
+            IrKind::Failure(FailureOp::At) => "failure-at",
+            IrKind::Failure(FailureOp::Raise(_)) => "raise",
             IrKind::SecretValue { .. } => "secret-value",
             IrKind::SecretWrap(..) => "secret-wrap",
             IrKind::With { .. } => "with",
@@ -1879,9 +2016,11 @@ impl IrNode {
             | IrKind::MakeClosure { .. }
             | IrKind::Call { .. }
             | IrKind::Arg { .. }
+            | IrKind::CallBlock { .. }
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
@@ -2146,6 +2285,52 @@ impl Ir {
             .collect()
     }
 
+    /// For each call, of a function or of a block, in the order its node was
+    /// made, whether it is independent (see [`Ir::is_independent`]), for
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn independent_calls(&self) -> Vec<bool> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| match node.kind {
+                IrKind::Call { .. } | IrKind::CallBlock { .. } => {
+                    self.independent.get(index).copied()
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The kind and the depth of each call of a block, in the order its
+    /// node was made, for tests.
+    #[cfg(test)]
+    pub(crate) fn block_calls(&self) -> Vec<(ValueKind, u16)> {
+        self.nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                IrKind::CallBlock { kind, depth, .. } => Some((kind, depth)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The height of each block argument's body, in the order its node was
+    /// made, an inner block's before an outer one's, for tests.
+    #[cfg(test)]
+    pub(crate) fn block_heights(&self) -> Vec<u16> {
+        self.nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                IrKind::Arg {
+                    value: ArgValue::Block { height, .. },
+                    ..
+                } => Some(height),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether node `id` is *simple*: whether its subtree runs nothing but
     /// operators, constants, reads, literals, `if`s and blocks, and so
     /// calls, loops, awaits, reads no context, sets none, recovers from no
@@ -2158,8 +2343,10 @@ impl Ir {
     }
 
     /// Whether node `id` is *independent*: whether its subtree assigns no
-    /// variable (`:=`) and holds no `break`, `continue` or `return`, outside
-    /// the bodies of the functions it makes closures of. The evaluation of
+    /// variable (`:=`), holds no `break`, `continue` or `return`, and calls
+    /// no block, which may assign the variables of the frame that gave it
+    /// (see [Blocks](#blocks)), outside the bodies of the functions it
+    /// makes closures of. The evaluation of
     /// an independent element of a list, field of a record, piece of an
     /// interpolation or argument of a call writes nothing the pieces after
     /// it read and leaves nothing it is in, so that in graph mode it may be
@@ -2875,11 +3062,12 @@ impl IrBuilder {
         self.finish_program(root, (frame_size, slot_names), Vec::new(), (0, 0))
     }
 
-    /// Gives every [`IrKind::Call`], [`IrKind::Await`] and
-    /// [`IrKind::Update`] of the program whose root is `root` and whose
-    /// functions are `functions` its depth in its frame, and every function
-    /// its body's height, [`FnCode::height`]: one walk of the root and one of
-    /// each function's body, through [`IrKind::children`]. The heights of all
+    /// Gives every [`IrKind::Call`], [`IrKind::CallBlock`], [`IrKind::Await`]
+    /// and [`IrKind::Update`] of the program whose root is `root` and whose
+    /// functions are `functions` its depth in its frame, every function its
+    /// body's height, [`FnCode::height`], and every block argument its
+    /// body's ([`ArgValue::Block`]): one walk of the root and one of each
+    /// function's body, through [`IrKind::children`]. The heights of all
     /// the nodes are kept in one vector, and the walks share one stack.
     ///
     /// An update is two levels taller than its tallest child for each step
@@ -2904,9 +3092,11 @@ impl IrBuilder {
         }
     }
 
-    /// Walks the frame whose body is `body` depth first, giving each call
-    /// and await its depth on the way down and each node its height in
-    /// `heights` on the way up, and returns the body's height. Iterative,
+    /// Walks the frame whose body is `body` depth first, giving each call,
+    /// of a function or of a block, and each await its depth on the way
+    /// down, and each node its height in `heights`, and each block
+    /// argument its body's (see [Blocks](crate::ir#blocks)), on the way up,
+    /// and returns the body's height. Iterative,
     /// with `stack` as the work list, since a body can be
     /// [`crate::MAX_DEPTH`] deep: each entry is a node, its depth, and
     /// whether its children have been pushed, in which case they have all
@@ -2938,11 +3128,23 @@ impl IrBuilder {
                         .map_or(0, |steps| steps.len.saturating_mul(2)),
                     _ => 0,
                 };
+                // A block's body is run by a call of the block, which
+                // charges the budget for it then.
+                if let IrKind::Arg {
+                    value: ArgValue::Block { height, .. },
+                    ..
+                } = &mut node.kind
+                {
+                    *height = u16::try_from(tallest).unwrap_or(u16::MAX);
+                }
                 if let Some(entry) = heights.get_mut(id.index()) {
                     *entry = tallest.saturating_add(1).saturating_add(path);
                 }
             } else if height == 0 {
                 if let IrKind::Call {
+                    depth: node_depth, ..
+                }
+                | IrKind::CallBlock {
                     depth: node_depth, ..
                 }
                 | IrKind::Await {
@@ -3032,16 +3234,21 @@ fn simple_nodes(nodes: &[IrNode], pool: &[IrId]) -> Vec<bool> {
 
 /// For each of `nodes`, whose lists are in `pool` and whose assignments are
 /// `assignments`, whether it is independent (see [`Ir::is_independent`]):
-/// a node that is no assignment, `break`, `continue` or `return`, and all
-/// of whose children are independent, found in one pass as
+/// a node that is no assignment, `break`, `continue`, `return` or call of
+/// a block, and all of whose children are independent, found in one pass as
 /// [`simple_nodes`] finds its answers.
 fn independent_nodes(nodes: &[IrNode], pool: &[IrId], mut assignments: Vec<IrId>) -> Vec<bool> {
     assignments.sort_unstable_by_key(|id| id.index());
     let mut independent = Vec::with_capacity(nodes.len());
     for (index, node) in nodes.iter().enumerate() {
+        // A call of a block may assign the variables of the frame that
+        // gave it (see [Blocks](crate::ir#blocks)).
         let leaves = matches!(
             node.kind,
-            IrKind::Break { .. } | IrKind::Continue { .. } | IrKind::Return { .. }
+            IrKind::Break { .. }
+                | IrKind::Continue { .. }
+                | IrKind::Return { .. }
+                | IrKind::CallBlock { .. }
         );
         let assigns = assignments
             .binary_search_by_key(&index, |id| id.index())
@@ -3397,6 +3604,10 @@ impl Pretty<'_> {
                 param,
                 value: ArgValue::Default { capture, .. },
             } => write!(f, " {param} default {capture}")?,
+            IrKind::Arg {
+                param,
+                value: ArgValue::Block { .. },
+            } => write!(f, " {param} block")?,
             IrKind::Arg { param, .. } | IrKind::LoadCapture(param, _) => write!(f, " {param}")?,
             IrKind::For { slot, parts, .. } => {
                 self.slot(f, slot)?;

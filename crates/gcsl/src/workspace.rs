@@ -239,6 +239,7 @@
 use std::mem;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::Outcome;
 
@@ -504,6 +505,18 @@ impl Progress {
             Wait::Node(_) => None,
         })
     }
+}
+
+/// What a run of a unit in graph mode that was given a slice came to (see
+/// [`Workspace::run_prepared_for`] and
+/// [Yielding](crate::eval::machine#yielding)).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Turn {
+    /// It ended or stopped to wait, as a run with no slice does.
+    Progress(Progress),
+    /// Its slice was spent while it was computing: it waits for nothing,
+    /// and its next run carries on where it was.
+    Yielded,
 }
 
 /// A file runs at most once. A failed attempt must remain a failure for every
@@ -839,7 +852,10 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// What of it is no data, or that `graph` has no node `id`.
+    /// What of it is no data, or that `graph` has no node `id`. A handle
+    /// given to a deferred call is no data here, though it is elsewhere: "a
+    /// step's input must be plain data: it holds a handle of the kind
+    /// `vm.machine`, which is not data".
     pub fn step_inputs(&self, graph: &Graph, id: NodeId) -> Result<StepInputs, String> {
         self.inputs_of(graph, id, (to_plain, to_key_plain))
     }
@@ -922,10 +938,24 @@ impl Workspace {
             .closure()
             .map(|closure| key(&Value::Fn(Rc::clone(closure)), names))
             .transpose()?;
+        let args = plain_all(node.args())?;
+        // A handle is the host's, of this run: nothing to key or record a
+        // step by. An effect's node is given one freely, an operation's
+        // being how a handle is used.
+        if node.kind() == NodeKind::Deferred {
+            let given = args.iter().chain(&captures);
+            let read = context.iter().map(|(_, value)| value);
+            if let Some(kind) = given.chain(read).find_map(Plain::handle_within) {
+                return Err(format!(
+                    "a step's input must be plain data: it holds a handle of the kind `{kind}`, \
+                     which is not data"
+                ));
+            }
+        }
         Ok(StepInputs {
             kind: node.kind(),
             callee,
-            args: plain_all(node.args())?,
+            args,
             captures,
             context,
             attributes,
@@ -999,8 +1029,36 @@ impl Workspace {
     pub(crate) fn run_files(
         &mut self,
         index: u32,
-        mut graph: Option<(&mut Graph, GraphHost<'_>)>,
+        graph: Option<(&mut Graph, GraphHost<'_>)>,
     ) -> Result<Option<Progress>, Vec<Diagnostic>> {
+        match self.run_files_until(index, graph, None)? {
+            None => Ok(None),
+            Some(Turn::Progress(progress)) => Ok(Some(progress)),
+            Some(Turn::Yielded) => Err(vec![
+                InternalError {
+                    message: "a run with no slice yielded",
+                    span: Span::new(0, 0),
+                }
+                .into(),
+            ]),
+        }
+    }
+
+    /// [`Workspace::run_files`], each file's unit yielding once `until`
+    /// has passed, if it is an instant (see
+    /// [Yielding](crate::eval::machine#yielding)): returns
+    /// [`Turn::Yielded`] then, the file that yielded kept to take up where
+    /// it was.
+    ///
+    /// # Errors
+    ///
+    /// As [`Workspace::run`].
+    pub(crate) fn run_files_until(
+        &mut self,
+        index: u32,
+        mut graph: Option<(&mut Graph, GraphHost<'_>)>,
+        until: Option<Instant>,
+    ) -> Result<Option<Turn>, Vec<Diagnostic>> {
         for at in self.scan.needed(index) {
             let Some(state) = self.runs.get_mut(at as usize) else {
                 continue;
@@ -1037,21 +1095,24 @@ impl Workspace {
             );
             let suspended = self.suspended.remove(&at);
             let run = graph.as_mut().map(|(graph, host)| {
-                GraphRun::new(mem::take(*graph), at, host.defers).resuming(suspended)
+                GraphRun::new(mem::take(*graph), at, host.defers)
+                    .sliced(until)
+                    .resuming(suspended)
             });
             let outcome =
                 session::run_input_in(&ir, &mut self.frame, context, (None, run.as_ref()));
             self.scan.names = names.into_inner();
-            let paused = match (run, graph.as_mut()) {
+            let (paused, yielded) = match (run, graph.as_mut()) {
                 (Some(run), Some((graph, _))) => {
                     if let Some(suspended) = run.take_suspended() {
                         self.suspended.insert(at, suspended);
                     }
+                    let yielded = run.yielded();
                     let (left, paused) = run.finish();
                     **graph = left;
-                    paused
+                    (paused, yielded)
                 }
-                _ => Vec::new(),
+                _ => (Vec::new(), false),
             };
             let Some(state) = self.runs.get_mut(at as usize) else {
                 continue;
@@ -1066,8 +1127,11 @@ impl Workspace {
                 // once the host has given it.
                 Err(error) if error.mark == Mark::PENDING => {
                     *state = FileRun::Paused(ir);
+                    if yielded {
+                        return Ok(Some(Turn::Yielded));
+                    }
                     return match Progress::stopped(&paused) {
-                        Some(progress) => Ok(Some(progress)),
+                        Some(progress) => Ok(Some(Turn::Progress(progress))),
                         None => Err(vec![
                             InternalError {
                                 message: "a unit stopped for no step",

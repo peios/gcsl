@@ -34,8 +34,8 @@ workspace directories and imports like other public declarations.
 
 A definition's parameters are written by name alone: their types come
 from the definition type's function parameter. After them, a definition
-can declare parameters of its own, each with a type and a default, since
-the definition type calls it with none:
+can declare parameters of its own, each with a default, since the
+definition type calls it with none:
 
 ```gcsl
 #[def_type]
@@ -46,12 +46,58 @@ def describe dev.peios.gcsl(version: String = "1.0") { "language tools {version}
 result = describe dev.peios.gcsl()
 ```
 
+A parameter of the definition's own can leave out its type and take it
+from its default, as a [function's parameter
+can](~gcsl/functions-and-effects). A name with `=` after it is the
+definition's own, and a name alone is one the definition type gives:
+
+```gcsl
+#[def_type]
+def test(name: String, body: fn(): String): String {
+    "{name}: {body()}"
+}
+fn machine(): String { "vm-1" }
+def test boots(m = machine(), retries = 3) { "{m} booted within {retries} tries" }
+result = test boots()
+```
+
+Here `m` is a `String` and `retries` is an `Int`, and `result` is
+`"boots: vm-1 booted within 3 tries"`. The definition's own parameters
+come after the ones the definition type gives.
+
 The defaults are evaluated where the definition type calls the
 definition, and the body is then run with what they came to. So a
 deferring attribute on the definition, its own or its definition type's,
 makes the body the step and gives it those values: a test that is given
 its program, `def test runs(prog: File = build app())`, is a step given
 the built program, and reruns only when the program changes.
+
+## Ending a definition that returns nothing
+
+When a definition type's definitions return `{}`, as a test's do, a
+definition's body can end with anything that can stand alone as a
+statement. A call of an impure function is one, and its value is
+discarded, so the body doesn't need a `{}` after it:
+
+```gcsl
+#[def_type]
+def check(name: String, body: fn() -> {}) -> String {
+    body()
+    = "{name} ran"
+}
+fn say(word: String) -> String { sh("echo {word}").trim() }
+def check greets() { say("hello") }
+result = check greets()
+```
+
+`result` is `"greets ran"`. A loop whose body gives `{}` can end the body
+too. Any other value there, such as a number or the result of a pure
+function, is the error "unused value of type Int". This is the rule for a
+[block that gives `{}`](~gcsl/block-parameters#ending-a-block-with-a-call-or-a-loop).
+
+The rule applies only to a definition of such a definition type. Where
+the definitions return a value, the last expression is that value, and an
+ordinary function's body always ends with its result.
 
 ## Importing every definition of a type
 

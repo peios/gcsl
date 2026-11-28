@@ -76,6 +76,10 @@ const EXTENSIBLE: &str = "extensible";
 /// `enum`.
 const MISPLACED_ENUM: &str = "`enum` is declared only at the top level of a file";
 
+/// The word that starts an `extern` item, which is no keyword (see [Host
+/// operations](crate::parser::externs#host-operations)).
+const EXTERN: &str = "extern";
+
 /// The word that starts a `context` item, which is no keyword (see
 /// [Context](crate::parser::context#context)).
 const CONTEXT: &str = "context";
@@ -90,6 +94,21 @@ const ASSERT: &str = "assert";
 /// The word that starts a `recover` expression, which is no keyword (see
 /// [Failure](crate::parser::failure#failure)).
 const RECOVER: &str = "recover";
+
+/// The word that starts a `try` expression, which is no keyword (see
+/// [Failure](crate::parser::failure#failure)).
+const TRY: &str = "try";
+
+/// The word that starts a block parameter's type, which is no keyword (see
+/// [Blocks](crate::parser::functions#blocks)).
+const BLOCK: &str = "block";
+
+/// The error for a block parameter that is not its function's last.
+const BLOCK_NOT_LAST: &str = "a block is a function's last parameter";
+
+/// The note of [`BLOCK_NOT_LAST`].
+const BLOCK_NOT_LAST_NOTE: &str =
+    "a call gives the block after its other arguments, as `f(x) { ... }`";
 
 /// The error for a `context` item anywhere but at a file's top level, at
 /// its `context`.
@@ -238,6 +257,10 @@ const MUT_FIELD_NOTE: &str = "a field is defined once; declare a variable with `
 
 /// The note on [`MISPLACED_MUT`] before a parameter.
 const MUT_PARAM_NOTE: &str = "copy the parameter into a mutable variable, as in `let mut n = n`";
+
+/// The note on a parameter written with neither a type nor a default.
+const UNTYPED_NOTE: &str = "a parameter is written with its type, as in `n: Int`, or with a \
+     default its type is inferred from, as in `n = 3`";
 
 /// The note on [`MISSING_RETURN_TYPE`].
 const RETURN_TYPE_NOTE: &str = "a function declares its return type: `: T` for a pure function, `-> T` for an impure one, \
@@ -391,6 +414,7 @@ pub(crate) fn parse_parts(
         unclosed: false,
         deep: false,
         line_end: None,
+        external: None,
         diagnostics: Vec::new(),
     };
     if lexical > 0 {
@@ -577,6 +601,10 @@ struct Parser<'a> {
     /// set while an item that failed is parsed again up to the end of its
     /// line ([`Parser::item_line`]).
     line_end: Option<usize>,
+    /// The operation being parsed, from its `extern` until its function
+    /// is reached, which takes it (see [Host
+    /// operations](crate::parser::externs#host-operations)).
+    external: Option<externs::External>,
     /// Errors reported so far, in the order found: at most [`MAX_ERRORS`]
     /// and one more, after which the parser skips to the end of the input.
     diagnostics: Vec<Diagnostic>,
@@ -977,6 +1005,7 @@ pub(crate) mod context;
 pub(crate) mod deftypes;
 pub(crate) mod enums;
 pub(crate) mod expressions;
+pub(crate) mod externs;
 pub(crate) mod failure;
 pub(crate) mod functions;
 pub(crate) mod imports;

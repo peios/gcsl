@@ -177,6 +177,33 @@ before GCSL knows what it needs, from a function nested in it or as a
 value, is an error if it turns out to need a context there. Call it
 directly, or set the context around the call.
 
+## Context and blocks
+
+A block given to a [block parameter](~gcsl/block-parameters) runs in the
+context that is in force where the function calls it. A `with` that the
+function puts around that call reaches the block, so a function can set a
+context for its caller's code:
+
+```gcsl
+context arch: String = "x86_64"
+
+fn for_arm(body: block -> String) -> String {
+    body() with { arch = "aarch64" }
+}
+fn compiler(): String { "gcc-{^arch}" }
+
+native = compiler()
+cross = for_arm { compiler() }
+```
+
+Here `cross` is `gcc-aarch64`. This is unlike the block's variables, which
+are those of the code the block is written in.
+
+What a block needs is still checked where it is written. If a block reads
+a context with no default, a `with` around the call that gives the block
+must set it, even when the function sets it too. Give the context a
+default to let a function alone decide its value.
+
 ## Context and deferred work
 
 A `lazy` keeps the context it was made in. Wherever it is later

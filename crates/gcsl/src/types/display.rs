@@ -7,7 +7,7 @@ use crate::names::{Name, Names, key_context};
 use crate::strings::{FieldName, Quoted};
 use crate::value::write_quantity;
 
-use super::{RecordTy, TyId, TyKind, TypeTable};
+use super::{Effect, FnTy, RecordTy, TyId, TyKind, TypeTable};
 
 /// A type shown as it is written in source. Returned by
 /// [`TypeTable::display`].
@@ -15,15 +15,28 @@ pub(super) struct Display<'a> {
     pub(super) table: &'a TypeTable,
     pub(super) names: &'a Names,
     pub(super) id: TyId,
+    /// Whether an either shape and a provisional type are shown as the type
+    /// a source writes them as, bare ([`TypeTable::display_written`]).
+    pub(super) written: bool,
 }
 
 impl Display<'_> {
-    /// Type `id` shown with the same table and names.
+    /// Type `id` shown with the same table and names, in the same way.
     fn nested(&self, id: TyId) -> Self {
         Self {
             table: self.table,
             names: self.names,
             id,
+            written: self.written,
+        }
+    }
+
+    /// Type `id`, a position of a function type, which says what it is:
+    /// shown as it is.
+    fn position(&self, id: TyId) -> Self {
+        Self {
+            written: false,
+            ..self.nested(id)
         }
     }
 
@@ -74,6 +87,12 @@ impl Display<'_> {
             if index > 0 {
                 f.write_str(" | ")?;
             }
+            // In the same order, each member as a source writes it.
+            let text = if self.written {
+                self.nested(member).to_string()
+            } else {
+                text
+            };
             if self.table.fn_sig(member).is_some() {
                 write!(f, "({text})")?;
             } else {
@@ -106,6 +125,85 @@ impl Display<'_> {
     }
 }
 
+impl Display<'_> {
+    /// Writes the block type of the result `ret` and the effect `effect`,
+    /// `block -> T` or `block: T`.
+    fn block(&self, f: &mut fmt::Formatter<'_>, ret: TyId, effect: Effect) -> fmt::Result {
+        let marker = if effect == Effect::Pure { ":" } else { " ->" };
+        write!(f, "block{marker} {}", self.nested(ret))
+    }
+}
+
+impl Display<'_> {
+    /// Writes the function type `sig` (see [`TypeTable::display`]): its
+    /// type parameters, its parameters, what it needs, its marker, its
+    /// result and its meta, each position as it is.
+    fn function(&self, sig: &FnTy, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("fn")?;
+        if let Some(generic) = sig.generic {
+            let names: Vec<&str> = self
+                .table
+                .generic_names(generic)
+                .iter()
+                .map(|&name| self.names.get(name))
+                .collect();
+            write!(f, "<{}>", names.join(", "))?;
+        }
+        f.write_str("(")?;
+        for (index, &(name, ty)) in sig.params.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            if sig.rest.map(usize::from) == Some(index) {
+                f.write_str("...")?;
+            }
+            if let Some(name) = name {
+                write!(f, "{}: ", FieldName(self.names.get(name)))?;
+            }
+            fmt::Display::fmt(&self.position(ty), f)?;
+        }
+        // What it needs, after its parameters: `^arch`, or `^arch |
+        // ^target` for a need read through a default.
+        let mut needs: Vec<String> = self
+            .table
+            .need_set(sig.needs)
+            .iter()
+            .map(|need| {
+                let shown: Vec<String> = need
+                    .iter()
+                    .map(|&key| self.names.get(key))
+                    .map(|key| format!("^{}", key_context(key).unwrap_or(key)))
+                    .collect();
+                shown.join(" | ")
+            })
+            .collect();
+        needs.sort_unstable();
+        for (index, need) in needs.into_iter().enumerate() {
+            if index > 0 || !sig.params.is_empty() {
+                f.write_str(", ")?;
+            }
+            f.write_str(&need)?;
+        }
+        f.write_str(sig.effect.params_end())?;
+        let Some(meta) = sig.meta else {
+            return fmt::Display::fmt(&self.position(sig.ret), f);
+        };
+        // A return type that is a function type would take the
+        // meta.
+        if self.table.fn_sig(sig.ret).is_some() {
+            write!(f, "({})", self.position(sig.ret))?;
+        } else {
+            fmt::Display::fmt(&self.position(sig.ret), f)?;
+        }
+        write!(
+            f,
+            " {} {}",
+            meta.effect.meta_marker(),
+            self.position(meta.ty)
+        )
+    }
+}
+
 impl fmt::Display for Display<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.table.kind(self.id) {
@@ -117,6 +215,7 @@ impl fmt::Display for Display<'_> {
             TyKind::File => f.write_str("File"),
             TyKind::Dir => f.write_str("Dir"),
             TyKind::Sandbox => f.write_str("Sandbox"),
+            &TyKind::Block { ret, effect } => self.block(f, ret, effect),
             TyKind::Data => f.write_str("*"),
             TyKind::Error => f.write_str("<error>"),
             TyKind::Never => f.write_str("Never"),
@@ -133,6 +232,9 @@ impl fmt::Display for Display<'_> {
             | TyKind::Variant { .. }
             | TyKind::Partial(_)
             | TyKind::Secret(..) => self.enum_like(f),
+            TyKind::Either(inner) | TyKind::Provisional { inner, .. } if self.written => {
+                self.nested(*inner).fmt(f)
+            }
             TyKind::Provisional { inner, .. } => {
                 let shown = self.nested(*inner);
                 // A function type's return type, or a union's last member,
@@ -155,65 +257,7 @@ impl fmt::Display for Display<'_> {
             }
             TyKind::Union(members) => self.union(members, f),
             TyKind::Record(record) => self.record(record, f),
-            TyKind::Fn(sig) => {
-                f.write_str("fn")?;
-                if let Some(generic) = sig.generic {
-                    let names: Vec<&str> = self
-                        .table
-                        .generic_names(generic)
-                        .iter()
-                        .map(|&name| self.names.get(name))
-                        .collect();
-                    write!(f, "<{}>", names.join(", "))?;
-                }
-                f.write_str("(")?;
-                for (index, &(name, ty)) in sig.params.iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(", ")?;
-                    }
-                    if sig.rest.map(usize::from) == Some(index) {
-                        f.write_str("...")?;
-                    }
-                    if let Some(name) = name {
-                        write!(f, "{}: ", FieldName(self.names.get(name)))?;
-                    }
-                    self.nested(ty).fmt(f)?;
-                }
-                // What it needs, after its parameters: `^arch`, or `^arch |
-                // ^target` for a need read through a default.
-                let mut needs: Vec<String> = self
-                    .table
-                    .need_set(sig.needs)
-                    .iter()
-                    .map(|need| {
-                        let shown: Vec<String> = need
-                            .iter()
-                            .map(|&key| self.names.get(key))
-                            .map(|key| format!("^{}", key_context(key).unwrap_or(key)))
-                            .collect();
-                        shown.join(" | ")
-                    })
-                    .collect();
-                needs.sort_unstable();
-                for (index, need) in needs.into_iter().enumerate() {
-                    if index > 0 || !sig.params.is_empty() {
-                        f.write_str(", ")?;
-                    }
-                    f.write_str(&need)?;
-                }
-                f.write_str(sig.effect.params_end())?;
-                let Some(meta) = sig.meta else {
-                    return self.nested(sig.ret).fmt(f);
-                };
-                // A return type that is a function type would take the
-                // meta.
-                if self.table.fn_sig(sig.ret).is_some() {
-                    write!(f, "({})", self.nested(sig.ret))?;
-                } else {
-                    self.nested(sig.ret).fmt(f)?;
-                }
-                write!(f, " {} {}", meta.effect.meta_marker(), self.nested(meta.ty))
-            }
+            TyKind::Fn(sig) => self.function(sig, f),
         }
     }
 }

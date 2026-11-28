@@ -15,6 +15,16 @@
 //! split off from the loops, nodes and calls the child takes with it is
 //! the child's to wait for.
 //!
+//! What may be split off assigns nothing that what goes on reads: an
+//! iteration of a `for` that is forkable, a piece that is independent
+//! ([`crate::ir::Ir::is_independent`]). A call of a block (see
+//! [Blocks](crate::eval::blocks#blocks)) runs code of another frame, which
+//! may assign that frame's variables, so nothing that holds one is either:
+//! the iterations of a loop that calls its function's block run in order,
+//! and a piece that holds a call of a block is never split off. A call
+//! that gives a block is a piece like any other, split off or not by what
+//! its arguments and its block assign.
+//!
 //! The task running has its frames, activations and calls in the
 //! machine's fields, its value stack in the run's, and what the run shares
 //! that is a task's own in the run's [`Shared`], memo tables, graph run and
@@ -57,7 +67,9 @@
 //! tasks, and a unit's run wakes no task whose run goes on. One that waits
 //! for its turn is woken whenever a task ends, and whenever the unit runs
 //! again, since a run it is in may have become demanded meanwhile (see
-//! [Across units](#across-units)).
+//! [Across units](#across-units)). A unit taken up after a yield, which
+//! the host was not asked anything by, wakes none until every task waits
+//! (see [Yielding](super#yielding)).
 //!
 //! # Wound-wait
 //!
@@ -132,7 +144,7 @@ mod stuck;
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::diagnostic::Mark;
 use crate::source::Span;
@@ -269,6 +281,37 @@ pub(in crate::eval) struct Task {
     own: Own,
     /// What it is doing.
     pub(super) status: Status,
+}
+
+impl Task {
+    /// Charges it `time` of the time it has been set aside: its deadlines
+    /// are moved back by it, so that, moved on by the whole time once it
+    /// runs, they have passed over what was charged (see [Charged
+    /// time](super::suspend#charged-time)).
+    pub(super) fn charge(&mut self, time: Duration) {
+        for deadline in &mut self.own.deadlines {
+            deadline.own = deadline.own.checked_sub(time).unwrap_or(deadline.own);
+            deadline.effective = deadline
+                .effective
+                .checked_sub(time)
+                .unwrap_or(deadline.effective);
+        }
+    }
+
+    /// How long its nearest deadline had left when it was set aside, less
+    /// what a taking up of its unit has charged it ([`Task::charge`]);
+    /// `None` if it has none running.
+    pub(super) fn time_left(&self) -> Option<Duration> {
+        self.own
+            .deadlines
+            .last()
+            .map(|deadline| deadline.effective.saturating_duration_since(self.own.since))
+    }
+
+    /// Whether a deadline of it has passed by what it has been charged.
+    fn overdue(&self) -> bool {
+        self.time_left().is_some_and(|left| left.is_zero())
+    }
 }
 
 /// Where an iteration of a forkable `for`, or a piece (see
@@ -617,13 +660,18 @@ impl Machine<'_> {
     /// Wakes every task that waits for a node, a unit or its turn, as the
     /// unit runs again, but those still waiting for a node whose result the
     /// host has yet to give, which would only stop again. One that waits
-    /// for another task's run waits on: that run ending wakes it.
+    /// for another task's run waits on: that run ending wakes it. In a
+    /// unit its host has charged, one whose deadline has passed by what
+    /// it was charged is woken whatever it waits for, to raise it (see
+    /// [Charged time](super::suspend#charged-time)).
     fn wake_given(&mut self) {
         let graph = self.shared.graph;
+        let charged = self.charged;
         let waiting = |id: NodeId| graph.is_some_and(|graph| graph.is_waiting(id));
         for task in &mut self.tasks {
+            let overdue = charged && task.overdue();
             let woken = match std::mem::replace(&mut task.status, Status::Joining) {
-                Status::Blocked(Wait::Node(id), resume) if waiting(id) => {
+                Status::Blocked(Wait::Node(id), resume) if waiting(id) && !overdue => {
                     Status::Blocked(Wait::Node(id), resume)
                 }
                 Status::Waiting(resume) | Status::Blocked(_, resume) => Status::Wake(resume),
@@ -1318,12 +1366,71 @@ impl Machine<'_> {
             ) => self.resume_next(resume),
             Some(Status::Ready(next)) => next,
             Some(status) => self.park(status).unwrap_or(Next::Stop),
-            None => {
-                let span = self.running().ir.get(self.running().ir.root()).span;
-                Next::Give(Err(Box::new(
-                    internal("a unit taken up with nothing to do", span).into(),
-                )))
-            }
+            None => self.nothing_to_do(),
         }
+    }
+
+    /// What the unit's evaluation, taken up after a yield that stopped it
+    /// as `how` says, does first (see [Yielding](super#yielding)): the
+    /// task that was running runs again, doing what it was to do next,
+    /// and the root, if it is another, is set aside where it was, so that
+    /// the unit goes on exactly as it would have with no yield. No waiting
+    /// task is woken: none of them stopped the unit, and each run after a
+    /// yield would otherwise spend its slice on their looking again. They
+    /// are woken once every task waits, if something they wait for is
+    /// there ([`Machine::wake_due`]).
+    pub(super) fn take_up_yielded(&mut self, how: super::Yield) -> Next {
+        let Some(root) = how.root else {
+            return match self.status.take() {
+                Some(Status::Ready(next)) => next,
+                Some(status) => self.park(status).unwrap_or(Next::Stop),
+                None => self.nothing_to_do(),
+            };
+        };
+        // The task that yielded was set aside last, for the root.
+        let (Some(mut task), Some(status)) = (self.tasks.pop(), self.status.take()) else {
+            return self.nothing_to_do();
+        };
+        self.pause_profile();
+        let start = std::mem::replace(&mut task.status, status);
+        let parked = self.exchange(task);
+        self.tasks.push(parked);
+        let last = self.tasks.len() - 1;
+        if root < last {
+            self.tasks.swap(root, last);
+        }
+        self.unpause_profile();
+        self.start(start)
+    }
+
+    /// The internal error of a unit taken up whose root has no status.
+    fn nothing_to_do(&self) -> Next {
+        let span = self.running().ir.get(self.running().ir.root()).span;
+        Next::Give(Err(Box::new(
+            internal("a unit taken up with nothing to do", span).into(),
+        )))
+    }
+
+    /// Whether a task of the unit, every one of which waits, waits for
+    /// what is there already: a node whose result the host has given, a
+    /// run of another unit's that has ended, or, in a unit its host has
+    /// charged, a deadline that has passed. Asked of a unit taken up after
+    /// a yield, whose waiting tasks were not woken then (see
+    /// [Yielding](super#yielding)): waking them now moves the unit on,
+    /// and stopping would tell the host to give what it has given.
+    pub(super) fn wake_due(&self) -> bool {
+        let graph = self.shared.graph;
+        let there = |status: &Status| match status {
+            Status::Blocked(Wait::Node(id), _) => !graph.is_some_and(|graph| graph.is_waiting(*id)),
+            Status::Blocked(Wait::Unit(_), resume) => resume
+                .waits_for()
+                .is_none_or(|run| !is_running(self.memo, &run)),
+            _ => false,
+        };
+        self.status.as_ref().is_some_and(there)
+            || self
+                .tasks
+                .iter()
+                .any(|task| there(&task.status) || (self.charged && task.overdue()))
     }
 }

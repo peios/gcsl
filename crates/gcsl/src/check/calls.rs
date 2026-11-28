@@ -263,11 +263,9 @@ impl Checker<'_> {
         if builtin.effect() != Effect::Pure {
             self.impure_calls.insert(id);
         }
-        if let Some(function) = self.functions.last()
-            && function.effect == Effect::Pure
-            && builtin.effect() != Effect::Pure
+        if builtin.effect() != Effect::Pure
+            && let Some(marker) = self.pure_marker()
         {
-            let marker = function.marker;
             self.errors.push(
                 Diagnostic::error(
                     "cannot call an impure function from a pure function",
@@ -622,6 +620,7 @@ impl Checker<'_> {
         let (mut erroneous, mut misplaced_spread) = (false, false);
         // Where the rest parameter's arguments are written.
         let (mut next_positional, mut rest_run) = (0, None);
+        let block_after_rest = self.block_after_rest(sig);
         for (index, arg) in site.arg_list.iter().enumerate() {
             let target = match arg.kind {
                 ArgKind::Positional => {
@@ -633,7 +632,9 @@ impl Checker<'_> {
                     self.misplaced_spread(span, label, &mut erroneous)
                 }
                 ArgKind::Spread { .. } => rest,
-                ArgKind::Trailing => (shape.positional < count).then(|| count - 1),
+                ArgKind::Trailing => {
+                    (shape.positional < count || block_after_rest).then(|| count - 1)
+                }
                 ArgKind::Named {
                     name,
                     span,
@@ -732,6 +733,11 @@ impl Checker<'_> {
             .map_or(TyId::ERROR, |&(_, ty)| ty);
         let context =
             self.argument_context(site.known, param + site.offset, (site.id, site.callee));
+        if let Some(block) = self.types.block_sig(param_ty) {
+            let label = (site.callee_span, site.function_label);
+            return self.bind_block_argument(arg, block, label, context);
+        }
+        // A trailing block where no block is taken is the value it is.
         let found = self.check_expr_expecting_at(
             arg.value,
             param_ty,
@@ -1264,6 +1270,26 @@ impl Checker<'_> {
             return false;
         }
         let count = sig.params.len();
+        // A call that gives everything but its callee's block (see
+        // [Blocks](crate::check::blocks#blocks)).
+        let last = count.saturating_sub(1);
+        if filled.get(last) == Some(&u32::MAX)
+            && filled.iter().take(last).all(|&arg| arg != u32::MAX)
+            && let Some(&(name, ty)) = sig.params.get(last)
+            && self.types.block_sig(ty).is_some()
+        {
+            let close = call.close_span().unwrap_or(call.span);
+            let message = match name {
+                Some(name) => format!("missing the block `{}`", self.ast.names().get(name)),
+                None => "missing the block".to_owned(),
+            };
+            self.errors.push(
+                Diagnostic::error(message, close)
+                    .with_context(callee_span, function_label)
+                    .with_note("give it after the call's arguments, as in `f(x) { ... }`"),
+            );
+            return true;
+        }
         if !named && !trailing {
             let noun = if count == 1 { "argument" } else { "arguments" };
             self.errors.push(

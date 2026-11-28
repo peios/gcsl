@@ -33,7 +33,9 @@ scale(value = 21)
 
 Positional and named arguments are evaluated in source order. A trailing
 block supplies the last parameter, which is useful for functions that
-accept a configuration record.
+accept a configuration record. If the last parameter is declared as a
+block, the trailing block isn't evaluated as an argument: the function
+runs it when it chooses (see [Block Parameters](~gcsl/block-parameters)).
 
 A default can be any expression. It can use the parameters before it and
 anything visible where the function is written:
@@ -54,6 +56,34 @@ impure function. A default cannot use its own parameter or a later one.
 Only a call by the function's own name uses its defaults. A call through
 a copy, such as `g` after `let g = object`, or through a parameter must
 supply every argument.
+
+A parameter with a default can leave out its type. It then has the type
+of its default, as a `let` has the type of its value:
+
+```gcsl
+fn compile(source: String, flags = ["-O2"], output = "{source}.o"): String {
+    "cc {join(flags, " ")} -c {source} -o {output}"
+}
+usual = compile("main.c")
+debug = compile("main.c", flags = ["-g", "-O0"])
+```
+
+Here `flags` is a `List<String>` and `output` is a `String`, and a call
+that passes anything else is a type error, as it would be had you written
+the types. This works in `fn`, `def`, methods, and function expressions.
+A method's receiver, a rest parameter, and a parameter of a function type
+always have a written type, and a parameter needs a type or a default.
+
+Two defaults can't be used this way:
+
+- A default with no type of its own. `xs = []` is the error "cannot infer
+  the element type of `[]`", as `let xs = []` is. Write `xs: List<Int> =
+  []`.
+- A default that calls its own function, or a function whose own untyped
+  parameter needs this one. GCSL works out the parameter's type before it
+  knows the function's, so `fn f(x = f(1))` is the error "cannot infer the
+  type of `x`: its default needs the type of `f`, which needs it". Write
+  the parameter's type.
 
 After a named argument, a name on its own is shorthand for passing the
 variable of that name to the parameter of that name. These two calls are
@@ -198,7 +228,9 @@ result with `= ...`, bind it with `let`, or remove it.
 
 Closures hold copies of the values they capture. Rebinding a variable
 later doesn't change an existing closure. An inner function cannot rebind
-an outer function's variable.
+an outer function's variable. A block given to a
+[block parameter](~gcsl/block-parameters) is not a closure: it runs in the
+scope it is written in, and rebinds the `let mut` variables there.
 
 Top-level named functions are available regardless of textual order and
 can refer to each other within the file. Workspace files still need an

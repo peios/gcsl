@@ -82,6 +82,7 @@ use crate::lexer::{Token, TokenKind};
 use crate::names::Name;
 use crate::source::Span;
 
+use super::externs::{EXTERN_DEF_TYPE, EXTERN_DEF_TYPE_NOTE};
 use super::{
     Braces, LET_SHADOWS_NOTE, MISPLACED_ATTRIBUTE, MISPLACED_DEF_TYPE, MISPLACED_DEFERS,
     MISPLACED_NO_PRELUDE, MISPLACED_SHADOWABLE, MISPLACED_USE, NO_PRELUDE, ParseResult, Parser,
@@ -416,6 +417,11 @@ impl Parser<'_> {
         top: bool,
     ) -> ParseResult<()> {
         let kind = self.builder.item(item).kind;
+        if self.builder.is_extern_fn(item) {
+            return Err(self.report(
+                Diagnostic::error(EXTERN_DEF_TYPE, attribute).with_note(EXTERN_DEF_TYPE_NOTE),
+            ));
+        }
         if top && matches!(kind, ItemKind::Field { function: true, .. }) {
             self.builder.mark_def_type(item);
             return Ok(());

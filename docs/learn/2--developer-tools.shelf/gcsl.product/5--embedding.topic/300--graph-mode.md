@@ -95,6 +95,18 @@ a block's value waits for all of them. An element, argument or statement
 is set aside only if it assigns no variable with `:=` and has no
 `break`, `continue` or `return` in it.
 
+Code that calls a [block parameter](~gcsl/block-parameters) is never set
+aside, whether it is an iteration, an element, an argument or a
+statement. The block can assign variables of the code that gave it, which
+the function calling it can't see, so a function's calls of its block
+always run in order. A call that gives a block follows the rules for any
+other code: what its block assigns counts as the call's own assignments.
+An iteration that declares a variable, gives a block that assigns it, and
+assigns nothing outside the loop is still set aside, with its own copy of
+the variable. A unit can stop inside a block as it can anywhere else, and
+carries on from there with the caller's variables as the block left them.
+A block's effects stay in program order like any others.
+
 If two parts set aside need the same memoised call or `lazy` value, it
 runs once. Should a later part have begun it and then had to wait for an
 earlier one, the later part gives up its run and the earlier part runs
@@ -169,6 +181,26 @@ also hold a failed step's result that no code used. Once
 `graph.holes(&value)` is empty, `graph.failures(&value)` lists those
 failures so that you can report them.
 
+A program that catches a failure with `recover` or `try` goes on, and the
+failure never reaches you as an error. To hear of it anyway, implement
+`Effects::caught`. GCSL calls it for every failure a program catches, as
+it is caught and before the fallback runs, with a `CaughtFailure`:
+
+- `failure` is the `Diagnostic` as it would have been reported: its
+  message, where it was raised, its labels and its notes. Its `input` is
+  always set, to the file its spans are in.
+- `again` is `true` when the failure was caught before and raised again
+  with `raise`.
+
+A step function that catches a failure, records it and raises it again,
+called under `try`, tells you of the failure twice, the second time with
+`again` set. Report only the failures whose `again` is `false` to report
+each failure once. In graph mode, `Effects::caught` is called during the
+run of the unit that caught the failure, on the `Effects` of that run's
+`GraphHost`. A unit that is stopped, whether it waits or it yielded (see
+[Sharing one thread between units](#sharing-one-thread-between-units)),
+tells you nothing. By default `Effects::caught` does nothing.
+
 Effects that aren't inside a step are steps too: in graph mode, a unit
 never runs a program or touches a file itself. Each such effect becomes a
 step that the unit needs at once, which keeps it in program order.
@@ -176,6 +208,71 @@ step that the unit needs at once, which keeps it in program order.
 Every run in graph mode takes a `GraphHost`: which deferred calls the
 host takes as steps, and the `Effects` the unit's own effects use, such
 as the working directory that `file("hello.c")` resolves against.
+
+## Sharing one thread between units
+
+GCSL evaluates on one thread, so a unit that computes for a long time
+without waiting keeps every other unit from running. To prevent that,
+give each run a slice with `Workspace::run_prepared_for`, or
+`Workspace::run_step_for` for a step's unit. Both return a `Turn`:
+
+- `Turn::Progress(progress)` if the run ended or stopped to wait within
+  its slice, with the same `Progress` that `Workspace::run_prepared`
+  returns.
+- `Turn::Yielded` if the slice ran out while the unit was computing. The
+  unit waits for nothing. Run it again when its turn comes, with or
+  without a slice, and it carries on from where it was.
+
+A yield changes nothing that the program can see. No `recover` catches
+it, a `#[retry]` function doesn't start another attempt, and a memoised
+call the unit is in the middle of stays its own, so another unit that
+needs it gets `Progress::Waiting`. The slice covers the whole run: the
+files a target needs and the target's call share it.
+
+GCSL looks at the clock every 1,024 steps of evaluation, so a run
+overruns its slice by tens of microseconds at most in ordinary code. One
+call of a built-in function is never interrupted, and neither is one
+expression that contains no call and no loop. A run can therefore
+overrun its slice by as long as the slowest of those takes, such as a
+sort of a large list.
+
+Every run evaluates 1,024 steps before it first looks at the clock. A
+unit therefore makes progress in every run, even with a slice of zero.
+`Workspace::run_prepared` and `Workspace::run_step` take no slice and
+never yield.
+
+## Deciding what a timeout counts
+
+A `#[timeout]` on a function that runs inside a unit measures the time
+the unit spends running. A step's own `#[timeout]` is different:
+`Workspace::run_step` doesn't apply it, and it is yours to keep (see
+[Running many steps at once](#running-many-steps-at-once)).
+While the unit is stopped, whether it yielded or it waits for a result,
+the function's clock stands still. That suits a host that keeps units
+waiting for reasons of its own, but not an operation that the host runs
+for a unit: the time the operation takes is time the function spent.
+
+Call `Workspace::charge_stopped` with the unit and a duration before you
+run a stopped unit again. That much of the time the unit was stopped
+counts toward every `#[timeout]` running in it. Several calls add up
+until the unit next runs. A charge of more than the time the unit was
+stopped counts as that time. If you never call it, no stopped time
+counts.
+
+`Workspace::time_left` gives the time that the nearest `#[timeout]`
+running in a stopped unit has left, with your charges taken off. It
+returns `None` if no `#[timeout]` is running there, or if the unit isn't
+stopped. Use it to set a timer when you start an operation for the unit.
+
+If a timeout has passed by what you charged, the unit fails with it when
+you next run the unit, at the place where it was waiting. The error is
+the function's own, such as "`fetch` timed out after 30s", and a
+`recover` around the call catches it, as it does when the timeout passes
+while the function runs. The unit doesn't read the result you gave for
+the operation it was waiting for, whether a value or a failure, and you
+don't have to give one. That matches an `exec` that outlives its
+timeout: GCSL kills the program and reports the timeout, whatever the
+program would have printed.
 
 ## Running many steps at once
 

@@ -4,7 +4,9 @@
 //! # Functions
 //!
 //! A function expression's type is known before its body is checked, since
-//! every parameter and the return type are declared: its parameter and
+//! every parameter and the return type are declared, a parameter written
+//! with no type by its default (see [Untyped
+//! parameters](crate::check::untyped#untyped-parameters)): its parameter and
 //! return types are resolved and its function type interned first, and then
 //! the body is checked as a block whose scope starts with the parameters,
 //! against the return type as an annotated initialiser is checked against
@@ -112,7 +114,12 @@
 //!
 //! **Defaults.** A parameter of a function expression may have a default,
 //! `greeting: String = "hello"`, in any position, before, between or after
-//! parameters without one. A default is any expression. One that is a
+//! parameters without one. A default is any expression. What follows is of
+//! a parameter written with its type; one written with none, `greeting =
+//! "hello"`, has a default of either kind too, kept and given by calls as
+//! below, but checked with nothing expected of it, before the parameter's
+//! type is known, which it gives (see [Untyped
+//! parameters](crate::check::untyped#untyped-parameters)). One that is a
 //! *constant*, a literal (a string without interpolation, raw or not, an
 //! integer, a float, `true` or `false`), `-` applied directly to an integer
 //! or float literal, or a list literal without spreads or a record block of
@@ -312,9 +319,27 @@ use crate::types::{FnTy, Laziness, Need, TyId, TyKind};
 
 use super::needs::NeedWhy;
 use super::{
-    Bareness, Binding, BindingKind, Checker, Constant, DefaultFn, Expecting, FnResolution,
-    Function, PURE_CONTEXT, RESULT_WHY, Reach, Slot, bareness_of, merged_defaults, position,
+    Bareness, Binding, BindingKind, Checker, Constant, DefaultFn, DefaultType, EarlyDefaults,
+    Expecting, FnResolution, Function, RESULT_WHY, Reach, Slot, bareness_of, merged_defaults,
+    position,
 };
+
+/// The parameters of a function expression, as resolved before its body is
+/// checked (see `Checker::resolve_params`).
+struct ParamsResolved {
+    /// Whether one has a provisional type, which the body's check settles.
+    provisional: bool,
+    /// Each default of a parameter written with its type, by its
+    /// parameter's number, with the type it is checked against, its
+    /// parameter's before any inference, and as written.
+    defaults: Vec<(usize, ExprId, (TyId, TypeExprId))>,
+    /// Each parameter's type before any inference, which its default
+    /// functions' copies of it are given.
+    resolved: Vec<TyId>,
+    /// What the defaults of the parameters written with no type came to,
+    /// checked already.
+    early: EarlyDefaults,
+}
 
 impl Checker<'_> {
     /// Pops the innermost function off the stack of functions being
@@ -400,7 +425,9 @@ impl Checker<'_> {
     /// [`Checker::narrow_callbacks`]), and its type, recorded again, is the
     /// function type of those parameters and that result. Its parameters'
     /// defaults are checked before its body, in its frame (see
-    /// [`Checker::check_defaults`]).
+    /// [`Checker::check_defaults`]); a parameter written with no type is
+    /// typed by its default as the parameters are resolved, unless its
+    /// signature was found already (see [`Checker::type_untyped`]).
     pub(super) fn check_fn(&mut self, id: ExprId, function: FnId) -> TyId {
         if let Some(&def) = self.def_types.definitions.get(&function) {
             return self.check_definition(id, function, def);
@@ -414,29 +441,15 @@ impl Checker<'_> {
         // [Generic results](crate::check::deftypes#generic-results)).
         let gives_own = forced_ret == Some(TyId::ERROR);
         let pure = decl.effect == Effect::Pure;
-        let (params_mode, ret_mode) = bareness_of(decl.effect);
+        let (_, ret_mode) = bareness_of(decl.effect);
         let params = self.ast.params(decl.params);
         let base = self.fn_params.len();
-        let mut provisional = false;
-        // Each default and the type it is checked against: its parameter's,
-        // before any inference.
-        let mut defaults = Vec::new();
-        // Each parameter's type before any inference, which its default
-        // functions' copies of it are given.
-        let mut resolved = Vec::with_capacity(params.len());
-        self.check_rests(params);
-        for (index, param) in params.iter().enumerate() {
-            let mut ty = self.resolve_type(param.ty, params_mode);
-            resolved.push(ty);
-            if let Some(default) = param.default {
-                defaults.push((index, default, (ty, param.ty)));
-            }
-            if pure && ty != TyId::ERROR && self.is_inferred(param.ty) {
-                ty = self.types.provisional(function, position(index), ty);
-                provisional = true;
-            }
-            self.fn_params.push((Some(param.name), ty));
-        }
+        let ParamsResolved {
+            provisional,
+            mut defaults,
+            resolved,
+            mut early,
+        } = self.resolve_params((function, decl.effect), params);
         let ret = forced_ret.unwrap_or_else(|| self.declared_result(id, decl.ret, ret_mode));
         self.check_deferred_result(function, ret, decl.ret);
         let mut ty = self.function_type(function, base, (ret, decl.effect));
@@ -445,7 +458,8 @@ impl Checker<'_> {
         let ret_span = decl.ret.map_or(self.ast.get(decl.body).span, |ret| {
             self.ast.type_expr(ret).span
         });
-        let (default_fns, measured) = self.check_default_fns((params, &resolved), &mut defaults);
+        let (default_fns, measured) =
+            self.check_default_fns((params, &resolved), &mut defaults, &mut early);
         self.functions.push(Function {
             fn_id: function,
             bindings_start: self.bindings.len(),
@@ -464,7 +478,7 @@ impl Checker<'_> {
             needs: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
-        let defaults = self.check_defaults(&defaults, params.len());
+        let defaults = self.check_defaults(&defaults, params.len(), early.constants);
         let span = self.ast.get(id).span;
         let errors = self.errors.len();
         let callbacks = (self.callbacks.len(), self.callback_positions.len());
@@ -518,6 +532,53 @@ impl Checker<'_> {
         self.expr_types[id.index()]
     }
 
+    /// Resolves the types of `params`, the parameters of `function`, of
+    /// `effect`, as [`Checker::check_fn`] says, and pushes each on
+    /// `fn_params`: a bare type as the effect says, a pure function's
+    /// provisional, and one written with no type as its default types it,
+    /// its default checked here unless its signature was found already (see
+    /// [Untyped parameters](crate::check::untyped#untyped-parameters)).
+    fn resolve_params(
+        &mut self,
+        (function, effect): (FnId, Effect),
+        params: &[Param],
+    ) -> ParamsResolved {
+        let pure = effect == Effect::Pure;
+        let mode = bareness_of(effect).0;
+        let mut found = ParamsResolved {
+            provisional: false,
+            defaults: Vec::new(),
+            resolved: Vec::with_capacity(params.len()),
+            early: self
+                .calls
+                .untyped
+                .early
+                .remove(&function)
+                .unwrap_or_default(),
+        };
+        self.check_rests(params);
+        for (index, param) in params.iter().enumerate() {
+            let untyped = self.is_untyped(param);
+            if untyped && !self.calls.untyped.types.contains_key(&param.ty) {
+                let typed = (function, effect);
+                self.type_untyped(typed, (params, &found.resolved), index, &mut found.early);
+            }
+            let mut ty = self.resolve_type(param.ty, mode);
+            found.resolved.push(ty);
+            if let Some(default) = param.default
+                && !untyped
+            {
+                found.defaults.push((index, default, (ty, param.ty)));
+            }
+            if pure && ty != TyId::ERROR && self.is_inferred(param.ty) {
+                ty = self.types.provisional(function, position(index), ty);
+                found.provisional = true;
+            }
+            self.fn_params.push((Some(param.name), ty));
+        }
+        found
+    }
+
     /// The result type the function expression `id` declares, `ret`,
     /// resolved as `mode` says; `Error` with an internal error if it declares
     /// none, as the parser gives every function expression one.
@@ -548,15 +609,21 @@ impl Checker<'_> {
     /// [Functions](crate::check::functions#functions)), and takes it out of
     /// `defaults`, which keeps the constants. Returns each parameter with a
     /// default function, in order, with whether it checked without an error,
-    /// and, for each parameter, where a default first measures it, if one does.
+    /// and, for each parameter, where a default first measures it, if one
+    /// does: those of `early` among them, the defaults of the parameters
+    /// written with no type, checked already, whose copies join the
+    /// function's own here.
     pub(super) fn check_default_fns(
         &mut self,
         (params, resolved): (&[Param], &[TyId]),
         defaults: &mut Vec<(usize, ExprId, (TyId, TypeExprId))>,
+        early: &mut EarlyDefaults,
     ) -> (Vec<DefaultFn>, Vec<Option<Span>>) {
-        let mut default_fns = Vec::new();
-        let mut measured = vec![None; params.len()];
-        for &(index, _, expected) in defaults.iter() {
+        let mut default_fns = std::mem::take(&mut early.default_fns);
+        let mut measured = std::mem::take(&mut early.measured);
+        measured.resize(params.len(), None);
+        self.defaults_checked.copies.append(&mut early.copies);
+        for &(index, _, (expected, written)) in defaults.iter() {
             let Some(default_fn) = params.get(index).and_then(|param| param.default_fn) else {
                 continue;
             };
@@ -566,6 +633,7 @@ impl Checker<'_> {
             let unseen = unseen.iter().map(|param| (param.name, param.span));
             self.defaults_checked.unseen.extend(unseen);
             let earlier = resolved.get(..index).unwrap_or_default();
+            let expected = (DefaultType::Written(expected), written);
             let (checked, demanded, needs) = self.check_default_fn(default_fn, (earlier, expected));
             self.defaults_checked.unseen.truncate(outer);
             default_fns.push(DefaultFn {
@@ -582,6 +650,8 @@ impl Checker<'_> {
                 .get(index)
                 .is_some_and(|param| param.default_fn.is_none())
         });
+        // In parameter order, as their closures are kept.
+        default_fns.sort_by_key(|default| default.param);
         (default_fns, measured)
     }
 
@@ -606,7 +676,8 @@ impl Checker<'_> {
 
     /// Checks the default function `function` of a parameter whose type, as
     /// resolved for its function before any inference and as written, is
-    /// `expected` (see "Calls" under
+    /// `expected`, or which is written with no type and takes it from this
+    /// check ([`DefaultType::Untyped`]) (see "Calls" under
     /// [Functions](crate::check::functions#functions)): in a frame of its own,
     /// as a function written where its parameter's function is, whose
     /// parameters are the ones before the parameter, declared with the types
@@ -625,7 +696,7 @@ impl Checker<'_> {
     pub(super) fn check_default_fn(
         &mut self,
         function: FnId,
-        (earlier, (expected, written)): (&[TyId], (TyId, TypeExprId)),
+        (earlier, (expected, written)): (&[TyId], (DefaultType, TypeExprId)),
     ) -> (bool, Vec<Option<Span>>, Box<[Need]>) {
         // A function in the body must not see a name meant for another.
         self.callee_name = None;
@@ -654,7 +725,10 @@ impl Checker<'_> {
             marker: decl.marker,
             keyword: decl.marker,
             demanded: vec![None; params.len()],
-            result: Some((expected, context)),
+            result: match expected {
+                DefaultType::Written(expected) => Some((expected, context)),
+                DefaultType::Untyped(_) => None,
+            },
             returns: Vec::new(),
             with_depth: self.contexts.bound.len(),
             needs: Vec::new(),
@@ -668,16 +742,18 @@ impl Checker<'_> {
             self.declare_binding(param.name, ty, Some(param.span), BindingKind::Variable);
         }
         let errors = self.errors.len();
-        let found = if expected == TyId::ERROR {
-            self.check_expr(decl.body);
-            TyId::ERROR
-        } else {
-            self.check_expr_expecting(
+        let found = match expected {
+            DefaultType::Written(TyId::ERROR) => {
+                self.check_expr(decl.body);
+                TyId::ERROR
+            }
+            DefaultType::Written(expected) => self.check_expr_expecting(
                 decl.body,
                 expected,
                 context,
                 "expected because of this annotation",
-            )
+            ),
+            DefaultType::Untyped(effect) => self.check_untyped_default_fn(&decl, written, effect),
         };
         self.bindings.truncate(self.block_start);
         (self.block_start, self.fields_start) = outer;
@@ -714,16 +790,23 @@ impl Checker<'_> {
     /// as an annotated initialiser is against its annotation. Returns the
     /// constant each parameter's default is, for [`FnResolution::defaults`]:
     /// empty if none has one, and `None` for a parameter without one or whose
-    /// default is in error.
+    /// default is in error. `early` has those of the parameters written
+    /// with no type, checked already.
     pub(super) fn check_defaults(
         &mut self,
         defaults: &[(usize, ExprId, (TyId, TypeExprId))],
         count: usize,
+        early: Vec<(usize, Option<Constant>)>,
     ) -> Vec<Option<Constant>> {
-        if defaults.is_empty() {
+        if defaults.is_empty() && early.is_empty() {
             return Vec::new();
         }
         let mut constants = vec![None; count];
+        for (param, constant) in early {
+            if let Some(entry) = constants.get_mut(param) {
+                *entry = constant;
+            }
+        }
         for &(param, default, (ty, written)) in defaults {
             if ty == TyId::ERROR {
                 continue;
@@ -783,11 +866,14 @@ impl Checker<'_> {
     /// Types the call `id` of `callee` with the arguments `args` (see the
     /// module documentation): the callee's return type, or `Error` if the
     /// callee is not a function or the arguments do not fit its parameters.
-    /// Every argument is checked whatever goes wrong. A callee that may be
+    /// Every argument is checked whatever goes wrong, once. A callee that may be
     /// a future is awaited. A call of a callback parameter through its name
     /// records what it gives each position (see
     /// [`Checker::record_argument`]), and is not a use of it as a value.
     pub(super) fn check_call(&mut self, id: ExprId, callee: ExprId, args: ArgRange) -> TyId {
+        if self.ast.get(callee).kind == ExprKind::Operation {
+            return self.check_operation_call(id, callee, args);
+        }
         if let ExprKind::Field {
             expr: receiver,
             name,
@@ -829,7 +915,7 @@ impl Checker<'_> {
     ) -> TyId {
         if callee_ty == self.never {
             for arg in self.ast.args(args) {
-                self.check_alone(arg.value);
+                self.check_unchecked(arg.value);
             }
             return self.never;
         }
@@ -851,10 +937,20 @@ impl Checker<'_> {
         let unknown = u32::from(callee_ty == TyId::ERROR);
         self.quiet.expecting_error = self.quiet.expecting_error.saturating_add(unknown);
         for arg in self.ast.args(args) {
-            self.check_alone(arg.value);
+            self.check_unchecked(arg.value);
         }
         self.quiet.expecting_error = self.quiet.expecting_error.saturating_sub(unknown);
         TyId::ERROR
+    }
+
+    /// Checks the argument `value` alone, unless it is checked already: the
+    /// default of a definition's own parameter written with no type, which
+    /// its body's function, then erroneous, was typed by (see [Untyped
+    /// parameters](crate::check::untyped#untyped-parameters)).
+    fn check_unchecked(&mut self, value: ExprId) {
+        if self.calls.prechecked.remove(&value).is_none() {
+            self.check_alone(value);
+        }
     }
 
     /// Types the call `id` of `callee`, already checked, of type
@@ -869,6 +965,9 @@ impl Checker<'_> {
     ) -> TyId {
         if let TyKind::Builtin(builtin) = *self.types.kind(callee_ty) {
             return self.check_builtin_call(id, (callee, builtin), args);
+        }
+        if let Some(block) = self.types.block_sig(callee_ty) {
+            return self.check_block_call(id, callee, block, args);
         }
         let callee_ty = self.measure(callee, callee_ty);
         let Some(sig) = self.types.fn_sig(callee_ty).cloned() else {
@@ -903,14 +1002,16 @@ impl Checker<'_> {
         let why = NeedWhy::Call(self.callee_written_name(callee));
         let needs = self.types.need_set(sig.needs).to_vec();
         self.charge_needs(&needs, self.ast.get(id).span, why);
-        if let Some(function) = self.functions.last()
-            && function.effect == Effect::Pure
-            && sig.effect != Effect::Pure
+        if sig.effect != Effect::Pure
+            && let Some(marker) = self.pure_marker()
         {
-            let (marker, function) = (function.marker, function.fn_id);
+            let context = self.pure_context();
             let label = format!("this is {}", self.in_label(callee_ty));
             // A context's default, which has no marker of its own to change.
-            if self.is_context_default(function) {
+            if let Some(function) = self.functions.last().map(|function| function.fn_id)
+                && self.block_arg().is_none()
+                && self.is_context_default(function)
+            {
                 self.errors.push(
                     Diagnostic::error(
                         "the default of a context must be pure",
@@ -930,7 +1031,7 @@ impl Checker<'_> {
                     self.ast.get(id).span,
                 )
                 .with_context(self.ast.get(callee).span, label)
-                .with_context(marker, PURE_CONTEXT)
+                .with_context(marker, context)
                 .with_note(
                     "a pure function, declared with `:`, may call only pure functions; declare \
                      it with `->` to make it impure",
@@ -1047,6 +1148,7 @@ impl Checker<'_> {
         } else if let Some(found) = self.empty_body(body, ret, (context, why)) {
             self.expr_types[body.index()] = found;
         } else {
+            self.note_definition_end(body, ret);
             let expecting = self.result_expecting(ret, items, (context, why), block.span);
             // A labelled body is a labelled block like any other, whose
             // `return`s give it its value, checked as ever where only a

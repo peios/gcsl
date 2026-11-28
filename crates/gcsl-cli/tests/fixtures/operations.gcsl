@@ -1,0 +1,13 @@
+# What the host gives: machines, booted and run.
+extern type Vm = "vm.machine"
+
+extern fn boot(name: String, cpus: Int = 1) -> Vm = "vm.boot"
+extern fn (m: Vm) run(...argv: String) -> {status: Int, stdout: String}
+
+fn hostname(name: String) -> String {
+    let m = boot(name)
+    = m.run("hostname").stdout
+}
+
+known = recover { hostname("a") } else (failure) { failure.message }
+name = hostname("b")

@@ -321,6 +321,10 @@ impl TypeArena {
                 TypeExprKind::List(element) => {
                     TypeExprKind::List(self.copy(from, element, memo, (replace, constant)))
                 }
+                TypeExprKind::Block { ret, effect } => TypeExprKind::Block {
+                    ret: self.copy(from, ret, memo, (replace, constant)),
+                    effect,
+                },
                 TypeExprKind::Union { lhs, rhs, bar } => {
                     let lhs = self.copy(from, lhs, memo, (replace, constant));
                     let rhs = self.copy(from, rhs, memo, (replace, constant));
@@ -336,6 +340,7 @@ impl TypeArena {
                 | TypeExprKind::Param(_)
                 | TypeExprKind::Enum { .. }
                 | TypeExprKind::Context(_)
+                | TypeExprKind::Inferred
                 | TypeExprKind::Data
                 | TypeExprKind::Invalid) => kind,
             },
@@ -471,6 +476,10 @@ impl TypeArena {
                 let new = self.substitute(element, args, memo);
                 (new != element).then_some(TypeExprKind::List(new))
             }
+            TypeExprKind::Block { ret, effect } => {
+                let new = self.substitute(ret, args, memo);
+                (new != ret).then_some(TypeExprKind::Block { ret: new, effect })
+            }
             TypeExprKind::Union { lhs, rhs, bar } => {
                 let new = (
                     self.substitute(lhs, args, memo),
@@ -488,6 +497,7 @@ impl TypeArena {
             | TypeExprKind::Ref(_)
             | TypeExprKind::Enum { .. }
             | TypeExprKind::Context(_)
+            | TypeExprKind::Inferred
             | TypeExprKind::Data
             | TypeExprKind::Invalid => None,
         };
@@ -561,7 +571,9 @@ impl TypeArena {
             TypeExprKind::Applied { args, .. }
             | TypeExprKind::PathApplied { args, .. }
             | TypeExprKind::Instance { args, .. } => self.args(args).to_vec(),
-            TypeExprKind::List(element) => vec![element],
+            TypeExprKind::List(element) | TypeExprKind::Block { ret: element, .. } => {
+                vec![element]
+            }
             TypeExprKind::Union { lhs, rhs, .. } => vec![lhs, rhs],
             TypeExprKind::Named(_)
             | TypeExprKind::Path(_)
@@ -569,6 +581,7 @@ impl TypeArena {
             | TypeExprKind::Param(_)
             | TypeExprKind::Enum { .. }
             | TypeExprKind::Context(_)
+            | TypeExprKind::Inferred
             | TypeExprKind::Data
             | TypeExprKind::Invalid => Vec::new(),
         }

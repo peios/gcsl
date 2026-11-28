@@ -11,8 +11,7 @@ use crate::names::Name;
 use crate::value::{Closure, ContextFrame, Value};
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
-use super::super::failure::Caught;
-use super::super::{Callee, Unwind, nested_too_deeply};
+use super::super::{Callee, Unwind, mistyped, nested_too_deeply};
 use super::super::graph::GraphRun;
 use super::suspend::Resume;
 use super::tasks::Status;
@@ -47,6 +46,61 @@ impl DefaultRun {
 }
 
 impl Machine<'_> {
+    /// Evaluates the `CallBlock` node `id`, at depth `depth`, of the block
+    /// that `block`, a read of the running frame's block parameter, gives,
+    /// as [`Evaluator::call_block`](super::Evaluator::call_block) does: its
+    /// body, in an activation of the frame of the call that gave it (see
+    /// [Blocks](crate::eval::blocks#blocks)).
+    pub(super) fn call_block(&mut self, id: IrId, (block, depth): (IrId, u16)) -> Next {
+        let found = self.walker(|walker| {
+            let node = walker.ir.get(id);
+            let Value::Block(block) = walker.value(block)? else {
+                return mistyped(node, "a call of a block of a value that is none");
+            };
+            if walker.past_deadline() {
+                return walker.timed_out(node);
+            }
+            let entering = walker.levels + usize::from(depth) + CALL_LEVELS;
+            if entering + usize::from(block.height) > MAX_DEPTH {
+                return Err(nested_too_deeply(node).into());
+            }
+            Ok((block, entering))
+        });
+        let (block, levels) = match found {
+            Ok(found) => found,
+            Err(unwind) => return fail(unwind),
+        };
+        self.activations.push(Activation {
+            ir: Rc::clone(&block.code),
+            base: block.base,
+            callee: block.callee.clone(),
+            owned: block.captures.as_deref().map(Box::from),
+            caller: block.caller,
+            levels,
+        });
+        self.frames.push(Frame::BlockBody(id));
+        Next::Eval(block.body)
+    }
+
+    /// Takes up the `CallBlock` node `id` with `result`, what the block's
+    /// body came to, as
+    /// [`Evaluator::call_block`](super::Evaluator::call_block) ends.
+    pub(super) fn block_done(&mut self, id: IrId, result: Outcome) -> Next {
+        let Some(ran) = self.activations.pop() else {
+            return self.mistyped(id, "a block's body with no activation");
+        };
+        match result {
+            Ok(value) => Next::Give(Ok(value)),
+            Err(unwind) => match *unwind {
+                Unwind::Error(error) => fail(self.walker(|walker| walker.marked(error, &ran.ir))),
+                Unwind::Stop(_) => {
+                    let span = self.running().ir.get(id).span;
+                    fail(super::super::internal("a jump left a block", span))
+                }
+            },
+        }
+    }
+
     /// Evaluates the `With` node `id` of `parts`, as
     /// [`Evaluator::with`](super::Evaluator::with) does: each binding's
     /// value, in order, in the running context, and then the body in a new
@@ -131,7 +185,8 @@ impl Machine<'_> {
         match result {
             Err(unwind) => match *unwind {
                 Unwind::Error(error) if error.mark == ErrorMark::NONE => {
-                    self.shared.failures.borrow_mut().push(Caught::of(error));
+                    let caught = self.walker(|walker| walker.caught(error));
+                    self.shared.failures.borrow_mut().push(caught);
                     self.frames.push(Frame::Fallback);
                     Next::Eval(fallback)
                 }

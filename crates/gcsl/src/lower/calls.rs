@@ -112,11 +112,72 @@ impl Lowerer<'_> {
             | Builtin::SandboxDir
             | Builtin::Contains
             | Builtin::ListUnique
-            | Builtin::ListContains => Err(InternalError {
+            | Builtin::ListContains
+            | Builtin::Operation => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),
         }
+    }
+
+    /// Lowers the call `id`, of kind `kind`, with the arguments `args`, that
+    /// the body of an operation is (see the checker's [Host
+    /// operations](crate::check::operations#host-operations)): a `Call` of
+    /// the built-in [`Builtin::Operation`], yielded by a node of its own,
+    /// with the operation's name and a `MakeList` of each parameter's read,
+    /// awaited as the checker marked it; inside an `As` of the test the
+    /// checker planned of the declared result's type, since what the host
+    /// gives may be of any shape. The call itself is of kind
+    /// [`ValueKind::Mixed`], whatever the host gives.
+    pub(super) fn lower_operation(
+        &mut self,
+        id: ExprId,
+        args: ArgRange,
+        kind: ValueKind,
+    ) -> Result<IrKind, InternalError> {
+        let (ast, resolution) = (self.ast, self.resolution);
+        let span = ast.get(id).span;
+        let parts = match ast.args(args) {
+            [name, list] => match ast.get(list.value).kind {
+                ExprKind::List(elements) => Some((name.value, elements)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (Some((name, elements)), Some(test)) = (parts, resolution.test_of(id)) else {
+            return Err(InternalError {
+                message: "an operation's call is not the body the parser gives an operation",
+                span,
+            });
+        };
+        let test = self.push_test(test);
+        let callee = self
+            .builder
+            .alloc(IrKind::Builtin(Builtin::Operation), span);
+        let name = ArgValue::Node(self.lower_operand(name, ValueKind::String)?);
+        let mut given = Vec::new();
+        for element in ast.elements(elements) {
+            given.push(self.lower_expr(element.value)?);
+        }
+        let items = self.builder.push_item_list(&given);
+        let spreads = false;
+        let list = self
+            .builder
+            .alloc(IrKind::MakeList { items, spreads }, span);
+        let base = self.item_stack.len();
+        self.push_arg(0, name, span);
+        self.push_arg(1, ArgValue::Node(list), span);
+        let args = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        let call = IrKind::Call {
+            callee,
+            args,
+            kind: ValueKind::Mixed,
+            // Set by `IrBuilder::measure` once every node is built.
+            depth: 0,
+        };
+        let value = self.builder.alloc(call, span);
+        Ok(IrKind::As { value, test, kind })
     }
 
     /// Lowers the call spanning `span` of `record` with the arguments
@@ -353,7 +414,18 @@ impl Lowerer<'_> {
                 rest_items.push(item);
                 continue;
             }
-            let value = ArgValue::Node(self.lower_expr(arg.value)?);
+            // A trailing block that fills a block parameter is its body,
+            // which the callee's calls of the block run (see the checker's
+            // "Blocks").
+            let value = if resolution.is_block_arg(arg.value).is_some() {
+                ArgValue::Block {
+                    body: self.lower_expr(arg.value)?,
+                    // Set by `IrBuilder::measure` once every node is built.
+                    height: 0,
+                }
+            } else {
+                ArgValue::Node(self.lower_expr(arg.value)?)
+            };
             let node = self
                 .builder
                 .alloc(IrKind::Arg { param, value }, arg.span(ast));

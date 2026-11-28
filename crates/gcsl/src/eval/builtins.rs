@@ -121,6 +121,7 @@ pub(super) const fn described(value: &Value) -> &'static str {
         Value::Empty | Value::Record(_) => "a record",
         Value::List(_) => "a list",
         Value::Fn(_) | Value::Builtin(_) => "a function",
+        Value::Block(_) => "a block",
         Value::Tag(_) => "a variant",
         Value::Variant(_) => "a value of an enum",
         Value::Secret(_) => "a secret",

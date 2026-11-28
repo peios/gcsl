@@ -1046,6 +1046,12 @@ pub(super) fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize)
             state.write_u8(16);
             sandbox.hash(state);
         }
+        // Never a memoised call's argument, which takes no block.
+        Value::Block(block) => {
+            state.write_u8(17);
+            state.write_usize(block.body.index());
+            state.write_usize(block.base);
+        }
         Value::Record(record) => {
             state.write_u8(5);
             state.write_usize(record.values.len());

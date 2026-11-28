@@ -48,6 +48,28 @@
 //! arguments, as if every one had been written, and a memoised function's key
 //! is the same either way.
 //!
+//! A trailing block that fills its callee's block parameter (see the
+//! checker's [Blocks](crate::check::blocks#blocks),
+//! [`Resolution::is_block_arg`](crate::check::Resolution::is_block_arg)) is
+//! the `Arg` of that parameter with an
+//! [`ArgValue::Block`](crate::ir::ArgValue::Block) of its body, the block
+//! lowered where it is written, in its caller's function, with the
+//! caller's slots, loops and catches: so its body reads and stores the
+//! caller's variables as any block of the caller does, and is no function
+//! of its own. It is not a value the call evaluates before its callee
+//! runs, so it is left out of what an unreached call's operands are. Where
+//! the checker made the block's last expression a statement, an impure
+//! call that ends a block whose result is `{}`, that expression is an item
+//! of the `Block`, its value dropped as a discarded call's is, and the
+//! `Block`'s result is `Empty`. A call of a block parameter
+//! ([`Resolution::is_block_call`](crate::check::Resolution::is_block_call))
+//! lowers to a `CallBlock` of the read of the parameter, of the kind of
+//! the block's result, awaited where the checker marked it as any call is.
+//! Since the block it runs may assign the variables of the frame that gave
+//! it, a `CallBlock` makes every `for` whose guard or body it is being
+//! lowered in not forkable (`Lowerer::calls_block`), as an assignment
+//! outside the iteration does.
+//!
 //! A declaration a later one shadows (see [`crate::mentions`], "Shadowed
 //! declarations") lowers to nothing and is in no record: it is never run.
 //! Its function expressions and `lazy`s are never made, but the function
@@ -218,7 +240,13 @@
 //! value, of any kind, in the `Await` the checker marked it for, as an
 //! interpolated expression is. A call of an ordinary built-in
 //! function (`int`, `float`) is a `Call` of its callee, a read of its cell,
-//! as a call of any function value is. A member of the `fileroot` module,
+//! as a call of any function value is. The call that is the body of an
+//! operation, whose callee is an [`ExprKind::Operation`], lowers to a
+//! `Call` of a `Builtin` node, which yields the built-in that asks the
+//! host, with the operation's name and a `MakeList` of its parameters'
+//! reads, inside an `As` of the test the checker planned of the declared
+//! result (`Lowerer::lower_operation`; see [`crate::ir`], "Host
+//! operations"). A member of the `fileroot` module,
 //! which the checker resolved to [`VarRef::Fileroot`], lowers to a node of
 //! its own, never reading the module: `fileroot.this` and
 //! `fileroot.workspace` to a `StrConst` of the file's place as the checker
@@ -390,10 +418,11 @@
 //! [`crate::check::Resolution::test_of`]).
 //!
 //! Once every node is built, one post-pass computes what the evaluator's
-//! nesting budget needs (see [`crate::MAX_DEPTH`]): each `Call`'s and each
-//! `Await`'s depth in the body of its frame, the body node being at depth 0,
-//! and each function's body height, the number of nodes on its longest path
-//! to a leaf. It walks the root and then each function's body, depth first
+//! nesting budget needs (see [`crate::MAX_DEPTH`]): each `Call`'s, each
+//! `CallBlock`'s and each `Await`'s depth in the body of its frame, the body
+//! node being at depth 0, and each function's body height, the number of
+//! nodes on its longest path to a leaf, and each block argument's body
+//! height likewise. It walks the root and then each function's body, depth first
 //! and iteratively, with an explicit stack, since a body can be `MAX_DEPTH`
 //! deep: a call or an await gets its depth on the way down, and every node
 //! its height, in one vector indexed by node, on the way up. A
@@ -963,8 +992,7 @@ impl Lowerer<'_> {
     /// Lowers expression `id`, of kind `kind`, as it is, without any await
     /// the checker marked it for.
     fn lower_plain(&mut self, id: ExprId, kind: ValueKind) -> Result<IrId, InternalError> {
-        let expr = *self.ast.get(id);
-        let span = expr.span;
+        let (expr, span) = (*self.ast.get(id), self.ast.get(id).span);
         let lowered = match (expr.kind, kind) {
             (ExprKind::Paren(inner) | ExprKind::Ascribe { expr: inner, .. }, _) => {
                 return self.lower_operand(inner, kind);
@@ -1046,6 +1074,7 @@ impl Lowerer<'_> {
                 message: self.lower_operand(message, ValueKind::String)?,
             },
             (ExprKind::Recover(recover), _) => self.lower_recover(recover, kind)?,
+            (ExprKind::Try(operand), _) => self.lower_try(operand, kind, span)?,
             (ExprKind::With { bindings, body }, _) => {
                 self.lower_with(id, (bindings, body), kind)?
             }
@@ -1060,7 +1089,8 @@ impl Lowerer<'_> {
                 | ExprKind::Size(_)
                 | ExprKind::Bool(_)
                 | ExprKind::Str(_)
-                | ExprKind::Interp(_),
+                | ExprKind::Interp(_)
+                | ExprKind::Operation,
                 _,
             ) => return Err(mistyped(expr.kind, kind, span)),
         };

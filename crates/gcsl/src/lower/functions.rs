@@ -4,7 +4,7 @@
 use crate::ast::{DefTypeId, Effect, ExprId, ExprKind, FnId};
 use crate::check::{Fileroot, Slot, VarRef};
 use crate::diagnostic::InternalError;
-use crate::ir::{ArgValue, FnCode, FnKind, IrId, IrKind, IrRange};
+use crate::ir::{ArgValue, FailureOp, FnCode, FnKind, IrId, IrKind, IrRange};
 use crate::names::Name;
 use crate::source::Span;
 use crate::types::FnTy;
@@ -25,6 +25,14 @@ impl Lowerer<'_> {
     ) -> Result<IrKind, InternalError> {
         let expr = *self.ast.get(id);
         match (expr.kind, kind) {
+            // A `raise`, of the failure whose number its fallback kept (see
+            // the checker's "Failure").
+            (ExprKind::Name(_), _) if let Some(slot) = self.resolution.raise_of(id) => {
+                let at = self
+                    .builder
+                    .alloc(IrKind::Load(slot, ValueKind::Int), expr.span);
+                Ok(IrKind::Failure(FailureOp::Raise(at)))
+            }
             (ExprKind::Name(_), _) => {
                 read(self.resolution.expr_var(id), kind).ok_or(InternalError {
                     message: "a variable use has no slot",
@@ -37,6 +45,11 @@ impl Lowerer<'_> {
                 message: "a `lazy` typed as something other than a future",
                 span: expr.span,
             }),
+            (ExprKind::Call { callee, args }, _)
+                if self.ast.get(callee).kind == ExprKind::Operation =>
+            {
+                self.lower_operation(id, args, kind)
+            }
             (ExprKind::Call { callee, args }, _) => match self.resolution.expr_var(callee) {
                 VarRef::Builtin(builtin) => self.lower_builtin(id, builtin, args, kind),
                 // `fileroot.helper()`, which takes no argument, is its own
@@ -52,6 +65,17 @@ impl Lowerer<'_> {
                     span: expr.span,
                 }),
                 _ if self.resolution.method_receiver(id).is_some() => self.lower_method_call(id),
+                // A call of a block, the read of this function's block
+                // parameter (see the checker's "Blocks").
+                _ if self.resolution.is_block_call(id) => {
+                    self.calls_block();
+                    Ok(IrKind::CallBlock {
+                        block: self.lower_operand(callee, ValueKind::Fn)?,
+                        kind,
+                        // Set by `IrBuilder::measure` once every node is built.
+                        depth: 0,
+                    })
+                }
                 _ => Ok(IrKind::Call {
                     callee: self.lower_operand(callee, ValueKind::Fn)?,
                     args: self.lower_args(id, args, expr.span)?,

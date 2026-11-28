@@ -469,11 +469,14 @@ impl Checker<'_> {
 
     /// Checks the bodies of the group `group`, whose callee groups are
     /// checked, members in source order, and gives each member's binding
-    /// the type and function its body gives it.
+    /// the type and function its body gives it. The signatures of its
+    /// members that are pending are found first (see
+    /// [`Checker::type_signatures`]).
     pub(super) fn finish_group(&mut self, group: u32) {
         let Some(members) = self.mentions.groups.get(group as usize).cloned() else {
             return;
         };
+        self.type_signatures(&members);
         for &member in &members {
             self.check_top_body(member as usize);
         }

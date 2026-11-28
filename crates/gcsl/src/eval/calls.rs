@@ -858,6 +858,9 @@ impl Evaluator<'_> {
             (Builtin::FsWrite, Some((Value::Str(p), _)), Some(Value::Str(contents))) => {
                 write_file(&p, &contents, self.shared.effects, node)
             }
+            (Builtin::Operation, Some((Value::Str(name), _)), Some(Value::List(args))) => {
+                self.ask_host(&name, &args, node)
+            }
             (Builtin::FsTempDir, None, None) => self.temp_dir(node),
             (Builtin::WorkingDir, None, None) => self.working_dir_value(node),
             (_, Some((first, _)), second) if builtin.is_of_elements() => {
@@ -927,6 +930,7 @@ impl Evaluator<'_> {
         };
         let value = match value {
             ArgValue::Node(value) => self.value(value)?,
+            ArgValue::Block { body, height } => self.make_block(body, height),
             ArgValue::Default { capture, .. } => {
                 let earlier = base..base + param as usize;
                 self.default_arg((callee, capture), earlier, (depth, node))?
@@ -1050,13 +1054,15 @@ impl Evaluator<'_> {
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_function),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
             IrKind::LoadCallee => self.callee(node).map(Callee::Closure),
+            IrKind::Builtin(builtin) => Ok(Callee::Builtin(builtin)),
             IrKind::Tag { key, of, shown } => Ok(Callee::Tag(self.tag((key, of, shown)))),
-            IrKind::ContextRead { .. } | IrKind::With { .. } | IrKind::Recover { .. } => {
-                match into_callee(self.whole_node(node)?) {
-                    Some(callee) => Ok(callee),
-                    None => mistyped(node, "a context's value that is no function"),
-                }
-            }
+            IrKind::ContextRead { .. }
+            | IrKind::With { .. }
+            | IrKind::Recover { .. }
+            | IrKind::CallBlock { .. } => match into_callee(self.whole_node(node)?) {
+                Some(callee) => Ok(callee),
+                None => mistyped(node, "a context's value that is no function"),
+            },
             IrKind::Top(slot, _) => self.top_function(slot, node),
             IrKind::MakeClosure { function, captures } => {
                 self.make_closure(function, captures).map(Callee::Closure)

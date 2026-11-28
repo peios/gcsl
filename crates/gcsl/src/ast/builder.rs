@@ -9,11 +9,12 @@ use crate::strings::Strings;
 
 use super::{
     Arg, ArgRange, Ast, AttributeUse, ContextDecl, DefTypeId, DefTypeUse, Element, ElementRange,
-    Expansion, Expr, ExprId, ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForDecl, ForId,
-    GenericOwner, Generics, ImportDecl, ImportId, ImportMember, ImportMemberRange, Item, ItemId,
-    ItemKind, ItemRange, Label, LabelId, MethodDecl, NeedTy, NeedTyRange, Param, ParamRange,
-    ParamTy, ParamTyRange, PartRange, PathRange, PathSegment, RecoverDecl, RecoverId, StrPart,
-    TypeArena, TypeArgRange, TypeExpr, TypeExprId, UnaryOp, WithBinding, WithRange, next_id,
+    Expansion, Expr, ExprId, ExprKind, ExternFn, ExternType, FieldTy, FieldTyRange, FnDecl, FnId,
+    ForDecl, ForId, GenericOwner, Generics, ImportDecl, ImportId, ImportMember, ImportMemberRange,
+    Item, ItemId, ItemKind, ItemRange, Label, LabelId, MethodDecl, NeedTy, NeedTyRange, Param,
+    ParamRange, ParamTy, ParamTyRange, PartRange, PathRange, PathSegment, RecoverDecl, RecoverId,
+    StrPart, TypeArena, TypeArgRange, TypeExpr, TypeExprId, UnaryOp, WithBinding, WithRange,
+    next_id,
 };
 
 /// Arenas under construction. Allocate children before their parents, then
@@ -45,6 +46,8 @@ pub struct AstBuilder {
     pub(super) generics: Vec<Generics>,
     pub(super) methods: Vec<MethodDecl>,
     pub(super) contexts: Vec<ContextDecl>,
+    pub(super) extern_fns: Vec<ExternFn>,
+    pub(super) extern_types: Vec<ExternType>,
     pub(super) def_types: Vec<DefTypeUse>,
     pub(super) no_prelude: Option<Span>,
     pub(super) syntax: Syntax,
@@ -438,6 +441,34 @@ impl AstBuilder {
         self.contexts.push(context);
     }
 
+    /// Records `operation`, an operation the file declares (see [Host
+    /// operations](crate::ast#host-operations)).
+    pub fn push_extern_fn(&mut self, operation: ExternFn) {
+        self.extern_fns.push(operation);
+    }
+
+    /// Records `handle`, a handle type the file declares (see [Host
+    /// operations](crate::ast#host-operations)).
+    pub fn push_extern_type(&mut self, handle: ExternType) {
+        self.extern_types.push(handle);
+    }
+
+    /// Whether the function of the function item `id` is an operation's
+    /// (see [Host operations](crate::ast#host-operations)).
+    #[must_use]
+    pub fn is_extern_fn(&self, id: ItemId) -> bool {
+        self.item(id)
+            .kind
+            .value()
+            .is_some_and(|value| match self.get(value).kind {
+                ExprKind::Fn(function) => self
+                    .extern_fns
+                    .iter()
+                    .any(|operation| operation.function == function),
+                _ => false,
+            })
+    }
+
     /// The number of type expressions made so far: the number of the next.
     #[must_use]
     pub fn type_count(&self) -> u32 {
@@ -576,6 +607,9 @@ impl AstBuilder {
         });
         self.methods.retain(|method| method.item.0 < items);
         self.contexts.retain(|context| context.item.0 < items);
+        self.extern_fns
+            .retain(|operation| operation.function.0 < fns);
+        self.extern_types.retain(|handle| handle.item.0 < items);
     }
 
     /// Returns the node `id`.
@@ -653,6 +687,8 @@ impl AstBuilder {
             generics: self.generics,
             methods: self.methods,
             contexts: self.contexts,
+            extern_fns: self.extern_fns,
+            extern_types: self.extern_types,
             def_types: self.def_types,
             no_prelude: self.no_prelude,
             syntax: self.syntax,

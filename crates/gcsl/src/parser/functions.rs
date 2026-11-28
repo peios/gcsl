@@ -25,24 +25,43 @@
 //! A function expression is `fn`, `(`, parameters `NAME: TYPE` separated by
 //! `,` with an optional trailing `,`, `)`, the return marker, the return
 //! type, and the body, a block whose `{` must follow the return type
-//! directly, as an `if`'s block follows its condition. Every parameter is
-//! annotated. A parameter may have a default, `NAME: TYPE = EXPR`, any
+//! directly, as an `if`'s block follows its condition. A parameter may
+//! have a default, `NAME: TYPE = EXPR`, any
 //! expression after the `=` as an argument is (`Parser::parse_default`),
 //! in any position, in a `fn` expression, a named `fn` item, a `def` and a
 //! def-type's `def` alike, since each is parsed as one ([`Param::default`]).
+//! A parameter with a default may be written with no type, `NAME = EXPR`
+//! (`Parser::parse_inferred_param`): its type is its default's, which the
+//! checker infers (see the checker's [Untyped
+//! parameters](crate::check::untyped#untyped-parameters)), and its type
+//! expression, which nothing writes, says so
+//! ([`TypeExprKind::Inferred`], spanning its name, as the parameter then
+//! does). `fn f(n = 3)` was "expected `:` and a type after parameter `n`"
+//! before, so no program that parsed means anything else. A parameter with
+//! neither a type nor a default is that error still, at what follows its
+//! name, noted "a parameter is written with its type, as in `n: Int`, or
+//! with a default its type is inferred from, as in `n = 3`". Only a
+//! parameter of a function expression is written so: a rest parameter is
+//! "a rest parameter's type is not inferred", at its `=`, noted that it
+//! has no default; a method's receiver "a receiver takes no default", noted
+//! "a receiver is written with its type, as in `(xs: List<Int>)`"; and in a
+//! function type, where `x = 1` reads `x` as a type, it is the error any
+//! default there is. A block parameter is one by its type, so it is never
+//! written without it.
 //! Once the parameters and the return marker are parsed, each default that
 //! is no constant ([`crate::ast::is_constant`]) is given its *default
 //! function* ([`Param::default_fn`], `Parser::with_default_fns`): a
 //! [`FnDecl`] with no expression of its own, whose parameters are copies of
 //! the ones before it, as written, without their defaults, whose return
-//! type is the parameter's, whose effect is the function's (a memoised
+//! type is the parameter's (none written, for a parameter written with no
+//! type), whose effect is the function's (a memoised
 //! one's is impure), whose marker is the function's, and whose body is the
 //! default, as a `lazy`'s body is an expression. It adds no syntax: the
 //! default is still where it is written, and the formatter and the index see
 //! it there. How it is checked, and run, is the checker's business (see
-//! [`crate::check`], "Calls"). Not in a function type,
-//! nor in the parameters of a definition made with a def-type, which are
-//! names alone ("expected `,` or `)`" at an `=` there, as before). The
+//! [`crate::check`], "Calls"). Not in a function type; a definition made
+//! with a def-type has its own rule (see the parser's
+//! [Def-types](crate::parser::deftypes#def-types)). The
 //! marker is one of three, each an [`Effect`] of the
 //! [`FnDecl`] and of a function type alike: `:` for a pure function, `->>`
 //! for an impure one that is memoised, run at most once per distinct
@@ -72,7 +91,7 @@
 //! same with `def` (`Parser::parse_method`), is a function called on a value
 //! of its receiver's type, `xs.unique()`, rather than by a name: `fn` or
 //! `def`, the receiver in parentheses, one parameter written as any is but
-//! with no default, the method's name, its type parameters if it is
+//! with its type and no default, the method's name, its type parameters if it is
 //! generic, and then a function expression's parameters, marker, return
 //! type and body. Its item is a `let` of a name no source can write
 //! ([`crate::names::method_binding`]), its value the function, whose first
@@ -87,6 +106,72 @@
 //! at the second, and a receiver with a default "a receiver takes no
 //! default", at the `=`.
 //!
+//! # Blocks
+//!
+//! A function's last parameter may be a *block* (see the checker's
+//! [Blocks](crate::check::blocks#blocks)): a parameter whose type is a
+//! block type, `block -> T` or `block: T`
+//! ([`TypeExprKind::Block`](crate::ast::TypeExprKind::Block),
+//! `Parser::parse_param_type`), which a call gives as its trailing block,
+//! `step("boot") { ... }`.
+//!
+//! ```text
+//! PARAM      = NAME ":" (BLOCK_TYPE | TYPE) ("=" EXPR)? | ...
+//! PARAM_TY   = (NAME ":")? (BLOCK_TYPE | TYPE)
+//! BLOCK_TYPE = "block" ("->" | ":") TYPE
+//! ```
+//!
+//! `block` is no keyword. It starts a block type only where a parameter's
+//! type is written, in the parameters of a function expression (a named
+//! `fn`'s, a `def`'s and a method's among them) and of a function type,
+//! and only directly followed by a marker (`Parser::starts_block_type`);
+//! anywhere else, and before anything else, it is the name it always was,
+//! a variable's, a parameter's (`fn f(block: Int)`) or a type's. The
+//! marker is a function's: `->` for a block whose body may do anything,
+//! `:` for one whose body is pure. The type after it is what a call of the
+//! block gives, a whole type, so that it takes a union that follows it, as
+//! a function's return type does, and nothing after it is "expected a
+//! type". The marker `->>` is "a block is not memoised", at the marker,
+//! noted that a block runs each time its function calls it.
+//!
+//! In a function type a parameter's name is read first, an identifier
+//! followed by `:`, so `fn(block: Int): Int` is the type of a function of
+//! a parameter named `block`, as it always was. A pure block there is
+//! written with a name, `fn(body: block: Int): Int`, and an impure one with
+//! a name or with none, `fn(block -> Int) -> Int`.
+//!
+//! A block is its function's last parameter and nothing else
+//! (`Parser::check_block_last`): one before another parameter is "a block
+//! is a function's last parameter", at its type, noted that a call gives
+//! the block after its other arguments, so that a function takes one block
+//! at most. A rest parameter whose type is a block's is "a rest parameter
+//! is not a block", at the type; an `=` after a block parameter is "a block
+//! parameter has no default", at the `=`, noted that every call gives the
+//! block; and a method's receiver of a block type is "a method's receiver
+//! is not a block", at the type. A function with a block that is marked
+//! `->>`, and a function type so marked, is "a memoised function cannot
+//! take a block", at the function's marker, noted that a memoised call is
+//! found by its arguments, which a block is none of. A function type's
+//! needs come after its parameters still, the block among them, `fn(block
+//! -> Int, ^arch) -> Int`.
+//!
+//! A block type is written nowhere else. As an annotation's type, a
+//! field's, a return type or a type argument, and in parentheses, `block`
+//! is a type's name and the marker after it whatever follows a type there:
+//! "expected `=` after variable name" after a `let`'s annotation, "expected
+//! `{` to start the function body" after a return type. That a pure
+//! function takes no impure block, and what its body may do with the
+//! block, is the checker's.
+//!
+//! A call gives a block as it gives any trailing block (see [Functions and
+//! calls](#functions-and-calls)): the parser does not know which callees
+//! take one, so the trailing block is the call's last argument
+//! ([`ArgKind::Trailing`]), an ordinary block, which the checker makes the
+//! block's body. No program that parsed had `block` and a marker where a
+//! function expression's parameter's type is written, and a function
+//! type's parameter named `block` is read as it was, so every one parses
+//! as it did.
+//!
 //! # Futures
 //!
 //! `lazy EXPR` is a prefix expression that takes the longest expression it
@@ -100,16 +185,17 @@
 use super::Sync;
 use crate::ast::{
     Arg, ArgKind, Effect, ExprId, ExprKind, FnDecl, GenericOwner, Generics, ItemId, ItemKind,
-    MethodDecl, Param, PathSegment, SegmentKind,
+    MethodDecl, Param, PathSegment, SegmentKind, TypeExpr, TypeExprKind,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
 use crate::names::Name;
 use crate::source::Span;
 
+use super::types::{MEMO_BLOCK, MEMO_BLOCK_NOTE, REST_BLOCK};
 use super::{
     Braces, Entry, MISPLACED_META, MUT_PARAM_NOTE, PLAIN_VARIABLE_NAME, ParseResult, Parser, Stop,
-    error_span,
+    UNTYPED_NOTE, error_span,
 };
 
 impl Parser<'_> {
@@ -126,6 +212,8 @@ impl Parser<'_> {
     ) -> ParseResult<(ItemId, u32)> {
         self.advance();
         self.advance();
+        self.external_named(name, name_span);
+        self.no_external_generics()?;
         let params = if self.peek().kind == TokenKind::Lt {
             Some(self.parse_type_params()?)
         } else {
@@ -211,6 +299,8 @@ impl Parser<'_> {
             ));
         };
         self.advance();
+        self.external_named(name, name_token.span);
+        self.no_external_generics()?;
         let params = if self.peek().kind == TokenKind::Lt {
             Some(self.parse_type_params()?)
         } else {
@@ -282,7 +372,18 @@ impl Parser<'_> {
             return Err(self.error("a method has one receiver", error_span(next)));
         }
         if let Some(default) = receiver.default {
-            return Err(self.error("a receiver takes no default", self.span_of(default)));
+            let error = Diagnostic::error("a receiver takes no default", self.span_of(default));
+            // Written with no type, which only a default gives.
+            let inferred = self.builder.type_expr(receiver.ty).kind == TypeExprKind::Inferred;
+            return Err(self.report(if inferred {
+                error.with_note("a receiver is written with its type, as in `(xs: List<Int>)`")
+            } else {
+                error
+            }));
+        }
+        if self.is_block_type(receiver.ty) {
+            let span = self.type_span(receiver.ty);
+            return Err(self.error("a method's receiver is not a block", span));
         }
         Ok(receiver)
     }
@@ -368,6 +469,9 @@ impl Parser<'_> {
         keyword: Token,
         receiver: Option<Param>,
     ) -> ParseResult<ExprId> {
+        // An operation's function is the first parsed once its own name is
+        // read (see [Host operations](crate::parser::externs#host-operations)).
+        let external = self.take_external();
         let open = self.expect_fn_paren()?;
         let base = self.param_stack.len();
         self.param_stack.extend(receiver);
@@ -397,7 +501,20 @@ impl Parser<'_> {
             return Err(reported);
         }
         let own: Vec<Param> = self.param_stack.drain(base..).collect();
+        self.check_block_last(own.iter().map(|param| param.ty))?;
         let (effect, marker) = self.return_marker()?;
+        if external.is_some() {
+            self.operation_signature(&own, (effect == Effect::Impure, marker))?;
+        }
+        let reads: Vec<(Name, Span)> = match external {
+            Some(_) => own.iter().map(|param| (param.name, param.span)).collect(),
+            None => Vec::new(),
+        };
+        if effect == Effect::Memo && own.last().is_some_and(|param| self.is_block_type(param.ty)) {
+            return Err(
+                self.report(Diagnostic::error(MEMO_BLOCK, marker).with_note(MEMO_BLOCK_NOTE))
+            );
+        }
         let own = self.with_default_fns(own, (effect, marker));
         let params = self.builder.push_params(&own);
         let (ret, ret_height) = self.parse_type()?;
@@ -406,11 +523,19 @@ impl Parser<'_> {
             let span = Span::join(self.peek().span, self.peek_at(1).span);
             return Err(self.error(MISPLACED_META, span));
         }
-        let brace = self.peek();
-        if brace.kind != TokenKind::LBrace {
-            return Err(self.error("expected `{` to start the function body", error_span(brace)));
-        }
-        let body = self.parse_block()?;
+        let (body, operation) = if let Some(external) = external {
+            let end = self.type_span(ret);
+            let (body, names) = self.operation_body(keyword, external, &reads, end)?;
+            (body, Some(names))
+        } else {
+            let brace = self.peek();
+            if brace.kind != TokenKind::LBrace {
+                return Err(
+                    self.error("expected `{` to start the function body", error_span(brace))
+                );
+            }
+            (self.parse_block()?, None)
+        };
         let height = tallest.max(ret_height).max(self.height_of(body)) + 1;
         let span = Span::join(keyword.span, self.span_of(body));
         let id = self.builder.push_fn(FnDecl {
@@ -420,7 +545,11 @@ impl Parser<'_> {
             marker,
             body,
         });
-        self.alloc(ExprKind::Fn(id), span, height)
+        let value = self.alloc(ExprKind::Fn(id), span, height)?;
+        if let Some(names) = operation {
+            self.record_operation(value, names);
+        }
+        Ok(value)
     }
 
     /// The parameters `params` of a function expression of effect `effect`,
@@ -473,7 +602,8 @@ impl Parser<'_> {
     }
 
     /// Parses a parameter of a function expression whose parameter list
-    /// `open` opens, `NAME: TYPE` and its default, if it has one, and the
+    /// `open` opens, `NAME: TYPE` and its default, if it has one, or `NAME =
+    /// DEFAULT` ([`Parser::parse_inferred_param`]), and the
     /// `,` or the `)` after it, raising `tallest` to the height of its type
     /// and its default. Returns whether the `)` ends the list.
     pub(super) fn parse_param(&mut self, open: Token, tallest: &mut u32) -> ParseResult<bool> {
@@ -508,19 +638,33 @@ impl Parser<'_> {
         };
         self.advance();
         let colon = self.peek();
+        if colon.kind == TokenKind::Eq {
+            return self.parse_inferred_param(open, tallest, (name, token.span), dots);
+        }
         if colon.kind != TokenKind::Colon {
             let message = format!(
                 "expected `:` and a type after parameter `{}`",
                 self.names.get(name)
             );
-            return Err(self.report(
-                Diagnostic::error(message, error_span(colon))
-                    .with_note("parameters must be annotated"),
-            ));
+            return Err(
+                self.report(Diagnostic::error(message, error_span(colon)).with_note(UNTYPED_NOTE))
+            );
         }
         self.advance();
-        let (ty, height) = self.parse_type()?;
+        let (ty, height) = self.parse_param_type()?;
         *tallest = (*tallest).max(height);
+        if self.is_block_type(ty) {
+            let span = self.type_span(ty);
+            if dots.is_some() {
+                return Err(self.error(REST_BLOCK, span));
+            }
+            if self.peek().kind == TokenKind::Eq {
+                return Err(self.report(
+                    Diagnostic::error("a block parameter has no default", self.peek().span)
+                        .with_note("every call gives the block, as `f(x) { ... }`"),
+                ));
+            }
+        }
         if dots.is_some() && self.peek().kind == TokenKind::Eq {
             return Err(self.report(
                 Diagnostic::error("a rest parameter has no default", self.peek().span)
@@ -538,6 +682,48 @@ impl Parser<'_> {
             default,
             default_fn: None,
             rest: dots.is_some(),
+        });
+        self.list_separator(open)
+    }
+
+    /// Parses the rest of a parameter written with no type, `NAME =
+    /// DEFAULT`, whose name, `name`, written at `span`, has been consumed, at
+    /// its `=`: its default, and the `,` or the `)` after it, as
+    /// [`Parser::parse_param`] does. Its type is its default's, the
+    /// checker's to infer ([`TypeExprKind::Inferred`], spanning its name).
+    /// One after `...`, at `dots`, is "a rest parameter's type is not
+    /// inferred", at its `=`.
+    fn parse_inferred_param(
+        &mut self,
+        open: Token,
+        tallest: &mut u32,
+        (name, span): (Name, Span),
+        dots: Option<Span>,
+    ) -> ParseResult<bool> {
+        if dots.is_some() {
+            return Err(self.report(
+                Diagnostic::error("a rest parameter's type is not inferred", self.peek().span)
+                    .with_note(
+                        "a rest parameter has no default: write the type of its elements, as in \
+                         `...words: String`",
+                    ),
+            ));
+        }
+        let ty = self.builder.alloc_type(TypeExpr {
+            kind: TypeExprKind::Inferred,
+            span,
+        });
+        let default = self.parse_default()?;
+        if let Some(default) = default {
+            *tallest = (*tallest).max(self.height_of(default));
+        }
+        self.param_stack.push(Param {
+            name,
+            span,
+            ty,
+            default,
+            default_fn: None,
+            rest: false,
         });
         self.list_separator(open)
     }

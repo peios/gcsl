@@ -68,7 +68,14 @@
 //!   item of that name is then the symbol; nothing else is tracked.
 //! - A type's name in a type position, bare or qualified, is a
 //!   [`Symbol::Type`] (its `type` item's), or a [`Symbol::BuiltinType`]; a
-//!   `type` item's name is its declaration.
+//!   `type` item's name is its declaration, and so is a handle type's,
+//!   `extern type Vm` (see the checker's [Handle
+//!   types](crate::check::operations#handle-types)).
+//! - An operation, `extern fn boot(...) -> Vm`, is the function item it is
+//!   parsed as: a local, a node or a method, as its keyword and receiver
+//!   say. The body the parser gives it reads each parameter where the
+//!   parameter is written, so those reads are the parameters' declarations
+//!   again and add no occurrence.
 //! - An import's names are occurrences of what they bind, and each prefix
 //!   of its path of the module it names.
 //! - A def-type reference's and a definition's path, `package
@@ -103,12 +110,19 @@
 //! name(a: Int): Int` or `def name(...)`, a method's with its receiver
 //! first, `fn (x: Int) twice(): Int`, its parameters named as its source
 //! names them, a mutable variable `mut name: Type`, a type `type Name =
-//! TYPE` with its expansion, a built-in type its name; then its
+//! TYPE` with its expansion, a built-in type its name, an operation as it
+//! is declared, `extern fn boot(name: String) -> Vm = "vm.boot"`, with the
+//! name its host knows it by whether it is written or not, a handle type
+//! `extern type Vm = "vm.machine"`, with its kind, said to be a "handle
+//! type of `lib/vm.gcsl`"; then its
 //! documentation, if it has any (see "Documentation"); then, if useful, one
 //! line saying where it comes from ("parameter", "field of directory
 //! `pkgs/`", "standard library `path`", "built-in", "imported from `a.b`").
 //! Types are shown by the printer diagnostics use
-//! ([`TypeTable::display`]); a line wider than 80 columns, a hover
+//! ([`TypeTable::display`]), so a block parameter is `body: block -> {} |
+//! Future<{}>`, "parameter", its impure block's bare result the either
+//! shape as an impure function's bare parameter is, and a pure one's
+//! `body: block: Int`; a line wider than 80 columns, a hover
 //! panel's width, lays its record out a field per line, or its
 //! signature or function type a parameter per line, each indented by 2;
 //! and anything of more than [`MAX_LINES`] lines is cut short with `…`. An
@@ -119,7 +133,8 @@
 //! # Documentation
 //!
 //! The DOC COMMENT of a declaration (a `let`, a field, a `fn`, a `def`, a
-//! `defmeta`, a definition or a `type` item) is the run of comment lines
+//! `defmeta`, a definition, a `type` item, or an `extern` item, an
+//! operation or a handle type) is the run of comment lines
 //! directly above its item, its attributes' lines apart, with no blank line
 //! between: each line a comment alone (a trailing comment, on a line with
 //! code, is none, so neither is the declaration's own), shown without its
@@ -168,7 +183,12 @@
 //! a record not tracked); for what the standard library or a built-in
 //! declares; for a name a directory or a file gives (`sandbox` of `import
 //! _lib.sandbox`), or `fileroot`'s; for an import's alias; for a name
-//! written somewhere as a string, `"a-b" = 1`; and for a new name that is
+//! written somewhere as a string, `"a-b" = 1`; for a name a host knows
+//! something by, an operation's with no name written after its `=`, or a
+//! handle type's with no kind, which a new name would make another
+//! operation or kind to the host ("the host knows this operation by its
+//! name, `halt`: write the name it is known by after its return type, `=
+//! "halt"`, and then rename it"); and for a new name that is
 //! not one identifier (a definition's segment: a segment as the parser
 //! takes one). Then it is checked: the files with its edits made are
 //! indexed again, and it is refused, naming the first problem, if that
@@ -184,7 +204,9 @@
 //! fields, each with the fields of the record block written as its value as
 //! children, three levels deep at most; its top-level `let`s and `fn`s; its
 //! `def`s, definitions and metas, named by their whole paths, `package
-//! x.y`; its `type` items; and its imports, as one group. Each has its type
+//! x.y`; its `type` items and its handle types, each of those with `extern
+//! type = "KIND"` for its detail; and its imports, as one group. An
+//! operation is the function, the `def` or the method it is declared as. Each has its type
 //! on one line, cut to 60 characters. The workspace's
 //! ([`Index::workspace_symbols`]) are every file's but the imports, matched
 //! by a subsequence of a query, ignoring case.
@@ -209,8 +231,10 @@
 //!
 //! - In a comment or in a string's text, nothing. Nor where a name is
 //!   declared (after `let`, `mut`, `fn`, `def`, `for`, at a function's or a
-//!   definition's parameter, a `type` item's name), nor after what ends an
-//!   expression (a literal, a closing bracket).
+//!   definition's parameter, a `type` item's name or a handle type's), nor
+//!   after what ends an expression (a literal, a closing bracket).
+//! - After the `extern` that starts an item of the file, what it may
+//!   declare: `fn`, `def` and `type`.
 //! - After a `.`, the fields of what is before it: of a path through the
 //!   file's view, `com.foo.`, the children of its node, of a module an
 //!   import reaches, `lib.`, its members, of `fileroot.`, its four; else of
@@ -249,7 +273,8 @@
 //!   argument of a call starts (after its `(` or a `,` of its argument
 //!   list), first the named arguments, `name = `, of the callee's
 //!   parameters no other argument fills (as signature help counts them;
-//!   none for `len` and `show`); the locals
+//!   none for `len` and `show`, nor for a block parameter, which only a
+//!   trailing block gives); the locals
 //!   (the `let`s, `fn`s and fields of each block around the place before
 //!   the item it is in, the parameters of each function whose body it is
 //!   in, the variable of each `for` whose body or guard it is in), rebuilt
@@ -257,10 +282,17 @@
 //!   the check recorded; then the file's own top-level `let`s before the
 //!   place, `fn`s and fields; its directories' fields; what it imports; the
 //!   standard library's, the prelude's names; and the keywords an
-//!   expression or an item may start with. The field being declared, the
+//!   expression or an item may start with, and, where an item of the
+//!   file's outermost body starts (at the start of a line or after a `;`,
+//!   with no bracket open), `extern`. The field being declared, the
 //!   top-level field named by one segment whose value the place is in, is
 //!   not offered, as no block's item is before its own end; a `def` or a
-//!   `fn`, which may call itself, is.
+//!   `fn`, which may call itself, is. A trailing block that fills a block
+//!   parameter (see the checker's [Blocks](crate::check::blocks#blocks))
+//!   is a block of its caller as any other is: in it the caller's locals
+//!   are offered, and not the parameters of the function it is given to;
+//!   in that function, its block parameter is offered as a function is
+//!   ([`CompletionKind::Function`]), since it is called.
 //!
 //! # Inlay hints
 //!
@@ -272,11 +304,14 @@
 //! whose parameters are written by name alone and whose result is not
 //! written, `: Int` after each parameter, and its result after its `)` as
 //! GCSL writes one after its marker, `: Int`, ` ->> Int` or ` -> Int`,
-//! as the def-type declares it. GCSL's other functions write their
+//! as the def-type declares it; and `: Int` after the name of a parameter
+//! written with no type, `m = machine()`, a function's or a definition's
+//! own, whose type is its default's. GCSL's other functions write their
 //! parameters' and results' types, as must be, so a function expression has
-//! none, and neither has a call's argument: arguments are often named
+//! no other, and neither has a call's argument: arguments are often named
 //! already. They are conservative: a field has none (a configuration is
-//! mostly fields, `version = "1"`), nor has a `let` whose value spells its
+//! mostly fields, `version = "1"`), nor has a `let`, or a parameter, whose
+//! value, or default, spells its
 //! type (a literal, a negated number among them; a list written out; a
 //! record block; a function expression; an ascription or an `as`), nor a
 //! type the check did not find or found erroneous anywhere in it, nor one
@@ -308,7 +343,12 @@
 //! argument names, `name = ...`, when the place is in one; else the next one
 //! not yet filled, from the left, by a positional argument before the
 //! place, nor anywhere by a named one, nor, the last, by a trailing block;
-//! in a trailing block, the last. The arguments are counted on the tokens,
+//! in a trailing block, the last. A block parameter (see the checker's
+//! [Blocks](crate::check::blocks#blocks)) is shown as it is written too,
+//! `body: block -> {}`, its result without the either shape, and is the
+//! active one anywhere in the trailing block that gives it; a call of a
+//! block, `body()`, takes no arguments and has no signature. The arguments
+//! are counted on the tokens,
 //! so a list half-typed counts as it is written. A trailing block left
 //! open, `pair("a", "b") {` while it is typed, leaves the file's braces
 //! unmatched, so the file has nothing indexed: its signature is found as
@@ -382,7 +422,7 @@ use crate::lexer::Comments;
 use crate::mentions::Resolve;
 use crate::names::{self, Name, Names};
 use crate::source::{SourceFile, Span};
-use crate::strings::FieldName;
+use crate::strings::{FieldName, Quoted};
 use crate::types::{TyId, TyKind, TypeTable, write_constant};
 use crate::workspace::{
     File, FileScope, Modules, Recorded, STANDARD_DIR, Scan, Target, module, target_roots,
@@ -1119,6 +1159,16 @@ impl Index {
             .and_then(|f| f.declared.iter().find(|&&(item, _)| item == declared.item))
             .map(|&(_, ty)| ty)
             .and_then(known);
+        let file = self.scan.files.get(declared.file as usize);
+        let path = file.map_or("", |f| f.path.as_str());
+        // A handle type is declared by its kind alone.
+        if let Some(file) = file
+            && let Some(handle) = file.ast.extern_type(declared.item)
+        {
+            let kind = file.ast.strings().get(handle.kind);
+            let code = format!("extern type {name} = {}", Quoted(kind));
+            return Some((code, Some(format!("handle type of `{path}`"))));
+        }
         let shown = match (expansion, declared.ty) {
             // An enum is its own type.
             (_, None) => format!("enum {name} extensible"),
@@ -1130,11 +1180,6 @@ impl Index {
                 .ast
                 .show_type_with(written, &self.scan.names),
         };
-        let path = self
-            .scan
-            .files
-            .get(declared.file as usize)
-            .map_or("", |f| f.path.as_str());
         let origin = match standard_stem(path) {
             Some(stem) => format!("standard library `{stem}`"),
             None => format!("type of `{path}`"),
@@ -1177,6 +1222,19 @@ impl Index {
             })
             .collect();
         let tail = self.sig_tail(sig);
+        // An operation's, as it is declared: with `extern`, and the name
+        // its host knows it by.
+        let operation = match ast.get(function).kind {
+            ExprKind::Fn(id) => ast.extern_fn(id),
+            _ => None,
+        };
+        let (keyword, tail) = match operation {
+            Some(operation) => (
+                format!("extern {keyword}"),
+                format!("{tail} = {}", Quoted(ast.strings().get(operation.name))),
+            ),
+            None => (keyword.to_owned(), tail),
+        };
         let name = match sig.generic {
             Some(generic) => {
                 let params: Vec<&str> = table
@@ -2530,11 +2588,15 @@ impl<'s> Builder<'s> {
             }
         }
         for &id in ast.items(ast.root()) {
-            let ItemKind::Type {
-                name, name_span, ..
-            } = ast.item(id).kind
-            else {
-                continue;
+            // A `type` item's name, and a handle type's.
+            let (name, name_span) = match ast.item(id).kind {
+                ItemKind::Type {
+                    name, name_span, ..
+                } => (name, name_span),
+                ItemKind::Enum {
+                    name, name_span, ..
+                } if ast.extern_type(id).is_some() => (name, name_span),
+                _ => continue,
             };
             let decl = (0u32..)
                 .zip(&self.scan.types)

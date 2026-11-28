@@ -90,12 +90,22 @@
 //! - Before `[`: none after a name, `)`, `]` or a string, an index or a
 //!   list type's `[]`; as written after `}`, a literal other than a string,
 //!   or a type argument's `>`; one after anything else, a list literal's.
-//! - Before `:`: none (`name: Type`, `fn(x: Int): Int`), but as written
-//!   before an ascription's (`x : Int`). One after it.
+//! - Before `:`: none (`name: Type`, `fn(x: Int): Int`, a pure block's
+//!   `body: block: Int`), but as written before an ascription's (`x :
+//!   Int`). One after it.
 //! - One space anywhere else: either side of `=`, `:=`, `->`, `->>`, `|`,
 //!   every other binary operator, `and`, `or`, `in`, `is` and `as`; before
-//!   a negation's `-`; between two names or keywords (`not x`, `await x`);
-//!   before a block's `{`; after `}`; around a string literal.
+//!   a negation's `-`; between two names or keywords (`not x`, `await x`,
+//!   and `block` and the marker of a block parameter's type, `body: block
+//!   -> Int`); before a block's `{`, a call's trailing block among them
+//!   (`step("boot") { ... }`); after `}`; around a string literal.
+//!
+//! An `extern` item (see the parser's [Host
+//! operations](crate::parser::externs#host-operations)) is laid out by
+//! these rules, as the declaration it is: one space after `extern`, a
+//! method's `fn` spaced from its receiver as any method's is, and one
+//! space either side of the `=` before the name a host knows it by
+//! (`extern fn (m: Vm) read(path: String) -> String = "vm.file.read"`).
 //!
 //! What the syntax tree says is kept as written, untouched: inside a
 //! def-type's path (`org.gnu.gmp-c++`, `go-stage0-1.24`), whose glued
@@ -1195,8 +1205,13 @@ fn internal(message: &'static str) -> Diagnostic {
 fn declaration_facts(input: &Input<'_>, facts: &mut Facts) {
     let ast = &input.ast;
     for method in ast.methods() {
-        let start = ast.item(method.item).span.start;
-        facts.methods.extend(input.token_at(start, TokenKind::Fn));
+        // An operation's item starts at its `extern`, its keyword after.
+        let keyword = match ast.extern_fn_of(method.item) {
+            Some(operation) => Some(input.first_from(operation.keyword.end))
+                .filter(|&at| input.kind(at) == TokenKind::Fn),
+            None => input.token_at(ast.item(method.item).span.start, TokenKind::Fn),
+        };
+        facts.methods.extend(keyword);
     }
     // An enum's bound and a variant's payload are bracketed as a type's
     // argument is: the `<` after the name, the `>` that ends the item.
@@ -1280,6 +1295,42 @@ mod tests {
     }
 
     #[test]
+    fn extern_items_are_spaced_as_the_declarations_they_are() {
+        check(&[
+            (
+                "extern   type  Vm=\"vm.machine\"\nextern type\tNetwork\n",
+                "extern type Vm = \"vm.machine\"\nextern type Network\n",
+            ),
+            (
+                "extern fn   boot ( profile : Profile ,nics:List<Network> =[] )->Vm=\"vm.boot\"\n",
+                "extern fn boot(profile: Profile, nics: List<Network> = []) -> Vm = \"vm.boot\"\n",
+            ),
+            // A method's keyword is spaced from its receiver, as any is.
+            (
+                "extern fn(m:Vm)read(path:String,limit:Size=64MiB)  ->  String  =  \"vm.file.read\"\n",
+                "extern fn (m: Vm) read(path: String, limit: Size = 64MiB) -> String = \
+                 \"vm.file.read\"\n",
+            ),
+            (
+                "extern def(m: Vm)run(\n...argv: String\n)->{status: Int, stdout: String}=\"vm.run\"\n",
+                "extern def (m: Vm) run(\n    ...argv: String,\n) -> {status: Int, stdout: String} = \
+                 \"vm.run\"\n",
+            ),
+            (
+                "extern  fn halt(m: Vm)->{}\n",
+                "extern fn halt(m: Vm) -> {}\n",
+            ),
+            // Attributes, a return type on the next line, and comments.
+            (
+                "#[retry(2)]\nextern def a.b(^arch) ->\nInt # the host's\n",
+                "#[retry(2)]\nextern def a.b(^arch) ->\n    Int # the host's\n",
+            ),
+            // Elsewhere `extern` is a name.
+            ("extern=1\ny = extern .x\n", "extern = 1\ny = extern.x\n"),
+        ]);
+    }
+
+    #[test]
     fn enums_glue_their_colons_and_bracket_their_types() {
         check(&[
             (
@@ -1304,6 +1355,113 @@ mod tests {
             ),
             ("r = t.Tool :: C  gcc()\n", "r = t.Tool::C gcc()\n"),
         ]);
+    }
+
+    #[test]
+    fn a_block_parameter_s_type_is_spaced_as_a_function_s_result_is() {
+        check(&[
+            (
+                "fn step(name:String,body:block->{})->{} { body( ) }\n",
+                "fn step(name: String, body: block -> {}) -> {} { body() }\n",
+            ),
+            (
+                "fn twice( body :block:Int ):Int { body()+body() }\n",
+                "fn twice(body: block: Int): Int { body() + body() }\n",
+            ),
+            (
+                "fn  measure<T>(body: block   ->   T) -> T { body() }\n",
+                "fn measure<T>(body: block -> T) -> T { body() }\n",
+            ),
+            (
+                "fn (n:Int)times(body:block->{})->{} { body() }\n",
+                "fn (n: Int) times(body: block -> {}) -> {} { body() }\n",
+            ),
+            (
+                "let f = fn (body: block:List<Int>): Int { len(body()) }\n",
+                "let f = fn(body: block: List<Int>): Int { len(body()) }\n",
+            ),
+            (
+                "type Runner = fn(String,block->{})->{}\n",
+                "type Runner = fn(String, block -> {}) -> {}\n",
+            ),
+            (
+                "type Pure = fn(name:String,body:block:Int):Int\n",
+                "type Pure = fn(name: String, body: block: Int): Int\n",
+            ),
+            // `block` as a name is a name.
+            (
+                "let block=1\nr = block+1\n",
+                "let block = 1\nr = block + 1\n",
+            ),
+            (
+                "fn f(block:block:Int):Int { block() }\n",
+                "fn f(block: block: Int): Int { block() }\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_block_parameter_over_several_lines_keeps_its_lines() {
+        check(&[
+            // The parameters a line each: the last gets its `,`.
+            (
+                "fn step(\n  name: String,\n      body: block -> {}\n) -> {} {\n  body()\n}\n",
+                "fn step(\n    name: String,\n    body: block -> {},\n) -> {} {\n    body()\n}\n",
+            ),
+            // A line that ends with the block's marker is continued.
+            (
+                "fn step(\n    body: block ->\n    {a: Int},\n) -> {} {\n    body()\n}\n",
+                "fn step(\n    body: block ->\n        {a: Int},\n) -> {} {\n    body()\n}\n",
+            ),
+            (
+                "fn twice(\n    body: block:\n    Int,\n): Int { body() }\n",
+                "fn twice(\n    body: block:\n        Int,\n): Int { body() }\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_trailing_block_is_one_space_after_its_call() {
+        check(&[
+            ("step(\"a\"){ op() }\n", "step(\"a\") { op() }\n"),
+            ("step(\"a\")   {op()}\n", "step(\"a\") {op()}\n"),
+            ("r = run{ 1 }\n", "r = run { 1 }\n"),
+            ("3.times{ n := n+1 }\n", "3.times { n := n + 1 }\n"),
+            ("3.times( ){ n := n+1 }\n", "3.times() { n := n + 1 }\n"),
+            // Over lines, its items a level in and its `}` at the call's.
+            (
+                "step(\"a\"){\n  seen := seen + 1\n        op()\n  }\n",
+                "step(\"a\") {\n    seen := seen + 1\n    op()\n}\n",
+            ),
+            // A block in a block, and a block after arguments over lines.
+            (
+                "step(\"a\") {\nstep(\"b\") {\nn := n + 1;\n}\n}\n",
+                "step(\"a\") {\n    step(\"b\") {\n        n := n + 1\n    }\n}\n",
+            ),
+            (
+                "let v = measure(\n  \"name\"\n) {\n  compute()\n}\n",
+                "let v = measure(\n    \"name\",\n) {\n    compute()\n}\n",
+            ),
+            // A call of the block in its function.
+            (
+                "fn f(body: block -> Int) -> Int {\n  let a = body( )\n  = a+body ()\n}\n",
+                "fn f(body: block -> Int) -> Int {\n    let a = body()\n    = a + body()\n}\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn comments_in_and_around_a_trailing_block_are_kept() {
+        check(&[(
+            "# Before the call.\nstep(\"a\"){ # after the brace\n  # first in the block\n  \
+             op()   # after code\n      # last in the block\n} # after the block\n\
+             fn step(name: String, # the name\n  body: block -> {} # the block\n) -> {} { \
+             body() }\n",
+            "# Before the call.\nstep(\"a\") { # after the brace\n    # first in the block\n    \
+             op() # after code\n    # last in the block\n} # after the block\n\
+             fn step(name: String, # the name\n    body: block -> {}, # the block\n) -> {} { \
+             body() }\n",
+        )]);
     }
 
     #[test]
@@ -1338,6 +1496,37 @@ mod tests {
                 "r = with { arch = \"y\" } { f() }\n",
             ),
         ]);
+    }
+
+    #[test]
+    fn a_parameter_written_with_no_type_is_kept_so() {
+        let cases = [
+            (
+                "fn  f( n=3,m   =  n+1 ): Int { n }\n",
+                "fn f(n = 3, m = n + 1): Int { n }\n",
+            ),
+            (
+                "def f(a:Int,xs=[1,2],o={a=1}) -> Int { a }\n",
+                "def f(a: Int, xs = [1, 2], o = {a = 1}) -> Int { a }\n",
+            ),
+            (
+                "f = fn (m=machine( )): Int { 1 }\n",
+                "f = fn(m = machine()): Int { 1 }\n",
+            ),
+            (
+                "fn (x:Int)add(n=1):Int { x+n }\n",
+                "fn (x: Int) add(n = 1): Int { x + n }\n",
+            ),
+            (
+                "def test t( m=fixture machine( ),s:String=\"x\" ) { m }\n",
+                "def test t(m = fixture machine(), s: String = \"x\") { m }\n",
+            ),
+        ];
+        check(&cases);
+        // Formatted, it is left as it is.
+        for (_, formatted) in cases {
+            assert_eq!(fmt(formatted), formatted);
+        }
     }
 
     #[test]

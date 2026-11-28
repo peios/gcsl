@@ -45,6 +45,7 @@ const fn treatment(kind: &ExprKind) -> Treatment {
         | ExprKind::List(_)
         | ExprKind::Variant { .. }
         | ExprKind::Recover(_)
+        | ExprKind::Try(_)
         | ExprKind::ContextRead(_)
         | ExprKind::With { .. } => Treatment::Carries,
         ExprKind::Int(_)
@@ -54,6 +55,7 @@ const fn treatment(kind: &ExprKind) -> Treatment {
         | ExprKind::Bool(_)
         | ExprKind::Str(_)
         | ExprKind::DefTypeRef(_)
+        | ExprKind::Operation
         | ExprKind::Error
         | ExprKind::NoField(_)
         | ExprKind::Unclosed { .. } => Treatment::Plain,

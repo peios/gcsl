@@ -173,6 +173,7 @@ fn labels(diagnostic: &Diagnostic) -> Vec<(Span, &str)> {
 // ----- Enums and partial records -----
 
 mod basics;
+mod blocks;
 mod builtins;
 mod callbacks;
 mod defaults;
@@ -185,9 +186,11 @@ mod lists;
 mod loops;
 mod memoised;
 mod mutation;
+mod operations;
 mod records;
 mod scalars;
 mod secrets;
 mod suggestions;
 mod toplevel;
 mod unions;
+mod untyped;

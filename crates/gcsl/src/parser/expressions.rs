@@ -397,6 +397,7 @@ impl Parser<'_> {
             TokenKind::Ident(_) if self.starts_variant() => return self.parse_variant_expr(),
             TokenKind::Ident(_) if self.starts_with_block() => return self.parse_with(None),
             TokenKind::Ident(_) if self.starts_recover() => return self.parse_recover(),
+            TokenKind::Ident(_) if self.starts_try() => return self.parse_try(),
             TokenKind::Caret => return self.parse_context_read(),
             TokenKind::Ident(name) => ExprKind::Name(name),
             TokenKind::StrStart(first) => return self.parse_interpolation(first),

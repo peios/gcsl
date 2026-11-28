@@ -85,6 +85,20 @@ const KEYWORDS: [&str; 13] = [
     "continue",
 ];
 
+/// The completion of the keyword `word`, or of a word that starts an item
+/// as one does.
+fn keyword(word: &str) -> Completion {
+    Completion {
+        label: word.to_owned(),
+        kind: CompletionKind::Keyword,
+        detail: None,
+        documentation: None,
+        sort: sort_text(KEYWORD, word),
+        insert: None,
+        range: None,
+    }
+}
+
 /// The file that marks a workspace's root, which no `import` names.
 const WORKSPACE: &str = "workspace.gcsl";
 
@@ -332,6 +346,28 @@ impl<'s> Tokens<'s> {
         }
     }
 
+    /// Whether an item of the file's outermost body starts at the token
+    /// after token number `previous`, `None` at the start of the file:
+    /// after a line break or a `;`, with no bracket open.
+    fn starts_top_item(&self, previous: Option<usize>) -> bool {
+        let Some(previous) = previous else {
+            return true;
+        };
+        matches!(self.kind(previous), TokenKind::Newline | TokenKind::Semi)
+            && self.open_before(previous).is_none()
+    }
+
+    /// Whether token number `at` is the word `extern` where an item of the
+    /// file's outermost body starts, directly before token number `next`
+    /// on its line: the start of an `extern` item (see the parser's [Host
+    /// operations](crate::parser::externs#host-operations)).
+    fn starts_extern(&self, at: usize, next: usize) -> bool {
+        at + 1 == next
+            && self.is_ident(at)
+            && self.word(at) == "extern"
+            && self.starts_top_item(at.checked_sub(1))
+    }
+
     /// What the place at `offset` is (see [`Place`]).
     fn place(&self, offset: u32) -> Place {
         let dashed = self
@@ -380,9 +416,11 @@ impl<'s> Tokens<'s> {
             | TokenKind::RBracket
             | TokenKind::RBrace
             | TokenKind::Error => Place::Nothing,
-            // A `type` item's name is declared.
+            // A `type` item's name is declared, and a handle type's.
             TokenKind::Ident(_)
-                if self.word(previous) == "type" && self.line_start(previous) == previous =>
+                if self.word(previous) == "type"
+                    && (self.line_start(previous) == previous
+                        || self.starts_extern(previous.saturating_sub(1), previous)) =>
             {
                 Place::Nothing
             }
@@ -589,6 +627,10 @@ impl Index {
             Place::Name => {
                 let mut found = self.named_arguments(file, &tokens, offset);
                 found.extend(self.names_at(file, offset));
+                // Where an item of the file starts, an `extern` item may.
+                if tokens.starts_top_item(tokens.before_word(offset).ok().flatten()) {
+                    found.push(keyword("extern"));
+                }
                 found
             }
             Place::Member { dot, chain } => self.members(file, offset, dot, chain.as_deref()),
@@ -602,7 +644,15 @@ impl Index {
                 }
                 found
             }
-            Place::Definition { def_type, prefix } => self.definitions(file, &def_type, &prefix),
+            Place::Definition { def_type, prefix } => {
+                let mut found = self.definitions(file, &def_type, &prefix);
+                // After the `extern` that starts an item, what it declares.
+                let at = tokens.starting_before(def_type.1.start);
+                if prefix.is_empty() && tokens.starts_extern(at, at + 1) {
+                    found.extend(["fn", "def", "type"].map(keyword));
+                }
+                found
+            }
         };
         found.sort_by(|a, b| a.sort.cmp(&b.sort));
         found
@@ -613,7 +663,8 @@ impl Index {
     /// argument list: after its `(` or a `,` of it, the word half-typed set
     /// aside. One, `name = `, for each parameter of the callee that has a
     /// name and that no other argument fills (see [`Arguments::filled`]),
-    /// typed as its signature types it; none for `len` and `show`.
+    /// typed as its signature types it; none for `len` and `show`, nor for
+    /// a block parameter, which only a trailing block gives.
     fn named_arguments(&self, file: u32, tokens: &Tokens<'_>, offset: u32) -> Vec<Completion> {
         let Some(ast) = self.scan.files.get(file as usize).map(|f| &f.ast) else {
             return Vec::new();
@@ -652,8 +703,9 @@ impl Index {
             .params
             .iter()
             .zip(filled)
-            // A rest parameter is given by position, never by name.
-            .filter(|(param, filled)| !filled && !param.rest)
+            // A rest parameter is given by position, never by name, and a
+            // block by the trailing block.
+            .filter(|(param, filled)| !filled && !param.rest && !param.block)
             .filter_map(|(param, _)| {
                 let name = param.name.as_deref()?;
                 Some(Completion {
@@ -731,17 +783,7 @@ impl Index {
             let symbol = scope.root(name).and_then(|n| scope_symbol(&scope, n));
             found.push(self.view_completion(name, symbol, group));
         }
-        for keyword in KEYWORDS {
-            found.push(Completion {
-                label: keyword.to_owned(),
-                kind: CompletionKind::Keyword,
-                detail: None,
-                documentation: None,
-                sort: sort_text(KEYWORD, keyword),
-                insert: None,
-                range: None,
-            });
-        }
+        found.extend(KEYWORDS.map(keyword));
         found
     }
 
@@ -938,10 +980,13 @@ impl Index {
         }
     }
 
-    /// Whether `ty` is a function's type, a built-in function's included.
+    /// Whether `ty` is a function's type, a built-in function's included, or
+    /// a block's, which is called as a function is.
     fn is_function(&self, ty: TyId) -> bool {
-        matches!(self.types.kind(ty), TyKind::Builtin(_))
-            || self.types.fn_sig(self.types.strip(ty)).is_some()
+        matches!(
+            self.types.kind(ty),
+            TyKind::Builtin(_) | TyKind::Block { .. }
+        ) || self.types.fn_sig(self.types.strip(ty)).is_some()
     }
 
     /// The fields of what is before the `.` at `dot` of file `file`, the
@@ -1738,6 +1783,109 @@ mod tests {
         assert!(labels(&found).contains(&"f"));
     }
 
+    /// Functions that take a block: `step`, an impure one, and `twice`, a
+    /// pure one.
+    const BLOCKS: &str = "w = 0\n\
+                          fn step(name: String, body: block -> {}) -> {} {\n    body()\n    = {}\n}\n\
+                          fn twice(count: Int, body: block: Int): Int { body() + count }\n";
+
+    #[test]
+    fn a_trailing_block_is_offered_its_caller_s_names() {
+        // The caller's parameter and variables, the block's own declared
+        // before the place, and the file's; not the callee's parameters,
+        // nor what is declared after the place, in the block or after it.
+        let text = format!(
+            "{BLOCKS}fn main(limit: Int) -> Int {{\n    let mut seen = 0\n    let conf = {{port = 80}}\n    \
+             step(\"a\") {{\n        let inner = \"s\"\n        seen := |\n        let after = 1\n    }}\n    \
+             let later = 2\n    = seen\n}}\n"
+        );
+        let found = complete(&[("app.gcsl", &text)], "app.gcsl");
+        assert_eq!(named(&found, "seen").detail.as_deref(), Some("Int"));
+        assert_eq!(named(&found, "seen").kind, CompletionKind::Variable);
+        assert_eq!(
+            named(&found, "limit").detail.as_deref(),
+            Some("Int | Future<Int>")
+        );
+        assert_eq!(named(&found, "inner").detail.as_deref(), Some("String"));
+        assert_eq!(named(&found, "conf").detail.as_deref(), Some("{port: Int}"));
+        assert_eq!(named(&found, "step").kind, CompletionKind::Function);
+        assert_eq!(named(&found, "w").kind, CompletionKind::Field);
+        for absent in ["body", "name", "count", "after", "later"] {
+            assert!(!labels(&found).contains(&absent), "{absent}");
+        }
+        // The block's variables are nearer than nothing else: with the
+        // caller's, the locals' group.
+        let groups: Vec<&str> = ["inner", "seen", "limit", "step"]
+            .iter()
+            .map(|label| &named(&found, label).sort[..1])
+            .collect();
+        assert_eq!(groups, ["1", "1", "1", "2"]);
+        // After a `.`, the fields of the caller's record.
+        let text = format!(
+            "{BLOCKS}fn main() -> Int {{\n    let conf = {{port = 80; host = \"h\"}}\n    \
+             = twice(1) {{ conf.| }}\n}}\n"
+        );
+        let found = complete(&[("app.gcsl", &text)], "app.gcsl");
+        assert_eq!(labels(&found), ["host", "port"]);
+        // In a block in a block, the outer block's variables too.
+        let text = format!(
+            "{BLOCKS}fn main() -> Int {{\n    step(\"a\") {{\n        let outer = 1\n        \
+             let got = twice(2) {{ let own = 3; = | }}\n    }}\n    = 1\n}}\n"
+        );
+        let found = complete(&[("app.gcsl", &text)], "app.gcsl");
+        for present in ["outer", "own", "twice"] {
+            assert!(labels(&found).contains(&present), "{present}");
+        }
+        assert!(!labels(&found).contains(&"got"));
+        // After the block, what it declared is gone.
+        let text = format!(
+            "{BLOCKS}fn main() -> Int {{\n    step(\"a\") {{ let inner = 1; {{}} }}\n    = |\n}}\n"
+        );
+        let found = complete(&[("app.gcsl", &text)], "app.gcsl");
+        assert!(!labels(&found).contains(&"inner"));
+    }
+
+    #[test]
+    fn a_block_parameter_is_offered_in_its_function_as_a_function_is() {
+        let text = "w = 0\nfn step(name: String, body: block -> {}) -> {} {\n    |\n    = {}\n}\n";
+        let found = complete(&[("app.gcsl", text)], "app.gcsl");
+        let body = named(&found, "body");
+        assert_eq!(body.kind, CompletionKind::Function);
+        assert_eq!(body.detail.as_deref(), Some("block -> {} | Future<{}>"));
+        assert_eq!(body.insert, None);
+        assert_eq!(named(&found, "name").kind, CompletionKind::Variable);
+        // A pure block, and one of a generic function.
+        let text = "w = 0\nfn twice(body: block: Int): Int { | }\n";
+        let found = complete(&[("app.gcsl", text)], "app.gcsl");
+        assert_eq!(named(&found, "body").detail.as_deref(), Some("block: Int"));
+        let text = "w = 0\nfn measure<T>(body: block -> T) -> T { | }\n";
+        let found = complete(&[("app.gcsl", text)], "app.gcsl");
+        assert_eq!(named(&found, "body").detail.as_deref(), Some("block -> T"));
+    }
+
+    #[test]
+    fn a_call_with_a_block_is_offered_its_other_parameters_by_name() {
+        // In its parentheses: the parameters a named argument may fill,
+        // never the block, which only the trailing block gives.
+        let text = format!("{BLOCKS}fn main() -> Int {{\n    = twice(|) {{ 1 }}\n}}\n");
+        let found = complete(&[("app.gcsl", &text)], "app.gcsl");
+        let arguments: Vec<&str> = found
+            .iter()
+            .filter(|c| c.kind == CompletionKind::Argument)
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(arguments, ["count ="]);
+        // Before its block is written, too.
+        let text = format!("{BLOCKS}fn main() -> Int {{\n    = twice(|)\n}}\n");
+        let found = complete(&[("app.gcsl", &text)], "app.gcsl");
+        let arguments: Vec<&str> = found
+            .iter()
+            .filter(|c| c.kind == CompletionKind::Argument)
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(arguments, ["count ="]);
+    }
+
     #[test]
     fn a_default_is_offered_the_parameters_before_it() {
         let found = complete(
@@ -2049,6 +2197,90 @@ mod tests {
         assert_eq!(
             named(&complete(&files, "app.gcsl"), "file").kind,
             CompletionKind::Method
+        );
+    }
+
+    #[test]
+    fn extern_is_offered_where_an_item_of_the_file_starts() {
+        let lib = "w = 0\nextern type Vm\n# Boots a machine.\n\
+                   extern def boot(name: String, cpus: Int = 1) -> Vm = \"vm.boot\"\n\
+                   # Runs a program.\n\
+                   extern def (m: Vm) run(...argv: String) -> Int\n";
+        let import = "import Vm, boot from lib/vm\nx = 1\n";
+        let offered = |text: &str| -> Vec<String> {
+            let text = format!("{import}{text}");
+            complete(&[("lib/vm.gcsl", lib), ("app.gcsl", &text)], "app.gcsl")
+                .into_iter()
+                .map(|completion| completion.label)
+                .collect()
+        };
+        let has = |found: &[String], label: &str| found.iter().any(|found| found == label);
+        // At the start of a line of the file, typed or not, and after a `;`.
+        for text in ["|", "ext|", "y = 2; |"] {
+            assert!(has(&offered(text), "extern"), "{text}");
+        }
+        // Nowhere else: in a block, in brackets, inside an expression.
+        for text in [
+            "y = { | }",
+            "y = {\n    |\n}",
+            "y = [\n    |\n]",
+            "y = 1 + |",
+            "y = boot(|",
+        ] {
+            let found = offered(text);
+            assert!(!has(&found, "extern"), "{text}");
+            assert!(has(&found, "boot"), "{text}");
+        }
+        // After it, what it declares; and then a name is declared.
+        assert_eq!(offered("extern |"), ["def", "fn", "type"]);
+        assert_eq!(offered("extern f|"), ["def", "fn", "type"]);
+        for text in [
+            "extern type |",
+            "extern fn |",
+            "extern def |",
+            "y = extern |",
+        ] {
+            assert_eq!(offered(text), [""; 0], "{text}");
+        }
+    }
+
+    #[test]
+    fn operations_and_handle_types_complete_as_functions_and_types() {
+        let lib = "w = 0\nextern type Vm\n# Boots a machine.\n\
+                   extern def boot(name: String, cpus: Int = 1) -> Vm = \"vm.boot\"\n\
+                   # Runs a program.\n\
+                   extern def (m: Vm) run(...argv: String) -> Int\n";
+        let with = |text: &str| {
+            let text = format!("import Vm, boot from lib/vm\n{text}");
+            complete(&[("lib/vm.gcsl", lib), ("app.gcsl", &text)], "app.gcsl")
+        };
+        // An operation, as a function is, with its doc comment.
+        let found = with("y = |");
+        let boot = found.iter().find(|c| c.label == "boot").unwrap();
+        assert_eq!(boot.kind, CompletionKind::Function);
+        assert_eq!(
+            boot.detail.as_deref(),
+            Some("fn(name: String | Future<String>, cpus: Int | Future<Int>) …")
+        );
+        assert_eq!(boot.documentation.as_deref(), Some("Boots a machine."));
+        // Its named arguments, where an argument starts.
+        let found = with("y = boot(|");
+        assert!(found.iter().any(|c| c.label == "name ="));
+        assert!(found.iter().any(|c| c.label == "cpus ="));
+        // A handle type, where a type is written.
+        let found = with("fn f(m: |");
+        let vm = found.iter().find(|c| c.label == "Vm").unwrap();
+        assert_eq!(vm.kind, CompletionKind::Type);
+        // A method that is an operation, after a handle.
+        let found = with("y = boot(\"a\").|");
+        assert_eq!(labels(&found), ["run"]);
+        assert_eq!(found[0].kind, CompletionKind::Method);
+        assert_eq!(
+            found[0].detail.as_deref(),
+            Some(
+                "extern fn (m: Vm | Future<Vm>) run(argv: String | Future<String>) -> Int = \
+                 \"run\""
+            )
         );
     }
 }

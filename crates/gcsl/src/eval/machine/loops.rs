@@ -205,7 +205,10 @@ impl Machine<'_> {
 
     /// Runs the iterations of the `for` `state` from its next element on,
     /// the simple guards and bodies at once, until one needs a frame or
-    /// the elements run out.
+    /// the elements run out; or, in a run with a slice, until it has run
+    /// as many as the machine takes steps between two looks at the clock,
+    /// when the next runs through its frames, as one that needs a frame
+    /// does (see [Yielding](crate::eval::machine#yielding)).
     pub(super) fn for_next(&mut self, mut state: Box<ForState>) -> Next {
         loop {
             let deadline = self.walker(|walker| {
@@ -237,8 +240,10 @@ impl Machine<'_> {
                 return fail(error);
             };
             *variable = element;
+            // Through its frames, where the machine looks at the clock.
+            let slow = self.steps_spent();
             if let Some(guard) = state.guard {
-                if !self.running().ir.is_simple(guard) {
+                if slow || !self.running().ir.is_simple(guard) {
                     self.frames.push(Frame::ForGuard(state));
                     return Next::Eval(guard);
                 }
@@ -249,7 +254,7 @@ impl Machine<'_> {
                     Err(unwind) => return self.guard_failed(state, Box::new(unwind)),
                 }
             }
-            if !self.running().ir.is_simple(state.body) {
+            if slow || !self.running().ir.is_simple(state.body) {
                 return self.for_body_begin(state);
             }
             let body = state.body;

@@ -24,6 +24,51 @@
 //! stopped is none of the unit's: its deadlines and its profiled calls are
 //! moved on by it, so that `#[timeout]` measures running time, as with
 //! restarts, and the profile counts no waiting.
+//!
+//! A unit whose slice is spent is set aside the same way, waiting for
+//! nothing, with how it stopped ([`Parked`]'s `yielded`), by which its
+//! next run puts its tasks back as they were (see
+//! [Yielding](super#yielding)).
+//!
+//! # Charged time
+//!
+//! Some of the time a unit is stopped may be its own after all: a host
+//! that runs an operation for a unit wants the operation's time to count
+//! toward the `#[timeout]` of the function that asked for it, and the
+//! time the host kept the unit waiting for its own reasons not to. So a
+//! host says how much counts
+//! ([`Workspace::charge_stopped`](crate::workspace::Workspace::charge_stopped)):
+//! the unit's [`Suspended`] keeps the sum of what it was charged, and when
+//! the unit is taken up its deadlines are moved on by the time it was
+//! stopped less that sum, the sum held to the time it was in fact
+//! stopped. A unit never charged is moved on by the whole time, as ever.
+//! The profile is not charged: it counts running time only.
+//!
+//! The charge is every task's of the unit, since each has deadlines of
+//! its own (see [Tasks](super::tasks#tasks)): a task set aside has its
+//! deadlines moved back by the charge, and they are moved on by the whole
+//! time it was set aside when it next runs. What a deadline has left by
+//! this clock, the nearest in any task of the unit, is
+//! [`Suspended::time_left`], by which a host sets its own timer for an
+//! operation.
+//!
+//! A deadline that passes while a unit runs is raised at the next call,
+//! iteration or `exec` (see [Retry and
+//! timeout](crate::eval::retry#retry-and-timeout)). One that has passed
+//! by what a host charged is raised where the task takes up
+//! ([`Machine::resume_next`]), before the task looks at what it waited
+//! for: at the effect's call, the await, or the call that waited for
+//! another's run, with the deadline's own message and mark, so that the
+//! timed function's call makes it its own failure, which its `#[retry]`
+//! retries and a `recover` around the call catches. The result the host
+//! gave for the effect, a value or a failure, is not read, and it need
+//! have given none: an `exec` that outlives its deadline is killed and
+//! times out whatever its program would have printed, and an operation
+//! that the unit's clock says ran too long is the same. A task that waits
+//! for a result the host has not given is woken all the same when its
+//! deadline has passed ([`Machine::wake_given`]). A unit a host has once
+//! charged looks at its deadlines whenever one of its tasks takes up
+//! after waiting; one never charged does not, as before.
 
 use std::fmt;
 use std::rc::Rc;
@@ -90,6 +135,9 @@ pub(crate) struct Suspended {
     profile: Option<profile::Suspended>,
     /// When it stopped.
     since: Instant,
+    /// How much of the time since the host has said is the unit's own (see
+    /// [Charged time](#charged-time)).
+    charged: Duration,
 }
 
 /// Releases what the unit `unit`, which ended or was given up without
@@ -115,6 +163,35 @@ impl Suspended {
     /// running memoised calls and `lazy`s.
     pub(super) fn parts(&self) -> (&Parked, &[Running], &[Rc<Future>]) {
         (&self.parked, &self.running, &self.task.futures)
+    }
+
+    /// Charges the unit `time` more of the time it has been stopped (see
+    /// [Charged time](#charged-time)).
+    pub(crate) const fn charge(&mut self, time: Duration) {
+        self.charged = self.charged.saturating_add(time);
+    }
+
+    /// How long the nearest deadline running in the unit has left by the
+    /// unit's own clock, which stopped when it did and has since run for
+    /// what the host charged it; `None` if none is running (see [Charged
+    /// time](#charged-time)).
+    pub(crate) fn time_left(&self) -> Option<Duration> {
+        let charged = self.charged.min(self.since.elapsed());
+        let root = self
+            .task
+            .deadlines
+            .last()
+            .map(|deadline| deadline.effective.saturating_duration_since(self.since));
+        let others = self
+            .parked
+            .tasks
+            .0
+            .iter()
+            .filter_map(super::tasks::Task::time_left);
+        root.into_iter()
+            .chain(others)
+            .min()
+            .map(|left| left.saturating_sub(charged))
     }
 }
 
@@ -190,9 +267,14 @@ pub(in crate::eval) fn run_machine(
     let resumed = graph.and_then(GraphRun::take_suspended);
     let (start, ran, parked) = if let Some(suspended) = resumed {
         let (start, parked) = take_up(suspended, (stack, memo), shared, own);
+        let yielded = parked.yielded;
         // Its profiled calls are back above where its run started.
         let mut machine = Machine::parked((stack, memo), shared, parked, start.profiled);
-        let next = machine.take_up_tasks();
+        // One that yielded waited for nothing: it goes on as it was.
+        let next = match yielded {
+            Some(how) => machine.take_up_yielded(how),
+            None => machine.take_up_tasks(),
+        };
         let ran = machine.run_from(next);
         (start, ran, machine.into_parked())
     } else {
@@ -239,7 +321,17 @@ pub(in crate::eval) fn run_machine(
             }
             Err(pending(span).into())
         }
-        (Ran::Blocked(..), None) => {
+        // Its slice spent: set aside as one that waits is, waiting for
+        // nothing (see [Yielding](super#yielding)).
+        (Ran::Yielded(how), Some(run)) => {
+            let mut parked = parked;
+            parked.yielded = Some(how);
+            let suspended = set_aside(parked, start, (stack, memo), shared);
+            run.suspend(suspended);
+            run.note_yield();
+            Err(pending(span).into())
+        }
+        (Ran::Blocked(..) | Ran::Yielded(_), None) => {
             Err(super::super::internal("a plain run stopped to wait", span).into())
         }
     }
@@ -281,6 +373,7 @@ fn set_aside(
         run,
         profile,
         since: Instant::now(),
+        charged: Duration::ZERO,
     }
 }
 
@@ -303,8 +396,15 @@ fn take_up(
         run,
         profile,
         since,
+        charged,
     } = suspended;
     let blocked = since.elapsed();
+    // What the host charged of it counts as the unit's own (see [Charged
+    // time](#charged-time)).
+    let charged = charged.min(blocked);
+    if !charged.is_zero() {
+        parked.charge(charged);
+    }
     // A prepared call's own slots are its alone while it runs: whatever
     // another left there goes. A file's slots are followed by the cells of
     // files that ran since, which stay.
@@ -318,7 +418,19 @@ fn take_up(
     stack.resize(at, Value::Empty);
     stack.extend(segment);
     if at != base {
-        parked.rebase(base, at.wrapping_sub(base));
+        let delta = at.wrapping_sub(base);
+        parked.rebase(base, delta);
+        // A block names the frame it runs in by where it starts (see
+        // [Blocks](crate::eval::blocks#blocks)).
+        for value in stack.iter_mut().skip(at) {
+            if let Value::Block(block) = value
+                && block.base >= base
+            {
+                let mut moved = crate::value::Block::clone(block);
+                moved.base = moved.base.wrapping_add(delta);
+                *value = Value::Block(Rc::new(moved));
+            }
+        }
     }
     let start = Start {
         base: at,
@@ -329,7 +441,7 @@ fn take_up(
     if let (Some(profile), Some(suspended)) = (shared.profile, profile) {
         profile.resume(suspended, blocked);
     }
-    restore_task(task, shared, blocked);
+    restore_task(task, shared, blocked.saturating_sub(charged));
     if let Some(graph) = shared.graph {
         graph.restore_state(run);
     }
@@ -337,7 +449,7 @@ fn take_up(
 }
 
 /// Puts `task` back into `shared`, its deadlines moved on by `blocked`,
-/// the time its unit was stopped.
+/// the time its unit was stopped that is none of its own.
 fn restore_task(task: Task, shared: &Shared<'_>, blocked: Duration) {
     let mut deadlines = task.deadlines;
     for deadline in &mut deadlines {
@@ -361,6 +473,16 @@ fn restore_task(task: Task, shared: &Shared<'_>, blocked: Duration) {
 }
 
 impl Parked {
+    /// Charges every task set aside `time` of the time the unit was
+    /// stopped, and notes that the unit is charged; the root's deadlines
+    /// are its run's to move (see [Charged time](#charged-time)).
+    fn charge(&mut self, time: Duration) {
+        self.charged = true;
+        for task in &mut self.tasks.0 {
+            task.charge(time);
+        }
+    }
+
     /// Moves every frame from `from` on, those set aside with the unit, by
     /// `delta` slots up the stack, wrapping, so that a negative move is a
     /// wrapped subtraction; the top level's frame, below, stays.
@@ -410,8 +532,13 @@ impl Resume {
 }
 
 impl Machine<'_> {
-    /// What the machine does first when it takes up after `resume`.
+    /// What the machine does first when it takes up after `resume`. In a
+    /// unit its host has charged, a deadline that has passed is raised
+    /// first, where the task waited (see [Charged time](#charged-time)).
     pub(super) fn resume_next(&mut self, resume: Resume) -> Next {
+        if self.charged && self.walker(|walker| walker.past_deadline()) {
+            return self.timed_out_waiting(&resume);
+        }
         match resume {
             Resume::Await(state, future) => self.await_fully(state, Value::Future(future)),
             Resume::Deep(state, value, _) => self.await_deep(state, value),
@@ -431,5 +558,37 @@ impl Machine<'_> {
             },
             Resume::Read(id) => Next::Eval(id),
         }
+    }
+
+    /// Raises the passing of a deadline for a task that was to take up
+    /// after `resume`, where it waited: what it waited for is not looked
+    /// at, as a program that outlives its deadline is killed whatever it
+    /// would have printed. A call that waited to be looked up fails as a
+    /// call whose argument failed does, its frame going.
+    fn timed_out_waiting(&mut self, resume: &Resume) -> Next {
+        let ir = &self.running().ir;
+        let span = match resume {
+            Resume::Await(state, _) | Resume::Deep(state, ..) => state.span(),
+            Resume::Builtin(call) => ir.get(call.node()).span,
+            Resume::Apply(state, _) => ir.get(state.node()).span,
+            Resume::Effect(node, _) | Resume::Read(node) => ir.get(*node).span,
+            Resume::Lookup(_) => {
+                let node = self.calls.last().map_or(ir.root(), |call| call.node);
+                ir.get(node).span
+            }
+        };
+        let unwind: Unwind = self
+            .walker(|walker| walker.passed_deadline(span))
+            .unwrap_or_else(|| {
+                super::super::internal("a deadline passed that no running call has", span)
+            })
+            .into();
+        if matches!(resume, Resume::Lookup(_)) {
+            return match self.calls.pop() {
+                Some(state) => self.argument_failed(&state, unwind),
+                None => self.lost_call(),
+            };
+        }
+        fail(unwind)
     }
 }

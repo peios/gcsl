@@ -36,6 +36,13 @@ pub(in crate::eval) struct OperandsState {
     pub(super) pieces: Pieces,
 }
 
+impl OperandsState {
+    /// The node.
+    pub(super) const fn node(&self) -> IrId {
+        self.node
+    }
+}
+
 impl Machine<'_> {
     /// Whether the machine applies node `kind` itself, its operands
     /// evaluated here ([`apply`]).
@@ -413,6 +420,7 @@ const fn variant_name(value: &Value) -> &'static str {
         Value::File(_) => "a File",
         Value::Dir(_) => "a Dir",
         Value::Sandbox(_) => "a Sandbox",
+        Value::Block(_) => "a block",
     }
 }
 

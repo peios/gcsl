@@ -217,12 +217,15 @@ use super::{
 impl Checker<'_> {
     /// Checks what the file declares before its body is checked: its `type`
     /// items, quietly in a workspace, which has checked them first
-    /// ([`check_types`](super::check_types)), and the uses of attributes on its functions.
+    /// ([`check_types`](super::check_types)), and the uses of attributes on its functions,
+    /// its operations given theirs (see [Host
+    /// operations](crate::check::operations#host-operations)).
     pub(super) fn check_declarations(&mut self) {
         let quiet = std::mem::replace(&mut self.quiet.types, self.workspace.is_some());
         self.type_items();
         self.quiet.types = quiet;
         self.check_attribute_uses();
+        self.track_operations();
     }
 
     /// Whether `ty` holds only constants, as an attribute's arguments must
@@ -388,6 +391,7 @@ impl Checker<'_> {
         ret: TyId,
         written: Option<TypeExprId>,
     ) {
+        self.check_block_param(function);
         if !self.lowering.deferred.contains(&function)
             || ret == TyId::ERROR
             || self.types.laziness(ret) != Laziness::Present
@@ -748,11 +752,9 @@ impl Checker<'_> {
         } = self.meta_of(id, record);
         let mut impure = false;
         if meta.effect != Effect::Pure
-            && let Some(function) = self.functions.last()
-            && function.effect == Effect::Pure
+            && let Some(marker) = self.pure_marker()
         {
             impure = true;
-            let marker = function.marker;
             let label = format!(
                 "reading {subject} is impure (`{}`)",
                 meta.effect.meta_marker()

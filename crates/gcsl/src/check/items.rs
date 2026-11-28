@@ -31,7 +31,7 @@
 //! input's record and, in a workspace, of its directory, which commits
 //! only fields ([`Scope`](super::Scope)'s `commit`): a `let` or `fn` is the file's own.
 
-use crate::ast::{Effect, ExprId, ExprKind, ItemId, ItemKind, UnaryOp};
+use crate::ast::{ExprId, ExprKind, ItemId, ItemKind, UnaryOp};
 use crate::diagnostic::Diagnostic;
 use crate::names::Name;
 use crate::source::Span;
@@ -203,22 +203,39 @@ impl Checker<'_> {
     /// ([`BUILTIN_TYPE_NAMES`]) and "type `Foo` is declared twice" at a
     /// second of one name, labelled "first declared here", unless resolving
     /// quietly, as a workspace's check of a file does, the workspace having
-    /// checked them first ([`check_types`](super::check_types)).
+    /// checked them first ([`check_types`](super::check_types)). A handle
+    /// type's name is reported so too, which is new among the file's `type`
+    /// items, its handle types and its enums (see [Handle
+    /// types](crate::check::operations#handle-types)).
     pub(super) fn type_items(&mut self) {
         let ast = self.ast;
         let mut declared: Vec<(Name, Span)> = Vec::new();
+        // The enums declared so far, which a handle type's name is new
+        // among too.
+        let mut enums: Vec<(Name, Span)> = Vec::new();
         for &id in ast.items(ast.root()) {
-            let ItemKind::Type {
-                name,
-                name_span,
-                ty,
-            } = ast.item(id).kind
-            else {
-                continue;
+            let (name, name_span, ty) = match ast.item(id).kind {
+                ItemKind::Type {
+                    name,
+                    name_span,
+                    ty,
+                } => (name, name_span, Some(ty)),
+                ItemKind::Enum {
+                    name, name_span, ..
+                } if ast.extern_type(id).is_some() => (name, name_span, None),
+                ItemKind::Enum {
+                    name, name_span, ..
+                } => {
+                    enums.push((name, name_span));
+                    continue;
+                }
+                _ => continue,
             };
             let text = ast.names().get(name);
+            let among = if ty.is_some() { &[][..] } else { &enums[..] };
             let first = declared
                 .iter()
+                .chain(among)
                 .find(|&&(earlier, _)| earlier == name)
                 .map(|&(_, span)| span);
             let error = if BUILTIN_TYPE_NAMES.contains(&text) {
@@ -242,6 +259,10 @@ impl Checker<'_> {
                     self.errors.push(error);
                 }
             }
+            // A handle type is defined by no type expression.
+            let Some(ty) = ty else {
+                continue;
+            };
             let errors = self.errors.len();
             self.in_type_item = true;
             let resolved = self.resolve_type(ty, Bareness::Present);
@@ -341,12 +362,7 @@ impl Checker<'_> {
         let present = self.types.present(ty);
         if self.types.is_unit_like(present) {
             self.measure_deep(value, ty);
-        } else if self.impure_calls.contains(&value)
-            && self
-                .functions
-                .last()
-                .is_none_or(|function| function.effect != Effect::Pure)
-        {
+        } else if self.impure_calls.contains(&value) && self.pure_marker().is_none() {
             // In a pure function the call is an error already.
             self.measure_deep(value, ty);
             self.discarded.insert(value);

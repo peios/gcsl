@@ -95,6 +95,9 @@ fn body_item(ast: &Ast, id: ItemId, out: &mut String) {
                 ItemKind::Field { .. } => "def ",
                 _ => "fn ",
             };
+            if let Some(operation) = ast.extern_fn_of(id) {
+                return operation_item(ast, (keyword, path), operation, out);
+            }
             out.push_str(keyword);
             path_shape(ast, path, out);
             let mut function = String::new();
@@ -233,7 +236,39 @@ fn path_shape(ast: &Ast, path: PathRange, out: &mut String) {
 }
 
 /// Writes the item `id`, an enum or a variant, as it is written.
+/// An operation as written, its body, which the parser made, left out:
+/// `extern fn boot(profile: Profile) -> Vm = "vm.boot"`, its name always
+/// shown; a method by its binding, as any method is.
+fn operation_item(
+    ast: &Ast,
+    (keyword, path): (&str, PathRange),
+    operation: &crate::ast::ExternFn,
+    out: &mut String,
+) {
+    let mut function = String::new();
+    fn_shape(ast, operation.function, &mut function);
+    let signature = function.strip_prefix("fn").unwrap();
+    let signature = &signature[..signature.rfind(" {").unwrap()];
+    out.push_str("extern ");
+    out.push_str(keyword);
+    path_shape(ast, path, out);
+    write!(
+        out,
+        "{signature} = \"{}\"",
+        ast.strings().get(operation.name)
+    )
+    .unwrap();
+}
+
 fn enum_item(ast: &Ast, id: ItemId, out: &mut String) {
+    if let Some(handle) = ast.extern_type(id) {
+        let ItemKind::Enum { name, .. } = ast.item(id).kind else {
+            return;
+        };
+        let kind = ast.strings().get(handle.kind);
+        write!(out, "extern type {} = \"{kind}\"", ast.names().get(name)).unwrap();
+        return;
+    }
     let (written, ty) = match ast.item(id).kind {
         ItemKind::Enum { name, bound, .. } => {
             (format!("enum {} extensible", ast.names().get(name)), bound)
@@ -293,6 +328,12 @@ fn type_args(ast: &Ast, args: TypeArgRange, out: &mut String) {
 }
 
 /// Writes a `recover`, `recover BODY else (NAME) FALLBACK`.
+fn try_shape(ast: &Ast, operand: ExprId, out: &mut String) {
+    out.push_str("(try ");
+    expr(ast, operand, out);
+    out.push(')');
+}
+
 fn recover_shape(ast: &Ast, id: crate::ast::RecoverId, out: &mut String) {
     let decl = ast.recover_decl(id);
     out.push_str("recover ");
@@ -345,6 +386,7 @@ fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
         TypeExprKind::Named(name) => out.push_str(ast.names().get(name)),
         TypeExprKind::Context(name) => write!(out, "^{}", ast.names().get(name)).unwrap(),
         TypeExprKind::Data => out.push('*'),
+        TypeExprKind::Inferred => out.push('_'),
         TypeExprKind::Path(path) => out.push_str(&ast.show_path(ast.path(path)).to_string()),
         TypeExprKind::Record(fields) => {
             out.push('{');
@@ -373,6 +415,14 @@ fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
         | TypeExprKind::Param(_)
         | TypeExprKind::Enum { .. }
         | TypeExprKind::Invalid => out.push('?'),
+        TypeExprKind::Block { ret, effect } => {
+            out.push_str(if effect == Effect::Pure {
+                "block: "
+            } else {
+                "block -> "
+            });
+            type_name(ast, ret, out);
+        }
         TypeExprKind::Fn {
             params,
             needs,
@@ -544,6 +594,7 @@ fn expr(ast: &Ast, id: ExprId, out: &mut String) {
             expr(ast, message, out);
         }
         ExprKind::Recover(id) => recover_shape(ast, id, out),
+        ExprKind::Try(operand) => try_shape(ast, operand, out),
         ExprKind::With { bindings, body } => with_shape(ast, (bindings, body), out),
         ExprKind::DefTypeRef(def) => {
             let (def_type, path) = ast.show_def_type(def);
@@ -676,7 +727,9 @@ fn list_shape(ast: &Ast, elements: crate::ast::ElementRange, out: &mut String) {
 
 /// A function expression as `fn(x: Int): Int {..}`, `->> Int` if
 /// memoised and `-> Int` if impure, a parameter with a default as `x:
-/// Int = 1`.
+/// Int = 1`, and one written with no type as `x = 1`, or as `x: _` where
+/// its default is written elsewhere, as a definition's own is; the body's
+/// function of a definition, which has no return type, as `fn(x: _) {..}`.
 fn fn_shape(ast: &Ast, function: crate::ast::FnId, out: &mut String) {
     let decl = ast.fn_decl(function);
     out.push_str("fn(");
@@ -685,16 +738,24 @@ fn fn_shape(ast: &Ast, function: crate::ast::FnId, out: &mut String) {
             out.push_str(", ");
         }
         out.push_str(ast.names().get(param.name));
-        out.push_str(": ");
-        type_name(ast, param.ty, out);
+        let untyped = ast.type_expr(param.ty).kind == TypeExprKind::Inferred;
+        if !untyped || param.default.is_none() {
+            out.push_str(": ");
+            type_name(ast, param.ty, out);
+        }
         if let Some(default) = param.default {
             out.push_str(" = ");
             expr(ast, default, out);
         }
     }
-    out.push_str(decl.effect.params_end());
-    type_name(ast, decl.ret.unwrap(), out);
-    out.push(' ');
+    match decl.ret {
+        Some(ret) => {
+            out.push_str(decl.effect.params_end());
+            type_name(ast, ret, out);
+            out.push(' ');
+        }
+        None => out.push_str(") "),
+    }
     expr(ast, decl.body, out);
 }
 
@@ -759,8 +820,10 @@ fn message(text: &str) -> String {
 // ----- Errors and recovery -----
 
 mod basics;
+mod blocks;
 mod conditions;
 mod extensions;
+mod externs;
 mod functions;
 mod imports;
 mod items;

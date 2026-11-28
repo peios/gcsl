@@ -28,6 +28,13 @@ impl Lowerer<'_> {
         let items = self.ast.items(body);
         let is_record = self.is_record_body(body)
             || block.is_some_and(|block| !self.resolution.record_fills(block).is_empty());
+        // A trailing block whose last expression is a statement (see the
+        // checker's "Blocks"), or a definition's body (see its "A
+        // definition's last expression").
+        let discards = block.is_some_and(|block| {
+            self.resolution.is_block_arg(block) == Some(true)
+                || self.resolution.ends_as_statement(block)
+        });
         let base = self.item_stack.len();
         let mut result = None;
         let is_root = body == self.ast.root();
@@ -37,7 +44,9 @@ impl Lowerer<'_> {
         }
         for (index, &id) in items.iter().enumerate() {
             // A record block's final expression is a statement.
-            let is_result = !is_record && index + 1 == items.len();
+            let is_result = !is_record
+                && index + 1 == items.len()
+                && !(discards && matches!(self.ast.item(id).kind, ItemKind::Expr(_)));
             let item = self.ast.item(id);
             if is_root {
                 self.store_cells(index)?;

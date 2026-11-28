@@ -1,0 +1,3 @@
+extern type Vm
+extern fn watch(m: Vm, each: fn(String) -> {}) -> {}
+enum Vm::Fake<Int>

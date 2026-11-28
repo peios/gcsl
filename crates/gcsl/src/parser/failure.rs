@@ -19,13 +19,31 @@
 //! line, as an `if`'s may, the name its fallback binds the failure to, in
 //! parentheses, if any, and the fallback. Anything but `else` after the
 //! body is "expected `else` after the body of `recover`".
+//!
+//! ```text
+//! TRY = "try" EXPR
+//! ```
+//!
+//! `try`, no keyword either, starts a `try` expression ([`ExprKind::Try`])
+//! where an expression starts and what starts an expression follows it on
+//! its line (`Parser::starts_try`): a name, a literal, `{`, `not`, `await`,
+//! `^`, `if`, `do`, `for`, `fn` or `lazy`. Its operand is the longest
+//! expression that follows, as a `lazy`'s is, so `try a + f()` is the
+//! `try` of the sum. Two names in a row never parsed, nor a name and a
+//! literal, so every program that parsed parses as it did, but one: a
+//! call of a function named `try` with only a trailing block, `try { ...
+//! }`, is now the `try` of the block, as `recover { ... }` is no call of a
+//! function named `recover`. `(`, `[` and `-` after `try` are what they
+//! were, the call `try(x)`, the index `try[0]` and the subtraction `try -
+//! 1` of a variable named `try`: the `try` of an expression in parentheses
+//! is written `try { (x) }`.
 
 use crate::ast::{ExprId, ExprKind, Item, ItemId, ItemKind, RecoverDecl};
 use crate::lexer::{Token, TokenKind};
 use crate::names::Name;
 use crate::source::Span;
 
-use super::{ASSERT, LEAF_HEIGHT, ParseResult, Parser, RECOVER, error_span, one_line};
+use super::{ASSERT, LEAF_HEIGHT, ParseResult, Parser, RECOVER, TRY, error_span, one_line};
 
 impl Parser<'_> {
     /// Whether the tokens here start an `assert` statement: the word
@@ -108,6 +126,9 @@ impl Parser<'_> {
     pub(super) fn parse_recover(&mut self) -> ParseResult<ExprId> {
         let keyword = self.peek();
         self.advance();
+        // The variable its fallback keeps its failure's number in, which
+        // the checker and lowering name it by.
+        self.names.intern(crate::check::FAILURE_AT);
         let body = self.parse_block()?;
         // An `else` may start a later line, as an `if`'s may.
         self.skip_newlines();
@@ -142,6 +163,55 @@ impl Parser<'_> {
             fallback,
         });
         self.alloc(ExprKind::Recover(id), span, height)
+    }
+
+    /// Whether the current token starts a `try` expression: the word
+    /// `try`, then on its line what starts an expression, but `(`, `[` and
+    /// `-` (see [Failure](#failure)).
+    pub(super) fn starts_try(&self) -> bool {
+        let keyword = self.peek();
+        if !matches!(keyword.kind, TokenKind::Ident(name) if self.names.get(name) == TRY) {
+            return false;
+        }
+        let next = self.peek_at(1);
+        let on_line = !self
+            .source
+            .slice(Span::new(keyword.span.end, next.span.start))
+            .contains('\n');
+        on_line
+            && matches!(
+                next.kind,
+                TokenKind::Ident(_)
+                    | TokenKind::Int(_)
+                    | TokenKind::Float(_)
+                    | TokenKind::Duration(_)
+                    | TokenKind::Size(_)
+                    | TokenKind::Str(_)
+                    | TokenKind::StrStart(_)
+                    | TokenKind::True
+                    | TokenKind::False
+                    | TokenKind::LBrace
+                    | TokenKind::Not
+                    | TokenKind::Await
+                    | TokenKind::Caret
+                    | TokenKind::If
+                    | TokenKind::Do
+                    | TokenKind::For
+                    | TokenKind::Fn
+                    | TokenKind::Lazy
+            )
+    }
+
+    /// Parses a `try` expression, at its `try`, which
+    /// [`Parser::starts_try`] has found (see [Failure](#failure)): its
+    /// operand, the longest expression that follows, as a `lazy`'s is.
+    pub(super) fn parse_try(&mut self) -> ParseResult<ExprId> {
+        let keyword = self.peek();
+        self.advance();
+        let operand = self.parse_expr(0)?;
+        let height = self.height_of(operand) + 1;
+        let span = Span::join(keyword.span, self.span_of(operand));
+        self.alloc(ExprKind::Try(operand), span, height)
     }
 
     /// Parses the name a `recover`'s fallback binds its failure to, `(e)`,
