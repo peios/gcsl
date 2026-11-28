@@ -693,7 +693,7 @@ impl AstBuilder {
             no_prelude: self.no_prelude,
             syntax: self.syntax,
             implicit_import: None,
-            given_import: None,
+            given_imports: Vec::new(),
             expansion: Expansion::default(),
             root,
             names,

@@ -20,7 +20,7 @@ fn given(files: &[(&str, &str, Option<&str>)]) -> Result<Workspace, Vec<Diagnost
         .map(|&(path, text, prelude)| {
             let source = SourceFile::new(path, text).unwrap();
             match prelude {
-                Some(library) => source.with_prelude(library),
+                Some(library) => source.with_prelude([format!("import * from \"{library}\"")]),
                 None => source,
             }
         })
@@ -136,7 +136,7 @@ fn no_prelude_turns_a_given_prelude_off() {
     );
     let source = SourceFile::new("t.prvm", "#![no_prelude]\nx = 1")
         .unwrap()
-        .with_prelude("kit");
+        .with_prelude(["import * from \"kit\""]);
     assert!(library_imports(&source).is_empty());
 }
 
@@ -144,7 +144,7 @@ fn no_prelude_turns_a_given_prelude_off() {
 fn the_given_prelude_is_the_first_library_a_file_imports() {
     let source = SourceFile::new("t.prvm", "import \"other\"\nx = 1")
         .unwrap()
-        .with_prelude("kit");
+        .with_prelude(["import * from \"kit\""]);
     assert_eq!(library_imports(&source), ["kit", "other"]);
 }
 
@@ -265,4 +265,116 @@ fn one_workspace_mixes_files_given_preludes_and_files_not() {
     let tests: Vec<&DefType> = listed.iter().filter(|found| found.path == "test").collect();
     assert_eq!(tests.len(), 1, "{listed:?}");
     assert_eq!(tests[0].definitions[0].path, "t");
+}
+
+/// The library `kit/vm`, beside `kit` ([`KIT`]).
+const VM: &str = "def boot(): String { \"vm\" }\nlimit = 9\n";
+
+/// The workspace of `files`, each a path, a text and the imports of the
+/// prelude given it, beside the libraries `kit` and `kit/vm`, checked.
+fn given_imports(files: &[(&str, &str, &[&str])]) -> Result<Workspace, Vec<Diagnostic>> {
+    let mut sources: Vec<SourceFile> = files
+        .iter()
+        .map(|&(path, text, imports)| {
+            SourceFile::new(path, text)
+                .unwrap()
+                .with_prelude(imports.iter().copied())
+        })
+        .collect();
+    sources.push(SourceFile::new("<lib>/kit/kit.gcsl", KIT).unwrap());
+    sources.push(SourceFile::new("<lib>/kit/vm/vm.gcsl", VM).unwrap());
+    check_with_standard(&sources, &[], SCRATCH).1
+}
+
+/// The value of the file `path` of `files`, as [`given_imports`] checks
+/// them, run.
+fn given_value(files: &[(&str, &str, &[&str])], path: &str) -> String {
+    let mut workspace = given_imports(files).unwrap_or_else(|errors| panic!("{errors:?}"));
+    let file = workspace.file(path).unwrap();
+    workspace.run(file).unwrap().value.to_string()
+}
+
+#[test]
+fn a_prelude_is_imports_in_order_of_each_form() {
+    let kit_and_vm: &[&str] = &["import * from \"kit\"", "import \"kit/vm\""];
+    assert_eq!(
+        given_value(
+            &[
+                ("workspace.gcsl", "", &[]),
+                ("t.prvm", "x = vm.boot()\ny = limit", kit_and_vm),
+            ],
+            "t.prvm"
+        ),
+        "{x = \"vm\"; y = 3}"
+    );
+    // Whole as another name, and by members.
+    assert_eq!(
+        given_value(
+            &[
+                ("workspace.gcsl", "", &[]),
+                (
+                    "t.prvm",
+                    "x = machine.boot()\ny = most",
+                    &[
+                        "import \"kit/vm\" as machine",
+                        "import limit as most from \"kit\""
+                    ],
+                ),
+            ],
+            "t.prvm"
+        ),
+        "{x = \"vm\"; y = 3}"
+    );
+    // A later import shadows an earlier one's name.
+    assert_eq!(
+        given_value(
+            &[
+                ("workspace.gcsl", "", &[]),
+                (
+                    "t.prvm",
+                    "y = limit",
+                    &["import * from \"kit\"", "import * from \"kit/vm\""],
+                ),
+            ],
+            "t.prvm"
+        ),
+        "{y = 9}"
+    );
+}
+
+#[test]
+fn an_import_a_prelude_does_not_take_is_an_error_and_the_others_stand() {
+    let errors = given_imports(&[
+        ("workspace.gcsl", "", &[]),
+        ("lib/x.gcsl", "w = 1", &[]),
+        (
+            "t.prvm",
+            "y = limit",
+            &[
+                "import lib/x",
+                "import * from \"kit\"",
+                "import * from \"absent\"",
+            ],
+        ),
+    ])
+    .unwrap_err();
+    let messages: Vec<&str> = errors
+        .iter()
+        .filter(|error| error.severity == crate::diagnostic::Severity::Error)
+        .map(|error| error.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "the prelude given for this file imports only libraries, whole, `*` or by name: \
+             `import lib/x`",
+            "the prelude `absent` given for this file is not found",
+        ]
+    );
+    let source = SourceFile::new("t.prvm", "x = 1").unwrap().with_prelude([
+        "import \"a\"",
+        "import lib/x",
+        "import b from \"c/d\"",
+    ]);
+    assert_eq!(library_imports(&source), ["a", "c/d"]);
 }

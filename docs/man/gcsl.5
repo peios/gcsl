@@ -435,10 +435,11 @@ A file and directory with the same module name are ambiguous.
 A file's module name is its path without the last extension of its name, so a host's file such as tests/boot.prvm is imported as tests/boot, as a .gcsl file is; two files of one directory that differ only by extension are an error.
 A file outside any workspace can import standard modules only.
 .PP
-A host that embeds GCSL can give any file a library as a prelude of its own.
-That file is checked as if, after the standard prelude's import, it began with #[shadowable] import * from "LIBRARY", written nowhere: the library's names shadow the standard prelude's, and the file's own declarations and imports, and those of directories above it, shadow both.
+A host that embeds GCSL can give any file a prelude of its own: import items of libraries, such as import * from "provium" and import "provium/vm", in order.
+That file is checked as if, after the standard prelude's import, it began with each of them marked #[shadowable], written nowhere: what they bind shadows the standard prelude's names, a later one an earlier one's, and the file's own declarations and imports, and those of directories above it, shadow them all.
+A prelude imports only libraries, whole, with *, or by name; any other import given is an error at the start of the file.
 #![no_prelude] turns both off.
-A prelude library the host did not supply is one error at the start of the file.
+A prelude's library the host did not supply is one error at the start of the file.
 The gcsl tools give a host's files their host's prelude by their extension; see gcsl(1), HOSTS.
 Hidden names, symbolic-link directories, and nested workspace trees are excluded from workspace discovery.
 .PP

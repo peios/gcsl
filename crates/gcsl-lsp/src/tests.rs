@@ -684,7 +684,7 @@ fn a_host_s_file_is_checked_with_its_prelude() {
     );
     // Installed in the workspace, which the client reports: its prelude's
     // names are found, and an error of the file's own is published.
-    scratch.write(".gcsl/hosts/prvm/prelude", "provium\n");
+    scratch.write(".gcsl/hosts/prvm/prelude", "import * from \"provium\"\n");
     let core = scratch.write(
         ".gcsl/hosts/prvm/provium/core.gcsl",
         "#[def_type]\ndef test(name: String, f: fn() -> {}) -> {} { f() }\n\

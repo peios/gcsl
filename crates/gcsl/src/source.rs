@@ -80,9 +80,9 @@ pub struct SourceFile {
     /// Where the host found the file's directory, for a library's file
     /// ([`SourceFile::with_dir`]); `None` otherwise.
     dir: Option<String>,
-    /// The library whose declarations the file sees as it sees the
-    /// prelude's, if its host gave it one ([`SourceFile::with_prelude`]).
-    prelude: Option<String>,
+    /// The imports of the prelude its host gave it, in order, none if it
+    /// gave none ([`SourceFile::with_prelude`]).
+    prelude: Vec<String>,
     /// Byte offset at which each line starts. Always non-empty: line 1 starts
     /// at offset 0, and every `\n` starts a new line after it.
     line_starts: Vec<u32>,
@@ -120,7 +120,7 @@ impl SourceFile {
             text,
             line_starts,
             dir: None,
-            prelude: None,
+            prelude: Vec::new(),
         })
     }
 
@@ -141,27 +141,28 @@ impl SourceFile {
         self
     }
 
-    /// The file, given the library of the path `library`, `provium` or
-    /// `github.com/example/kit`, as a prelude of its host's: the file is
-    /// checked as if, after its `import * from prelude`, it began with
-    /// `#[shadowable] import * from "LIBRARY"`, written nowhere, so that it
-    /// sees every declaration of the library's with no import, one of them
-    /// shadowing the prelude's of its name, and any declaration or import of
-    /// its own shadowing both (see the workspace's [Given
+    /// The file, given a prelude of its host's: `imports`, import items of
+    /// libraries, each as it is written in a file, in order, such as
+    /// `import * from "provium"` and `import "provium/vm"`. The file is
+    /// checked as if, after its `import * from prelude`, it began with each
+    /// of them marked `#[shadowable]`, written nowhere: so it sees what they
+    /// bind with no import, one of their names shadowing the prelude's of
+    /// its name, and a later one an earlier one's, and any declaration or
+    /// import of its own shadowing them all (see the workspace's [Given
     /// preludes](crate::workspace#given-preludes)). The host gives the
-    /// library's files with the workspace's, as it gives any library's. A
-    /// file marked `#![no_prelude]` has neither import.
+    /// libraries' files with the workspace's, as it gives any library's. A
+    /// file marked `#![no_prelude]` has none of them.
     #[must_use]
-    pub fn with_prelude(mut self, library: impl Into<String>) -> Self {
-        self.prelude = Some(library.into());
+    pub fn with_prelude<I: Into<String>>(mut self, imports: impl IntoIterator<Item = I>) -> Self {
+        self.prelude = imports.into_iter().map(Into::into).collect();
         self
     }
 
-    /// The library the file's host gave it as a prelude, if it gave one
+    /// The imports of the prelude its host gave it, in order
     /// ([`SourceFile::with_prelude`]).
     #[must_use]
-    pub fn prelude(&self) -> Option<&str> {
-        self.prelude.as_deref()
+    pub fn prelude(&self) -> &[String] {
+        &self.prelude
     }
 
     /// Where the host found the file's directory, if it said

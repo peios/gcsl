@@ -4,18 +4,21 @@
 //! A *host* is named by the extension of its files, `prvm` for Provium's
 //! `.prvm` tests. Its *host directory*, named the same, is a library root
 //! (see the crate's "Libraries") that holds the libraries of its prelude,
-//! and a file `prelude` ([`PRELUDE_FILE`]) whose one line names the
-//! library that is its files' prelude, `provium`, which the library gives
-//! each of them ([`SourceFile::with_prelude`]):
+//! and a file `prelude` ([`PRELUDE_FILE`]) whose lines are its files'
+//! prelude, import items of libraries, which the library gives each of
+//! them ([`SourceFile::with_prelude`]); a blank line, and one starting with
+//! `#`, is none:
 //!
 //! ```text
 //! .gcsl/hosts/prvm/
-//!   prelude              provium
+//!   prelude              import * from "provium"
+//!                        import "provium/vm"
 //!   provium/core.gcsl
+//!   provium/vm/vm.gcsl
 //! ```
 //!
-//! A host with no `prelude` file gives its files no prelude: they are
-//! checked as `.gcsl` files are. Hosts are found ([`find_hosts`]) in two
+//! A host with no `prelude` file, or none but blank lines, gives its files
+//! no prelude: they are checked as `.gcsl` files are. Hosts are found ([`find_hosts`]) in two
 //! places, by the name of each directory there: `.gcsl/hosts/` under the
 //! workspace's root ([`WORKSPACE_HOSTS`]), which the host writes when it
 //! loads a workspace, and then `/usr/share/gcsl/hosts/` ([`SYSTEM_HOSTS`]),
@@ -43,7 +46,7 @@ pub const WORKSPACE_HOSTS: &str = ".gcsl/hosts";
 /// The directory of the hosts a host's package installs.
 pub const SYSTEM_HOSTS: &str = "/usr/share/gcsl/hosts";
 
-/// The file of a host directory that names its prelude's library.
+/// The file of a host directory that holds its prelude's imports.
 pub const PRELUDE_FILE: &str = "prelude";
 
 /// A host known by name, so that its files are recognised when it is not
@@ -54,8 +57,8 @@ pub struct KnownHost {
     pub extension: &'static str,
     /// Its name, as a person knows it: `Provium`.
     pub name: &'static str,
-    /// The library that is its files' prelude, if they have one.
-    pub prelude: Option<&'static str>,
+    /// The imports of its files' prelude, none if they have none.
+    pub prelude: &'static [&'static str],
     /// Whether GCSL's tools carry it, so that it is never missing.
     pub built_in: bool,
     /// How to install it, for the error of a file whose host is missing.
@@ -67,14 +70,14 @@ pub const KNOWN_HOSTS: [KnownHost; 2] = [
     KnownHost {
         extension: "pekit",
         name: "pekit",
-        prelude: None,
+        prelude: &[],
         built_in: true,
         install: "",
     },
     KnownHost {
         extension: "prvm",
         name: "Provium",
-        prelude: Some("provium"),
+        prelude: &["import * from \"provium\""],
         built_in: false,
         install: "run `provium prelude --write` in this workspace, or install Provium",
     },
@@ -116,12 +119,23 @@ pub struct Host {
     pub place: Place,
     /// Its directory, a library root, if it has one on disk.
     pub dir: Option<PathBuf>,
-    /// The library that is its files' prelude, if they have one: what its
-    /// `prelude` file names, or a known host's.
-    pub prelude: Option<String>,
+    /// The imports of its files' prelude, in order, none if they have
+    /// none: what its `prelude` file holds, or a known host's.
+    pub prelude: Vec<String>,
 }
 
 impl Host {
+    /// The libraries its prelude imports, each once, in order, as
+    /// [`gcsl::workspace::library_imports`] finds them.
+    #[must_use]
+    pub fn libraries(&self) -> Vec<String> {
+        SourceFile::new("", "")
+            .map(|source| {
+                gcsl::workspace::library_imports(&source.with_prelude(self.prelude.iter().cloned()))
+            })
+            .unwrap_or_default()
+    }
+
     /// The host known by name of the extension `extension`, if there is
     /// one, as it is when it is not installed, or built in.
     #[must_use]
@@ -137,7 +151,7 @@ impl Host {
                 Place::Missing
             },
             dir: None,
-            prelude: known.prelude.map(str::to_owned),
+            prelude: known.prelude.iter().map(|&line| line.to_owned()).collect(),
         })
     }
 }
@@ -196,9 +210,8 @@ fn hosts_in(dir: &Path, place: Place) -> Vec<Host> {
                 return None;
             }
             let prelude = fs::read_to_string(path.join(PRELUDE_FILE))
-                .ok()
-                .map(|text| text.trim().to_owned())
-                .filter(|text| !text.is_empty());
+                .map(|text| prelude_lines(&text))
+                .unwrap_or_default();
             Some(Host {
                 extension: name,
                 place,
@@ -206,6 +219,17 @@ fn hosts_in(dir: &Path, place: Place) -> Vec<Host> {
                 prelude,
             })
         })
+        .collect()
+}
+
+/// The imports of a prelude whose `prelude` file holds `text`: each line,
+/// blanks around it left out, but an empty one or a comment, which starts
+/// with `#`.
+fn prelude_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
         .collect()
 }
 
@@ -221,38 +245,50 @@ pub fn host_of<'a>(hosts: &'a [Host], path: &Path) -> Option<&'a Host> {
 /// file and the host has one.
 #[must_use]
 pub fn with_host_prelude(hosts: &[Host], path: &Path, source: SourceFile) -> SourceFile {
-    match host_of(hosts, path).and_then(|host| host.prelude.as_deref()) {
-        Some(library) => source.with_prelude(library),
-        None => source,
+    match host_of(hosts, path) {
+        Some(host) if !host.prelude.is_empty() => source.with_prelude(host.prelude.iter().cloned()),
+        _ => source,
     }
 }
 
-/// Says each error of `errors` that a file's prelude is not found, which
+/// Says the errors of `errors` that a file's prelude is not found, which
 /// the library reports for a file whose host is missing ([`Place::Missing`])
 /// among `hosts`, as the host's: "Provium is not installed, so the prelude
-/// of this `.prvm` file cannot be found", noted with how to install it (see
-/// the module documentation).
-pub fn explain_missing_hosts(hosts: &[Host], errors: &mut [Diagnostic]) {
+/// of this `.prvm` file cannot be found", noted with how to install it,
+/// once for each file (see the module documentation).
+pub fn explain_missing_hosts(hosts: &[Host], errors: &mut Vec<Diagnostic>) {
     for host in hosts.iter().filter(|host| host.place == Place::Missing) {
-        let Some(library) = host.prelude.as_deref() else {
-            continue;
-        };
-        let message = gcsl::workspace::prelude_not_given_message(library);
+        let messages: Vec<String> = host
+            .libraries()
+            .iter()
+            .map(|library| gcsl::workspace::prelude_not_given_message(library))
+            .collect();
         let known = KNOWN_HOSTS
             .iter()
             .find(|known| known.extension == host.extension);
         let (name, install) = known.map_or((host.extension.as_str(), ""), |known| {
             (known.name, known.install)
         });
-        for error in errors.iter_mut().filter(|error| error.message == message) {
-            error.message = format!(
-                "{name} is not installed, so the prelude of this `.{}` file cannot be found",
-                host.extension
-            );
+        let said = format!(
+            "{name} is not installed, so the prelude of this `.{}` file cannot be found",
+            host.extension
+        );
+        // One error for each file, however many of its libraries are gone.
+        let mut told: Vec<Option<u32>> = Vec::new();
+        errors.retain_mut(|error| {
+            if !messages.contains(&error.message) {
+                return true;
+            }
+            if told.contains(&error.input) {
+                return false;
+            }
+            told.push(error.input);
+            error.message.clone_from(&said);
             if !install.is_empty() {
                 error.notes.push(install.to_owned());
             }
-        }
+            true
+        });
     }
 }
 

@@ -32,22 +32,30 @@ A name the files see through the prelude must be declared with `def`. A
 
 ## Give the prelude to your files
 
-1. Give each of your files the library as its prelude with
-   `SourceFile::with_prelude`:
+1. Give each of your files its prelude with `SourceFile::with_prelude`:
+   the imports the file should start with, each written as in a file, in
+   order:
 
    ```rust
-   let source = SourceFile::new("tests/boot.prvm", text)?.with_prelude("provium");
+   let source = SourceFile::new("tests/boot.prvm", text)?
+       .with_prelude(["import * from \"provium\"", "import \"provium/vm\""]);
    ```
 
-   The file is checked as if it began with `#[shadowable] import * from
-   "provium"`. A name the library declares replaces the standard
-   prelude's name of the same spelling, and anything the file declares or
-   imports itself replaces both.
+   The file is checked as if it began with each import marked
+   `#[shadowable]`. A name the imports bind replaces the standard
+   prelude's name of the same spelling, a later import replaces an
+   earlier one's, and anything the file declares or imports itself
+   replaces them all.
 
-2. Give the library's files with the workspace's, named
+   A prelude imports only libraries: whole, as in `import "provium/vm"`,
+   with `*`, or by name, as in `import step from "provium"`. Any other
+   import given is an error at the start of the file, and the others are
+   still given.
+
+2. Give the libraries' files with the workspace's, named
    `<lib>/provium/FILE.gcsl`, as you would any library's.
-   `gcsl::workspace::library_imports` returns a file's prelude first, so
-   code that loads the libraries a file imports loads the prelude too.
+   `gcsl::workspace::library_imports` returns a file's prelude libraries
+   first, so code that loads the libraries a file imports loads them too.
 
 3. Check the workspace with `check_with_standard` as usual.
 
@@ -56,7 +64,7 @@ same path. So `def_types` lists your `test`, and `prepare_call(("test",
 name), ...)` invokes it, even though the standard prelude has a `test` of
 its own.
 
-If the prelude's library isn't among the files, each file given it has
+If a prelude's library isn't among the files, each file given it has
 one error at its start: "the prelude `provium` given for this file is not
 found". The file's uses of the missing names aren't reported one by one.
 
@@ -71,7 +79,7 @@ let host = gcsl_disk::Host {
     extension: "prvm".to_owned(),
     place: gcsl_disk::Place::Workspace,
     dir: Some(root.join(gcsl_disk::WORKSPACE_HOSTS).join("prvm")),
-    prelude: Some("provium".to_owned()),
+    prelude: vec!["import * from \"provium\"".to_owned()],
 };
 let sources = gcsl_disk::read_workspace_for(&root, None, &[host])?;
 ```
@@ -88,15 +96,17 @@ one, so that `gcsl check` and editors use the prelude your host runs:
 .gcsl/hosts/
   .gitignore            *
   prvm/
-    prelude             provium
+    prelude             import * from "provium"
+                        import "provium/vm"
     provium/core.gcsl
+    provium/vm/vm.gcsl
 ```
 
 - The directory's name is your files' extension.
 - It is a library root: your libraries go in it, each in a directory of
   its path.
-- The file `prelude` holds one line, the path of the library that is the
-  prelude.
+- The file `prelude` holds the prelude's imports, one to a line. Blank
+  lines and lines starting with `#` are ignored.
 - The `.gitignore` keeps the directory out of version control, so a
   workspace carries nothing for your host.
 
@@ -108,11 +118,11 @@ none of its own.
 ## Check the result
 
 Run `gcsl hosts` in the workspace. Your host is listed with the place it
-was found and its prelude:
+was found and the libraries its prelude imports:
 
 ```text
 pekit  built in   no prelude
-prvm   workspace  provium     .gcsl/hosts/prvm
+prvm   workspace  provium, provium/vm  .gcsl/hosts/prvm
 ```
 
 Then run `gcsl check`. Your files are checked with their prelude, and a

@@ -543,7 +543,7 @@ fn host_files_are_read_with_their_preludes() {
         "pekit  built in       no prelude\nprvm   not installed  provium\n"
     );
     // Installed in the workspace.
-    scratch.write(".gcsl/hosts/prvm/prelude", "provium\n");
+    scratch.write(".gcsl/hosts/prvm/prelude", "import * from \"provium\"\n");
     scratch.write(
         ".gcsl/hosts/prvm/provium/core.gcsl",
         "#[def_type]\ndef test(name: String, f: fn() -> {}) -> String { f(); = \"ran {name}\" }\n\
@@ -564,12 +564,12 @@ fn host_files_are_read_with_their_preludes() {
     let output = gcsl_in(&scratch.0, &["hosts", "--json"], "");
     assert_eq!(
         stdout(&output),
-        "[{\"extension\":\"pekit\",\"path\":null,\"place\":\"built in\",\"prelude\":null},\
+        "[{\"extension\":\"pekit\",\"path\":null,\"place\":\"built in\",\"prelude\":[]},\
          {\"extension\":\"prvm\",\"path\":\".gcsl/hosts/prvm\",\"place\":\"workspace\",\
-         \"prelude\":\"provium\"}]\n"
+         \"prelude\":[\"import * from \\\"provium\\\"\"]}]\n"
     );
     // A host of a third party, found by its directory alone.
-    scratch.write(".gcsl/hosts/kit/prelude", "kit\n");
+    scratch.write(".gcsl/hosts/kit/prelude", "import * from \"kit\"\n");
     scratch.write(".gcsl/hosts/kit/kit/kit.gcsl", "def limit(): Int { 3 }\n");
     scratch.write("a.kit", "y = limit()\n");
     let output = gcsl_in(&scratch.0, &["run", "a.kit"], "");

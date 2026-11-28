@@ -604,10 +604,7 @@ impl Worker {
                 stamp.as_ref()?;
                 let text = fs::read_to_string(root.join(file.name())).ok()?;
                 let source = SourceFile::new(file.name(), text).ok()?;
-                Some(match file.prelude() {
-                    Some(library) => source.with_prelude(library),
-                    None => source,
-                })
+                Some(source.with_prelude(file.prelude().iter().cloned()))
             });
             let (Some(source), Some(file)) = (source, disk.files.get_mut(at)) else {
                 // Gone, or not readable: as a read of the workspace finds.

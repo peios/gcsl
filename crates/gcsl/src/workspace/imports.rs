@@ -326,10 +326,10 @@ pub(super) fn imports(
         if let Some(item) = file.ast.implicit_import().filter(|_| prelude) {
             import(item, (&mut aliases, &mut types));
         }
-        if let Some(item) = file.ast.given_import() {
+        for &item in file.ast.given_imports() {
             import(item, (&mut aliases, &mut types));
-            prelude_not_given(scan, (&file.ast, item), &failed_imports, &mut own_errors);
         }
+        prelude_not_given(scan, &file.ast, &failed_imports, &mut own_errors);
         clashes(scan, index, &aliases, (&mut own_errors, &mut poisoned));
         errors.extend(own_errors.into_iter().map(|e| e.in_input(index)));
         found.push((
@@ -724,38 +724,46 @@ pub(super) fn contents(scan: &Scan, dir: Option<u32>) -> String {
     }
 }
 
-/// If the import of the prelude a file's host gave it, the import `item`
-/// of `ast`, is among the file's `failed` imports, replaces its errors in
-/// `errors`, written nowhere as it is, with the one error of a prelude not
-/// given: of a library not among the files the host gave, or one the file
-/// cannot import, "the prelude `provium` given for this file is not
-/// found", at the file's start, the names in `scan`'s table (see [Given
+/// Replaces the errors in `errors` of each import of the prelude the host
+/// of the file of tree `ast` gave it that is among the file's `failed`
+/// imports, written nowhere as they are, with one error for each of them,
+/// of a library not among the files the host gave or one the file cannot
+/// import: "the prelude `provium` given for this file is not found", at
+/// the file's start, the names in `scan`'s table (see [Given
 /// preludes](crate::workspace#given-preludes)).
 fn prelude_not_given(
     scan: &Scan,
-    (ast, item): (&Ast, ItemId),
+    ast: &Ast,
     failed: &[(ItemId, Option<Target>)],
     errors: &mut Vec<Diagnostic>,
 ) {
-    if !failed.iter().any(|&(at, _)| at == item) {
+    let missing: Vec<ItemId> = ast
+        .given_imports()
+        .iter()
+        .copied()
+        .filter(|&item| failed.iter().any(|&(at, _)| at == item))
+        .collect();
+    if missing.is_empty() {
         return;
     }
     errors.retain(|error| error.span != Span::new(0, 0));
-    let library = match ast.item(item).kind {
-        ItemKind::Import(id) => ast
+    for item in missing {
+        let ItemKind::Import(id) = ast.item(item).kind else {
+            continue;
+        };
+        let library = ast
             .path(ast.import_decl(id).path)
             .iter()
             .skip(1)
             .filter_map(PathSegment::name)
             .map(|name| scan.names.get(name))
             .collect::<Vec<_>>()
-            .join("/"),
-        _ => String::new(),
-    };
-    errors.push(Diagnostic::error(
-        prelude_not_given_message(&library),
-        Span::new(0, 0),
-    ));
+            .join("/");
+        errors.push(Diagnostic::error(
+            prelude_not_given_message(&library),
+            Span::new(0, 0),
+        ));
+    }
 }
 
 /// The message of the error of a file whose host gave it the library
@@ -782,8 +790,7 @@ pub(super) fn members(
     errors: &mut Vec<Diagnostic>,
 ) {
     let path = file.ast.path(decl.path);
-    let implicit =
-        file.ast.implicit_import() == Some(item) || file.ast.given_import() == Some(item);
+    let implicit = file.ast.is_implicit_import(item);
     match decl.form {
         ImportForm::Whole(alias) => {
             let bound = alias.map(|a| (a.name, a.span)).or_else(|| {

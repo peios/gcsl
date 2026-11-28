@@ -702,26 +702,39 @@ mod tests {
     fn hosts_are_found_by_directory_and_known_by_name() {
         let scratch = Scratch::new("hosts");
         let root = hosted(&scratch);
-        scratch.write(".gcsl/hosts/prvm/prelude", "provium\n");
+        scratch.write(
+            ".gcsl/hosts/prvm/prelude",
+            "# Provium's\nimport * from \"provium\"\n\n",
+        );
         scratch.write(".gcsl/hosts/prvm/provium/core.gcsl", "");
-        scratch.write("system/prvm/prelude", "elsewhere");
-        scratch.write("system/kit/prelude", "github.com/example/kit");
+        scratch.write("system/prvm/prelude", "import * from \"elsewhere\"");
+        scratch.write(
+            "system/kit/prelude",
+            "import * from \"github.com/example/kit\"\nimport \"github.com/example/kit/vm\"",
+        );
         scratch.write("system/plain/x.gcsl", "");
         scratch.write("system/.hidden/prelude", "x");
         let hosts = find_hosts_in(Some(&root.join(WORKSPACE_HOSTS)), &root.join("system"));
-        let shown: Vec<(&str, Place, Option<&str>)> = hosts
+        let shown: Vec<(&str, Place, Vec<String>)> = hosts
             .iter()
-            .map(|host| (host.extension.as_str(), host.place, host.prelude.as_deref()))
+            .map(|host| (host.extension.as_str(), host.place, host.libraries()))
             .collect();
+        let libraries =
+            |of: &[&str]| -> Vec<String> { of.iter().map(|&at| at.to_owned()).collect() };
         assert_eq!(
             shown,
             [
-                ("kit", Place::System, Some("github.com/example/kit")),
-                ("pekit", Place::BuiltIn, None),
-                ("plain", Place::System, None),
-                ("prvm", Place::Workspace, Some("provium")),
+                (
+                    "kit",
+                    Place::System,
+                    libraries(&["github.com/example/kit", "github.com/example/kit/vm"])
+                ),
+                ("pekit", Place::BuiltIn, Vec::new()),
+                ("plain", Place::System, Vec::new()),
+                ("prvm", Place::Workspace, libraries(&["provium"])),
             ]
         );
+        assert_eq!(hosts[3].prelude, ["import * from \"provium\""]);
         // With neither place, the known hosts alone.
         let none = find_hosts_in(None, &root.join("absent"));
         let places: Vec<(&str, Place)> = none
@@ -738,7 +751,7 @@ mod tests {
     fn a_host_s_files_are_read_with_their_prelude_and_its_library() {
         let scratch = Scratch::new("hosted");
         let root = hosted(&scratch);
-        scratch.write(".gcsl/hosts/prvm/prelude", "provium");
+        scratch.write(".gcsl/hosts/prvm/prelude", "import * from \"provium\"");
         scratch.write(
             ".gcsl/hosts/prvm/provium/core.gcsl",
             "#[def_type]\ndef test(name: String, f: fn() -> {}) -> {} { f() }",
@@ -748,14 +761,14 @@ mod tests {
         let named: Vec<(&str, Option<&str>)> = sources
             .relative
             .iter()
-            .map(|source| (source.name(), source.prelude()))
+            .map(|source| (source.name(), source.prelude().first().map(String::as_str)))
             .collect();
         assert_eq!(
             named,
             [
                 ("<lib>/provium/core.gcsl", None),
                 ("main.gcsl", None),
-                ("tests/boot.prvm", Some("provium")),
+                ("tests/boot.prvm", Some("import * from \"provium\"")),
                 ("workspace.gcsl", None),
             ]
         );

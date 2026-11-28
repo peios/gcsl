@@ -613,6 +613,20 @@ pub struct ImportMemberRange {
     len: u32,
 }
 
+/// What an implicit import of a prelude a host gave a file binds
+/// ([`Ast::add_given_imports`]): written nowhere, so its names have no
+/// spans.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GivenForm {
+    /// `import PATH`, or `import PATH as NAME`.
+    Whole(Option<Name>),
+    /// `import * from PATH`.
+    All,
+    /// `import NAME, NAME as ALIAS, ... from PATH`, each member and the
+    /// name it is bound as, if written with `as`.
+    Members(Vec<(Name, Option<Name>)>),
+}
+
 /// What an import item binds, [`ImportDecl::form`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ImportForm {

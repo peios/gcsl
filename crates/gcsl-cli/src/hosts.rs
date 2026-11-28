@@ -7,8 +7,8 @@
 //! in, if it is in one, then in `/usr/share/gcsl/hosts/`; pekit's is built
 //! in, and a known host that is installed nowhere is listed as not
 //! installed. Each is one line on standard output, its extension, where it
-//! was found, its prelude's library or `no prelude`, and its directory if
-//! it has one, in columns:
+//! was found, the libraries its prelude imports or `no prelude`, and its
+//! directory if it has one, in columns:
 //!
 //! ```text
 //! pekit  built in       no prelude
@@ -18,7 +18,8 @@
 //! With `--json`, the hosts are one JSON list on standard output, each
 //! `{"extension", "place", "prelude", "path"}`, `place` one of
 //! `"workspace"`, `"system"`, `"built in"` and `"not installed"`, `prelude`
-//! and `path` `null` where it has none. The exit code is 0, or 2 if the
+//! the list of its prelude's imports, empty if it has none, and `path`
+//! `null` where it has none. The exit code is 0, or 2 if the
 //! output cannot be written.
 
 use std::fmt::Write as _;
@@ -78,9 +79,10 @@ fn table(hosts: &[Host]) -> String {
             [
                 host.extension.clone(),
                 host.place.shown().to_owned(),
-                host.prelude
-                    .clone()
-                    .unwrap_or_else(|| "no prelude".to_owned()),
+                match host.libraries().join(", ") {
+                    libraries if libraries.is_empty() => "no prelude".to_owned(),
+                    libraries => libraries,
+                },
                 gcsl_disk::shown_dir(host)
                     .map(|path| path.display().to_string())
                     .unwrap_or_default(),
