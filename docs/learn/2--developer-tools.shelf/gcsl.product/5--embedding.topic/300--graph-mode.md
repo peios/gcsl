@@ -197,8 +197,9 @@ called under `try`, tells you of the failure twice, the second time with
 `again` set. Report only the failures whose `again` is `false` to report
 each failure once. In graph mode, `Effects::caught` is called during the
 run of the unit that caught the failure, on the `Effects` of that run's
-`GraphHost`. A unit that is stopped tells you nothing. By default
-`Effects::caught` does nothing.
+`GraphHost`. A unit that is stopped, whether it waits or it yielded (see
+[Sharing one thread between units](#sharing-one-thread-between-units)),
+tells you nothing. By default `Effects::caught` does nothing.
 
 Effects that aren't inside a step are steps too: in graph mode, a unit
 never runs a program or touches a file itself. Each such effect becomes a
@@ -242,7 +243,10 @@ never yield.
 
 ## Deciding what a timeout counts
 
-A `#[timeout]` on a function measures the time its unit spends running.
+A `#[timeout]` on a function that runs inside a unit measures the time
+the unit spends running. A step's own `#[timeout]` is different:
+`Workspace::run_step` doesn't apply it, and it is yours to keep (see
+[Running many steps at once](#running-many-steps-at-once)).
 While the unit is stopped, whether it yielded or it waits for a result,
 the function's clock stands still. That suits a host that keeps units
 waiting for reasons of its own, but not an operation that the host runs

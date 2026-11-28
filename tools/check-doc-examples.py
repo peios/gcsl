@@ -27,6 +27,9 @@ EXPECTED = {
     ("200--records-and-types.md", 8): "2\n",
     ("200--records-and-types.md", 10): "8080\n",
     ("300--functions-and-effects.md", 0): "42\n",
+    ("300--functions-and-effects.md", 2): (
+        '{usual = "cc -O2 -c main.c -o main.c.o"; debug = "cc -g -O0 -c main.c -o main.c.o"}\n'
+    ),
     ("320--block-parameters.md", 0): "192.0.2.7\n",
     ("320--block-parameters.md", 1): "3\n",
     ("320--block-parameters.md", 3): "...\n",

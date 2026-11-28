@@ -34,8 +34,8 @@ workspace directories and imports like other public declarations.
 
 A definition's parameters are written by name alone: their types come
 from the definition type's function parameter. After them, a definition
-can declare parameters of its own, each with a type and a default, since
-the definition type calls it with none:
+can declare parameters of its own, each with a default, since the
+definition type calls it with none:
 
 ```gcsl
 #[def_type]
@@ -45,6 +45,25 @@ def describe(name: String, body: fn(): String): String {
 def describe dev.peios.gcsl(version: String = "1.0") { "language tools {version}" }
 result = describe dev.peios.gcsl()
 ```
+
+A parameter of the definition's own can leave out its type and take it
+from its default, as a [function's parameter
+can](~gcsl/functions-and-effects). A name with `=` after it is the
+definition's own, and a name alone is one the definition type gives:
+
+```gcsl
+#[def_type]
+def test(name: String, body: fn(): String): String {
+    "{name}: {body()}"
+}
+fn machine(): String { "vm-1" }
+def test boots(m = machine(), retries = 3) { "{m} booted within {retries} tries" }
+result = test boots()
+```
+
+Here `m` is a `String` and `retries` is an `Int`, and `result` is
+`"boots: vm-1 booted within 3 tries"`. The definition's own parameters
+come after the ones the definition type gives.
 
 The defaults are evaluated where the definition type calls the
 definition, and the body is then run with what they came to. So a

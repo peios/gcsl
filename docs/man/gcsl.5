@@ -109,7 +109,7 @@ Any record type fits a rest-field of * if its named fields are data, with or wit
 What * covers is read by testing for the type expected, as in (r as {x: Int}).x or r is {x: Int}.
 .PP
 An empty list needs an expected element type.
-Function signatures declare parameter and result types.
+A function signature declares its result type and, for each parameter, a type or a default that the type is taken from.
 A function type is written as a signature without a name, as in fn(String, Int): Bool or fn(name: String) -> {}; its last parameter can be a block, as in fn(String, block -> {}) -> {}.
 A type may declare type parameters, as in type Pair<A, B> = {first: A, second: B}; each use gives as many type arguments, as in Pair<Int, String>, and is the definition with them in place of the parameters.
 A type without parameters takes no type arguments, a generic type cannot refer to itself, and a type parameter cannot be spread.
@@ -178,6 +178,12 @@ A fn method is visible in its own file; a def method also in the other files of 
 Parameter defaults belong to a function declaration, not a written function type.
 A default may be any expression; it sees the parameters before it and the scope the function is written in, has the function's effect, and is evaluated for each call that leaves its parameter out, after the written arguments and before the body.
 Only a call that names the function directly gives defaults.
+A parameter written NAME = DEFAULT, with no type, has the type of its default, as let NAME = DEFAULT gives it: fn f(n = 3) has n: Int, and xs = [1, 2] is a List<Int>.
+The parameter is exactly as if annotated with the type its default has once awaited, written bare, so FUTURES applies to it as to any bare parameter type.
+A fn, a def, a method and a function expression accept one; a receiver, a rest parameter and a function type's parameter do not, and a parameter with neither a type nor a default is an error.
+A default without a type of its own, such as [], is the error it is in a let: "cannot infer the element type of `[]`".
+Such a default is checked before its function's type is known.
+A default that needs its own function's type, or the type of a function whose own untyped parameter needs it in turn, is the error "cannot infer the type of `x`: its default needs the type of `f`, which needs it"; write the parameter's type.
 .PP
 A function's last parameter can be a block, declared NAME: block -> TYPE, or NAME: block: TYPE for a pure block.
 A call gives the block as its trailing block, as in step("boot") { ... }, and in no other way: a positional or named argument for it is an error, and a call without a trailing block is the error "missing the block `body`".
@@ -482,6 +488,9 @@ A definition-type declaration is followed by definitions of this form:
 .fi
 .PP
 Parameter types and the result contract come from the definition type.
+After the names the definition type gives, a definition can declare parameters of its own, each NAME: TYPE = DEFAULT or NAME = DEFAULT, whose type is its default's, as in def test boots(m = machine(), retries = 3) { ... }.
+Each has a default, because the definition type calls the definition with none; the defaults are evaluated where the definition type calls it.
+A name alone after a parameter of the definition's own is an error.
 Definitions occupy that type's namespace and do not bind an ordinary value of PATH.
 Declaration does not run the body.
 Definition paths support additional package-name characters and digit-starting segments after the first; ordinary identifiers retain their own rules.

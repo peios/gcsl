@@ -57,6 +57,34 @@ Only a call by the function's own name uses its defaults. A call through
 a copy, such as `g` after `let g = object`, or through a parameter must
 supply every argument.
 
+A parameter with a default can leave out its type. It then has the type
+of its default, as a `let` has the type of its value:
+
+```gcsl
+fn compile(source: String, flags = ["-O2"], output = "{source}.o"): String {
+    "cc {join(flags, " ")} -c {source} -o {output}"
+}
+usual = compile("main.c")
+debug = compile("main.c", flags = ["-g", "-O0"])
+```
+
+Here `flags` is a `List<String>` and `output` is a `String`, and a call
+that passes anything else is a type error, as it would be had you written
+the types. This works in `fn`, `def`, methods, and function expressions.
+A method's receiver, a rest parameter, and a parameter of a function type
+always have a written type, and a parameter needs a type or a default.
+
+Two defaults can't be used this way:
+
+- A default with no type of its own. `xs = []` is the error "cannot infer
+  the element type of `[]`", as `let xs = []` is. Write `xs: List<Int> =
+  []`.
+- A default that calls its own function, or a function whose own untyped
+  parameter needs this one. GCSL works out the parameter's type before it
+  knows the function's, so `fn f(x = f(1))` is the error "cannot infer the
+  type of `x`: its default needs the type of `f`, which needs it". Write
+  the parameter's type.
+
 After a named argument, a name on its own is shorthand for passing the
 variable of that name to the parameter of that name. These two calls are
 the same:

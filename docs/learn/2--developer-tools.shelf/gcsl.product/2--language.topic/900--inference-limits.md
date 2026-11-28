@@ -13,6 +13,7 @@ The following boundaries affect ordinary programs:
 | Boundary | What to write |
 |---|---|
 | An empty list has no independent element type | Give it an annotation or an expected `List<T>` type |
+| A parameter's type can't be taken from a default that needs its own function's type | Write the parameter's type, as in `x: Int = f(1)` |
 | A pure function does not preserve arbitrary future shapes | Write the present or future contract explicitly |
 | Recursive impure results can retain a deferred possibility | Use `Present<T>` when the result must be present |
 | General type parameters and intersections are unsupported | Write concrete structural types |
