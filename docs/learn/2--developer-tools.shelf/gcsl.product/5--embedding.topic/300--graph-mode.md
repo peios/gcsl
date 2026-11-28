@@ -181,6 +181,25 @@ also hold a failed step's result that no code used. Once
 `graph.holes(&value)` is empty, `graph.failures(&value)` lists those
 failures so that you can report them.
 
+A program that catches a failure with `recover` or `try` goes on, and the
+failure never reaches you as an error. To hear of it anyway, implement
+`Effects::caught`. GCSL calls it for every failure a program catches, as
+it is caught and before the fallback runs, with a `CaughtFailure`:
+
+- `failure` is the `Diagnostic` as it would have been reported: its
+  message, where it was raised, its labels and its notes. Its `input` is
+  always set, to the file its spans are in.
+- `again` is `true` when the failure was caught before and raised again
+  with `raise`.
+
+A step function that catches a failure, records it and raises it again,
+called under `try`, tells you of the failure twice, the second time with
+`again` set. Report only the failures whose `again` is `false` to report
+each failure once. In graph mode, `Effects::caught` is called during the
+run of the unit that caught the failure, on the `Effects` of that run's
+`GraphHost`. A unit that is stopped tells you nothing. By default
+`Effects::caught` does nothing.
+
 Effects that aren't inside a step are steps too: in graph mode, a unit
 never runs a program or touches a file itself. Each such effect becomes a
 step that the unit needs at once, which keeps it in program order.

@@ -147,7 +147,7 @@ In if NAME is TYPE, the branches receive narrowed copies of NAME.
 The checker does not generalize that narrowing to arbitrary conditions, field paths, or subsequent statements.
 .PP
 Precedence from loosest to tightest is or; and; prefix not; comparisons and is; ranges; addition and subtraction; multiplication and division; ascription and as; prefix negation and await; then fields, calls, and indexes.
-Lazy takes the longest following expression.
+Lazy and try take the longest following expression.
 Comparisons and ranges cannot be chained.
 Use parentheses to make a different grouping explicit.
 .SH FUNCTIONS
@@ -270,6 +270,43 @@ would retry: never a bug in GCSL, nor the timeout of an enclosing call.
 A failure in a trailing block given to a block parameter is a failure of the function's call of the block, so a
 .B recover
 in the function around that call catches it; one the function lets through is reported where it was raised.
+.PP
+.B try
+.I EXPR
+gives the value of
+.IR EXPR ,
+or {} if it fails; it is
+.BR "recover { EXPR } else { {} }" ,
+and catches what
+.B recover
+catches.
+Its operand is the longest expression after it, so try a + f() covers the sum.
+Its type is the join of the operand's type and {}: {} for a call made for its effects, Int | {} for an Int, and {} for any record, because a record joined with {} keeps no field that can be read.
+Use
+.B recover
+to tell a failed record-valued expression from its value.
+The operand is awaited deeply where it is, so work that it defers fails inside the
+.BR try .
+The word try is not reserved.
+It begins this form only where an expression starts and a name, a literal, {, not, await, ^, if, do, for, fn or lazy follows it on its line.
+Before (, [ or \-, and everywhere else, try is a name: try(x) is a call, try[0] an index and try \- 1 a subtraction.
+Write the try of a parenthesized expression as try { (x) }.
+A call of a function named try with only a trailing block is written (try) { ... }.
+.PP
+.B raise
+in the fallback of a
+.B recover
+raises again the failure that the
+.B recover
+caught, as it was: its message, the place it was raised, its labels and its notes.
+What catches or reports the failure next sees the original failure, not the
+.BR raise .
+Its type is Never.
+It belongs to the innermost
+.B recover
+whose fallback it is written in, including from a trailing block that the fallback gives to a block parameter.
+Anywhere else, including in a fn or lazy written in the fallback, it is the error "`raise` is only for the fallback of a `recover`".
+The word raise is not reserved: where a variable named raise is in scope, raise reads it.
 .SH SECRETS
 .BI Secret< T >
 is a value of the present type

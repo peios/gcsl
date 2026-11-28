@@ -221,15 +221,18 @@ inside the block is left with `break` and `continue` as usual.
 A failure inside a block is a failure of the function's call of the block.
 If the function doesn't handle it, the run ends with the error reported
 where it happened, inside the block. The function can also catch it with
-`recover`, which is how to write a retry:
+`recover`, which is how to write a retry. In the fallback, `raise` passes
+the block's failure on unchanged, so the last attempt's failure is the one
+reported:
 
 ```gcsl
 fn retrying(times: Int, body: block -> {}) -> {} {
-    let mut failure = "never tried"
-    for attempt in 0..times if failure != "" {
-        failure := recover { body(); = "" } else (caught) { caught.message }
+    let mut left = times
+    for left > 0 {
+        left := left - 1
+        recover { body(); left := 0 } else { if left == 0 { raise } }
     }
-    assert failure == "", "gave up after {times} attempts: {failure}"
+    = {}
 }
 
 let mut attempts = 0
@@ -242,7 +245,8 @@ attempts
 
 The block fails twice and succeeds the third time, so `attempts` is `3`.
 Whatever the block did before it failed stays done, including its updates
-of the caller's variables. [Failure](~gcsl/failure) describes `recover`.
+of the caller's variables. [Failure](~gcsl/failure) describes `recover`
+and `raise`, and has a `step` that records a failure and raises it again.
 
 ## Limits on functions that take blocks
 
