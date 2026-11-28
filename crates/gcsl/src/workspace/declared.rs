@@ -608,7 +608,7 @@ fn mark_attributes(scan: &mut Scan, types: &[DeclaredType], errors: &mut Vec<Dia
             );
             continue;
         }
-        let module = file.path.strip_suffix(".gcsl").unwrap_or(&file.path);
+        let module = super::module_path(&file.path);
         let id = AttributeId::Declared {
             module: Rc::from(module),
             name: Rc::from(name),

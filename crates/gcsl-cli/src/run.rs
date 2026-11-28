@@ -8,7 +8,7 @@
 //! the whole workspace is checked, and `FILE` runs after the files it
 //! needs; its own value is printed, with the warnings of every file.
 //! Finding and reading the files is the `gcsl-disk` crate's, which `pekit`
-//! shares ([`gcsl_disk::find_workspace`], [`gcsl_disk::read_workspace`]):
+//! shares ([`gcsl_disk::find_hosted_workspace`], [`gcsl_disk::read_workspace_for`]):
 //! the library reads no file. `FILE` is read once, here, and given to the
 //! reading as read. Each file is given to the library by its path relative
 //! to the root, and its diagnostics name it by its path from the current
@@ -92,7 +92,7 @@
 //!
 //! The library is also given where the files are, for the `fileroot`
 //! module (`import fileroot`): a workspace's root, which
-//! [`gcsl_disk::find_workspace`] found above the file's canonical path
+//! [`gcsl_disk::find_hosted_workspace`] found above the file's canonical path
 //! (`fs::canonicalize`, once, so the root is canonical too), or a lone
 //! file's directory, the parent of its canonical path, the working
 //! directory if that cannot be found; a path that is not UTF-8 is given
@@ -122,7 +122,7 @@ use gcsl::lexer::TokenKind;
 use gcsl::strings::Quoted;
 use gcsl::workspace::{self, Workspace};
 use gcsl::{Diagnostic, SourceFile, Value, lexer, parser};
-use gcsl_disk::{Sources, find_workspace};
+use gcsl_disk::{Sources, find_hosted_workspace};
 use crate::{EXIT_PROGRAM_ERROR, EXIT_USAGE_OR_IO, output};
 
 /// Arguments of `gcsl run`.
@@ -209,8 +209,8 @@ pub fn main(args: &RunArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE_OR_IO);
         }
     };
-    match find_workspace(&args.file) {
-        Some((root, relative)) => run_workspace(args, &source, &root, &relative),
+    match find_hosted_workspace(&args.file) {
+        Some((root, relative, hosts)) => run_workspace(args, &source, (&root, &relative), &hosts),
         None => run_alone(args, &source),
     }
 }
@@ -302,15 +302,22 @@ fn syntax(
 }
 
 /// Runs `gcsl run` on `file`, the file given, read, whose path relative to
-/// the workspace `root` is `relative`: reads the workspace's files
-/// ([`gcsl_disk::read_workspace`], `file` not read again), then checks the
-/// workspace and runs `file` in it.
+/// the workspace `root` is `relative`: reads the workspace's files, those
+/// of its `hosts` too ([`gcsl_disk::read_workspace_for`], `file` not read
+/// again), then checks the workspace and runs `file` in it.
 ///
 /// Each file is given to the workspace by its path relative to the root,
 /// and its diagnostics are shown with its path from the current directory
 /// (`file`'s as it was given).
-fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str) -> ExitCode {
-    let sources = match gcsl_disk::read_workspace(root, Some((relative, file))) {
+fn run_workspace(
+    args: &RunArgs,
+    file: &SourceFile,
+    (root, relative): (&Path, &str),
+    hosts: &[gcsl_disk::Host],
+) -> ExitCode {
+    // A host's file is given its host's prelude, as the workspace's are.
+    let file = &gcsl_disk::with_host_prelude(hosts, Path::new(relative), file.clone());
+    let sources = match gcsl_disk::read_workspace_for(root, Some((relative, file)), hosts) {
         Ok(sources) => sources,
         Err(error) => {
             output::error(error);
@@ -321,7 +328,7 @@ fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str)
         // Not found among the files listed (a link, say): it runs alone.
         return run_alone(args, file);
     };
-    // The root is canonical: `find_workspace` found it above the file's
+    // The root is canonical: `find_hosted_workspace` found it above the file's
     // canonical path.
     let root = root.to_string_lossy();
     let Sources {
@@ -330,7 +337,13 @@ fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str)
         nested,
         ..
     } = sources;
-    let check = || workspace::check_with_standard(&files, &nested, &root);
+    let check = || {
+        let (standard, mut checked) = workspace::check_with_standard(&files, &nested, &root);
+        if let Err(errors) = &mut checked {
+            gcsl_disk::explain_missing_hosts(hosts, errors);
+        }
+        (standard, checked)
+    };
     execute_workspace(args, file, check, (shown, position))
 }
 

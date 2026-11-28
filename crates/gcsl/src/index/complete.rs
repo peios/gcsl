@@ -1381,10 +1381,9 @@ impl Index {
             if f.dir != dir || at < scan.standard() || at == file || f.path == WORKSPACE {
                 continue;
             }
-            let name = f.path.rsplit('/').next().unwrap_or(&f.path);
-            if let Some(stem) = name.strip_suffix(".gcsl") {
-                module(stem, format!("file `{}`", f.path), FILE);
-            }
+            let module_of = crate::workspace::module_path(&f.path);
+            let stem = module_of.rsplit('/').next().unwrap_or(module_of);
+            module(stem, format!("file `{}`", f.path), FILE);
         }
         found
     }

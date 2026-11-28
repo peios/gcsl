@@ -15,12 +15,12 @@ use super::{
     Annotate, Arg, ArgRange, AttributeUse, ContextDecl, DefTypeId, DefTypeRole, DefTypeUse,
     Element, ElementRange, Expr, ExprId, ExprKind, ExternFn, ExternType, FieldDefault, FieldTy,
     FieldTyKind, FieldTyRange, FnDecl, FnId, ForDecl, ForHead, ForId, GenericOwner, Generics,
-    ImportDecl, ImportForm, ImportGlob, ImportId, ImportMember, ImportMemberRange, Item, ItemId,
-    ItemKind, ItemRange, Label, LabelId, MethodDecl, NeedTy, NeedTyRange, NoAnnotation, Param,
-    ParamRange, ParamTy, ParamTyRange, PartRange, PathDisplay, PathRange, PathSegment, Pretty,
-    RecoverDecl, RecoverId, SegmentKind, StrPart, Syntax, TypeArena, TypeArgRange, TypeExpr,
-    TypeExprId, TypeExprKind, TypeLink, TypeProblem, TypeStore, WithBinding, WithRange,
-    WrittenType, next_id, symbol_span,
+    GivenForm, ImportDecl, ImportForm, ImportGlob, ImportId, ImportMember, ImportMemberRange,
+    ImportName, Item, ItemId, ItemKind, ItemRange, Label, LabelId, MethodDecl, NeedTy, NeedTyRange,
+    NoAnnotation, Param, ParamRange, ParamTy, ParamTyRange, PartRange, PathDisplay, PathRange,
+    PathSegment, Pretty, RecoverDecl, RecoverId, SegmentKind, StrPart, Syntax, TypeArena,
+    TypeArgRange, TypeExpr, TypeExprId, TypeExprKind, TypeLink, TypeProblem, TypeStore,
+    WithBinding, WithRange, WrittenType, next_id, symbol_span,
 };
 
 /// A complete syntax tree: the arenas, the file's body, the names and the
@@ -79,6 +79,9 @@ pub struct Ast {
     /// The implicit `#[shadowable] import * from prelude`, if a workspace
     /// gave the file one.
     pub(super) implicit_import: Option<ItemId>,
+    /// The implicit `#[shadowable]` imports of the prelude the file's host
+    /// gave it, in order.
+    pub(super) given_imports: Vec<ItemId>,
     /// What the expansion of its types did to the tree.
     pub(super) expansion: Expansion,
     pub(super) root: ItemRange,
@@ -910,12 +913,12 @@ impl Ast {
     }
 
     /// Whether an item of the file's own is marked `#[shadowable]`, the
-    /// implicit import aside: without one, nothing of the file is shadowed.
+    /// implicit imports aside: without one, nothing of the file is shadowed.
     #[must_use]
     pub fn marks_any(&self) -> bool {
-        self.shadowable
-            .iter()
-            .any(|&marked| Some(marked) != self.implicit_import)
+        self.shadowable.iter().any(|&marked| {
+            Some(marked) != self.implicit_import && !self.given_imports.contains(&marked)
+        })
     }
 
     /// Where the file's `#![no_prelude]` is written, if it is marked so.
@@ -966,24 +969,84 @@ impl Ast {
         if self.no_prelude.is_some() || self.implicit_import.is_some() {
             return;
         }
+        self.implicit_import = Some(self.add_hidden_import(&[prelude], &GivenForm::All));
+    }
+
+    /// The implicit `#[shadowable]` imports of the prelude the file's host
+    /// gave it, in order, none if it gave none (see
+    /// [Attributes](crate::ast#attributes)).
+    #[must_use]
+    pub fn given_imports(&self) -> &[ItemId] {
+        &self.given_imports
+    }
+
+    /// Whether the item `item` is one of the file's implicit imports, the
+    /// prelude's or one of a prelude its host gave it.
+    #[must_use]
+    pub fn is_implicit_import(&self, item: ItemId) -> bool {
+        self.implicit_import == Some(item) || self.given_imports.contains(&item)
+    }
+
+    /// Gives the file the implicit imports of a prelude its host gave it,
+    /// `imports`, in order, each its module path's names and what it binds:
+    /// `#[shadowable]` import items written nowhere and kept apart from the
+    /// file's body, as the prelude's is. Does nothing to a file marked
+    /// `#![no_prelude]` or given some already.
+    pub fn add_given_imports(&mut self, imports: &[(Vec<Name>, GivenForm)]) {
+        if self.no_prelude.is_some() || !self.given_imports.is_empty() {
+            return;
+        }
+        for (path, form) in imports {
+            if !path.is_empty() {
+                let item = self.add_hidden_import(path, form);
+                self.given_imports.push(item);
+            }
+        }
+    }
+
+    /// Adds an import item `#[shadowable] import ... PATH` that binds as
+    /// `form` says, written nowhere and in no block, `path` being its
+    /// module path's names.
+    fn add_hidden_import(&mut self, path: &[Name], form: &GivenForm) -> ItemId {
         let nowhere = Span::new(0, 0);
         let path_start = next_id(self.paths.len());
-        self.paths.push(PathSegment {
-            kind: SegmentKind::Name(prelude),
+        self.paths.extend(path.iter().map(|&name| PathSegment {
+            kind: SegmentKind::Name(name),
             span: nowhere,
-        });
+        }));
+        let named = |name: Name| ImportName {
+            name,
+            span: nowhere,
+        };
         let members_start = next_id(self.import_members.len());
-        self.import_members.push(ImportMember::All(nowhere));
+        let form = match form {
+            GivenForm::Whole(alias) => ImportForm::Whole(alias.map(named)),
+            GivenForm::All => {
+                self.import_members.push(ImportMember::All(nowhere));
+                ImportForm::Members(ImportMemberRange {
+                    start: members_start,
+                    len: 1,
+                })
+            }
+            GivenForm::Members(members) => {
+                self.import_members
+                    .extend(members.iter().map(|&(name, alias)| ImportMember::Named {
+                        name: named(name),
+                        alias: alias.map(named),
+                    }));
+                ImportForm::Members(ImportMemberRange {
+                    start: members_start,
+                    len: next_id(members.len()),
+                })
+            }
+        };
         let import = ImportId(next_id(self.imports.len()));
         self.imports.push(ImportDecl {
             path: PathRange {
                 start: path_start,
-                len: 1,
+                len: next_id(path.len()),
             },
-            form: ImportForm::Members(ImportMemberRange {
-                start: members_start,
-                len: 1,
-            }),
+            form,
             glob: ImportGlob::Exact,
             path_at: nowhere,
         });
@@ -992,9 +1055,9 @@ impl Ast {
             kind: ItemKind::Import(import),
             span: nowhere,
         });
-        self.implicit_import = Some(item);
         let at = self.shadowable.partition_point(|&marked| marked.0 < item.0);
         self.shadowable.insert(at, item);
+        item
     }
 
     /// Expands the tree's types, once (see [Types](crate::ast::typeexprs#types)). Every type

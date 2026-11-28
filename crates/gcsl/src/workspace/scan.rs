@@ -931,7 +931,7 @@ impl Scan {
     /// How `target` is shown in a diagnostic: a directory's or a file's
     /// module path, a node's dotted path, `fileroot` or `fileroot.caller`.
     pub(super) fn show_target(&self, target: Target) -> String {
-        let module = |path: &str| path.trim_end_matches(".gcsl").replace('/', ".");
+        let module = |path: &str| super::module_path(path).replace('/', ".");
         match target {
             Target::Fileroot(None) => Fileroot::MODULE.to_owned(),
             Target::Fileroot(Some(member)) => format!("{}.{}", Fileroot::MODULE, member.name()),

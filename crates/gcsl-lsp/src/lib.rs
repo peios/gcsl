@@ -29,7 +29,10 @@
 //! `workspace/configuration` request is answered with a null for each
 //! item; any other request it does not know with `MethodNotFound`;
 //! notifications it does not know are ignored. If the client can register
-//! for watched files dynamically, the server asks it to watch `**/*.gcsl`.
+//! for watched files dynamically, the server asks it to watch `**/*.gcsl`,
+//! the files of each host it knows of or finds installed when it starts
+//! (`**/*.prvm`), and the hosts' directories, `**/.gcsl/hosts/**` and
+//! `/usr/share/gcsl/hosts/**` (see `gcsl-disk`'s "Hosts").
 //!
 //! QUERIES. `textDocument/hover`, `definition`, `references`,
 //! `documentHighlight`, `prepareRename`, `rename`, `documentSymbol`,
@@ -144,8 +147,9 @@
 //! open with `null`.
 //!
 //! SOURCES. It keeps the text of each open document, applying incremental
-//! changes in the negotiated encoding. A `.gcsl` file is a file of the
-//! workspace whose root [`gcsl_disk::find_workspace`] finds above it, a
+//! changes in the negotiated encoding. A `.gcsl` file, or a file of one of
+//! the workspace's hosts, by its extension, is a file of the workspace whose
+//! root [`gcsl_disk::find_hosted_workspace`] finds above it, a
 //! file not on disk yet of the one its directory is in, and any other
 //! document is checked alone, as `gcsl run FILE` checks a lone file (see
 //! [`place`]). A server serves any number of workspaces, each by its root.
@@ -236,7 +240,7 @@ mod worker;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -705,13 +709,23 @@ impl Server<'_> {
             .map_err(|_| Error::WorkerStopped)
     }
 
-    /// Asks the client to report changes to `.gcsl` files.
+    /// Asks the client to report changes to `.gcsl` files, the files of
+    /// each host known or installed, and the hosts' directories.
     fn watch(&self) -> Result<(), Error> {
+        let mut globs = vec!["**/*.gcsl".to_owned()];
+        for host in gcsl_disk::find_hosts(None) {
+            globs.push(format!("**/*.{}", host.extension));
+        }
+        globs.push(format!("**/{}/**", gcsl_disk::WORKSPACE_HOSTS));
+        globs.push(format!("{}/**", gcsl_disk::SYSTEM_HOSTS));
         let options = DidChangeWatchedFilesRegistrationOptions {
-            watchers: vec![FileSystemWatcher {
-                glob_pattern: GlobPattern::String("**/*.gcsl".to_owned()),
-                kind: None,
-            }],
+            watchers: globs
+                .into_iter()
+                .map(|glob| FileSystemWatcher {
+                    glob_pattern: GlobPattern::String(glob),
+                    kind: None,
+                })
+                .collect(),
         };
         let params = RegistrationParams {
             registrations: vec![Registration {
@@ -1041,9 +1055,28 @@ impl Server<'_> {
         for key in roots {
             self.change(key, true);
         }
-        let workspaces = paths
-            .iter()
-            .any(|path| path.file_name().is_some_and(|name| name == WORKSPACE));
+        // A host installed or removed, in a workspace or the system's
+        // place, changes which files are a workspace's, as a
+        // `workspace.gcsl` does.
+        let system = Path::new(gcsl_disk::SYSTEM_HOSTS);
+        let hosted = paths.iter().any(|path| {
+            path.starts_with(system) || path.to_string_lossy().contains("/.gcsl/hosts/")
+        });
+        if paths.iter().any(|path| path.starts_with(system)) {
+            let roots: Vec<Key> = self
+                .due
+                .keys()
+                .filter(|key| matches!(key, Key::Root(_)))
+                .cloned()
+                .collect();
+            for key in roots {
+                self.change(key, true);
+            }
+        }
+        let workspaces = hosted
+            || paths
+                .iter()
+                .any(|path| path.file_name().is_some_and(|name| name == WORKSPACE));
         if !workspaces {
             return Ok(());
         }

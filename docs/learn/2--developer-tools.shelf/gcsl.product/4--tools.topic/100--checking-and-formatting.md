@@ -54,6 +54,11 @@ workspaces too. However, `gcsl check DIRECTORY` checks workspaces, not
 unattached `.gcsl` files under that directory. Pass each standalone file
 explicitly when it also needs checking.
 
+Both commands also read the files of the workspace's hosts, such as
+Provium's `.prvm` tests, each with its host's prelude. `gcsl hosts` lists
+the hosts found. A `.pekit` or `.prvm` file whose host isn't installed has
+one error that names the host to install.
+
 For automation, `gcsl check --message-format json main.gcsl` writes one
 JSON diagnostic per line to standard output and keeps the summary on
 standard error. See `gcsl(1)` for the schema and exit statuses.

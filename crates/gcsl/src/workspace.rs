@@ -235,6 +235,36 @@
 //! module; one the host did not give is "library `PATH` is not found", noted
 //! with where hosts look for one. A library's path that is not segments of a
 //! module path separated by `/` is the parser's error.
+//!
+//! # Given preludes
+//!
+//! A host can give any file of a workspace a prelude of its own
+//! ([`SourceFile::with_prelude`]), as a test harness gives its tests the
+//! library that declares `test` and `step`: nothing here knows why a file is
+//! given one, a file's extension being its host's business. A prelude is
+//! import items of libraries, each as it is written, `import * from
+//! "provium"`, `import "provium/vm"`, `import step from "provium"`, in
+//! order (see the `preludes` module for what one takes). The parse gives
+//! the file's tree, after the prelude's implicit import, each of them,
+//! `#[shadowable]` and written nowhere
+//! ([`Ast::given_imports`](crate::ast::Ast::given_imports)). In the static
+//! order they come next after the prelude's, in the order given (see
+//! [Shadowable declarations](crate::workspace::parse#shadowable-declarations)),
+//! so a name one of them binds shadows the prelude's of that name, and an
+//! earlier one's, silently, and any declaration of the file's own or of a
+//! directory above it, or any import of the file's, shadows them all. Their
+//! aliases are implicit, as the prelude's are ([`Alias::implicit`]).
+//! `#![no_prelude]` turns them all off. The libraries are given with the
+//! workspace's files as any library is, and [`library_imports`] gives them
+//! first. An import that is none a prelude takes is an error at the file's
+//! start, and the others are given still; a library that is not among the
+//! files, or that the file may not import, is the error "the prelude
+//! `provium` given for this file is not found"
+//! ([`prelude_not_given_message`]), at the file's start, once for each,
+//! which makes the file blind, so that the names it would have bound are no
+//! further errors. A def-type a library declares is the workspace's own,
+//! and replaces the standard one of its path as any of the workspace's own
+//! does (see the requests' "Def-types by name").
 
 use std::mem;
 use std::path::PathBuf;
@@ -280,7 +310,8 @@ use parse::{
     place_dirs, reserved, resolve, shadow, shadowable_nodes,
 };
 use views::{merge, views};
-pub(crate) use imports::{Modules, module, target_roots};
+pub(crate) use imports::{Modules, module, module_path, target_roots};
+pub use imports::prelude_not_given_message;
 use imports::{context_in, imports, value_cells};
 use declared::{check_context_items, declare_types, define_types, method_views, type_views};
 use needs::{clashes, find_needs, order, report_cycles, schedule};
@@ -319,10 +350,23 @@ pub const STANDARD_DIR: &str = "<stdlib>";
 /// the file is checked, and loads again for each library's own files, until
 /// it has every library the workspace needs (see [Libraries](#libraries)).
 /// A file that does not parse gives what it imports as far as it parses.
+/// The libraries of the prelude its host gave it ([`SourceFile::with_prelude`])
+/// come first, unless the file is marked `#![no_prelude]` (see [Given
+/// preludes](#given-preludes)).
 #[must_use]
 pub fn library_imports(source: &SourceFile) -> Vec<String> {
     let (ast, _) = crate::parser::parse_source(source);
     let mut found: Vec<String> = Vec::new();
+    if ast.no_prelude().is_none() {
+        for import in preludes::prelude_imports(source.prelude())
+            .into_iter()
+            .flatten()
+        {
+            if !found.contains(&import.library) {
+                found.push(import.library);
+            }
+        }
+    }
     for &item in ast.items(ast.root()) {
         let crate::ast::ItemKind::Import(id) = ast.item(item).kind else {
             continue;
@@ -1162,6 +1206,7 @@ pub(crate) mod input;
 pub(crate) mod invoke;
 pub(crate) mod needs;
 pub(crate) mod parse;
+pub(crate) mod preludes;
 pub(crate) mod reach;
 pub(crate) mod requests;
 pub(crate) mod scan;
