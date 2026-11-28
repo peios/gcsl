@@ -517,6 +517,7 @@ A kind is declared once in a workspace, and a second declaration of it is an err
 A handle type takes no type parameters, and no variant can be declared for one.
 No literal or conversion makes a handle, and nothing reads its number.
 A handle is data: it is held in records and lists, tested with is and as, compared with == by its kind and number, and is part of a memoized call's key.
+A handle is of one run, so it is no input of a call a host defers: a host refuses a step that is given one, or that captures or reads one.
 Show and interpolation give <KIND N>, the kind and the number, which is not source.
 .PP
 Extern fn and extern def declare an operation: a function with a signature and no body, called as any function is, and a value of its function type.

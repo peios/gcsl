@@ -123,6 +123,14 @@ equal, so give each thing you track one number for as long as programs
 can hold its handle. Answer an operation declared to return `{}` with
 `Plain::Empty`.
 
+A handle means something only in the run that made it, so it can't be an
+input of a step. If a program gives one to a deferred call, as an
+argument, a captured variable, or a context value, `step_inputs` and
+`step_identity` return the error "a step's input must be plain data: it
+holds a handle of the kind `vm.machine`, which is not data". To check a
+value yourself before you record it, `Plain::handle_within` returns the
+kind of a handle it holds at any depth, or `None`.
+
 GCSL checks every result against the operation's declared return type.
 If your host returns the wrong shape, the program's call fails with an
 error that names the operation, for example "the result of operation

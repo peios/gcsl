@@ -1340,3 +1340,102 @@ fn retry_and_timeout_wrap_an_operation_in_graph_mode() {
         ]
     );
 }
+
+/// A host that answers no operation, as one written before operations
+/// existed.
+#[derive(Debug)]
+struct Unaware;
+impl Effects for Unaware {
+    fn temp_dir(&self) -> Option<Result<String, String>> {
+        None
+    }
+}
+
+#[test]
+fn a_host_with_no_operations_never_holds_a_handle() {
+    // Run as a host runs any effect's node, an operation fails at its
+    // call, so no handle is made for the host to record.
+    let (mut workspace, _) =
+        machines("def test one() { = boot({name = \"a\"}).run(\"x\").stdout }");
+    let call = workspace.prepare_call(("test", "one"), &[], &[]).unwrap();
+    let mut graph = Graph::new();
+    let Progress::Paused(nodes) = workspace.run_prepared(&call, &mut graph, every()).unwrap()
+    else {
+        panic!("the unit did not stop at its operation");
+    };
+    let job = workspace.effect_job(&graph, nodes[0]).unwrap();
+    let error = job.run(&Unaware, None).unwrap_err();
+    assert_eq!(error.message, "this host has no operation `vm.boot`");
+    assert!(graph.resolve(nodes[0], Err(error)));
+    let errors = match workspace.run_prepared(&call, &mut graph, every()) {
+        Err(InvokeError::Diagnostics(errors)) => errors,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(errors[0].message, "this host has no operation `vm.boot`");
+    assert_eq!(graph.len(), 1);
+}
+
+#[test]
+fn a_handle_given_to_a_step_is_not_data() {
+    // A deferred call is keyed and recorded by its inputs, and a handle,
+    // the host's of one run, is none: as an argument, inside one, captured
+    // or read from the context.
+    let steps = "#[attribute] #[defers] type step = {}\n\
+         context held: List<Vm> = []\n\
+         #[step] fn alone(m: Vm) -> String { \"a\" }\n\
+         #[step] fn within(all: {machines: List<Vm>}) -> String { \"b\" }\n\
+         #[step] fn reading(^held) -> String { \"c\" }\n\
+         #[step] fn plain(name: String) -> String { name }\n";
+    for (body, refused) in [
+        ("= alone(m)", true),
+        ("= within({machines = [m]})", true),
+        ("= reading() with { held = [m] }", true),
+        (
+            "#[step] fn inner() -> String { \"{m.run(\"x\").status}\" }\n = inner()",
+            true,
+        ),
+        ("= plain(\"p\")", false),
+    ] {
+        let text = format!(
+            "{steps}fn go(m: Vm) -> String {{\n {body}\n}}\n\
+             def test one() {{ = go(boot({{name = \"a\"}})) }}"
+        );
+        let (mut workspace, mut engine) = machines(&text);
+        let call = workspace.prepare_call(("test", "one"), &[], &[]).unwrap();
+        let mut graph = Graph::new();
+        // Its operations answered, the unit is left waiting for its step.
+        while let Progress::Paused(nodes) =
+            workspace.run_prepared(&call, &mut graph, every()).unwrap()
+        {
+            let operation = workspace.operation(&graph, nodes[0]).unwrap();
+            let answer = perform(&operation.name, &operation.args, &mut engine.made)
+                .map(|plain| workspace.from_plain(&plain))
+                .map_err(|failure| Diagnostic::error(failure.message, Span::new(0, 0)));
+            assert!(graph.resolve(nodes[0], answer));
+        }
+        let step = (0..graph.len())
+            .map(|at| NodeId::of(u32::try_from(at).unwrap()))
+            .find(|&id| graph.node(id).unwrap().kind() == crate::eval::graph::NodeKind::Deferred)
+            .unwrap_or_else(|| panic!("`{body}` made no step"));
+        let inputs = workspace.step_inputs(&graph, step);
+        let identity = workspace.step_identity(&graph, step);
+        if refused {
+            let message = "a step's input must be plain data: it holds a handle of the kind \
+                           `vm.machine`, which is not data";
+            assert_eq!(inputs.unwrap_err(), message, "{body}");
+            assert_eq!(identity.unwrap_err(), message, "{body}");
+        } else {
+            assert!(inputs.is_ok() && identity.is_ok(), "{body}");
+        }
+    }
+    // Nothing a program declares is taken for a handle, at any depth.
+    let declared = Plain::Variant {
+        key: "<variant C of <enum T@a.gcsl>@a.gcsl>".to_owned(),
+        of: "<enum T@a.gcsl>".to_owned(),
+        shown: "T::C".to_owned(),
+        payload: Some(Box::new(Plain::Int(1))),
+    };
+    assert_eq!(Plain::List(vec![declared]).handle_within(), None);
+    let held = Plain::Record(vec![("m".to_owned(), Plain::handle("Network", 2))]);
+    assert_eq!(Plain::List(vec![held]).handle_within(), Some("Network"));
+}

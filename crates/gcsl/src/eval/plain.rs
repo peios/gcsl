@@ -156,6 +156,34 @@ impl Plain {
         (crate::names::extern_kind(of) == Some(kind)).then_some((kind, id))
     }
 
+    /// The kind of a handle the value holds, at any depth, itself if it is
+    /// one, or `None` if it holds none: a handle is the host's, of one run,
+    /// so a value that holds one is nothing to record or to key a step by
+    /// (see [Handles](crate::eval::operations#handles)).
+    #[must_use]
+    pub fn handle_within(&self) -> Option<&str> {
+        let mut pending = vec![self];
+        while let Some(plain) = pending.pop() {
+            if let Some((kind, _)) = plain.as_handle() {
+                return Some(kind);
+            }
+            match plain {
+                Plain::Record(fields) => {
+                    pending.extend(fields.iter().rev().map(|(_, value)| value));
+                }
+                Plain::List(items) => pending.extend(items.iter().rev()),
+                Plain::Variant {
+                    payload: Some(payload),
+                    ..
+                } => pending.push(payload),
+                Plain::Secret { value, .. } => pending.push(value),
+                Plain::Closure { captures, .. } => pending.extend(captures.iter().rev()),
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// Every file and directory the value holds, at any depth, each with
     /// whether it is a directory, in the order they are found: what a host
     /// stages for a step that is given the value.

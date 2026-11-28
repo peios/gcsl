@@ -60,6 +60,16 @@
 //! encoding. Two handles are equal if they are of one kind and one number;
 //! a handle is shown as `<vm.machine 3>`, its kind and its number in angle
 //! brackets, which is no expression, as a sandbox's display is none.
+//!
+//! A handle is data to the program and to the host that made it, but it
+//! means something only in the run it was made in. So a deferred call's
+//! inputs, which a host keys and records the step by
+//! ([`Workspace::step_inputs`](crate::workspace::Workspace::step_inputs)),
+//! refuse one: "a step's input must be plain data: it holds a handle of the
+//! kind `vm.machine`, which is not data"
+//! ([`Plain::handle_within`](super::plain::Plain::handle_within)). A host
+//! with no operations never meets one, since only an operation's answer
+//! makes a handle and each of its operations fails at its call.
 
 use crate::diagnostic::Diagnostic;
 use crate::ir::IrNode;

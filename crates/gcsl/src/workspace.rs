@@ -852,7 +852,10 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// What of it is no data, or that `graph` has no node `id`.
+    /// What of it is no data, or that `graph` has no node `id`. A handle
+    /// given to a deferred call is no data here, though it is elsewhere: "a
+    /// step's input must be plain data: it holds a handle of the kind
+    /// `vm.machine`, which is not data".
     pub fn step_inputs(&self, graph: &Graph, id: NodeId) -> Result<StepInputs, String> {
         self.inputs_of(graph, id, (to_plain, to_key_plain))
     }
@@ -935,10 +938,24 @@ impl Workspace {
             .closure()
             .map(|closure| key(&Value::Fn(Rc::clone(closure)), names))
             .transpose()?;
+        let args = plain_all(node.args())?;
+        // A handle is the host's, of this run: nothing to key or record a
+        // step by. An effect's node is given one freely, an operation's
+        // being how a handle is used.
+        if node.kind() == NodeKind::Deferred {
+            let given = args.iter().chain(&captures);
+            let read = context.iter().map(|(_, value)| value);
+            if let Some(kind) = given.chain(read).find_map(Plain::handle_within) {
+                return Err(format!(
+                    "a step's input must be plain data: it holds a handle of the kind `{kind}`, \
+                     which is not data"
+                ));
+            }
+        }
         Ok(StepInputs {
             kind: node.kind(),
             callee,
-            args: plain_all(node.args())?,
+            args,
             captures,
             context,
             attributes,
