@@ -32,6 +32,7 @@ EXPECTED = {
     ("500--lists-and-control-flow.md", 1): "[4, 6]\n",
     ("500--lists-and-control-flow.md", 2): "[0, 2, 4]\n",
     ("300--file-and-process-effects.md", 0): "GCSL\n",
+    ("395--host-operations.md", 3): ('{outcome = "this host has no operation `vm.boot`"}\n'),
 }
 
 
