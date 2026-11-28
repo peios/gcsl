@@ -35,7 +35,7 @@ EXPECTED = {
     ("320--block-parameters.md", 3): "...\n",
     ("320--block-parameters.md", 4): "true\n",
     ("320--block-parameters.md", 5): '{tag = "[release]"}\n',
-    ("320--block-parameters.md", 7): "3\n",
+    ("320--block-parameters.md", 8): "3\n",
     ("370--context.md", 8): '{native = "gcc-x86_64"; cross = "gcc-aarch64"}\n',
     ("380--failure.md", 1): "{even = 5; odd = {}; sum = {}; size = 0}\n",
     ("380--failure.md", 2): "{status = -1}\n",
