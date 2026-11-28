@@ -298,6 +298,34 @@ mod tests {
     }
 
     #[test]
+    fn a_let_in_a_trailing_block_and_one_of_a_block_s_value_have_theirs() {
+        // In a trailing block as in any block, and the variable a call with
+        // a block gives, whose type the block binds; a block parameter has
+        // its type written, and so no hint.
+        let text = "fn f(): Int { 1 }\n\
+                    fn step(name: String, body: block -> {}) -> {} {\n    body()\n    = {}\n}\n\
+                    fn measure<T>(body: block -> T) -> T { body() }\n\
+                    fn twice(body: block: Int): Int {\n    let once = body()\n    once + once\n}\n\
+                    fn main() -> Int {\n    let mut seen = 0\n    \
+                    step(\"a\") {\n        let inner = f()\n        seen := seen + inner\n    }\n    \
+                    let got = measure { [seen] }\n    \
+                    let two = twice { let half = f(); = half }\n    \
+                    for x in got { step(\"b\") { let y = x + two; seen := y } }\n    = seen\n}\n";
+        assert_eq!(
+            hinted(text, &[], None),
+            "fn f(): Int { 1 }\n\
+             fn step(name: String, body: block -> {}) -> {} {\n    body()\n    = {}\n}\n\
+             fn measure<T>(body: block -> T) -> T { body() }\n\
+             fn twice(body: block: Int): Int {\n    let once⟨: Int⟩ = body()\n    once + once\n}\n\
+             fn main() -> Int {\n    let mut seen = 0\n    \
+             step(\"a\") {\n        let inner⟨: Int⟩ = f()\n        seen := seen + inner\n    }\n    \
+             let got⟨: List<Int>⟩ = measure { [seen] }\n    \
+             let two⟨: Int⟩ = twice { let half⟨: Int⟩ = f(); = half }\n    \
+             for x⟨: Int⟩ in got { step(\"b\") { let y⟨: Int⟩ = x + two; seen := y } }\n    = seen\n}\n"
+        );
+    }
+
+    #[test]
     fn what_spells_its_type_or_is_a_field_has_none() {
         let text = "fn f(): Int { 1 }\nfn g(): Int {\n    let a = 1\n    let s = \"s{a}\"\n    \
                     let b = true\n    let n = -1.5\n    let r = {a = 1}\n    let l = [1, 2]\n    \

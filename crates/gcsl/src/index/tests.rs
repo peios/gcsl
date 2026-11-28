@@ -138,7 +138,124 @@ fn cases() -> Vec<Case> {
     cases.extend(field_cases());
     cases.extend(other_cases());
     cases.extend(standard_cases());
+    cases.extend(block_cases());
     cases
+}
+
+/// Functions that take a block, a method among them, and `main`, which
+/// gives each a trailing block that reads and rebinds its variables.
+const BLOCKS: &str = "w = 0\n# Runs a step.\n\
+                      fn step(name: String, body: block -> {}) -> {} {\n    body()\n    = {}\n}\n\
+                      fn twice(n: Int, body: block: Int): Int { body() + n }\n\
+                      fn measure<T>(name: String, body: block -> T) -> T { body() }\n\
+                      fn (n: Int) times(body: block: Int): Int { body() * n }\n\
+                      fn main() -> Int {\n    let mut seen = 0\n    \
+                      step(\"a\") {\n        let inner = 1\n        seen := seen + inner\n    }\n    \
+                      let got = measure(\"m\") { seen }\n    \
+                      let thrice = 3.times { got }\n    \
+                      = twice(1) { seen + thrice }\n}\nr = main()\n";
+
+/// The cases of block parameters and trailing blocks.
+fn block_cases() -> Vec<Case> {
+    let blocks = BLOCKS;
+    vec![
+        Case {
+            name: "a block parameter",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "step(name: String, |body"),
+            hover: Some(vec!["body: block -> {} | Future<{}>", "parameter"]),
+            definition: vec![("app.gcsl", "step(name: String, |body", 4)],
+        },
+        Case {
+            name: "a call of a block",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "    |body()\n    = {}"),
+            hover: Some(vec!["body: block -> {} | Future<{}>", "parameter"]),
+            definition: vec![("app.gcsl", "step(name: String, |body", 4)],
+        },
+        Case {
+            name: "a pure block parameter",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "{ |body() + n }"),
+            hover: Some(vec!["body: block: Int", "parameter"]),
+            definition: vec![("app.gcsl", "twice(n: Int, |body", 4)],
+        },
+        Case {
+            name: "a generic function's block parameter",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "-> T { |body() }"),
+            hover: Some(vec!["body: block -> T", "parameter"]),
+            definition: vec![("app.gcsl", "measure<T>(name: String, |body", 4)],
+        },
+        Case {
+            name: "a function with a block, at its call",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "|step(\"a\")"),
+            hover: Some(vec![
+                "fn step(name: String | Future<String>, body: block -> {} | Future<{}>) -> {}",
+                "Runs a step.",
+            ]),
+            definition: vec![("app.gcsl", "fn |step", 4)],
+        },
+        Case {
+            name: "a function with a pure block",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "= |twice(1)"),
+            hover: Some(vec!["fn twice(n: Int, body: block: Int): Int"]),
+            definition: vec![("app.gcsl", "fn |twice", 5)],
+        },
+        Case {
+            name: "a generic function with a block",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "|measure(\"m\")"),
+            hover: Some(vec![
+                "fn measure<T>(name: String | Future<String>, body: block -> T) -> T",
+            ]),
+            definition: vec![("app.gcsl", "fn |measure", 7)],
+        },
+        Case {
+            name: "a method with a block, at its call",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "3.|times"),
+            hover: Some(vec!["fn (n: Int) times(body: block: Int): Int"]),
+            definition: vec![("app.gcsl", ") |times(body", 5)],
+        },
+        Case {
+            name: "the caller's variable, read in a trailing block",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", ":= |seen + inner"),
+            hover: Some(vec!["mut seen: Int"]),
+            definition: vec![("app.gcsl", "let mut |seen", 4)],
+        },
+        Case {
+            name: "the caller's variable, rebound in a trailing block",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "|seen := seen + inner"),
+            hover: Some(vec!["mut seen: Int"]),
+            definition: vec![("app.gcsl", "let mut |seen", 4)],
+        },
+        Case {
+            name: "a trailing block's own variable",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "seen + |inner"),
+            hover: Some(vec!["inner: Int"]),
+            definition: vec![("app.gcsl", "let |inner", 5)],
+        },
+        Case {
+            name: "the variable a call with a block gives",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "times { |got }"),
+            hover: Some(vec!["got: Int"]),
+            definition: vec![("app.gcsl", "let |got", 3)],
+        },
+        Case {
+            name: "the word `block` of a block type",
+            files: vec![("app.gcsl", blocks)],
+            at: ("app.gcsl", "body: |block -> {}"),
+            hover: None,
+            definition: vec![],
+        },
+    ]
 }
 
 /// The cases of locals.
@@ -1452,4 +1569,171 @@ fn a_method_renames_at_its_declaration_and_every_call() {
             "{at:?}"
         );
     }
+}
+
+#[test]
+fn references_and_highlights_reach_into_trailing_blocks() {
+    let files = [("app.gcsl", BLOCKS)];
+    // The caller's variable: its declaration, its rebind and read in one
+    // block, and its reads in the others, from any of them.
+    let seen = places(
+        &files,
+        &[
+            ("app.gcsl", "let mut |seen"),
+            ("app.gcsl", "|seen := seen + inner"),
+            ("app.gcsl", ":= |seen + inner"),
+            ("app.gcsl", "{ |seen }"),
+            ("app.gcsl", "{ |seen + thrice }"),
+        ],
+    );
+    for at in ["let mut |seen", ":= |seen + inner", "{ |seen + thrice }"] {
+        assert_eq!(references(&files, ("app.gcsl", at), true), seen, "{at}");
+    }
+    assert_eq!(
+        references(&files, ("app.gcsl", "{ |seen }"), false),
+        seen[1..]
+    );
+    // The rebind in the block writes it.
+    let (index, file) = index_of(&files, "app.gcsl");
+    let found: Vec<(u32, bool)> = index
+        .highlights(file, offset(BLOCKS, "{ |seen }"))
+        .iter()
+        .map(|h| (h.span.start, h.write))
+        .collect();
+    let writes = [true, true, false, false, false];
+    let wanted: Vec<(u32, bool)> = seen.iter().map(|place| place.1).zip(writes).collect();
+    assert_eq!(found, wanted);
+    // A block parameter: its declaration and its calls, in its function.
+    assert_eq!(
+        references(&files, ("app.gcsl", "    |body()\n    = {}"), true),
+        places(
+            &files,
+            &[
+                ("app.gcsl", "step(name: String, |body"),
+                ("app.gcsl", "    |body()\n    = {}"),
+            ]
+        )
+    );
+    // A function with a block: its declaration and the call that gives it
+    // one.
+    assert_eq!(
+        references(&files, ("app.gcsl", "fn |step"), true),
+        places(
+            &files,
+            &[("app.gcsl", "fn |step"), ("app.gcsl", "|step(\"a\")")]
+        )
+    );
+    // A block's own variable is its own.
+    assert_eq!(
+        references(&files, ("app.gcsl", "let |inner"), true),
+        places(
+            &files,
+            &[("app.gcsl", "let |inner"), ("app.gcsl", "seen + |inner")]
+        )
+    );
+}
+
+#[test]
+fn a_rename_reaches_into_trailing_blocks_and_renames_a_block_parameter() {
+    let files = [("app.gcsl", BLOCKS)];
+    // The caller's variable, from a block.
+    assert_eq!(
+        renamed(&files, ("app.gcsl", ":= |seen + inner"), "total"),
+        Ok(vec![(
+            "app.gcsl".to_owned(),
+            BLOCKS.replace("seen", "total")
+        )])
+    );
+    // A block parameter, at its declaration and at its call: only its own
+    // function's.
+    for at in ["step(name: String, |body", "    |body()\n    = {}"] {
+        assert_eq!(
+            renamed(&files, ("app.gcsl", at), "run"),
+            Ok(vec![(
+                "app.gcsl".to_owned(),
+                BLOCKS
+                    .replace("step(name: String, body:", "step(name: String, run:")
+                    .replace("    body()\n    = {}", "    run()\n    = {}")
+            )]),
+            "{at}"
+        );
+    }
+    // A function with a block, and a method with one.
+    assert_eq!(
+        renamed(&files, ("app.gcsl", "|step(\"a\")"), "stage"),
+        Ok(vec![(
+            "app.gcsl".to_owned(),
+            BLOCKS
+                .replace("fn step", "fn stage")
+                .replace("step(\"a\")", "stage(\"a\")")
+        )])
+    );
+    assert_eq!(
+        renamed(&files, ("app.gcsl", "3.|times"), "of"),
+        Ok(vec![("app.gcsl".to_owned(), BLOCKS.replace("times", "of"))])
+    );
+    // A block's variable renamed to its caller's would capture the reads
+    // of that one in the block.
+    let refused = renamed_err(&files, ("app.gcsl", "let |inner"), "seen");
+    assert!(
+        refused.contains("would make `seen`") && refused.contains("refer to something else"),
+        "{refused}"
+    );
+    // And the caller's to the block's.
+    let refused = renamed_err(&files, ("app.gcsl", "let mut |seen"), "inner");
+    assert!(refused.contains("refer to something else"), "{refused}");
+    // A block parameter is no keyword's: `block` itself is not renamed.
+    let (index, file) = index_of(&files, "app.gcsl");
+    assert!(
+        index
+            .prepare_rename(file, offset(BLOCKS, "body: |block -> {}"))
+            .is_err()
+    );
+}
+
+#[test]
+fn a_function_with_a_block_is_a_symbol_with_its_block_in_its_type() {
+    let files = [("app.gcsl", BLOCKS)];
+    let (index, file) = index_of(&files, "app.gcsl");
+    let symbols = index.document_symbols(file);
+    let top: Vec<(&str, SymbolKind, Option<&str>)> = symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.detail.as_deref()))
+        .collect();
+    assert_eq!(
+        top,
+        [
+            ("w", SymbolKind::Field, Some("Int")),
+            (
+                "step",
+                SymbolKind::Function,
+                Some("fn(name: String | Future<String>, body: block -> {} | Futur…")
+            ),
+            (
+                "twice",
+                SymbolKind::Function,
+                Some("fn(n: Int, body: block: Int): Int")
+            ),
+            (
+                "measure",
+                SymbolKind::Function,
+                Some("fn<T>(name: String | Future<String>, body: block -> T) -> T")
+            ),
+            (
+                "times",
+                SymbolKind::Method,
+                Some("fn(n: Int, body: block: Int): Int")
+            ),
+            ("main", SymbolKind::Function, Some("fn() -> Int")),
+            ("r", SymbolKind::Field, Some("Int")),
+        ]
+    );
+    // What a trailing block declares is no symbol of the file.
+    assert!(symbols.iter().all(|symbol| symbol.children.is_empty()));
+    let found: Vec<String> = index
+        .workspace_symbols("inner", 200)
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(found, Vec::<String>::new());
 }
