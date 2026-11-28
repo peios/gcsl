@@ -334,7 +334,7 @@ impl Parser<'_> {
 
     /// Whether the token number `index` starts what is surely an item, not
     /// the rest of an expression: a `let`, a `fn` and its name, a `def`, an
-    /// `import`, a `type`, a `defmeta`, a `return`, `break` or `continue`,
+    /// `import`, a `type`, an `extern` item, a `defmeta`, a `return`, `break` or `continue`,
     /// an attribute, or a field or a rebind, a path followed by `=`, `:=`
     /// or an annotation and `=`.
     pub(super) fn starts_item(&mut self, index: usize) -> bool {
@@ -356,6 +356,7 @@ impl Parser<'_> {
                 let at = std::mem::replace(&mut self.pos, index);
                 let item = self.starts_type_item()
                     || self.starts_enum_item()
+                    || self.starts_extern_item()
                     || self.starts_context_item()
                     || self.starts_defmeta()
                     || self.starts_path_item();

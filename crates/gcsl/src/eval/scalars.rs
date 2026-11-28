@@ -112,6 +112,7 @@ impl Evaluator<'_> {
             | IrKind::Range(..) => mistyped(node, "list node where an Int was expected"),
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where an Int was expected"),
@@ -346,6 +347,7 @@ impl Evaluator<'_> {
             | IrKind::Range(..) => mistyped(node, "list node where a Float was expected"),
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a Float was expected"),
@@ -460,6 +462,7 @@ impl Evaluator<'_> {
             | IrKind::Range(..) => mistyped(node, "list node where a Bool was expected"),
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a Bool was expected"),
@@ -599,6 +602,7 @@ impl Evaluator<'_> {
             | IrKind::Range(..) => mistyped(node, "list node where a String was expected"),
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a String was expected"),

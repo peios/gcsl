@@ -1,7 +1,7 @@
 //! Lowering type tests, for `is`, `as` and narrowing.
 
 use crate::ast::{ExprId, ExprKind};
-use crate::check::Slot;
+use crate::check::{Slot, TestResolution};
 use crate::diagnostic::InternalError;
 use crate::ir::{IrId, IrKind, TestCode, TestId};
 use crate::types::ValueTest;
@@ -65,6 +65,13 @@ impl Lowerer<'_> {
                 span,
             });
         }
+        let value = self.lower_expr(operand)?;
+        Ok((value, self.push_test(resolution)))
+    }
+
+    /// Adds the test that `resolution` plans to the IR, with the text of
+    /// each field name the test looks at, and returns it.
+    pub(super) fn push_test(&mut self, resolution: &TestResolution) -> TestId {
         let code = TestCode {
             test: resolution.test.clone(),
             subject: resolution.subject.clone(),
@@ -93,7 +100,6 @@ impl Lowerer<'_> {
                 ValueTest::Any(alternatives) => pending.extend(alternatives),
             }
         }
-        let value = self.lower_expr(operand)?;
-        Ok((value, self.builder.push_test(code)))
+        self.builder.push_test(code)
     }
 }

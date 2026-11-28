@@ -3,6 +3,7 @@
 
 use crate::ast::{Ast, ExprId, ExprKind, ImportForm, ImportMember, ItemId, ItemKind};
 use crate::source::Span;
+use crate::strings::Quoted;
 use crate::types::TyId;
 
 use super::{Index, Symbol, known, path_span, unparen};
@@ -114,6 +115,25 @@ impl Index {
         found
     }
 
+    /// The symbol of the enum item `item` of the tree `ast`, named `name`
+    /// at `selection`, if it is a handle type's: a type, by its kind.
+    fn handle_symbol(
+        &self,
+        ast: &Ast,
+        item: ItemId,
+        (name, selection): (crate::names::Name, Span),
+    ) -> Option<DocumentSymbol> {
+        let kind = ast.strings().get(ast.extern_type(item)?.kind);
+        Some(DocumentSymbol {
+            name: self.scan.names.get(name).to_owned(),
+            detail: Some(format!("extern type = {}", Quoted(kind))),
+            kind: SymbolKind::Type,
+            span: ast.item(item).span,
+            selection,
+            children: Vec::new(),
+        })
+    }
+
     /// The symbol of the top-level item `item` of file `file`, whose tree
     /// is `ast`, if it declares one.
     fn item_symbol(&self, file: u32, ast: &Ast, item: ItemId) -> Option<DocumentSymbol> {
@@ -210,6 +230,9 @@ impl Index {
                     children: Vec::new(),
                 })
             }
+            ItemKind::Enum {
+                name, name_span, ..
+            } => self.handle_symbol(ast, item, (name, name_span)),
             _ => None,
         }
     }

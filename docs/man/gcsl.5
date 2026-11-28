@@ -499,6 +499,45 @@ A function type can append META:, META->, or META->> and a record type.
 Metadata reads follow the declared pure, impure, or memoized effect.
 Defmeta TYPE_NAME PATH supplies a definition's metadata in its directory, using a block or = EXPR.
 Metadata follows references to the definition.
+.SH HOST OPERATIONS
+An extern item declares what the host of a program supplies: an operation, or a handle type.
+The word extern is not reserved.
+It begins an item only where an item of a file's outermost body begins and it is followed on its line by fn, by def, or by type and a name; anywhere else it is an identifier.
+.PP
+.nf
+    extern type NAME = "KIND"
+    extern fn NAME(PARAMETERS) -> TYPE = "OPERATION"
+    extern fn (RECEIVER: TYPE) NAME(PARAMETERS) -> TYPE = "OPERATION"
+    extern def PATH(PARAMETERS) -> TYPE = "OPERATION"
+.fi
+.PP
+Extern type declares a handle type: a nominal type with no fields, whose values, handles, only the host makes.
+KIND is the name the host knows the type by; without = "KIND" it is NAME.
+A kind is declared once in a workspace, and a second declaration of it is an error; other files import the type.
+A handle type takes no type parameters, and no variant can be declared for one.
+No literal or conversion makes a handle, and nothing reads its number.
+A handle is data: it is held in records and lists, tested with is and as, compared with == by its kind and number, and is part of a memoized call's key.
+Show and interpolation give <KIND N>, the kind and the number, which is not source.
+.PP
+Extern fn and extern def declare an operation: a function with a signature and no body, called as any function is, and a value of its function type.
+OPERATION is the name the host knows it by; without = "OPERATION" it is the function's own name, the last name of a def's path.
+The marker must be ->, since an operation is impure and is never memoized; a memoized function can call one.
+Parameters take defaults, and one can be a rest parameter or a context parameter.
+An operation has no body, no type parameters and no block parameter, is not a definition made with a definition type, and cannot be marked #[def_type].
+KIND and OPERATION are plain strings, not empty and without interpolation.
+.PP
+Each parameter, awaited deeply before the host is asked, and the declared result must be data.
+A function, a future written in the result, a secret, a Sandbox, a variant value or an enum without a data bound, at any depth, is an error.
+A call gives the host the operation's name and its arguments in parameter order, the receiver first, defaults filled in and the rest parameter as one list.
+The call's value is what the host returns, checked against the declared result as it arrives: a value of another type fails the call with "the result of operation OPERATION is not a TYPE".
+The host returns nothing for a result of {}.
+.PP
+A failure the host reports fails the call with the host's message and notes.
+An operation reports every error raised in it at the call of the operation, as a function with track_caller does.
+Recover, try and retry treat such a failure as any other.
+.PP
+The gcsl command is a host with no operations: under gcsl run and in the REPL, a call of an operation fails with "this host has no operation OPERATION".
+Gcsl check checks declarations and calls of operations for any host.
 .SH LIMITS
 Expression depth is limited to 10,000 syntax-tree levels, with additional parser recursion accounting.
 Runtime expressions, calls, and awaits share a nesting budget; tail calls are not eliminated.

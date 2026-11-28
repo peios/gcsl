@@ -83,6 +83,21 @@
 //! there could. A block marked `:` is pure, as a function is, and no jump
 //! leaves one (see [`parser`], [`check`] and [`eval`], each "Blocks").
 //!
+//! A file may declare what the *host* of the language gives it: an
+//! *operation*, `extern fn boot(profile: Profile) -> Vm = "vm.boot"`, a
+//! function with a signature and no body, whose calls carry its name and
+//! its arguments to the host and bring back a value of its declared
+//! result, checked as it arrives; and a *handle type*, `extern type Vm =
+//! "vm.machine"`, a nominal type whose values only the host makes, each
+//! its kind and a number. An operation is an impure function like any
+//! other, a method or a `def` too, and a handle is data like any other
+//! (see [`check`], "Host operations" and "Handle types"). Plain GCSL asks
+//! the run's effect context for an operation
+//! ([`eval::Effects::operation`]), which fails every one unless a host
+//! implements it; in graph mode an operation is an effect's node, which a
+//! host is given by [`workspace::Workspace::operation`] and answers (see
+//! [`eval`], "Host operations").
+//!
 //! [`run`] performs all of them on one file. A [`Session`] performs them on
 //! a sequence of inputs that share their variables, as the REPL needs. A
 //! [`workspace::Workspace`] performs them on the files of a directory tree,

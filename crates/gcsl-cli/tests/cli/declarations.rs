@@ -438,3 +438,143 @@ fn repl_keeps_def_types_across_lines() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+/// A program that declares what its host gives it, operations and a handle
+/// type, checks; run by `gcsl`, a host with no operations, the first one
+/// it calls fails where the program called it, once what it recovers from
+/// is recovered from.
+#[test]
+fn run_fails_an_operation_at_its_call() {
+    let file = "tests/fixtures/operations.gcsl";
+    let output = gcsl(&["check", file]);
+    assert_eq!(stderr(&output), "no problems in 1 file checked\n");
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", file]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: this host has no operation `vm.boot`\n\
+         \x20--> tests/fixtures/operations.gcsl:8:13\n\
+         \x20 |\n\
+         8 |     let m = boot(name)\n\
+         \x20 |             ^^^^^^^^^^\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let output = gcsl(&["fmt", "--check", file]);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// What an operation cannot take, and a variant declared for a handle
+/// type, rendered.
+#[test]
+fn run_renders_what_a_host_cannot_be_given() {
+    let output = gcsl(&["run", "tests/fixtures/operations_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: an operation's parameter must be data, found `fn(String | Future<String>) -> {} \
+         | Future<{}>`\n\
+         \x20--> tests/fixtures/operations_error.gcsl:2:24\n\
+         \x20 |\n\
+         2 | extern fn watch(m: Vm, each: fn(String) -> {}) -> {}\n\
+         \x20 |                        ^^^^^^^^^^^^^^^^^^^^^^ this is fn(String | Future<String>) -> \
+         {} | Future<{}>\n\
+         \x20 |\n\
+         \x20 = note: the host is given plain data and handles: no function, future, secret or \
+         sandbox\n\
+         \n\
+         error: `Vm` is a handle type: only the host makes its values\n\
+         \x20--> tests/fixtures/operations_error.gcsl:3:10\n\
+         \x20 |\n\
+         1 | extern type Vm\n\
+         \x20 |             -- declared `extern` here\n\
+         2 | extern fn watch(m: Vm, each: fn(String) -> {}) -> {}\n\
+         3 | enum Vm::Fake<Int>\n\
+         \x20 |          ^^^^\n\
+         \x20 |\n\
+         \x20 = note: an operation of the host's gives a handle; no variant is declared for one\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// `--dump-ast` shows an operation as the function item it is, with
+/// `extern` and the name its host knows it by, and the body the parser
+/// gave it; `--dump-ir` the call of the built-in inside the test of what
+/// the host gives. No built-in's cell moves: the file's first slot is the
+/// one it was.
+#[test]
+fn dumps_show_operations() {
+    let file = "tests/fixtures/operations.gcsl";
+    let output = gcsl(&["run", file, "--dump-ast"]);
+    assert!(
+        stdout(&output).starts_with(
+            "(file\n\
+             \x20 (extern type Vm \"vm.machine\" @49..78)\n\
+             \x20 (extern \"vm.boot\" fn boot @80..141\n\
+             \x20   (fn @80..141\n\
+             \x20     (params (name String) (cpus Int\n\
+             \x20       (int 1 @121..122)))\n\
+             \x20     (ret impure Vm)\n\
+             \x20     (block @80..141\n\
+             \x20       (expr @80..141\n\
+             \x20         (call @80..141\n\
+             \x20           (operation @80..141)\n\
+             \x20           (str \"vm.boot\" @80..141)\n\
+             \x20           (list @80..141\n\
+             \x20             (name name @95..107)\n\
+             \x20             (name cpus @109..118)))))))\n\
+             \x20 (extern \"run\" fn method run @142..213\n"
+        ),
+        "{}",
+        stdout(&output)
+    );
+    let output = gcsl(&["run", file, "--dump-ir"]);
+    let shown = stdout(&output);
+    assert!(
+        shown.contains(
+            "fn #0 boot (frame 2, params 2, captures 0, height 7)\n\
+             \x20 (block @80..141\n\
+             \x20   (as enum <extern vm.machine> @80..141\n\
+             \x20     (call @80..141\n\
+             \x20       (builtin @80..141)\n\
+             \x20       (arg 0 @80..141\n\
+             \x20         (str \"vm.boot\" @80..141))\n"
+        ),
+        "{shown}"
+    );
+    let plain = gcsl(&["run", "tests/fixtures/functions.gcsl", "--dump-ir"]);
+    let first_store = |text: &str| -> String {
+        let line = text.lines().find(|line| line.contains("(store ")).unwrap();
+        let slot = line.split('#').nth(1).unwrap();
+        slot.split(' ').next().unwrap().to_owned()
+    };
+    assert_eq!(first_store(shown), first_store(stdout(&plain)));
+}
+
+/// The REPL: a line may declare a handle type or an operation, which later
+/// lines use; `extern` is a name anywhere else; and a call of an operation
+/// fails, the REPL being a host with none.
+#[test]
+fn repl_keeps_operations_across_lines() {
+    let output = repl(
+        "extern type Vm\n\
+         extern fn boot() -> Vm\n\
+         boot\n\
+         extern = 3\n\
+         extern + 1\n\
+         boot()\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "fn() -> Vm : fn() -> Vm\n{extern = 3} : {extern: Int}\n4 : Int\n"
+    );
+    assert_eq!(
+        stderr(&output),
+        "error: this host has no operation `boot`\n\
+         \x20--> <repl>:1:1\n\
+         \x20 |\n\
+         1 | boot()\n\
+         \x20 | ^^^^^^\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}

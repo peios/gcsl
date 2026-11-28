@@ -1051,3 +1051,16 @@ fn a_block_s_height_is_capped_as_a_call_s_depth_is() {
         }
     );
 }
+
+#[test]
+fn a_built_in_s_node_is_a_function_with_no_children() {
+    let mut builder = IrBuilder::with_capacity(1);
+    let kind = IrKind::Builtin(Builtin::Operation);
+    let node = builder.alloc(kind, Span::new(0, 6));
+    let ir = builder.finish(node, 0, Vec::new());
+    assert_eq!(ir.kind_of(node), ValueKind::Fn);
+    assert!(!kind.is_control());
+    assert!(ir.is_simple(node));
+    assert_eq!(kind.children(&[]).count(), 0);
+    assert_eq!(ir.pretty(&Names::new()).to_string(), "(builtin @0..6)");
+}

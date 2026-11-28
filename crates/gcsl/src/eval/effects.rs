@@ -3,7 +3,9 @@
 //! # Effects
 //!
 //! Every effect of a run goes through its [`Effects`], the host's: running
-//! a program, the file system's operations, and temporary directories.
+//! a program, the file system's operations, temporary directories, and the
+//! operations a program declares the host to have (see [Host
+//! operations](crate::eval::operations#host-operations)).
 //! GCSL's values hold paths as GCSL code names them, and so do the
 //! commands it runs, whose words and working directory are those paths;
 //! what GCSL itself does to the file system, reading, writing, copying and
@@ -19,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::TempDirs;
+use super::plain::Plain;
 
 /// A failure a program caught, as its host is told of it
 /// ([`Effects::caught`]; see [Failure](crate::eval::failure#failure)).
@@ -32,6 +35,36 @@ pub struct CaughtFailure<'a> {
     /// Whether it was caught before, and raised again with `raise`: a host
     /// that reports each failure once reports only those that are not.
     pub again: bool,
+}
+
+/// Why a host did not perform an operation, as it tells the program
+/// ([`Effects::operation`]; see [Host
+/// operations](crate::eval::operations#host-operations)): the failure's
+/// message, which the call of the operation fails with, and its notes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperationFailure {
+    /// The message, without a trailing full stop, as a diagnostic's is.
+    pub message: String,
+    /// The notes, each a line shown under the message.
+    pub notes: Vec<String>,
+}
+
+impl OperationFailure {
+    /// A failure with the message `message` and no note.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// The failure with the note `note` added after its others.
+    #[must_use]
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
+    }
 }
 
 /// How a run's effects reach the system (see [Effects](#effects)).
@@ -130,6 +163,32 @@ pub trait Effects: std::fmt::Debug {
     /// program would otherwise absorb. By default, nothing.
     fn caught(&self, caught: &CaughtFailure<'_>) {
         let _ = caught;
+    }
+
+    /// Performs the host's operation `name`, which a program declared with
+    /// `extern fn` and called, given `args`, its arguments as plain data, in
+    /// parameter order, a method's receiver first, the call's defaults
+    /// among them (see [Host
+    /// operations](crate::eval::operations#host-operations)): what it gives
+    /// back, as plain data, which the call then checks against the
+    /// operation's declared result. A handle among the arguments is read
+    /// with [`Plain::as_handle`], and one given back is made with
+    /// [`Plain::handle`]; an operation declared to give `{}` is answered
+    /// with [`Plain::Empty`]. By default the host has no operations, and
+    /// every one fails: "this host has no operation `vm.boot`". Only plain
+    /// GCSL asks here: in graph mode an operation is an effect's node,
+    /// which the host answers (see
+    /// [`Workspace::operation`](crate::workspace::Workspace::operation)).
+    ///
+    /// # Errors
+    ///
+    /// Why the operation failed, which the program's call of it fails
+    /// with, at the call.
+    fn operation(&self, name: &str, args: &[Plain]) -> Result<Plain, OperationFailure> {
+        let _ = args;
+        Err(OperationFailure::new(format!(
+            "this host has no operation `{name}`"
+        )))
     }
 
     /// The path of the host's file system that `path`, an absolute path as

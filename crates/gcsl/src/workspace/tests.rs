@@ -315,6 +315,7 @@ mod memo;
 mod merging;
 mod metas;
 mod needs;
+mod operations;
 mod profile;
 mod reach;
 mod shadowing;

@@ -858,6 +858,9 @@ impl Evaluator<'_> {
             (Builtin::FsWrite, Some((Value::Str(p), _)), Some(Value::Str(contents))) => {
                 write_file(&p, &contents, self.shared.effects, node)
             }
+            (Builtin::Operation, Some((Value::Str(name), _)), Some(Value::List(args))) => {
+                self.ask_host(&name, &args, node)
+            }
             (Builtin::FsTempDir, None, None) => self.temp_dir(node),
             (Builtin::WorkingDir, None, None) => self.working_dir_value(node),
             (_, Some((first, _)), second) if builtin.is_of_elements() => {
@@ -1051,6 +1054,7 @@ impl Evaluator<'_> {
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_function),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
             IrKind::LoadCallee => self.callee(node).map(Callee::Closure),
+            IrKind::Builtin(builtin) => Ok(Callee::Builtin(builtin)),
             IrKind::Tag { key, of, shown } => Ok(Callee::Tag(self.tag((key, of, shown)))),
             IrKind::ContextRead { .. }
             | IrKind::With { .. }

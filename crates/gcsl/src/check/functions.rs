@@ -871,6 +871,9 @@ impl Checker<'_> {
     /// records what it gives each position (see
     /// [`Checker::record_argument`]), and is not a use of it as a value.
     pub(super) fn check_call(&mut self, id: ExprId, callee: ExprId, args: ArgRange) -> TyId {
+        if self.ast.get(callee).kind == ExprKind::Operation {
+            return self.check_operation_call(id, callee, args);
+        }
         if let ExprKind::Field {
             expr: receiver,
             name,

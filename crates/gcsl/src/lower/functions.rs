@@ -45,6 +45,11 @@ impl Lowerer<'_> {
                 message: "a `lazy` typed as something other than a future",
                 span: expr.span,
             }),
+            (ExprKind::Call { callee, args }, _)
+                if self.ast.get(callee).kind == ExprKind::Operation =>
+            {
+                self.lower_operation(id, args, kind)
+            }
             (ExprKind::Call { callee, args }, _) => match self.resolution.expr_var(callee) {
                 VarRef::Builtin(builtin) => self.lower_builtin(id, builtin, args, kind),
                 // `fileroot.helper()`, which takes no argument, is its own

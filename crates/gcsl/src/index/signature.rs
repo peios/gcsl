@@ -558,6 +558,47 @@ mod tests {
     }
 
     #[test]
+    fn an_operation_s_call_is_helped_as_any_function_s() {
+        let text = "w = 0\nextern type Vm\n# Boots a machine.\n\
+                    extern fn boot(name: String, cpus: Int = 1) -> Vm = \"vm.boot\"\n\
+                    # Runs a program.\n\
+                    extern fn (m: Vm) run(...argv: String) -> Int\n";
+        let boot = "fn boot(name: String, cpus: Int = 1) -> Vm";
+        let run = "fn run(m: Vm, ...argv: String) -> Int";
+        for (call, label, active, documentation) in [
+            ("r = boot(|\"a\")", boot, "name: String", "Boots a machine."),
+            (
+                "r = boot(\"a\", cpus = |2)",
+                boot,
+                "cpus: Int = 1",
+                "Boots a machine.",
+            ),
+            // A method's, the receiver its first parameter.
+            (
+                "r = boot(\"a\").run(\"x\", |\"y\")",
+                run,
+                "...argv: String",
+                "Runs a program.",
+            ),
+        ] {
+            let (found, at, documented) =
+                help(&format!("{text}{call}\n"), &[]).unwrap_or_else(|| panic!("{call}"));
+            assert_eq!(found, label, "{call}");
+            assert_eq!(at.as_deref(), Some(active), "{call}");
+            assert_eq!(documented.as_deref(), Some(documentation), "{call}");
+        }
+        // In its own declaration there is no call: the body the parser
+        // gives an operation is written nowhere.
+        for declaration in [
+            "extern fn f(|x: Int, y: Int) -> Int\n",
+            "extern fn f(x: Int, y: Int = |1) -> Int\n",
+            "extern fn f(x: Int) -> Int = |\"g\"\n",
+        ] {
+            assert_eq!(help(declaration, &[]), None, "{declaration}");
+        }
+    }
+
+    #[test]
     fn every_positional_argument_from_a_rest_parameter_fills_it() {
         let text = "w = 0\ndef f(a: Int, ...more: String, end: Bool = true): Int { a }\n";
         let label = "def f(a: Int, ...more: String, end: Bool = true): Int";

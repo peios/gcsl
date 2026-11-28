@@ -139,6 +139,22 @@
 //! of it is a constant, and makes its file need nothing. The bounds and
 //! payloads are resolved before any file is checked (`check_enum_items`).
 //!
+//! # Handle types
+//!
+//! A handle type, `extern type Vm = "vm.machine"` (see the checker's [Handle
+//! types](crate::check::operations#handle-types)), is declared, seen,
+//! imported and qualified as an enum is, and differs in its key alone: the
+//! key of its kind ([`names::extern_key`]), with nothing of the file that
+//! declares it, since the host that makes its values knows the kind and no
+//! file. Two declarations of one kind would then be one type under two
+//! names, so the scan lets a kind be declared once (`define_types`): a
+//! second handle type of it, in the same file or in any other of the scan,
+//! is "handle kind `vm.machine` is declared twice", at the later's name,
+//! labelled "declared here" there and "first declared here" at the first,
+//! noted that a handle type is declared once and imported where it is used.
+//! A session's input that declares a kind an earlier input declared
+//! declares the same type again, as it declares any name again.
+//!
 //! # Context
 //!
 //! A context (see the checker's [Context](crate::check::context#context)) is in no
@@ -1011,6 +1027,23 @@ pub(super) fn type_conflict(
     Some(error)
 }
 
+/// The error for the handle type `later`, of the kind `kind`, which the
+/// handle type `first` declared before it: "handle kind `vm.machine` is
+/// declared twice", at the later's name, labelled at each (see [Handle
+/// types](#handle-types)).
+fn kind_twice(kind: &str, later: DeclaredType, first: DeclaredType) -> Diagnostic {
+    let error = Diagnostic::error(
+        format!("handle kind `{kind}` is declared twice"),
+        later.span,
+    )
+    .with_label("declared here")
+    .in_input(later.file);
+    context_in(error, first.file, first.span, "first declared here").with_note(
+        "two handle types of one kind would be one type under two names: declare a handle \
+         type once and import it where it is used",
+    )
+}
+
 /// Defines the scan's types and expands every file's (see [Types](#types)):
 /// copies each declaration's definition into the store, each name in it of
 /// another type, or qualified, as its file's view resolves it
@@ -1028,6 +1061,8 @@ pub(super) fn define_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
         .map(|index| scan.type_links(index))
         .collect();
     let base = scan.type_base;
+    // The handle type that first declared each kind, by its key.
+    let mut kinds: HashMap<Name, DeclaredType> = HashMap::new();
     for (at, decl) in (0u32..).zip(&scan.types) {
         let (Some(file), Some(links)) = (
             scan.files.get(decl.file as usize),
@@ -1039,9 +1074,22 @@ pub(super) fn define_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
             scan.type_store
                 .declare(base.saturating_add(at), (&file.ast, ty), links);
         } else {
-            let origin = scan.origin(decl.file);
-            let text = names::enum_key(scan.names.get(decl.name), &origin);
+            // A handle type's key is its kind's, whatever declares it (see
+            // [Handle types](#handle-types)).
+            let kind = file
+                .ast
+                .extern_type(decl.item)
+                .map(|handle| file.ast.strings().get(handle.kind));
+            let text = match kind {
+                Some(kind) => names::extern_key(kind),
+                None => names::enum_key(scan.names.get(decl.name), &scan.origin(decl.file)),
+            };
             let key = scan.names.intern(&text);
+            if let Some(kind) = kind
+                && let Some(first) = kinds.insert(key, *decl)
+            {
+                errors.push(kind_twice(kind, *decl, first));
+            }
             scan.type_store
                 .declare_enum(base.saturating_add(at), (key, decl.name), decl.span);
         }

@@ -212,6 +212,8 @@ impl Parser<'_> {
     ) -> ParseResult<(ItemId, u32)> {
         self.advance();
         self.advance();
+        self.external_named(name, name_span);
+        self.no_external_generics()?;
         let params = if self.peek().kind == TokenKind::Lt {
             Some(self.parse_type_params()?)
         } else {
@@ -297,6 +299,8 @@ impl Parser<'_> {
             ));
         };
         self.advance();
+        self.external_named(name, name_token.span);
+        self.no_external_generics()?;
         let params = if self.peek().kind == TokenKind::Lt {
             Some(self.parse_type_params()?)
         } else {
@@ -465,6 +469,9 @@ impl Parser<'_> {
         keyword: Token,
         receiver: Option<Param>,
     ) -> ParseResult<ExprId> {
+        // An operation's function is the first parsed once its own name is
+        // read (see [Host operations](crate::parser::externs#host-operations)).
+        let external = self.take_external();
         let open = self.expect_fn_paren()?;
         let base = self.param_stack.len();
         self.param_stack.extend(receiver);
@@ -496,6 +503,13 @@ impl Parser<'_> {
         let own: Vec<Param> = self.param_stack.drain(base..).collect();
         self.check_block_last(own.iter().map(|param| param.ty))?;
         let (effect, marker) = self.return_marker()?;
+        if external.is_some() {
+            self.operation_signature(&own, (effect == Effect::Impure, marker))?;
+        }
+        let reads: Vec<(Name, Span)> = match external {
+            Some(_) => own.iter().map(|param| (param.name, param.span)).collect(),
+            None => Vec::new(),
+        };
         if effect == Effect::Memo && own.last().is_some_and(|param| self.is_block_type(param.ty)) {
             return Err(
                 self.report(Diagnostic::error(MEMO_BLOCK, marker).with_note(MEMO_BLOCK_NOTE))
@@ -509,11 +523,19 @@ impl Parser<'_> {
             let span = Span::join(self.peek().span, self.peek_at(1).span);
             return Err(self.error(MISPLACED_META, span));
         }
-        let brace = self.peek();
-        if brace.kind != TokenKind::LBrace {
-            return Err(self.error("expected `{` to start the function body", error_span(brace)));
-        }
-        let body = self.parse_block()?;
+        let (body, operation) = if let Some(external) = external {
+            let end = self.type_span(ret);
+            let (body, names) = self.operation_body(keyword, external, &reads, end)?;
+            (body, Some(names))
+        } else {
+            let brace = self.peek();
+            if brace.kind != TokenKind::LBrace {
+                return Err(
+                    self.error("expected `{` to start the function body", error_span(brace))
+                );
+            }
+            (self.parse_block()?, None)
+        };
         let height = tallest.max(ret_height).max(self.height_of(body)) + 1;
         let span = Span::join(keyword.span, self.span_of(body));
         let id = self.builder.push_fn(FnDecl {
@@ -523,7 +545,11 @@ impl Parser<'_> {
             marker,
             body,
         });
-        self.alloc(ExprKind::Fn(id), span, height)
+        let value = self.alloc(ExprKind::Fn(id), span, height)?;
+        if let Some(names) = operation {
+            self.record_operation(value, names);
+        }
+        Ok(value)
     }
 
     /// The parameters `params` of a function expression of effect `effect`,

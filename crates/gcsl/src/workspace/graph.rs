@@ -42,6 +42,22 @@
 //! was charged is raised when the unit next runs, where it takes up, in
 //! place of the result it waited for, whether or not the host gave one
 //! (see [Charged time](crate::eval::machine::suspend#charged-time)).
+//!
+//! # Host operations
+//!
+//! A unit that calls an operation (see [Host
+//! operations](crate::eval::operations#host-operations)) stops at it, as
+//! at any effect: the node it is paused for is the operation's, and
+//! [`Workspace::operation`] gives what it asks, the operation's name, its
+//! arguments as plain data and where the program called it. The host
+//! performs it and gives the node a value made of plain data
+//! ([`Workspace::from_plain`], a handle from
+//! [`Plain::handle`](crate::eval::plain::Plain::handle)), or a failure,
+//! and runs the unit again. [`Workspace::operation`] is `None` for any
+//! other node, so a host that runs other effects itself asks it first and
+//! [`Workspace::effect_job`] otherwise; an operation's job, run under an
+//! effect context, asks that context
+//! ([`Effects::operation`](crate::eval::Effects::operation)).
 
 use std::mem;
 use std::rc::Rc;
@@ -50,8 +66,8 @@ use std::time::{Duration, Instant};
 use crate::diagnostic::{Diagnostic, Mark};
 use crate::eval::machine::{Needed, Suspended};
 use crate::eval::graph::{
-    EffectJob, Graph, GraphHost, GraphRun, NodeId, NodeKind, RunExtras, STEP_UNITS, StepCall,
-    StepReads, run_step_call,
+    EffectJob, Graph, GraphHost, GraphRun, NodeId, NodeKind, Operation, RunExtras, STEP_UNITS,
+    StepCall, StepReads, run_step_call,
 };
 use crate::ir::Ir;
 use crate::source::Span;
@@ -255,6 +271,21 @@ impl Workspace {
             .map(|value| self.to_plain(value))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(EffectJob::new(builtin, args, node.span()))
+    }
+
+    /// What the node `id` of `graph` asks of the host, if it is the node of
+    /// an operation, a call of a function a program declared with `extern
+    /// fn` (see [Host operations](crate::eval::operations#host-operations)):
+    /// the operation's name, its arguments as plain data and where it was
+    /// called. The host performs it and gives the node its result
+    /// ([`Graph::resolve`], [`Workspace::from_plain`]), or its failure.
+    /// `None` for any other node, and for one `graph` lacks. An operation's
+    /// node is an effect's like any other, so [`Workspace::effect_job`]
+    /// gives its job too, which run under an effect context asks that
+    /// context ([`Effects::operation`](crate::eval::Effects::operation)).
+    #[must_use]
+    pub fn operation(&self, graph: &Graph, id: NodeId) -> Option<Operation> {
+        Operation::of(graph.node(id)?, |value| self.to_plain(value))
     }
 
     /// Prepares the invocation of the definition of path `path` of the

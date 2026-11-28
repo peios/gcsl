@@ -240,7 +240,13 @@
 //! value, of any kind, in the `Await` the checker marked it for, as an
 //! interpolated expression is. A call of an ordinary built-in
 //! function (`int`, `float`) is a `Call` of its callee, a read of its cell,
-//! as a call of any function value is. A member of the `fileroot` module,
+//! as a call of any function value is. The call that is the body of an
+//! operation, whose callee is an [`ExprKind::Operation`], lowers to a
+//! `Call` of a `Builtin` node, which yields the built-in that asks the
+//! host, with the operation's name and a `MakeList` of its parameters'
+//! reads, inside an `As` of the test the checker planned of the declared
+//! result (`Lowerer::lower_operation`; see [`crate::ir`], "Host
+//! operations"). A member of the `fileroot` module,
 //! which the checker resolved to [`VarRef::Fileroot`], lowers to a node of
 //! its own, never reading the module: `fileroot.this` and
 //! `fileroot.workspace` to a `StrConst` of the file's place as the checker
@@ -986,8 +992,7 @@ impl Lowerer<'_> {
     /// Lowers expression `id`, of kind `kind`, as it is, without any await
     /// the checker marked it for.
     fn lower_plain(&mut self, id: ExprId, kind: ValueKind) -> Result<IrId, InternalError> {
-        let expr = *self.ast.get(id);
-        let span = expr.span;
+        let (expr, span) = (*self.ast.get(id), self.ast.get(id).span);
         let lowered = match (expr.kind, kind) {
             (ExprKind::Paren(inner) | ExprKind::Ascribe { expr: inner, .. }, _) => {
                 return self.lower_operand(inner, kind);
@@ -1084,7 +1089,8 @@ impl Lowerer<'_> {
                 | ExprKind::Size(_)
                 | ExprKind::Bool(_)
                 | ExprKind::Str(_)
-                | ExprKind::Interp(_),
+                | ExprKind::Interp(_)
+                | ExprKind::Operation,
                 _,
             ) => return Err(mistyped(expr.kind, kind, span)),
         };

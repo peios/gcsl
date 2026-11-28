@@ -186,6 +186,7 @@ mod lists;
 mod loops;
 mod memoised;
 mod mutation;
+mod operations;
 mod records;
 mod scalars;
 mod secrets;

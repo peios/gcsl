@@ -870,6 +870,7 @@ pub(super) fn visit_lets(ast: &Ast, id: ExprId, out: &mut Vec<ItemId>) {
         | ExprKind::Variant { .. }
         | ExprKind::DefTypeRef(_)
         | ExprKind::ContextRead(_)
+        | ExprKind::Operation
         | ExprKind::Error => {}
     }
 }

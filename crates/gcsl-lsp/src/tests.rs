@@ -1178,6 +1178,63 @@ fn a_lone_file_is_indexed() {
     client.shut_down().unwrap();
 }
 
+#[test]
+fn extern_items_are_answered_for() {
+    let scratch = Scratch::workspace("extern", "");
+    let text = "x = 1\n# A machine of the host's.\nextern type Vm = \"vm.machine\"\n\
+                # Boots a machine.\nextern fn boot(name: String) -> Vm = \"vm.boot\"\n\
+                extern fn halt(m: Vm) -> {}\nm = boot(\"a\")\n";
+    let uri = scratch.write("app.gcsl", text);
+    let (mut client, _) = Client::start(&["utf-8"]);
+    client.open(&uri, text);
+    assert!(client.published(&uri).diagnostics.is_empty());
+    // An operation's call: its declaration, with the name its host knows.
+    let hover = client.hover(&uri, (6, 5));
+    let shown = hover["contents"]["value"].as_str().unwrap();
+    assert!(
+        shown.contains("extern fn boot(name: String | Future<String>) -> Vm = \"vm.boot\""),
+        "{shown}"
+    );
+    assert!(shown.contains("Boots a machine."), "{shown}");
+    let definition = client.definition(&uri, (6, 5));
+    assert_eq!(as_range(&definition["range"]), range((4, 10), (4, 14)));
+    // A handle type, where it is used.
+    let hover = client.hover(&uri, (5, 18));
+    let shown = hover["contents"]["value"].as_str().unwrap();
+    assert!(shown.contains("extern type Vm = \"vm.machine\""), "{shown}");
+    assert!(shown.contains("A machine of the host's."), "{shown}");
+    let definition = client.definition(&uri, (5, 18));
+    assert_eq!(as_range(&definition["range"]), range((2, 12), (2, 14)));
+    // A name the host knows an operation by is not renamed.
+    let position = json!({ "line": 5, "character": 10 });
+    let params = json!({ "textDocument": { "uri": uri }, "position": position });
+    let error = client
+        .request("textDocument/prepareRename", params)
+        .response_result
+        .unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("the host knows this operation by its name, `halt`"),
+        "{}",
+        error.message
+    );
+    // What an operation cannot be is published as it is typed.
+    client.change(&uri, 2, ((5, 27), (5, 27)), " { 1 }");
+    let published = client.published_at(&uri, 2);
+    let messages: Vec<&str> = published
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0].starts_with("an operation has no body"),
+        "{messages:?}"
+    );
+    client.shut_down().unwrap();
+}
+
 /// The `(uri, range)` of each location of `value`, a `Location[]`.
 fn locations(value: &Value) -> Vec<(String, Range)> {
     let locations: Vec<lsp_types::Location> = serde_json::from_value(value.clone()).unwrap();

@@ -254,6 +254,15 @@ pub enum Builtin {
     /// is special: `T` covers every field of `r`'s type, named or not (see
     /// [Entries of a record](crate::check::entries#entries-of-a-record)).
     Entries,
+    /// `operation(name: String, arguments: List<*>)`: asks the host of the
+    /// language for its operation `name`, given `arguments`, and yields
+    /// what the host gives back (see [Host
+    /// operations](crate::check::operations#host-operations)). Impure. It
+    /// is no member of `builtins` and is not among [`Builtin::ALL`]: it has
+    /// no cell and no name a program can write, and is called only by the
+    /// body the parser gives an `extern` function. Its typing is special:
+    /// its result's type is the one that function declares.
+    Operation,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -274,9 +283,10 @@ pub enum Typing {
 }
 
 impl Builtin {
-    /// Every built-in function, in the order of the `builtins` module, which
+    /// Every built-in function of the `builtins` module, in its order, which
     /// is also the order of their cells, the first slots of a workspace's
-    /// frame (see [`crate::workspace`]).
+    /// frame (see [`crate::workspace`]): every one but
+    /// [`Builtin::Operation`], which is no member of the module.
     pub const ALL: [Builtin; 61] = [
         Builtin::Len,
         Builtin::Int,
@@ -428,6 +438,7 @@ impl Builtin {
             Builtin::Contains => "contains",
             Builtin::ListUnique => "list_unique",
             Builtin::ListContains => "list_contains",
+            Builtin::Operation => "operation",
         }
     }
 
@@ -498,7 +509,8 @@ impl Builtin {
             | Builtin::SandboxDir
             | Builtin::Contains
             | Builtin::ListUnique
-            | Builtin::ListContains => None,
+            | Builtin::ListContains
+            | Builtin::Operation => None,
         }
     }
 
@@ -586,6 +598,7 @@ impl Builtin {
             Builtin::FsWrite => &["p", "contents"],
             Builtin::SortVersions => &["vs"],
             Builtin::Show => &["value"],
+            Builtin::Operation => &["name", "arguments"],
             Builtin::JsonDecode => &["text"],
             Builtin::VariantMatches | Builtin::VariantPayload => &["kind", "value"],
             Builtin::PartialMatches => &["partial", "full"],
@@ -600,7 +613,8 @@ impl Builtin {
     /// `fs_temp_dir` and `fs_write`, which touch the world; every other
     /// built-in function is pure, `panic` included, which ends the run as a
     /// division by zero does, `split`, whose empty separator does the same,
-    /// and `show`, which fails so on a `Float` with no literal.
+    /// and `show`, which fails so on a `Float` with no literal. A host's
+    /// operation is impure too, [`Builtin::Operation`].
     #[must_use]
     pub const fn effect(self) -> Effect {
         match self {
@@ -630,7 +644,8 @@ impl Builtin {
             | Builtin::FsComposeDir
             | Builtin::FsCompose
             | Builtin::DirSandbox
-            | Builtin::SandboxExec => Effect::Impure,
+            | Builtin::SandboxExec
+            | Builtin::Operation => Effect::Impure,
             Builtin::Len
             | Builtin::Int
             | Builtin::Float
@@ -676,7 +691,8 @@ impl Builtin {
             | Builtin::Show
             | Builtin::JsonDecode
             | Builtin::Record
-            | Builtin::Entries => Typing::Special,
+            | Builtin::Entries
+            | Builtin::Operation => Typing::Special,
             Builtin::Int
             | Builtin::Float
             | Builtin::Exec
@@ -749,6 +765,7 @@ impl Builtin {
             Builtin::JsonDecode => "builtin json_decode",
             Builtin::Record => "builtin record",
             Builtin::Entries => "builtin entries",
+            Builtin::Operation => "builtin operation",
             Builtin::Int => "fn(x: Float): Int",
             Builtin::Float => "fn(x: Int): Float",
             Builtin::Exec | Builtin::ExecLive => {
@@ -894,7 +911,11 @@ impl Builtin {
             }
             // TEMPORARY (alias rule): the opaque type, until a polymorphic one (see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/)).
-            Builtin::Len | Builtin::Show | Builtin::JsonDecode | Builtin::Record => {
+            Builtin::Len
+            | Builtin::Show
+            | Builtin::JsonDecode
+            | Builtin::Record
+            | Builtin::Operation => {
                 return types.builtin(self);
             }
             // The fields of the entries it makes, which a program need not

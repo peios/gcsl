@@ -1867,6 +1867,8 @@ impl Walker<'_> {
             // A variant is a constant: it reads no declaration (see
             // [Types](#types)).
             | ExprKind::Variant { .. }
+            // The host's, which is no declaration's.
+            | ExprKind::Operation
             | ExprKind::Error => {}
             // A read of a context the file declares with a default may call
             // the default's function, a binding of the file: it mentions it

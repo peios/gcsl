@@ -95,6 +95,9 @@ fn body_item(ast: &Ast, id: ItemId, out: &mut String) {
                 ItemKind::Field { .. } => "def ",
                 _ => "fn ",
             };
+            if let Some(operation) = ast.extern_fn_of(id) {
+                return operation_item(ast, (keyword, path), operation, out);
+            }
             out.push_str(keyword);
             path_shape(ast, path, out);
             let mut function = String::new();
@@ -233,7 +236,39 @@ fn path_shape(ast: &Ast, path: PathRange, out: &mut String) {
 }
 
 /// Writes the item `id`, an enum or a variant, as it is written.
+/// An operation as written, its body, which the parser made, left out:
+/// `extern fn boot(profile: Profile) -> Vm = "vm.boot"`, its name always
+/// shown; a method by its binding, as any method is.
+fn operation_item(
+    ast: &Ast,
+    (keyword, path): (&str, PathRange),
+    operation: &crate::ast::ExternFn,
+    out: &mut String,
+) {
+    let mut function = String::new();
+    fn_shape(ast, operation.function, &mut function);
+    let signature = function.strip_prefix("fn").unwrap();
+    let signature = &signature[..signature.rfind(" {").unwrap()];
+    out.push_str("extern ");
+    out.push_str(keyword);
+    path_shape(ast, path, out);
+    write!(
+        out,
+        "{signature} = \"{}\"",
+        ast.strings().get(operation.name)
+    )
+    .unwrap();
+}
+
 fn enum_item(ast: &Ast, id: ItemId, out: &mut String) {
+    if let Some(handle) = ast.extern_type(id) {
+        let ItemKind::Enum { name, .. } = ast.item(id).kind else {
+            return;
+        };
+        let kind = ast.strings().get(handle.kind);
+        write!(out, "extern type {} = \"{kind}\"", ast.names().get(name)).unwrap();
+        return;
+    }
     let (written, ty) = match ast.item(id).kind {
         ItemKind::Enum { name, bound, .. } => {
             (format!("enum {} extensible", ast.names().get(name)), bound)
@@ -788,6 +823,7 @@ mod basics;
 mod blocks;
 mod conditions;
 mod extensions;
+mod externs;
 mod functions;
 mod imports;
 mod items;
