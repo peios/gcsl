@@ -194,7 +194,7 @@ The parameter can only be called: binding it, storing it, returning it or passin
 To pass a block on, call it in another call's trailing block, as in inner(x) { body() }.
 The body of a pure block is pure code, whatever the code around it is.
 A pure function takes only a pure block.
-A trailing block given to a block whose result type is {} can end with what a statement can be: a call of an impure or memoized function, whose value is discarded as a call statement's is, or a value that holds nothing but {}, as a loop's list does.
+A trailing block given to a block whose result type is {} can end with what a statement can be: a call of an impure or memoized function, whose value is discarded as a call statement's is, or a value that holds nothing but {}, as a loop's list does, or a loop whose body ends with such a call.
 A function body cannot end that way, but the body of a definition can, where its definition type's definitions return {}.
 Only the last parameter can be a block.
 A block parameter has no default, and is neither a rest parameter nor a method's receiver.
@@ -240,7 +240,9 @@ Supported loops include:
     do { BODY } for CONDITION
 .fi
 .PP
-A loop in value position collects body results; one in statement position discards them.
+A loop in value position collects body results.
+A loop of any form standing as a statement must collect nothing that matters: its body's value must be {}, or its body must end with a call of an impure or memoized function, or with a loop that does, outside a pure function; that call is awaited deeply each time, and its value and the loop's list are discarded, as in for i in 0..3 { m.run("x") }.
+A loop whose body ends with any other value, such as for i in 0..3 { i * 2 }, or that a break or continue with a value is for, is an unused value when it stands as a statement.
 Break and continue can contribute a value before ending the loop or iteration.
 A plain header variable can be rebound by the header; use let mut when the body must update it.
 .PP
@@ -491,7 +493,7 @@ Parameter types and the result contract come from the definition type.
 After the names the definition type gives, a definition can declare parameters of its own, each NAME: TYPE = DEFAULT or NAME = DEFAULT, whose type is its default's, as in def test boots(m = machine(), retries = 3) { ... }.
 Each has a default, because the definition type calls the definition with none; the defaults are evaluated where the definition type calls it.
 A name alone after a parameter of the definition's own is an error.
-Where the definition type's definitions return {}, the body's last expression, if it is not {} itself, is a statement, as in a trailing block whose result type is {}: a call of an impure or memoized function, whose value is discarded, or a value that holds nothing but {}; any other value there is an unused value.
+Where the definition type's definitions return {}, the body's last expression, if it is not {} itself, is a statement, as in a trailing block whose result type is {}: a call of an impure or memoized function, whose value is discarded, a value that holds nothing but {}, or a loop whose body ends with such a call; any other value there is an unused value.
 Definitions occupy that type's namespace and do not bind an ordinary value of PATH.
 Declaration does not run the body.
 Definition paths support additional package-name characters and digit-starting segments after the first; ordinary identifiers retain their own rules.

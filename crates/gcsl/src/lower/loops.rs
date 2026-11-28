@@ -202,20 +202,25 @@ impl Lowerer<'_> {
 
     /// The `for` expression that the statement `value` is, through any
     /// parentheses, with its span, if its type is unit-like as it is, so
-    /// that nothing awaits it: its list would be dropped as soon as it was
-    /// built, so it is not built.
+    /// that nothing awaits it, or the checker found it collects nothing
+    /// (see its "A loop as a statement"): its list would be dropped as soon
+    /// as it was built, so it is not built.
     pub(super) fn discarded_for(&self, value: ExprId) -> Option<(ForId, Span)> {
-        if self.resolution.await_of(value) != AwaitMark::None
-            || !self.table.is_unit_like(self.expr_types.get(value))
-        {
+        if self.resolution.await_of(value) != AwaitMark::None {
             return None;
         }
+        let unit_like = self.table.is_unit_like(self.expr_types.get(value));
         let mut node = value;
         loop {
             let expr = self.ast.get(node);
             match expr.kind {
                 ExprKind::Paren(inner) => node = inner,
-                ExprKind::For(for_id) => return Some((for_id, expr.span)),
+                // One that collects nothing, its body ending with a call
+                // whose value it discards (see the checker's "A loop as a
+                // statement").
+                ExprKind::For(for_id) if unit_like || self.resolution.loop_of(for_id).discards => {
+                    return Some((for_id, expr.span));
+                }
                 _ => return None,
             }
         }

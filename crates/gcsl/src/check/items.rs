@@ -366,9 +366,66 @@ impl Checker<'_> {
             // In a pure function the call is an error already.
             self.measure_deep(value, ty);
             self.discarded.insert(value);
-        } else {
+        } else if !self.discards_loop(value) {
             self.unused_value(value, ty);
         }
+    }
+
+    /// Whether the statement `value`, whose value is no unit, is a loop
+    /// that collects nothing (see the loops' "A loop as a statement"): a
+    /// loop of any form, outside a pure function, that no `return'L` leaves
+    /// and no `break` or `continue` with a value is for, whose body is no
+    /// record block and ends with an expression, not a result written `=
+    /// EXPR`, that is a call of a function or built-in that is not pure, or
+    /// a loop that collects nothing by the same rule. That call is then
+    /// awaited deeply each time, as a call statement is, so that no effect
+    /// it defers is lost, and the loop is recorded for lowering as one that
+    /// collects nothing.
+    fn discards_loop(&mut self, value: ExprId) -> bool {
+        let mut node = value;
+        let for_id = loop {
+            match self.ast.get(node).kind {
+                ExprKind::Paren(inner) => node = inner,
+                ExprKind::For(for_id) => break for_id,
+                _ => return false,
+            }
+        };
+        let found = self
+            .loop_resolutions
+            .get(for_id.index())
+            .copied()
+            .unwrap_or_default();
+        if found.returned
+            || self.calls.valued_loops.contains(&for_id)
+            || self.pure_marker().is_some()
+        {
+            return false;
+        }
+        let ExprKind::Block { items, .. } = self.ast.get(self.ast.for_decl(for_id).body).kind
+        else {
+            return false;
+        };
+        if self.is_record_body(items) {
+            return false;
+        }
+        let Some(ItemKind::Expr(last)) = self
+            .ast
+            .items(items)
+            .last()
+            .map(|&item| self.ast.item(item).kind)
+        else {
+            return false;
+        };
+        if self.impure_calls.contains(&last) {
+            let last_ty = self.expr_types[last.index()];
+            self.measure_deep(last, last_ty);
+        } else if !self.discards_loop(last) {
+            return false;
+        }
+        if let Some(resolution) = self.loop_resolutions.get_mut(for_id.index()) {
+            resolution.discards = true;
+        }
+        true
     }
 
     /// Reports the statement `value`, of type `ty`, which is neither `{}`

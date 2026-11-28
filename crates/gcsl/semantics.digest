@@ -2,7 +2,7 @@
 # was last set or confirmed for (see tests/semantics.rs). Each line after
 # the digest says why it was written again without raising SEMANTICS.
 semantics 1
-digest 08848941a1b19d3ce09c5d5a495d385e3fd012f437b8b74458cf701987f802de
+digest ff09bf21f62d4d7cf544348409dc8d1fae4ae0b7c35f4d1d9a35b3320b50cb7d
 
 PEI-1775: recording of what a run used (functions, top-level cells, contexts), for tests only (cfg test or the coverage feature); what code means is unchanged.
 PEI-1786: block parameters, a new form: a trailing block where a function was expected was a check error, so what every program that checked means is unchanged.
@@ -12,3 +12,4 @@ PEI-1786: a parameter's type inferred from its default, a new form that was a sy
 PEI-1786: host operations and handles, new forms that were syntax errors; what every program that checked means is unchanged.
 PEI-1786: a host can ask whether plain data holds a handle, and a deferred call's inputs refuse one; no program that checked before handles existed can make one, so what every such program means is unchanged.
 PEI-1786: the body of a definition whose def-type's definitions return `{}` ends with a statement where its last expression is no `{}`, which was a check error; a last expression that is `{}` is its result as before, so what every program that checked means is unchanged.
+PEI-1789: a loop that stands as a statement collects nothing when its body ends with a call of an impure function, which was an unused-value error; every loop that checked before means what it meant.

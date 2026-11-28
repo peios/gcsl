@@ -102,6 +102,28 @@
 //! variable's slot as the after-items left it, and a closure made in the
 //! body copies it, so it captures that iteration's value.
 //!
+//! # A loop as a statement
+//!
+//! A loop is a list, and a list that a statement leaves unused is the
+//! error of any unused value (see the items' statements), unless it is
+//! unit-like, as the list of a body of `{}` is. A loop of any form that
+//! stands as a statement and would be that error collects nothing instead
+//! (`Checker::discards_loop`) if its body, no record block, ends with an
+//! expression, not a result written `= EXPR`, that could stand as a
+//! statement for its effects: a call of a function or built-in that is not
+//! pure, outside a pure function, or a loop that collects nothing by this
+//! rule. The call is awaited deeply each time, as a call statement is, so
+//! that nothing it defers is lost, and its value, and the loop's list, are
+//! discarded ([`LoopResolution::discards`](super::LoopResolution::discards)).
+//! So `for i in 0..3 { m.run("x") }` runs `m.run` three times and is
+//! `{}`, as a statement. A loop that a `return'L` leaves, or that a
+//! `break` or `continue` with a value is for, is not one: those values
+//! were written to be collected, and the loop stays an unused value. Any
+//! other body's value, `for i in 0..3 { i * 2 }`, is an unused value as
+//! ever, and a loop whose value is used collects as ever. The rule is
+//! asked only of a loop that would otherwise be the error, so nothing that
+//! checked before means anything else.
+//!
 //! # `break` and `continue`
 //!
 //! `break`, `continue`, each with an optional value and label, are items of a
@@ -380,6 +402,9 @@ impl Checker<'_> {
         let (values, broken, returns) = frame
             .map(|frame| (frame.values, frame.broken, frame.returns))
             .unwrap_or_default();
+        if !values.is_empty() {
+            self.calls.valued_loops.insert(for_id);
+        }
         let collected = self.element_type(id, (decl.body, body), values, element);
         // A loop with no condition ends only by a `break`.
         let endless = matches!(decl.head, ForHead::While { cond: None, .. }) && !broken;
