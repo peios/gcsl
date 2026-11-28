@@ -184,6 +184,32 @@
 //! `fn(Int) -> Int`, whose bare parameter is the either shape, but is one of
 //! `fn(Present<Int>) -> Int`. That is the contravariance above, nothing new.
 //!
+//! # Blocks
+//!
+//! A block type, [`TyKind::Block`], `block -> T` or `block: T`, is the type
+//! of a function's block parameter (see the checker's
+//! [Blocks](crate::check::blocks#blocks)): what a call of the block gives,
+//! and its [`Effect`], what its body may do, impure (`->`) or pure (`:`),
+//! never memoised. It is made by [`TypeTable::block`] and read by
+//! [`TypeTable::block_sig`], and is a type only of a parameter, the last of
+//! a function type's: `fn(name: String, body: block -> {}) -> {}`. What its
+//! bare result means is the checker's business, as a function's is: the
+//! either shape in an impure block and present in a pure one.
+//!
+//! A block is no value, so its type takes part in little. It is a subtype
+//! only of itself: two block types of one result and one effect are one
+//! id, and no others are related, so a function type with a block is a
+//! subtype of another only if their blocks are the same type, a pure block
+//! standing in for no impure one. It is not in the function lattice, has no
+//! equality ([`TypeTable::contains_fn`]) and no JSON form, and is
+//! laziness-present. Its value kind is a function's ([`ValueKind::Fn`]),
+//! since a block is called as a function is. A generic function's block
+//! may mention its type parameters in its result, which a call binds from
+//! the type of the trailing block's value ([`TypeTable::bind`]);
+//! [`TypeTable::substitute`] and [`TypeTable::settle`] rebuild it around
+//! its result. It is shown as it is written, `block -> Int` or `block:
+//! Int`, its result as any type is shown.
+//!
 //! # Generics
 //!
 //! A generic function's type, `fn<T>(x: T): T`, is a function type whose

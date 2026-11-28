@@ -41,7 +41,9 @@
 //! by an identifier followed by `:`, or just `TYPE`. A parameter type has no
 //! default: an `=` after one is "a default is written only in a function
 //! expression's parameters", at the `=` (see [Functions and
-//! calls](crate::parser::functions#functions-and-calls)).
+//! calls](crate::parser::functions#functions-and-calls)). The last
+//! parameter's type may be a block's, `block -> T` or `block: T`, which is
+//! a type nowhere else (see [Blocks](crate::parser::functions#blocks)).
 //!
 //! After its parameters, a function type may name the contexts it needs,
 //! each `^NAME`, the name directly after the `^`, as in `fn(String,

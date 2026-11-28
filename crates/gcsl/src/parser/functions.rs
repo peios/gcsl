@@ -87,6 +87,72 @@
 //! at the second, and a receiver with a default "a receiver takes no
 //! default", at the `=`.
 //!
+//! # Blocks
+//!
+//! A function's last parameter may be a *block* (see the checker's
+//! [Blocks](crate::check::blocks#blocks)): a parameter whose type is a
+//! block type, `block -> T` or `block: T`
+//! ([`TypeExprKind::Block`](crate::ast::TypeExprKind::Block),
+//! `Parser::parse_param_type`), which a call gives as its trailing block,
+//! `step("boot") { ... }`.
+//!
+//! ```text
+//! PARAM      = NAME ":" (BLOCK_TYPE | TYPE) ("=" EXPR)? | ...
+//! PARAM_TY   = (NAME ":")? (BLOCK_TYPE | TYPE)
+//! BLOCK_TYPE = "block" ("->" | ":") TYPE
+//! ```
+//!
+//! `block` is no keyword. It starts a block type only where a parameter's
+//! type is written, in the parameters of a function expression (a named
+//! `fn`'s, a `def`'s and a method's among them) and of a function type,
+//! and only directly followed by a marker (`Parser::starts_block_type`);
+//! anywhere else, and before anything else, it is the name it always was,
+//! a variable's, a parameter's (`fn f(block: Int)`) or a type's. The
+//! marker is a function's: `->` for a block whose body may do anything,
+//! `:` for one whose body is pure. The type after it is what a call of the
+//! block gives, a whole type, so that it takes a union that follows it, as
+//! a function's return type does, and nothing after it is "expected a
+//! type". The marker `->>` is "a block is not memoised", at the marker,
+//! noted that a block runs each time its function calls it.
+//!
+//! In a function type a parameter's name is read first, an identifier
+//! followed by `:`, so `fn(block: Int): Int` is the type of a function of
+//! a parameter named `block`, as it always was. A pure block there is
+//! written with a name, `fn(body: block: Int): Int`, and an impure one with
+//! a name or with none, `fn(block -> Int) -> Int`.
+//!
+//! A block is its function's last parameter and nothing else
+//! (`Parser::check_block_last`): one before another parameter is "a block
+//! is a function's last parameter", at its type, noted that a call gives
+//! the block after its other arguments, so that a function takes one block
+//! at most. A rest parameter whose type is a block's is "a rest parameter
+//! is not a block", at the type; an `=` after a block parameter is "a block
+//! parameter has no default", at the `=`, noted that every call gives the
+//! block; and a method's receiver of a block type is "a method's receiver
+//! is not a block", at the type. A function with a block that is marked
+//! `->>`, and a function type so marked, is "a memoised function cannot
+//! take a block", at the function's marker, noted that a memoised call is
+//! found by its arguments, which a block is none of. A function type's
+//! needs come after its parameters still, the block among them, `fn(block
+//! -> Int, ^arch) -> Int`.
+//!
+//! A block type is written nowhere else. As an annotation's type, a
+//! field's, a return type or a type argument, and in parentheses, `block`
+//! is a type's name and the marker after it whatever follows a type there:
+//! "expected `=` after variable name" after a `let`'s annotation, "expected
+//! `{` to start the function body" after a return type. That a pure
+//! function takes no impure block, and what its body may do with the
+//! block, is the checker's.
+//!
+//! A call gives a block as it gives any trailing block (see [Functions and
+//! calls](#functions-and-calls)): the parser does not know which callees
+//! take one, so the trailing block is the call's last argument
+//! ([`ArgKind::Trailing`]), an ordinary block, which the checker makes the
+//! block's body. No program that parsed had `block` and a marker where a
+//! function expression's parameter's type is written, and a function
+//! type's parameter named `block` is read as it was, so every one parses
+//! as it did.
+//!
 //! # Futures
 //!
 //! `lazy EXPR` is a prefix expression that takes the longest expression it

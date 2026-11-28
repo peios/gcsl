@@ -48,6 +48,28 @@
 //! arguments, as if every one had been written, and a memoised function's key
 //! is the same either way.
 //!
+//! A trailing block that fills its callee's block parameter (see the
+//! checker's [Blocks](crate::check::blocks#blocks),
+//! [`Resolution::is_block_arg`](crate::check::Resolution::is_block_arg)) is
+//! the `Arg` of that parameter with an
+//! [`ArgValue::Block`](crate::ir::ArgValue::Block) of its body, the block
+//! lowered where it is written, in its caller's function, with the
+//! caller's slots, loops and catches: so its body reads and stores the
+//! caller's variables as any block of the caller does, and is no function
+//! of its own. It is not a value the call evaluates before its callee
+//! runs, so it is left out of what an unreached call's operands are. Where
+//! the checker made the block's last expression a statement, an impure
+//! call that ends a block whose result is `{}`, that expression is an item
+//! of the `Block`, its value dropped as a discarded call's is, and the
+//! `Block`'s result is `Empty`. A call of a block parameter
+//! ([`Resolution::is_block_call`](crate::check::Resolution::is_block_call))
+//! lowers to a `CallBlock` of the read of the parameter, of the kind of
+//! the block's result, awaited where the checker marked it as any call is.
+//! Since the block it runs may assign the variables of the frame that gave
+//! it, a `CallBlock` makes every `for` whose guard or body it is being
+//! lowered in not forkable (`Lowerer::calls_block`), as an assignment
+//! outside the iteration does.
+//!
 //! A declaration a later one shadows (see [`crate::mentions`], "Shadowed
 //! declarations") lowers to nothing and is in no record: it is never run.
 //! Its function expressions and `lazy`s are never made, but the function
@@ -390,10 +412,11 @@
 //! [`crate::check::Resolution::test_of`]).
 //!
 //! Once every node is built, one post-pass computes what the evaluator's
-//! nesting budget needs (see [`crate::MAX_DEPTH`]): each `Call`'s and each
-//! `Await`'s depth in the body of its frame, the body node being at depth 0,
-//! and each function's body height, the number of nodes on its longest path
-//! to a leaf. It walks the root and then each function's body, depth first
+//! nesting budget needs (see [`crate::MAX_DEPTH`]): each `Call`'s, each
+//! `CallBlock`'s and each `Await`'s depth in the body of its frame, the body
+//! node being at depth 0, and each function's body height, the number of
+//! nodes on its longest path to a leaf, and each block argument's body
+//! height likewise. It walks the root and then each function's body, depth first
 //! and iteratively, with an explicit stack, since a body can be `MAX_DEPTH`
 //! deep: a call or an await gets its depth on the way down, and every node
 //! its height, in one vector indexed by node, on the way up. A

@@ -9,7 +9,9 @@
 //! parent and no runtime value is ever inspected to choose an operation.
 //! `Evaluator::function` returns the closure of a function value. Each
 //! typed walker handles the nodes of its kind and also loads, captures,
-//! blocks, `if`s, field accesses, indexes, calls, awaits and `as`es, which
+//! blocks, `if`s, field accesses, indexes, calls, of functions and of the
+//! blocks given to them (see [Blocks](crate::eval::blocks#blocks)), awaits
+//! and `as`es, which
 //! can be of any kind, and `break`s and `continue`s, which yield none (see
 //! [Stops](crate::eval::loops#stops)): an `if` evaluates its condition through `bool` and
 //! then exactly one branch through the walker it was called with, and a

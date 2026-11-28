@@ -15,6 +15,16 @@
 //! split off from the loops, nodes and calls the child takes with it is
 //! the child's to wait for.
 //!
+//! What may be split off assigns nothing that what goes on reads: an
+//! iteration of a `for` that is forkable, a piece that is independent
+//! ([`crate::ir::Ir::is_independent`]). A call of a block (see
+//! [Blocks](crate::eval::blocks#blocks)) runs code of another frame, which
+//! may assign that frame's variables, so nothing that holds one is either:
+//! the iterations of a loop that calls its function's block run in order,
+//! and a piece that holds a call of a block is never split off. A call
+//! that gives a block is a piece like any other, split off or not by what
+//! its arguments and its block assign.
+//!
 //! The task running has its frames, activations and calls in the
 //! machine's fields, its value stack in the run's, and what the run shares
 //! that is a task's own in the run's [`Shared`], memo tables, graph run and
