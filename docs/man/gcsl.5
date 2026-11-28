@@ -432,7 +432,14 @@ Two of those directories defining one name is an error at the import; finding no
 For a definition type whose definitions are made with a variant, import DT::V * from PATH imports those made with the variant V, and import DT::* from PATH those made with any; import DT * from PATH is then an error, as is a variant for a definition type that takes none.
 A definition's path in place of the *, as in import build greet from app/greet or import Toolchain::C gcc from lib/tools, imports that one definition and no other; finding it nowhere PATH names is an error.
 A file and directory with the same module name are ambiguous.
+A file's module name is its path without the last extension of its name, so a host's file such as tests/boot.prvm is imported as tests/boot, as a .gcsl file is; two files of one directory that differ only by extension are an error.
 A file outside any workspace can import standard modules only.
+.PP
+A host that embeds GCSL can give any file a library as a prelude of its own.
+That file is checked as if, after the standard prelude's import, it began with #[shadowable] import * from "LIBRARY", written nowhere: the library's names shadow the standard prelude's, and the file's own declarations and imports, and those of directories above it, shadow both.
+#![no_prelude] turns both off.
+A prelude library the host did not supply is one error at the start of the file.
+The gcsl tools give a host's files their host's prelude by their extension; see gcsl(1), HOSTS.
 Hidden names, symbolic-link directories, and nested workspace trees are excluded from workspace discovery.
 .PP
 Files are checked and run in dependency order, with path order breaking ties.

@@ -18,12 +18,27 @@ You need the following:
 
 ## Connect the server
 
-1. Associate files ending in `.gcsl` with a GCSL language entry in your
-   editor.
+1. Associate files ending in `.gcsl`, `.pekit`, and `.prvm` with a GCSL
+   language entry in your editor. pekit's build files and Provium's tests
+   are GCSL with a prelude of their own.
 2. Set the server command to `gcsl` and its argument list to `["lsp"]`.
    Use standard input and standard output for transport.
 3. Open a GCSL file. For a multifile project, open the workspace directory
    so the editor can supply file changes and watch notifications.
+
+## Add a third-party host's files
+
+A host other than pekit and Provium can give its own files a prelude, and
+the server checks them once the host is installed (see [Giving Your Files
+a Prelude](~gcsl/giving-a-prelude)). Your editor still needs to send them
+to the server:
+
+1. Run `gcsl hosts` in the workspace to list the installed hosts and the
+   extension of each.
+2. Add the extension to your editor's GCSL file association.
+
+The server takes a file's host from its extension, and watches the host
+directories, so it rechecks when a host writes a new prelude.
 
 ## Check the result
 
