@@ -294,7 +294,7 @@ pub(super) fn reserved(scan: &Scan, library: Library, errors: &mut Vec<Diagnosti
         let name = if file.path.contains('/') {
             first
         } else {
-            first.strip_suffix(".gcsl").unwrap_or(first)
+            super::imports::module_path(first)
         };
         let message = if name == BUILTINS || name == Fileroot::MODULE {
             format!("`{name}` is the name of a built-in module")
@@ -457,6 +457,15 @@ pub(super) fn parse(source: &SourceFile, names: &mut Names) -> Parsed {
     // declarations").
     if ast.no_prelude().is_none() {
         ast.add_implicit_import(names.intern(PRELUDE));
+    }
+    // And, after it, that of the prelude its host gave it (see [Given
+    // preludes](crate::workspace#given-preludes)).
+    if let Some(library) = source.prelude() {
+        let path: Vec<Name> = std::iter::once(LIBRARIES)
+            .chain(library.split('/'))
+            .map(|segment| names.intern(segment))
+            .collect();
+        ast.add_given_import(&path);
     }
     (ast, spelled, errors)
 }

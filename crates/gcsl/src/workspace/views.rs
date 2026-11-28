@@ -638,7 +638,8 @@ pub(super) fn conflict_root(nodes: &[ViewNode], parent: u32, name: Name) -> Name
 
 /// A place in the static order of the declarations and imports reaching a
 /// file's view (see the module documentation, "Shadowable declarations"),
-/// as a key: the implicit prelude's roots `(0, 0, 0)`; then a directory
+/// as a key: the implicit prelude's roots `(0, 0, 0)`, and a given
+/// prelude's `(0, 0, 1)`; then a directory
 /// above the file's own, `(1, its position in the chain from the root, 0)`;
 /// then a declaration of the file's own directory, or an import of the
 /// file, `(2, its file, its position among its file's items)`; then an
@@ -685,7 +686,10 @@ impl<'a> Order<'a> {
         if !part.chain {
             let at = part.source.saturating_sub(self.depth);
             let rank = match self.file.aliases.get(at as usize) {
-                Some(alias) if alias.implicit => (0, 0, 0),
+                Some(alias) if alias.implicit => {
+                    let given = alias.item.is_some() && alias.item == self.file.ast.given_import();
+                    (0, 0, u32::from(given))
+                }
                 Some(alias) if !alias.inherited => {
                     let position = alias.item.map_or(0, |item| self.position(item));
                     (2, self.index, position)

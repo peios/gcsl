@@ -190,8 +190,7 @@ pub(crate) fn index(source: &SourceFile, ast: &Ast, names: &mut Names, path: &st
             identity,
         });
     }
-    let components = path
-        .trim_end_matches(".gcsl")
+    let components = super::module_path(path)
         .split('/')
         .filter(|part| !part.is_empty() && !part.starts_with('<'))
         .map(|part| names.intern(part))

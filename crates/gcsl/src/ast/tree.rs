@@ -79,6 +79,9 @@ pub struct Ast {
     /// The implicit `#[shadowable] import * from prelude`, if a workspace
     /// gave the file one.
     pub(super) implicit_import: Option<ItemId>,
+    /// The implicit `#[shadowable] import * from "LIBRARY"` of the prelude
+    /// the file's host gave it, if it gave one.
+    pub(super) given_import: Option<ItemId>,
     /// What the expansion of its types did to the tree.
     pub(super) expansion: Expansion,
     pub(super) root: ItemRange,
@@ -910,12 +913,12 @@ impl Ast {
     }
 
     /// Whether an item of the file's own is marked `#[shadowable]`, the
-    /// implicit import aside: without one, nothing of the file is shadowed.
+    /// implicit imports aside: without one, nothing of the file is shadowed.
     #[must_use]
     pub fn marks_any(&self) -> bool {
-        self.shadowable
-            .iter()
-            .any(|&marked| Some(marked) != self.implicit_import)
+        self.shadowable.iter().any(|&marked| {
+            Some(marked) != self.implicit_import && Some(marked) != self.given_import
+        })
     }
 
     /// Where the file's `#![no_prelude]` is written, if it is marked so.
@@ -966,19 +969,46 @@ impl Ast {
         if self.no_prelude.is_some() || self.implicit_import.is_some() {
             return;
         }
+        self.implicit_import = Some(self.add_hidden_import(&[prelude]));
+    }
+
+    /// The implicit `#[shadowable] import * from "LIBRARY"` of the prelude
+    /// the file's host gave it, if it gave one (see
+    /// [Attributes](crate::ast#attributes)).
+    #[must_use]
+    pub fn given_import(&self) -> Option<ItemId> {
+        self.given_import
+    }
+
+    /// Gives the file the implicit `#[shadowable] import * from "LIBRARY"`
+    /// of a prelude its host gave it, `path` being the names of the
+    /// library's module path, [`LIBRARIES`](crate::workspace::LIBRARIES)
+    /// first: an import item written nowhere and kept apart from the file's
+    /// body, as the prelude's is. Does nothing to a file marked
+    /// `#![no_prelude]` or given one already.
+    pub fn add_given_import(&mut self, path: &[Name]) {
+        if self.no_prelude.is_some() || self.given_import.is_some() || path.is_empty() {
+            return;
+        }
+        self.given_import = Some(self.add_hidden_import(path));
+    }
+
+    /// Adds an import item `#[shadowable] import * from PATH`, written
+    /// nowhere and in no block, `path` being its module path's names.
+    fn add_hidden_import(&mut self, path: &[Name]) -> ItemId {
         let nowhere = Span::new(0, 0);
         let path_start = next_id(self.paths.len());
-        self.paths.push(PathSegment {
-            kind: SegmentKind::Name(prelude),
+        self.paths.extend(path.iter().map(|&name| PathSegment {
+            kind: SegmentKind::Name(name),
             span: nowhere,
-        });
+        }));
         let members_start = next_id(self.import_members.len());
         self.import_members.push(ImportMember::All(nowhere));
         let import = ImportId(next_id(self.imports.len()));
         self.imports.push(ImportDecl {
             path: PathRange {
                 start: path_start,
-                len: 1,
+                len: next_id(path.len()),
             },
             form: ImportForm::Members(ImportMemberRange {
                 start: members_start,
@@ -992,9 +1022,9 @@ impl Ast {
             kind: ItemKind::Import(import),
             span: nowhere,
         });
-        self.implicit_import = Some(item);
         let at = self.shadowable.partition_point(|&marked| marked.0 < item.0);
         self.shadowable.insert(at, item);
+        item
     }
 
     /// Expands the tree's types, once (see [Types](crate::ast::typeexprs#types)). Every type

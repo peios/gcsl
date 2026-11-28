@@ -1108,7 +1108,7 @@ impl Index {
                 if let Some(stem) = standard_stem(path) {
                     (stem.to_owned(), format!("standard library `{stem}`"))
                 } else {
-                    let stem = path.strip_suffix(".gcsl").unwrap_or(path);
+                    let stem = crate::workspace::module_path(path);
                     (stem.replace('/', "."), format!("file `{path}`"))
                 }
             }

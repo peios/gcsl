@@ -457,7 +457,10 @@ pub struct Alias {
     pub whole: bool,
     /// Whether it is a root of the implicit `#[shadowable] import * from
     /// prelude`, first of all in the static order (see the module
-    /// documentation, "Shadowable declarations").
+    /// documentation, "Shadowable declarations"), or of the implicit import
+    /// of a prelude its host gave the file, next after it, whose `item` is
+    /// [`Ast::given_import`] (see the workspace's [Given
+    /// preludes](crate::workspace#given-preludes)).
     pub implicit: bool,
     /// Whether a session's input inherits it from an earlier input, which
     /// the input's declarations shadow and which clashes with nothing (see
