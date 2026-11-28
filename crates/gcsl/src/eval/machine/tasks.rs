@@ -142,7 +142,7 @@
 
 mod stuck;
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -281,9 +281,20 @@ pub(in crate::eval) struct Task {
     own: Own,
     /// What it is doing.
     pub(super) status: Status,
+    /// Its path ([`path_of`]), found the first time it is asked for: a
+    /// task set aside does not move, so its path stays what it was when it
+    /// was set aside, and a task is set aside anew each time.
+    path: OnceCell<Vec<u32>>,
 }
 
 impl Task {
+    /// Its path (see [Tasks](self#tasks)), found once while it is set
+    /// aside.
+    fn path(&self) -> &[u32] {
+        self.path
+            .get_or_init(|| path_of(&self.meta, &self.frames, &self.calls))
+    }
+
     /// Charges it `time` of the time it has been set aside: its deadlines
     /// are moved back by it, so that, moved on by the whole time once it
     /// runs, they have passed over what was charged (see [Charged
@@ -512,6 +523,8 @@ impl Machine<'_> {
         let mine = self.take_own();
         let theirs = std::mem::replace(&mut task.own, mine);
         self.put_own(theirs);
+        // Set aside now, where it is.
+        task.path = OnceCell::new();
         task
     }
 
@@ -615,14 +628,47 @@ impl Machine<'_> {
         waits
     }
 
-    /// Wakes every task that waits for its turn: a task has ended.
+    /// Wakes the tasks that wait for their turn and may have it now: a task
+    /// has ended.
     fn wake_turns_after_end(&mut self) {
-        for task in &mut self.tasks {
-            if let Status::Waiting(_) = task.status {
-                let Status::Waiting(resume) = std::mem::replace(&mut task.status, Status::Joining)
-                else {
-                    continue;
-                };
+        self.wake_turns_due(false);
+    }
+
+    /// Wakes the tasks set aside that wait for their turn and may have it
+    /// now, and with `overdue`, each whose deadline has passed by what it
+    /// was charged, to raise it. A task has its turn once no live task
+    /// earlier in program order holds every demanded run it holds (see
+    /// [Tasks](#tasks)), so of the tasks waiting for theirs, holding no
+    /// demanded run, only the earliest can have it: every later one has
+    /// that one before it. The earliest is woken, and each that holds a
+    /// demanded run, which may go before earlier tasks that hold none (see
+    /// [Across units](#across-units)); the others would only look and wait
+    /// again, which, for a loop of a thousand iterations waiting their turn,
+    /// is a look at every task by every task each time any task ends.
+    fn wake_turns_due(&mut self, overdue: bool) {
+        let mut earliest: Option<usize> = None;
+        let mut woken: Vec<usize> = Vec::new();
+        for (at, task) in self.tasks.iter().enumerate() {
+            if !matches!(task.status, Status::Waiting(_)) {
+                continue;
+            }
+            if (overdue && task.overdue())
+                || self.holds_demanded(&task.own.running, &task.own.futures)
+            {
+                woken.push(at);
+            } else if earliest
+                .and_then(|first| self.tasks.get(first))
+                .is_none_or(|first| task.path() < first.path())
+            {
+                earliest = Some(at);
+            }
+        }
+        woken.extend(earliest);
+        for at in woken {
+            let Some(task) = self.tasks.get_mut(at) else {
+                continue;
+            };
+            if let Status::Waiting(resume) = std::mem::replace(&mut task.status, Status::Joining) {
                 task.status = Status::Wake(resume);
             }
         }
@@ -674,11 +720,12 @@ impl Machine<'_> {
                 Status::Blocked(Wait::Node(id), resume) if waiting(id) && !overdue => {
                     Status::Blocked(Wait::Node(id), resume)
                 }
-                Status::Waiting(resume) | Status::Blocked(_, resume) => Status::Wake(resume),
+                Status::Blocked(_, resume) => Status::Wake(resume),
                 status => status,
             };
             task.status = woken;
         }
+        self.wake_turns_due(charged);
     }
 
     /// Ends the task running, which delivered what it came to: another that
@@ -855,7 +902,7 @@ impl Machine<'_> {
                 .iter()
                 .enumerate()
                 .filter(|(_, task)| matches!(task.status, Status::Again(_)))
-                .min_by_key(|(_, task)| path_of(&task.meta, &task.frames, &task.calls))
+                .min_by_key(|(_, task)| task.path())
                 .map(|(at, _)| at)
         })
     }
@@ -907,9 +954,9 @@ impl Machine<'_> {
         }
         let mine = self.path();
         let demanded = self.demanded_held();
-        self.tasks.iter().any(|task| {
-            holds(task, &demanded) && path_of(&task.meta, &task.frames, &task.calls) < mine
-        })
+        self.tasks
+            .iter()
+            .any(|task| holds(task, &demanded) && task.path() < mine.as_slice())
     }
 
     /// Whether a task other than the one running waits for the result of
@@ -1016,7 +1063,7 @@ impl Machine<'_> {
                 && let Some(run) = resume.waits_for()
                 && self.is_demanded(&run)
             {
-                waiting.push((path_of(&task.meta, &task.frames, &task.calls), target(&run)));
+                waiting.push((task.path().to_vec(), target(&run)));
             }
         }
         if let Some(Status::Sibling(resume)) = &self.status
@@ -1074,17 +1121,11 @@ impl Machine<'_> {
             || futures.iter().any(|future| future.is_demanded())
     }
 
-    /// Wakes every task set aside that waits for its turn, to look again: a
-    /// run it holds may have become demanded (see [Across
-    /// units](#across-units)).
+    /// Wakes the tasks set aside that wait for their turn and may have it
+    /// now, to look again: a run one holds may have become demanded (see
+    /// [Across units](#across-units)).
     fn wake_turns(&mut self) {
-        for task in &mut self.tasks {
-            let status = std::mem::replace(&mut task.status, Status::Joining);
-            task.status = match status {
-                Status::Waiting(resume) => Status::Wake(resume),
-                status => status,
-            };
-        }
+        self.wake_turns_due(false);
     }
 
     /// The demanded runs the task running holds (see [Across
@@ -1183,6 +1224,7 @@ impl Machine<'_> {
             stack,
             own,
             status,
+            path: OnceCell::new(),
         });
         self.most_tasks = self.most_tasks.max(self.tasks.len());
     }
