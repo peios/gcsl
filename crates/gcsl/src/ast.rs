@@ -194,6 +194,25 @@
 //! `--dump-types` is, shows it as the reference to the definition with a
 //! field access around it for each segment past it.
 //!
+//! # Host operations
+//!
+//! An `extern` item declares what a host of the language gives a program
+//! (see the parser's [Host operations](crate::parser::externs#host-operations)).
+//! Neither kind fits in a node, so each has a side table of the tree. A
+//! handle type, `extern type NAME = "KIND"`, is an [`ItemKind::Enum`] with no
+//! bound written, recorded as an [`ExternType`] with the text of its kind
+//! ([`Ast::extern_type`]). An operation, `extern fn NAME(PARAMS) -> RET =
+//! "OPERATION"`, is a named function item, a method or a `def` like any
+//! other, whose function is recorded as an [`ExternFn`] with the text of
+//! the operation's name ([`Ast::extern_fn`]). It has no body in the source,
+//! so the parser gives it one: a block whose one item is the call of an
+//! [`ExprKind::Operation`] with two arguments, the operation's name, a
+//! string literal, and a list literal of a read of each parameter, in
+//! order, a method's receiver first. Each of those nodes is written
+//! nowhere: a read of a parameter spans the parameter, and the others the
+//! whole declaration, so that every node lies within its parent's span as
+//! any does.
+//!
 //! # Attributes
 //!
 //! An item of a file's outermost block may be marked `#[shadowable]` or
@@ -911,6 +930,42 @@ pub struct MethodDecl {
     /// Whether it is declared with `def`, visible beyond its file, rather
     /// than with `fn`.
     pub public: bool,
+}
+
+/// An operation a file declares, `extern fn NAME(PARAMS) -> RET = "OPERATION"`
+/// (see [Host operations](#host-operations)): a function with no body in
+/// the source, whose calls a host answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternFn {
+    /// Its function, whose body the parser made.
+    pub function: FnId,
+    /// Where its `extern` is written.
+    pub keyword: Span,
+    /// Where the function's own name is written.
+    pub declared: Span,
+    /// The operation's name as the host knows it: the text written after
+    /// the `=`, or the function's own name.
+    pub name: StrId,
+    /// Where the operation's name is written, the string literal after the
+    /// `=`, if it is.
+    pub name_span: Option<Span>,
+}
+
+/// A handle type a file declares, `extern type NAME = "KIND"` (see [Host
+/// operations](#host-operations)): a nominal type whose values only a host
+/// makes. Its item is an [`ItemKind::Enum`] with no bound written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternType {
+    /// Its item.
+    pub item: ItemId,
+    /// Where its `extern` is written.
+    pub keyword: Span,
+    /// The kind's name as the host knows it: the text written after the
+    /// `=`, or the type's own name.
+    pub kind: StrId,
+    /// Where the kind's name is written, the string literal after the `=`,
+    /// if it is.
+    pub kind_span: Option<Span>,
 }
 
 /// A context a file declares, `context NAME: TYPE = DEFAULT` or `context
@@ -1682,6 +1737,11 @@ pub enum ExprKind {
     /// [Context](crate::parser::context#context)). The name ends the expression's
     /// span.
     ContextRead(Name),
+    /// What the body of an operation calls, written nowhere: the host,
+    /// given the operation's name and its arguments (see [Host
+    /// operations](#host-operations)). Only ever the callee of the call the
+    /// parser makes the body of an `extern` function of.
+    Operation,
     /// `BODY with { NAME = VALUE; ... }`, or `with { ... } { BODY }`: the
     /// body evaluated with the contexts the bindings name bound (see the
     /// parser's [Context](crate::parser::context#context)).
@@ -1785,6 +1845,7 @@ impl Expr {
             | ExprKind::For(_)
             | ExprKind::DefTypeRef(_)
             | ExprKind::ContextRead(_)
+            | ExprKind::Operation
             | ExprKind::With { .. }
             | ExprKind::Assert { .. }
             | ExprKind::Recover(_)

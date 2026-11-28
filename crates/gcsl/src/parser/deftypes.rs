@@ -205,6 +205,7 @@ impl Parser<'_> {
         };
         // `def Toolchain::C gcc`: a definition made with a variant.
         if self.peek_at(2).kind == TokenKind::ColonColon {
+            self.no_external_definition()?;
             self.advance();
             self.advance();
             return self.parse_variant_def(keyword, &[first]);
@@ -212,6 +213,7 @@ impl Parser<'_> {
         // A name on its line after a name, `def package x`: the definition
         // of `x` made with the def-type `package`.
         if self.is_name_after(name_token.span, self.peek_at(2)) {
+            self.no_external_definition()?;
             self.advance();
             self.advance();
             return self.parse_def_type_def(keyword, (&[first], None));
@@ -256,15 +258,26 @@ impl Parser<'_> {
                     let (_, span) = self.parse_position()?;
                     return Err(self.error(DEF_PATH, span));
                 }
-                TokenKind::ColonColon => return self.parse_variant_def(keyword, &segments),
+                TokenKind::ColonColon => {
+                    self.no_external_definition()?;
+                    return self.parse_variant_def(keyword, &segments);
+                }
                 _ => break,
             }
         }
         if let Some(last) = segments.last()
             && self.is_name_after(last.span, self.peek())
         {
+            self.no_external_definition()?;
             return self.parse_def_type_def(keyword, (&segments, None));
         }
+        // A dotted operation's own name is its path's last.
+        if let Some(last) = segments.last()
+            && let SegmentKind::Name(last_name) = last.kind
+        {
+            self.external_named(last_name, last.span);
+        }
+        self.no_external_generics()?;
         let value = self.parse_fn(keyword)?;
         let base = self.path.len();
         self.path.extend(segments);

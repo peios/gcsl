@@ -217,12 +217,15 @@ use super::{
 impl Checker<'_> {
     /// Checks what the file declares before its body is checked: its `type`
     /// items, quietly in a workspace, which has checked them first
-    /// ([`check_types`](super::check_types)), and the uses of attributes on its functions.
+    /// ([`check_types`](super::check_types)), and the uses of attributes on its functions,
+    /// its operations given theirs (see [Host
+    /// operations](crate::check::operations#host-operations)).
     pub(super) fn check_declarations(&mut self) {
         let quiet = std::mem::replace(&mut self.quiet.types, self.workspace.is_some());
         self.type_items();
         self.quiet.types = quiet;
         self.check_attribute_uses();
+        self.track_operations();
     }
 
     /// Whether `ty` holds only constants, as an attribute's arguments must

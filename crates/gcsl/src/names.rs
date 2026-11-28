@@ -51,6 +51,21 @@
 //! `#` before digits and a `.`, so it is no namespace key, and does not
 //! start `<method `, so it is no method's binding.
 //!
+//! # Handle keys
+//!
+//! A handle type, `extern type Vm = "vm.machine"` (see the checker's
+//! "Handle types"), is an enum whose values the host of the language makes,
+//! so its key is made of what the host knows it by, its *kind*, and of
+//! nothing of the file that declares it: [`extern_key`]'s,
+//! `<extern vm.machine>`. Every handle of a kind is of one variant, which
+//! no source declares, whose key is [`handle_key`]'s, `<handle
+//! vm.machine>`; so a host makes a handle from its kind and a number alone.
+//! A kind is any text but the empty one, and each key starts with a word
+//! and a space, which no path of a def-type holds, so neither is a
+//! namespace key, an enum's or a method's binding. A handle's variant is
+//! shown as its kind in angle brackets ([`handle_shown`]), which a value's
+//! display tells it by, since no declared variant is shown so.
+//!
 //! # Namespace keys
 //!
 //! The definitions made with a def-type (`def package x() { ... }`) are kept
@@ -361,6 +376,45 @@ pub fn key_context(text: &str) -> Option<&str> {
 #[must_use]
 pub fn enum_key(name: &str, origin: &str) -> String {
     format!("<enum {name}@{origin}>")
+}
+
+/// The text of the key of the handle type of the kind `kind`, which a host
+/// knows it by (see [Handle keys](#handle-keys)): `<extern vm.machine>`.
+#[must_use]
+pub fn extern_key(kind: &str) -> String {
+    format!("<extern {kind}>")
+}
+
+/// The text of the key of the one variant every handle of the kind `kind`
+/// is of (see [Handle keys](#handle-keys)): `<handle vm.machine>`.
+#[must_use]
+pub fn handle_key(kind: &str) -> String {
+    format!("<handle {kind}>")
+}
+
+/// The kind of the handle type whose key's text is `text`, if `text` is a
+/// handle type's key: `vm.machine` for `<extern vm.machine>` (see [Handle
+/// keys](#handle-keys)).
+#[must_use]
+pub fn extern_kind(text: &str) -> Option<&str> {
+    text.strip_prefix("<extern ")?.strip_suffix('>')
+}
+
+/// The kind of the handle whose variant's key's text is `text`, if `text`
+/// is a handle's: `vm.machine` for `<handle vm.machine>` (see [Handle
+/// keys](#handle-keys)).
+#[must_use]
+pub fn handle_kind(text: &str) -> Option<&str> {
+    text.strip_prefix("<handle ")?.strip_suffix('>')
+}
+
+/// How a handle of the kind `kind` is shown but for its number, as its
+/// variant's tag holds it: the kind in angle brackets, `<vm.machine>`, as
+/// no variant a program declares is shown, so that a value's display tells
+/// a handle (see [Handle keys](#handle-keys)).
+#[must_use]
+pub fn handle_shown(kind: &str) -> String {
+    format!("<{kind}>")
 }
 
 /// The text of the key of the variant `name` of the enum whose key's text is

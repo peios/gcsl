@@ -22,8 +22,9 @@
 //!   [`lists`], [`loops`] and [`narrowing`].
 //! - Functions and calls: [`functions`], [`calls`], [`methods`],
 //!   [`inference`], [`futures`] and [`attributes`].
-//! - The rest of the language: [`enums`], [`context`], [`failure`] and
-//!   [`secrets`].
+//! - The rest of the language: [`enums`], [`context`], [`failure`],
+//!   [`secrets`] and [`operations`], the operations and handle types a
+//!   host of the language gives a program.
 //!
 //! # Types
 //!
@@ -1465,6 +1466,11 @@ pub(crate) fn check_enum_bounds(
         let ItemKind::Enum { bound, .. } = ast.item(item).kind else {
             continue;
         };
+        // A handle's payload is the number its host chose.
+        if ast.extern_type(item).is_some() {
+            checker.types.set_enum_bound(key, Some(TyId::INT));
+            continue;
+        }
         let bound = bound
             .map(|bound| checker.resolve_type(bound, Bareness::Present))
             .filter(|&bound| bound != TyId::ERROR);
@@ -1534,6 +1540,13 @@ pub(crate) fn check_variant_payloads(
             continue;
         };
         let names = ast.names();
+        if crate::names::extern_kind(names.get(enum_key)).is_some() {
+            checker
+                .errors
+                .push(handle_variant(ast, enum_name, name_span));
+            checker.types.set_variant_payload(key, TyId::ERROR);
+            continue;
+        }
         let shown = format!("{}::{}", names.get(enum_name), names.get(name));
         if let Some(&(_, _, first)) = declared
             .iter()
@@ -1572,6 +1585,31 @@ pub(crate) fn check_variant_payloads(
         checker.types.set_variant_payload(key, ty);
     }
     checker.errors
+}
+
+/// The error for a variant declared, at `name_span`, for the handle type
+/// named `enum_name`, labelled at the handle type if `ast` declares it (see
+/// [Handle types](crate::check::operations#handle-types)).
+fn handle_variant(ast: &Ast, enum_name: Name, name_span: Span) -> Diagnostic {
+    let shown = ast.names().get(enum_name);
+    let error = Diagnostic::error(
+        format!("`{shown}` is a handle type: only the host makes its values"),
+        name_span,
+    )
+    .with_note("an operation of the host's gives a handle; no variant is declared for one");
+    let declared = ast
+        .extern_types()
+        .iter()
+        .find_map(|handle| match ast.item(handle.item).kind {
+            ItemKind::Enum {
+                name, name_span, ..
+            } if name == enum_name => Some(name_span),
+            _ => None,
+        });
+    match declared {
+        Some(at) => error.with_context(at, "declared `extern` here"),
+        None => error,
+    }
 }
 
 /// The names of the built-in types: those of [`BuiltinTypes`], and the
@@ -2602,8 +2640,11 @@ impl<'a> Checker<'a> {
             ExprKind::Index { expr: list, index } => self.check_index(id, list, index),
             ExprKind::For(for_id) => self.check_for(id, for_id, (None, None)),
             ExprKind::DefTypeRef(def) => self.check_def_type_ref(id, def),
-            // What the parser could not parse, reported already.
-            ExprKind::Error => TyId::ERROR,
+            // What the parser could not parse, reported already; and what
+            // an operation's body calls, only ever a call's callee, typed
+            // with its call (see [Host
+            // operations](crate::check::operations#host-operations)).
+            ExprKind::Error | ExprKind::Operation => TyId::ERROR,
             // What the parser kept of what it could not finish, reported
             // already: checked for what it is, silently.
             ExprKind::NoField(record) => {
@@ -2722,6 +2763,7 @@ impl<'a> Checker<'a> {
             | ExprKind::For(_)
             | ExprKind::DefTypeRef(_)
             | ExprKind::ContextRead(_)
+            | ExprKind::Operation
             | ExprKind::Assert { .. }
             | ExprKind::Try(_)
             | ExprKind::Error
@@ -3217,6 +3259,7 @@ pub(crate) mod mutation;
 pub(crate) mod names;
 pub(crate) mod narrowing;
 pub(crate) mod needs;
+pub(crate) mod operations;
 pub(crate) mod operators;
 pub(crate) mod records;
 pub(crate) mod resolution;

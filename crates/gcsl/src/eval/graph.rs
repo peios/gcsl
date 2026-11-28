@@ -16,10 +16,26 @@
 //!   where it uses the result, as it awaits any future;
 //! - an **effect**, a call of an effectful built-in, `exec` and its kin, the
 //!   file system's, `File.read`, `Dir.files`, `fs.compose_dir`,
-//!   `Dir.sandbox` and `Sandbox.exec` ([`effect_builtin`]), whose arguments
-//!   are evaluated and whose result, a present value, is needed at once.
-//!   `file` and `dir`, which only read the working directory, fixed for an
-//!   evaluation, are computed as ever.
+//!   `Dir.sandbox` and `Sandbox.exec`, and a host's operation, the call
+//!   that is the body of a function declared with `extern fn`
+//!   ([`effect_builtin`]), whose arguments are evaluated and whose result,
+//!   a present value, is needed at once. `file` and `dir`, which only read
+//!   the working directory, fixed for an evaluation, are computed as ever.
+//!
+//! An **operation**'s node ([`Builtin::Operation`]; see [Host
+//! operations](crate::eval::operations#host-operations)) is an effect's
+//! like any other: its arguments are the operation's name and the list of
+//! what the call gave, it is met in program order, one at a time in its
+//! unit unless the host isolates it, which no host does by default
+//! ([`Effects::isolates`](super::Effects::isolates)), and the unit stops at
+//! it until the host gives its result. A host reads what it asks as plain
+//! data ([`Operation`],
+//! [`Workspace::operation`](crate::workspace::Workspace::operation)), with
+//! where the program called the operation, which the machine notes as it
+//! meets the node ([`Node::called`]), and answers with a value or a
+//! failure ([`Graph::resolve`]). The failure is raised at the operation's
+//! call, with its message and notes, whatever place it names, and the
+//! value is tested against the operation's declared result there.
 //!
 //! So a unit performs no effect of its own. A unit runs on the machine
 //! (see [Suspension](crate::eval::machine#suspension)), and a node whose
@@ -112,6 +128,7 @@ use crate::CALL_LEVELS;
 
 use super::plain::{Plain, from_plain, to_plain};
 use super::calls::{moved_to, raised_in_tracked};
+use super::operations::operation_failure;
 use super::{Caller, Evaluator, Flow, MemoTables, Shared, internal};
 
 /// A node of an action graph, by its number (see [Graph mode](#graph-mode)).
@@ -202,6 +219,10 @@ pub struct Node {
     reported: Option<(u32, Span)>,
     /// The caller a deferred call gives its callee.
     caller: Caller,
+    /// For the node of an operation, where the call of the operation's
+    /// function is, if the machine knows: its input and its span (see
+    /// [Host operations](crate::eval::operations#host-operations)).
+    called: Option<(u32, Span)>,
     /// Where it is in its life.
     state: NodeState,
     /// A deferred call's future, which code awaits.
@@ -257,6 +278,18 @@ impl Node {
     #[must_use]
     pub fn input(&self) -> u32 {
         self.code.input()
+    }
+
+    /// For the node of an operation, where the program called the
+    /// operation: the input number of the file and the span of the call of
+    /// the operation's function, as far as the machine knows it, and
+    /// otherwise the operation's own declaration, where its body's call is
+    /// (see [Host operations](crate::eval::operations#host-operations)).
+    /// For any other node, where the call that made it is, as
+    /// [`Node::input`] and [`Node::span`] say.
+    #[must_use]
+    pub fn called(&self) -> (u32, Span) {
+        self.called.unwrap_or((self.code.input(), self.site.span))
     }
 
     /// Where it is in its life.
@@ -511,8 +544,9 @@ impl Graph {
 }
 
 /// Whether `builtin` is an effect in graph mode (see [Graph mode](#graph-mode)):
-/// every impure built-in but `file`, `dir` and `working_dir`, which only
-/// name a path, from where the code is or the host's working directory.
+/// every impure built-in, a host's operation among them, but `file`, `dir`
+/// and `working_dir`, which only name a path, from where the code is or the
+/// host's working directory.
 #[must_use]
 pub fn effect_builtin(builtin: Builtin) -> bool {
     builtin.effect() != crate::ast::Effect::Pure
@@ -565,6 +599,9 @@ pub(crate) struct GraphRun<'g> {
     /// Where the unit's own top-level slots begin, for a prepared call,
     /// whose slots others share; `None` for a file or a step.
     own: Option<usize>,
+    /// Where the call is of the operation whose node is met next, if the
+    /// machine knows (see [`GraphRun::calling`]).
+    called: Cell<Option<(u32, Span)>>,
 }
 
 /// What a run of a unit in graph mode keeps of itself while the unit is
@@ -635,6 +672,7 @@ impl<'g> GraphRun<'g> {
             texts: HashMap::new(),
             suspended: RefCell::new(None),
             own: None,
+            called: Cell::new(None),
         }
     }
 
@@ -648,6 +686,13 @@ impl<'g> GraphRun<'g> {
     /// Where the unit's own top-level slots begin, for a prepared call.
     pub(crate) const fn own(&self) -> Option<usize> {
         self.own
+    }
+
+    /// Notes where the call is of the operation whose node the run meets
+    /// next, its input and span, `None` if it is not known: what the node
+    /// keeps for the host ([`Node::called`]).
+    pub(crate) fn calling(&self, site: Option<(u32, Span)>) {
+        self.called.set(site);
     }
 
     /// Notes that the run stopped for `wait`, among what it waits for.
@@ -1065,6 +1110,7 @@ impl Evaluator<'_> {
                 code: Rc::clone(self.ir),
                 reported,
                 caller: made,
+                called: None,
                 state: NodeState::Waiting,
                 future: Some(Rc::new(future)),
             }
@@ -1098,6 +1144,7 @@ impl Evaluator<'_> {
         let Some(run) = self.shared.graph else {
             return Err(internal("an effect made a node outside graph mode", node.span).into());
         };
+        let called = run.called.take();
         let context = self.shared.context.borrow().clone();
         let mut key = Vec::new();
         key.push(2);
@@ -1125,6 +1172,7 @@ impl Evaluator<'_> {
                 code: Rc::clone(self.ir),
                 reported,
                 caller: self.caller,
+                called,
                 state: NodeState::Waiting,
                 future: None,
             }
@@ -1138,15 +1186,28 @@ impl Evaluator<'_> {
         let Some(run) = self.shared.graph else {
             return Err(internal("an effect made a node outside graph mode", node.span).into());
         };
-        let state = run.graph.borrow().node(id).map(|found| found.state.clone());
+        let found = run
+            .graph
+            .borrow()
+            .node(id)
+            .map(|found| (found.state.clone(), found.kind));
+        let Some((state, kind)) = found else {
+            return Err(internal("an effect's node is missing", node.span).into());
+        };
         match state {
-            Some(NodeState::Done(value)) => Ok(Some(value)),
-            Some(NodeState::Failed(error)) => Err(error.into()),
-            Some(NodeState::Waiting) => Ok(None),
-            None => Err(internal("an effect's node is missing", node.span).into()),
+            NodeState::Done(value) => Ok(Some(value)),
+            // A host knows no place in the program: an operation's failure
+            // is its call's.
+            NodeState::Failed(error) if kind == NodeKind::Effect(Builtin::Operation) => {
+                Err(operation_failure(error, node.span).into())
+            }
+            NodeState::Failed(error) => Err(error.into()),
+            NodeState::Waiting => Ok(None),
         }
     }
+}
 
+impl Evaluator<'_> {
     /// Enters, in graph mode, the scope of the memoised call or `lazy` body
     /// whose key is `parts` encoded, returning whether it did, so that the
     /// caller leaves it again (see [Graph mode](#graph-mode)).
@@ -1506,7 +1567,10 @@ impl EffectJob {
             .map(|plain| from_plain(plain, &mut names))
             .collect();
         let layout = crate::workspace::exec_layout(&mut names);
-        let shared = Shared::new(Some(&layout), &[], effects);
+        // An operation's answer is made a value in these names too.
+        let names = RefCell::new(names);
+        let mut shared = Shared::new(Some(&layout), &[], effects);
+        shared.names = Some(&names);
         if let Some(own) = deadline {
             shared.deadlines.borrow_mut().push(super::Deadline {
                 number: 1,
@@ -1530,7 +1594,62 @@ impl EffectJob {
             (&mut Vec::new(), &mut MemoTables::new()),
             &shared,
         )?;
-        to_plain(&value, &names).map_err(|message| Diagnostic::error(message, self.span))
+        to_plain(&value, &names.borrow()).map_err(|message| Diagnostic::error(message, self.span))
+    }
+}
+
+/// What the node of an operation asks of its host, as plain data (see
+/// [Host operations](crate::eval::operations#host-operations)): what
+/// [`Workspace::operation`](crate::workspace::Workspace::operation) gives
+/// of an effect's node whose built-in is [`Builtin::Operation`]. The host
+/// performs it and gives the node what it came to
+/// ([`Graph::resolve`]): a value made of plain data
+/// ([`Workspace::from_plain`](crate::workspace::Workspace::from_plain)),
+/// which the call then checks against the operation's declared result, or
+/// a failure, a diagnostic whose message and notes the call fails with, at
+/// the call, whatever place the diagnostic names.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct Operation {
+    /// The operation's name as the host knows it: what its declaration
+    /// gives after `=`, or the function's own name.
+    pub name: String,
+    /// Its arguments, in parameter order, a method's receiver first, the
+    /// defaults the call gave among them, a rest parameter's as one list. A
+    /// handle among them is read with [`Plain::as_handle`].
+    pub args: Vec<Plain>,
+    /// The input number of the file the call of the operation is written
+    /// in.
+    pub input: u32,
+    /// Where the call of the operation is written in that file: the call
+    /// of the operation's function, `m.read("/etc/hostname")`, as far as
+    /// the machine knows it, and otherwise the operation's declaration.
+    pub span: Span,
+}
+
+impl Operation {
+    /// What the node `node` asks, its arguments made plain by `plain`, if
+    /// it is an operation's.
+    pub(crate) fn of(node: &Node, plain: impl Fn(&Value) -> Result<Plain, String>) -> Option<Self> {
+        if node.kind != NodeKind::Effect(Builtin::Operation) {
+            return None;
+        }
+        let [Value::Str(name), Value::List(args)] = &*node.args else {
+            return None;
+        };
+        let args = args
+            .values()
+            .iter()
+            .map(plain)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let (input, span) = node.called();
+        Some(Self {
+            name: name.to_string(),
+            args,
+            input,
+            span,
+        })
     }
 }
 

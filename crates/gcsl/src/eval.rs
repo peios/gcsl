@@ -70,7 +70,7 @@ use kinds::{Extract, Taken, mixed};
 use unions::{other_fields, with_fields};
 use builtins::described;
 use failure::Caught;
-pub use effects::{CaughtFailure, Direct, Effects};
+pub use effects::{CaughtFailure, Direct, Effects, OperationFailure};
 pub use files::fetched_name;
 use graph::GraphRun;
 pub use system::TempDirs;
@@ -544,6 +544,7 @@ impl Evaluator<'_> {
             IrKind::Top(slot, ValueKind::Fn) => self.top_function_value(slot, node),
             IrKind::Top(slot, kind) => self.top_value(slot, kind, node),
             IrKind::LoadCallee | IrKind::MakeClosure { .. } => self.closure_value(node),
+            IrKind::Builtin(builtin) => Ok(Value::Builtin(builtin)),
             IrKind::Tag { key, of, shown } => Ok(Value::Tag(self.tag((key, of, shown)))),
             IrKind::ContextRead { .. }
             | IrKind::With { .. }
@@ -1502,6 +1503,7 @@ pub(crate) mod machine;
 pub(crate) mod memoised;
 pub(crate) mod metas;
 pub(crate) mod narrowing;
+pub(crate) mod operations;
 pub(crate) mod records;
 pub(crate) mod retry;
 pub(crate) mod scalars;

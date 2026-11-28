@@ -117,7 +117,7 @@ impl Index {
 
     /// The start of the top-level item of file `file` whose path ends at
     /// `span`: a field or `def` whose last segment it is, a definition's
-    /// last segment, a meta's path, a `type` item's name.
+    /// last segment, a meta's path, a `type` item's name, a handle type's.
     fn item_ending_at(&self, file: u32, span: Span) -> Option<u32> {
         let ast = &self.scan.files.get(file as usize)?.ast;
         ast.items(ast.root()).iter().find_map(|&item| {
@@ -128,6 +128,10 @@ impl Index {
                 }
                 ItemKind::DefMeta { def, .. } => path_span(ast.path(ast.def_type(def).path)),
                 ItemKind::Type { name_span, .. } => Some(name_span),
+                // A handle type's.
+                ItemKind::Enum { name_span, .. } if ast.extern_type(item).is_some() => {
+                    Some(name_span)
+                }
                 _ => None,
             };
             (ends == Some(span)).then(|| ast.item(item).span.start)

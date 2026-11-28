@@ -97,6 +97,13 @@
 //!   a negation's `-`; between two names or keywords (`not x`, `await x`);
 //!   before a block's `{`; after `}`; around a string literal.
 //!
+//! An `extern` item (see the parser's [Host
+//! operations](crate::parser::externs#host-operations)) is laid out by
+//! these rules, as the declaration it is: one space after `extern`, a
+//! method's `fn` spaced from its receiver as any method's is, and one
+//! space either side of the `=` before the name a host knows it by
+//! (`extern fn (m: Vm) read(path: String) -> String = "vm.file.read"`).
+//!
 //! What the syntax tree says is kept as written, untouched: inside a
 //! def-type's path (`org.gnu.gmp-c++`, `go-stage0-1.24`), whose glued
 //! tokens make one name; inside an import's module path
@@ -1195,8 +1202,13 @@ fn internal(message: &'static str) -> Diagnostic {
 fn declaration_facts(input: &Input<'_>, facts: &mut Facts) {
     let ast = &input.ast;
     for method in ast.methods() {
-        let start = ast.item(method.item).span.start;
-        facts.methods.extend(input.token_at(start, TokenKind::Fn));
+        // An operation's item starts at its `extern`, its keyword after.
+        let keyword = match ast.extern_fn_of(method.item) {
+            Some(operation) => Some(input.first_from(operation.keyword.end))
+                .filter(|&at| input.kind(at) == TokenKind::Fn),
+            None => input.token_at(ast.item(method.item).span.start, TokenKind::Fn),
+        };
+        facts.methods.extend(keyword);
     }
     // An enum's bound and a variant's payload are bracketed as a type's
     // argument is: the `<` after the name, the `>` that ends the item.
@@ -1276,6 +1288,42 @@ mod tests {
                 "f = fn (x: Int): Int { x }\n",
                 "f = fn(x: Int): Int { x }\n",
             ),
+        ]);
+    }
+
+    #[test]
+    fn extern_items_are_spaced_as_the_declarations_they_are() {
+        check(&[
+            (
+                "extern   type  Vm=\"vm.machine\"\nextern type\tNetwork\n",
+                "extern type Vm = \"vm.machine\"\nextern type Network\n",
+            ),
+            (
+                "extern fn   boot ( profile : Profile ,nics:List<Network> =[] )->Vm=\"vm.boot\"\n",
+                "extern fn boot(profile: Profile, nics: List<Network> = []) -> Vm = \"vm.boot\"\n",
+            ),
+            // A method's keyword is spaced from its receiver, as any is.
+            (
+                "extern fn(m:Vm)read(path:String,limit:Size=64MiB)  ->  String  =  \"vm.file.read\"\n",
+                "extern fn (m: Vm) read(path: String, limit: Size = 64MiB) -> String = \
+                 \"vm.file.read\"\n",
+            ),
+            (
+                "extern def(m: Vm)run(\n...argv: String\n)->{status: Int, stdout: String}=\"vm.run\"\n",
+                "extern def (m: Vm) run(\n    ...argv: String,\n) -> {status: Int, stdout: String} = \
+                 \"vm.run\"\n",
+            ),
+            (
+                "extern  fn halt(m: Vm)->{}\n",
+                "extern fn halt(m: Vm) -> {}\n",
+            ),
+            // Attributes, a return type on the next line, and comments.
+            (
+                "#[retry(2)]\nextern def a.b(^arch) ->\nInt # the host's\n",
+                "#[retry(2)]\nextern def a.b(^arch) ->\n    Int # the host's\n",
+            ),
+            // Elsewhere `extern` is a name.
+            ("extern=1\ny = extern .x\n", "extern = 1\ny = extern.x\n"),
         ]);
     }
 

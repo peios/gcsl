@@ -13,14 +13,14 @@ use crate::strings::Strings;
 
 use super::{
     Annotate, Arg, ArgRange, AttributeUse, ContextDecl, DefTypeId, DefTypeRole, DefTypeUse,
-    Element, ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind,
-    FieldTyRange, FnDecl, FnId, ForDecl, ForHead, ForId, GenericOwner, Generics, ImportDecl,
-    ImportForm, ImportGlob, ImportId, ImportMember, ImportMemberRange, Item, ItemId, ItemKind,
-    ItemRange, Label, LabelId, MethodDecl, NeedTy, NeedTyRange, NoAnnotation, Param, ParamRange,
-    ParamTy, ParamTyRange, PartRange, PathDisplay, PathRange, PathSegment, Pretty, RecoverDecl,
-    RecoverId, SegmentKind, StrPart, Syntax, TypeArena, TypeArgRange, TypeExpr, TypeExprId,
-    TypeExprKind, TypeLink, TypeProblem, TypeStore, WithBinding, WithRange, WrittenType, next_id,
-    symbol_span,
+    Element, ElementRange, Expr, ExprId, ExprKind, ExternFn, ExternType, FieldDefault, FieldTy,
+    FieldTyKind, FieldTyRange, FnDecl, FnId, ForDecl, ForHead, ForId, GenericOwner, Generics,
+    ImportDecl, ImportForm, ImportGlob, ImportId, ImportMember, ImportMemberRange, Item, ItemId,
+    ItemKind, ItemRange, Label, LabelId, MethodDecl, NeedTy, NeedTyRange, NoAnnotation, Param,
+    ParamRange, ParamTy, ParamTyRange, PartRange, PathDisplay, PathRange, PathSegment, Pretty,
+    RecoverDecl, RecoverId, SegmentKind, StrPart, Syntax, TypeArena, TypeArgRange, TypeExpr,
+    TypeExprId, TypeExprKind, TypeLink, TypeProblem, TypeStore, WithBinding, WithRange,
+    WrittenType, next_id, symbol_span,
 };
 
 /// A complete syntax tree: the arenas, the file's body, the names and the
@@ -61,6 +61,11 @@ pub struct Ast {
     pub(super) methods: Vec<MethodDecl>,
     /// The contexts the outermost block declares, in source order.
     pub(super) contexts: Vec<ContextDecl>,
+    /// The operations the outermost block declares, in source order (see
+    /// [Host operations](crate::ast#host-operations)).
+    pub(super) extern_fns: Vec<ExternFn>,
+    /// The handle types the outermost block declares, in source order.
+    pub(super) extern_types: Vec<ExternType>,
     /// The def-type definitions and references, in the order they were
     /// parsed (see [Def-types](crate::ast#def-types)).
     pub(super) def_types: Vec<DefTypeUse>,
@@ -663,6 +668,44 @@ impl Ast {
         &self.contexts
     }
 
+    /// The operations the file declares, in source order (see [Host
+    /// operations](crate::ast#host-operations)).
+    #[must_use]
+    pub fn extern_fns(&self) -> &[ExternFn] {
+        &self.extern_fns
+    }
+
+    /// The operation whose function is `function`, if it is one's.
+    #[must_use]
+    pub fn extern_fn(&self, function: FnId) -> Option<&ExternFn> {
+        self.extern_fns
+            .iter()
+            .find(|operation| operation.function == function)
+    }
+
+    /// The operation that the function item `item` declares, if it declares
+    /// one.
+    #[must_use]
+    pub fn extern_fn_of(&self, item: ItemId) -> Option<&ExternFn> {
+        match self.get(self.item(item).kind.value()?).kind {
+            ExprKind::Fn(function) => self.extern_fn(function),
+            _ => None,
+        }
+    }
+
+    /// The handle types the file declares, in source order (see [Host
+    /// operations](crate::ast#host-operations)).
+    #[must_use]
+    pub fn extern_types(&self) -> &[ExternType] {
+        &self.extern_types
+    }
+
+    /// The handle type whose item is `item`, if it is one.
+    #[must_use]
+    pub fn extern_type(&self, item: ItemId) -> Option<&ExternType> {
+        self.extern_types.iter().find(|handle| handle.item == item)
+    }
+
     /// Every read of a context in the tree, `^NAME`, a dotted key's of a
     /// `with` and a `^NAME` parameter's default among them, by the name and
     /// the read's span, in the order the parser made them.
@@ -1188,6 +1231,7 @@ impl Ast {
                 | ExprKind::Name(_)
                 | ExprKind::Variant { .. }
                 | ExprKind::ContextRead(_)
+                | ExprKind::Operation
                 | ExprKind::Error => return node,
                 // The body before the bindings after it, `f() with {...}`,
                 // and the bindings before it, `with {...} {...}`: the

@@ -85,7 +85,8 @@ pub(super) fn passes(test: &ValueTest, value: &Value) -> bool {
 /// and its field `a` is a String", "it is a record without a field `a`" or
 /// "it is a list, and its element 3 is a String". A union's test fails
 /// inside as the first of its alternatives that looks inside a value of
-/// this one's kind does. Field names are taken from `ir`.
+/// this one's kind does. A handle is "a handle of the kind `vm.disk`".
+/// Field names are taken from `ir`.
 pub(super) fn failure(ir: &Ir, test: &ValueTest, value: &Value) -> String {
     let inside = match test {
         ValueTest::Any(alternatives) => alternatives.iter().find(|alternative| {
@@ -140,6 +141,12 @@ pub(super) fn failure(ir: &Ir, test: &ValueTest, value: &Value) -> String {
             }
         }
         _ => {}
+    }
+    // A handle is told by its kind, which is all a host knows it by.
+    if let Value::Variant(variant) = value
+        && let Some(kind) = variant.tag.handle()
+    {
+        return format!("it is a handle of the kind `{kind}`");
     }
     format!("it is {}", described(value))
 }

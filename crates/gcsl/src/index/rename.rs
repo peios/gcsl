@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{ArgKind, ExprKind};
+use crate::ast::{ArgKind, ExprKind, ItemKind};
 use crate::check::Builtin;
 use crate::diagnostic::Severity;
 use crate::lexer;
@@ -208,6 +208,9 @@ impl Index {
         places.sort_unstable_by_key(|&(file, span)| (file, span.start, span.end));
         places.dedup();
         for &(in_file, span) in &places {
+            if let Some(why) = self.known_to_host(in_file, span) {
+                return Err(why);
+            }
             let written = self
                 .text(in_file)
                 .get(span.start as usize..span.end as usize)
@@ -224,6 +227,42 @@ impl Index {
             at,
             places,
             segment,
+        })
+    }
+
+    /// Why the name written at `span` of file `file` is not renamed, if it
+    /// is the name a host knows something by: the own name of an operation
+    /// declared with no name after `=`, or of a handle type declared with
+    /// no kind (see the parser's [Host
+    /// operations](crate::parser::externs#host-operations)). A new name
+    /// would be a new operation, or a new kind, to the host.
+    fn known_to_host(&self, file: u32, span: Span) -> Option<Refusal> {
+        let ast = &self.scan.files.get(file as usize)?.ast;
+        let text = self
+            .text(file)
+            .get(span.start as usize..span.end as usize)?;
+        let operation = ast
+            .extern_fns()
+            .iter()
+            .any(|operation| operation.declared == span && operation.name_span.is_none());
+        if operation {
+            return Some(format!(
+                "the host knows this operation by its name, `{text}`: write the name it is known \
+                 by after its return type, `= \"{text}\"`, and then rename it"
+            ));
+        }
+        let handle = ast.extern_types().iter().any(|handle| {
+            handle.kind_span.is_none()
+                && matches!(
+                    ast.item(handle.item).kind,
+                    ItemKind::Enum { name_span, .. } if name_span == span
+                )
+        });
+        handle.then(|| {
+            format!(
+                "the host knows this handle type's kind by its name, `{text}`: write the kind \
+                 after it, `= \"{text}\"`, and then rename it"
+            )
         })
     }
 

@@ -1453,3 +1453,269 @@ fn a_method_renames_at_its_declaration_and_every_call() {
         );
     }
 }
+
+/// A library that declares a handle type and two operations, each
+/// documented below the file's header.
+const MACHINES: &str = "# The host's machines.\n\n\
+                        # A machine the host runs.\n\
+                        extern type Vm = \"vm.machine\"\n\
+                        # Boots a machine.\n\
+                        # It takes a while.\n\
+                        extern def boot(name: String, cpus: Int = 1) -> Vm = \"vm.boot\"\n\
+                        # Reads a file.\n\
+                        extern def (m: Vm) read(path: String) -> String = \"vm.file.read\"\n";
+
+/// A file that uses [`MACHINES`] and declares a handle type and an
+/// operation with no names of their own for the host.
+const USES_MACHINES: &str = "import Vm, boot from lib/vm\n\
+                             extern type Disk\n\
+                             extern fn attach(m: Vm, d: Disk) -> {}\n\
+                             fn go(m: Vm) -> String { m.read(\"/x\") }\n\
+                             r = go(boot(\"a\"))\n";
+
+#[test]
+fn an_operation_s_hover_is_its_declaration_with_the_host_s_name() {
+    let files = [("lib/vm.gcsl", MACHINES), ("app.gcsl", USES_MACHINES)];
+    let (mut index, file) = index_of(&files, "app.gcsl");
+    let mut hover = |needle: &str| {
+        index
+            .hover(file, offset(USES_MACHINES, needle))
+            .map(|hover| hover.text)
+    };
+    // A call of one of another file, its doc comment and where it is from.
+    assert_eq!(
+        hover("bo|ot(\"a\")").as_deref(),
+        Some(
+            "```gcsl\nextern def boot(\n  name: String | Future<String>,\n  cpus: Int | \
+             Future<Int>,\n) -> Vm = \"vm.boot\"\n```\n\nBoots a machine.\nIt takes a \
+             while.\n\nimported from `lib/vm`"
+        )
+    );
+    // A method's, its receiver first.
+    assert_eq!(
+        hover("m.re|ad").as_deref(),
+        Some(
+            "```gcsl\nextern fn (m: Vm | Future<Vm>) read(path: String | Future<String>) -> \
+             String = \"vm.file.read\"\n```\n\nReads a file."
+        )
+    );
+    // Its own name where none is written for the host.
+    assert_eq!(
+        hover("att|ach(").as_deref(),
+        Some(
+            "```gcsl\nextern fn attach(m: Vm | Future<Vm>, d: Disk | Future<Disk>) -> {} = \
+             \"attach\"\n```"
+        )
+    );
+    // A parameter is one, and `extern` and the name's string are nothing.
+    assert_eq!(
+        hover("|m: Vm, d").as_deref(),
+        Some("```gcsl\nm: Vm | Future<Vm>\n```\n\nparameter")
+    );
+    assert_eq!(hover("ext|ern fn"), None);
+    assert_eq!(hover("-> {|}"), None);
+}
+
+#[test]
+fn a_handle_type_s_hover_says_it_is_extern_and_its_kind() {
+    let files = [("lib/vm.gcsl", MACHINES), ("app.gcsl", USES_MACHINES)];
+    let (mut index, file) = index_of(&files, "app.gcsl");
+    let hover = |index: &mut Index, file: u32, text: &str, needle: &str| {
+        index
+            .hover(file, offset(text, needle))
+            .map(|hover| hover.text)
+    };
+    assert_eq!(
+        hover(&mut index, file, USES_MACHINES, "m: V|m, d").as_deref(),
+        Some(
+            "```gcsl\nextern type Vm = \"vm.machine\"\n```\n\nA machine the host \
+             runs.\n\nhandle type of `lib/vm.gcsl`"
+        )
+    );
+    // Where it is declared, and one whose kind is its name.
+    assert_eq!(
+        hover(&mut index, file, USES_MACHINES, "Di|sk\n").as_deref(),
+        Some("```gcsl\nextern type Disk = \"Disk\"\n```\n\nhandle type of `app.gcsl`")
+    );
+    let lib = index.file("lib/vm.gcsl").unwrap();
+    assert_eq!(
+        hover(&mut index, lib, MACHINES, "V|m = ").as_deref(),
+        hover(&mut index, file, USES_MACHINES, "m: V|m, d").as_deref()
+    );
+}
+
+#[test]
+fn operations_and_handle_types_are_declared_and_referred_to() {
+    let files = [("lib/vm.gcsl", MACHINES), ("app.gcsl", USES_MACHINES)];
+    let (index, file) = index_of(&files, "app.gcsl");
+    let definition = |needle: &str| {
+        shown(
+            &index,
+            &files,
+            &index.definition(file, offset(USES_MACHINES, needle)),
+        )
+    };
+    let at = |needle: &str| format!("{}@{}", needle.replace('|', ""), offset(MACHINES, needle));
+    assert_eq!(
+        definition("bo|ot(\"a\")"),
+        [("lib/vm.gcsl".to_owned(), at("|boot"))]
+    );
+    assert_eq!(
+        definition("m.re|ad"),
+        [("lib/vm.gcsl".to_owned(), at("|read"))]
+    );
+    assert_eq!(
+        definition("m: V|m, d"),
+        [("lib/vm.gcsl".to_owned(), at("|Vm"))]
+    );
+    assert_eq!(
+        definition("d: Di|sk"),
+        [("app.gcsl".to_owned(), "Disk@40".to_owned())]
+    );
+    // Every use, with the declaration.
+    assert_eq!(
+        references(&files, ("app.gcsl", "bo|ot(\"a\")"), true),
+        places(
+            &files,
+            &[
+                ("app.gcsl", "|boot from"),
+                ("app.gcsl", "|boot(\"a\")"),
+                ("lib/vm.gcsl", "|boot(name")
+            ]
+        )
+    );
+    assert_eq!(
+        references(&files, ("lib/vm.gcsl", "V|m = "), true),
+        places(
+            &files,
+            &[
+                ("app.gcsl", "|Vm, d"),
+                ("app.gcsl", "|Vm) -> String"),
+                ("lib/vm.gcsl", "|Vm = "),
+                ("lib/vm.gcsl", "|Vm = \"vm.boot\""),
+                ("lib/vm.gcsl", "|Vm) read"),
+            ]
+        )
+    );
+    assert_eq!(
+        references(&files, ("lib/vm.gcsl", "V|m = "), false).len(),
+        4
+    );
+    // A parameter of an operation is written once: the body's read of it
+    // is no second place.
+    assert_eq!(
+        references(&files, ("lib/vm.gcsl", "na|me: String"), true),
+        places(&files, &[("lib/vm.gcsl", "|name: String")])
+    );
+}
+
+#[test]
+fn operations_and_handle_types_are_symbols_of_their_file() {
+    let files = [("lib/vm.gcsl", MACHINES), ("app.gcsl", USES_MACHINES)];
+    let (index, file) = index_of(&files, "lib/vm.gcsl");
+    let symbols = index.document_symbols(file);
+    let top: Vec<(&str, SymbolKind, Option<&str>)> = symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.detail.as_deref()))
+        .collect();
+    assert_eq!(
+        top,
+        [
+            ("Vm", SymbolKind::Type, Some("extern type = \"vm.machine\"")),
+            (
+                "boot",
+                SymbolKind::Function,
+                Some("fn(name: String | Future<String>, cpus: Int | Future<Int>) …")
+            ),
+            (
+                "read",
+                SymbolKind::Method,
+                Some("fn(m: Vm | Future<Vm>, path: String | Future<String>) -> St…")
+            ),
+        ]
+    );
+    // Each from its `extern`, selected at its name.
+    let vm = &symbols[0];
+    assert_eq!(
+        &MACHINES[vm.span.start as usize..vm.span.end as usize],
+        "extern type Vm = \"vm.machine\""
+    );
+    assert_eq!(
+        &MACHINES[vm.selection.start as usize..vm.selection.end as usize],
+        "Vm"
+    );
+    let found: Vec<String> = index
+        .workspace_symbols("", 100)
+        .into_iter()
+        .map(|symbol| symbol.name)
+        .collect();
+    for name in ["Vm", "boot", "read", "Disk", "attach"] {
+        assert!(found.iter().any(|found| found == name), "{name}: {found:?}");
+    }
+}
+
+#[test]
+fn an_operation_and_a_handle_type_rename_but_not_what_the_host_knows() {
+    let files = [("lib/vm.gcsl", MACHINES), ("app.gcsl", USES_MACHINES)];
+    // An operation's name, at its declaration or at a call: the host's
+    // name for it stays.
+    let expected = vec![
+        (
+            "lib/vm.gcsl".to_owned(),
+            MACHINES.replace("def boot(", "def start("),
+        ),
+        (
+            "app.gcsl".to_owned(),
+            USES_MACHINES
+                .replace("Vm, boot from", "Vm, start from")
+                .replace("go(boot(", "go(start("),
+        ),
+    ];
+    for at in [("lib/vm.gcsl", "bo|ot(name"), ("app.gcsl", "bo|ot(\"a\")")] {
+        assert_eq!(renamed(&files, at, "start"), Ok(expected.clone()), "{at:?}");
+    }
+    // A method, a parameter, and a handle type whose kind is written.
+    assert_eq!(
+        renamed(&files, ("app.gcsl", "m.re|ad"), "slurp"),
+        Ok(vec![
+            (
+                "lib/vm.gcsl".to_owned(),
+                MACHINES.replace(") read(", ") slurp(")
+            ),
+            (
+                "app.gcsl".to_owned(),
+                USES_MACHINES.replace("m.read(", "m.slurp(")
+            ),
+        ])
+    );
+    assert_eq!(
+        renamed(&files, ("lib/vm.gcsl", "na|me: String"), "label"),
+        Ok(vec![(
+            "lib/vm.gcsl".to_owned(),
+            MACHINES.replace("name: String", "label: String")
+        )])
+    );
+    let own = [(
+        "app.gcsl",
+        "extern type Vm = \"vm.machine\"\nextern fn same(m: Vm) -> Vm\n",
+    )];
+    assert_eq!(
+        renamed(&own, ("app.gcsl", "m: V|m"), "Machine"),
+        Ok(vec![(
+            "app.gcsl".to_owned(),
+            "extern type Machine = \"vm.machine\"\nextern fn same(m: Machine) -> Machine\n"
+                .to_owned()
+        )])
+    );
+    // A name the host knows the declaration by is its to keep.
+    assert_eq!(
+        renamed_err(&files, ("app.gcsl", "att|ach("), "plug"),
+        "the host knows this operation by its name, `attach`: write the name it is known by \
+         after its return type, `= \"attach\"`, and then rename it"
+    );
+    assert_eq!(
+        renamed_err(&files, ("app.gcsl", "d: Di|sk"), "Drive"),
+        "the host knows this handle type's kind by its name, `Disk`: write the kind after it, \
+         `= \"Disk\"`, and then rename it"
+    );
+}

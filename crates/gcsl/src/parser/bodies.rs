@@ -11,7 +11,8 @@
 //! named function `fn NAME(...) ...`, a `break`, a `continue` or a `return`
 //! (see [Loops](crate::parser::loops#loops)), an expression, or, in a file's
 //! body only, an `import` (see [Imports](crate::parser::imports#imports)), a
-//! `type` (see [Types](crate::parser::types#types)) or a definition made with a
+//! `type` (see [Types](crate::parser::types#types)), an `extern` item (see [Host
+//! operations](crate::parser::externs#host-operations)) or a definition made with a
 //! def-type (see [Def-types](crate::parser::deftypes#def-types)). After an item
 //! the next token must be a separator or the end of the body; anything else is
 //! "expected end of item".
@@ -202,6 +203,7 @@ impl Parser<'_> {
                 }
                 self.parse_enum_item(token)?
             }
+            _ if !inner && self.starts_extern_item() => self.parse_extern_item(token)?,
             _ if self.starts_assert() => (self.parse_assert(token)?, 0),
             _ if self.starts_context_item() => {
                 if inner {

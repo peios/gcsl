@@ -218,6 +218,22 @@
 //! more for each step of its path. Lowering computes them once, after
 //! building the nodes; the evaluator only adds and compares.
 //!
+//! # Host operations
+//!
+//! An operation (see the checker's [Host
+//! operations](crate::check::operations#host-operations)) is a function
+//! like any other but for its body, which is one call: an
+//! [`IrKind::Call`], of kind [`ValueKind::Mixed`] since the host may give
+//! anything, whose callee is an [`IrKind::Builtin`] of
+//! [`Builtin::Operation`], the one node that yields a built-in function
+//! with no cell to read, and whose two arguments are the operation's name,
+//! a [`IrKind::StrConst`], and an [`IrKind::MakeList`] of a read of each
+//! parameter, awaited as the checker marked it. The call is wrapped in an
+//! [`IrKind::As`] of the test of the operation's declared result, whose
+//! kind is the node's: what the host gave is of that type from there on, or
+//! the run has failed. The call is a control node, so a unit in graph mode
+//! stops at it as at any effect.
+//!
 //! # Cells
 //!
 //! Every node of the tree of an input's top-level fields has a *cell*, a
@@ -299,7 +315,7 @@ use std::mem;
 use std::rc::Rc;
 
 use crate::ast::FnId;
-use crate::check::{Attribute, Slot};
+use crate::check::{Attribute, Builtin, Slot};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::{FieldName, Quoted};
@@ -1190,6 +1206,10 @@ pub enum IrKind {
     LoadCapture(u32, ValueKind),
     /// Yields the closure being run: a function's reference to itself.
     LoadCallee,
+    /// Yields a built-in function as a value, of kind `Fn`: the callee of
+    /// the call that the body of an operation is, whose built-in has no
+    /// cell to read it from (see [Host operations](#host-operations)).
+    Builtin(Builtin),
     /// A variant of an enum as a value, `Toolchain::C` (see the checker's
     /// "Enums"), of kind `Fn`: its key, its enum's, and how it is shown, an
     /// index into the IR's string table.
@@ -1450,6 +1470,7 @@ impl IrKind {
             }
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Tag { .. }
             | IrKind::Failure(FailureOp::Read(_) | FailureOp::At)
             | IrKind::Caller
@@ -1662,6 +1683,7 @@ impl IrKind {
             // A block is given as a function is.
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Meta(_)
             | IrKind::Arg {
                 value: ArgValue::Block { .. },
@@ -1726,6 +1748,7 @@ impl IrKind {
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
@@ -1832,6 +1855,7 @@ impl IrKind {
             IrKind::Top(_, ValueKind::Fn) => "fn",
             IrKind::Top(..) => "top",
             IrKind::LoadCallee => "load-callee",
+            IrKind::Builtin(_) => "builtin",
             IrKind::Tag { .. } => "tag",
             IrKind::ContextRead { .. } => "context-read",
             IrKind::Assert { .. } => "assert",
@@ -1952,6 +1976,7 @@ impl IrNode {
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
             | IrKind::Failure(_)

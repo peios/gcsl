@@ -76,6 +76,10 @@ const EXTENSIBLE: &str = "extensible";
 /// `enum`.
 const MISPLACED_ENUM: &str = "`enum` is declared only at the top level of a file";
 
+/// The word that starts an `extern` item, which is no keyword (see [Host
+/// operations](crate::parser::externs#host-operations)).
+const EXTERN: &str = "extern";
+
 /// The word that starts a `context` item, which is no keyword (see
 /// [Context](crate::parser::context#context)).
 const CONTEXT: &str = "context";
@@ -406,6 +410,7 @@ pub(crate) fn parse_parts(
         unclosed: false,
         deep: false,
         line_end: None,
+        external: None,
         diagnostics: Vec::new(),
     };
     if lexical > 0 {
@@ -592,6 +597,10 @@ struct Parser<'a> {
     /// set while an item that failed is parsed again up to the end of its
     /// line ([`Parser::item_line`]).
     line_end: Option<usize>,
+    /// The operation being parsed, from its `extern` until its function
+    /// is reached, which takes it (see [Host
+    /// operations](crate::parser::externs#host-operations)).
+    external: Option<externs::External>,
     /// Errors reported so far, in the order found: at most [`MAX_ERRORS`]
     /// and one more, after which the parser skips to the end of the input.
     diagnostics: Vec<Diagnostic>,
@@ -992,6 +1001,7 @@ pub(crate) mod context;
 pub(crate) mod deftypes;
 pub(crate) mod enums;
 pub(crate) mod expressions;
+pub(crate) mod externs;
 pub(crate) mod failure;
 pub(crate) mod functions;
 pub(crate) mod imports;

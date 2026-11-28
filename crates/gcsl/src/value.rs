@@ -1052,6 +1052,16 @@ pub struct Tag {
     pub shown: Rc<str>,
 }
 
+impl Tag {
+    /// The kind of the handle the tag is the variant of, if it is a
+    /// handle's (see [`crate::names`], "Handle keys"): what it is shown
+    /// as, between angle brackets, as no variant a program declares is.
+    #[must_use]
+    pub fn handle(&self) -> Option<&str> {
+        self.shown.strip_prefix('<')?.strip_suffix('>')
+    }
+}
+
 /// A value of an enum: its variant and its payload.
 #[derive(Debug, PartialEq)]
 pub struct Variant {
@@ -1270,9 +1280,10 @@ impl fmt::Display for Value {
             Value::Fn(closure) => f.write_str(closure.display()),
             Value::Builtin(builtin) => f.write_str(builtin.display()),
             Value::Tag(tag) => f.write_str(&tag.shown),
-            Value::Variant(variant) => {
-                write!(f, "{}({})", variant.tag.shown, variant.payload.repr())
-            }
+            Value::Variant(variant) => match variant.tag.handle() {
+                Some(kind) => write!(f, "<{kind} {}>", variant.payload.repr()),
+                None => write!(f, "{}({})", variant.tag.shown, variant.payload.repr()),
+            },
             // The one way a secret is shown, wherever it is.
             Value::Secret(_) => f.write_str("***"),
             // As the call that makes it, which reads back as an equal file.
@@ -1357,7 +1368,7 @@ impl fmt::Display for Derivation<'_> {
                 }
                 f.write_str("]")
             }
-            Value::Variant(variant) => {
+            Value::Variant(variant) if variant.tag.handle().is_none() => {
                 write!(f, "{}({})", variant.tag.shown, Derivation(&variant.payload))
             }
             value => value.repr().fmt(f),

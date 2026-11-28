@@ -114,6 +114,12 @@ impl Machine<'_> {
             arguments,
             ..
         } = *call;
+        // An operation's node keeps where the operation was called.
+        if builtin == Builtin::Operation
+            && let Some(run) = self.shared.graph
+        {
+            run.calling(self.called());
+        }
         let applied =
             self.walker(|walker| walker.apply_or_meet(builtin, arguments, walker.ir.get(node)));
         match applied {
@@ -122,6 +128,22 @@ impl Machine<'_> {
             Ok(Applied::Waiting(id)) => Next::Block(Wait::Node(id), Resume::Effect(node, id)),
             Err(unwind) => fail(unwind),
         }
+    }
+
+    /// Where the function whose body is running was called, the input of
+    /// the calling code and the span of the call, if the machine runs the
+    /// call: the innermost of its calls, if that is of the closure running,
+    /// in the activation below. What the node of an operation keeps for its
+    /// host (see [Host operations](crate::eval::operations#host-operations)).
+    fn called(&self) -> Option<(u32, crate::source::Span)> {
+        let call = self.calls.last()?;
+        let running = self.running().callee.as_ref()?;
+        if !std::rc::Rc::ptr_eq(&call.closure, running) {
+            return None;
+        }
+        let below = self.activations.len().checked_sub(2)?;
+        let caller = self.activations.get(below)?;
+        Some((caller.ir.input(), caller.ir.get(call.node).span))
     }
 
     /// Takes up `call` with `result`, the value of its next argument.

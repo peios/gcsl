@@ -55,6 +55,7 @@ const fn treatment(kind: &ExprKind) -> Treatment {
         | ExprKind::Bool(_)
         | ExprKind::Str(_)
         | ExprKind::DefTypeRef(_)
+        | ExprKind::Operation
         | ExprKind::Error
         | ExprKind::NoField(_)
         | ExprKind::Unclosed { .. } => Treatment::Plain,

@@ -2923,3 +2923,80 @@ fn a_piece_is_independent_unless_it_assigns_or_stops() {
         [false, true]
     );
 }
+
+#[test]
+fn an_operation_s_body_is_a_tested_call_of_the_built_in() {
+    // The call is of a node that yields the built-in, with the name and a
+    // list of the parameters, each awaited as it is read; around it, the
+    // test of the declared result. A call of the function is any call.
+    assert_eq!(
+        dump(
+            "extern fn f(x: Int, p: {a: Int}, ...rest: String) -> {status: Int} = \"vm.f\"\n\
+             f(1, {a = 2}, \"a\")"
+        ),
+        "(block @0..94\n\
+         \x20 (store f#0 @0..75\n\
+         \x20   (make-closure #0 @0..75))\n\
+         \x20 (call @76..94\n\
+         \x20   (load f#0 @76..77)\n\
+         \x20   (arg 0 @78..79\n\
+         \x20     (int 1 @78..79))\n\
+         \x20   (arg 1 @81..88\n\
+         \x20     (block @81..88\n\
+         \x20       (store a#1 @82..87\n\
+         \x20         (int 2 @86..87))\n\
+         \x20       (make-record [a] @81..88\n\
+         \x20         (load a#1 @82..83))))\n\
+         \x20   (arg 2 @90..93\n\
+         \x20     (make-list @90..93\n\
+         \x20       (str \"a\" @90..93)))))\n\
+         fn #0 f (frame 3, params 3, captures 0, height 7)\n\
+         \x20 (block @0..75\n\
+         \x20   (as {status: int} @0..75\n\
+         \x20     (call @0..75\n\
+         \x20       (builtin @0..75)\n\
+         \x20       (arg 0 @0..75\n\
+         \x20         (str \"vm.f\" @0..75))\n\
+         \x20       (arg 1 @0..75\n\
+         \x20         (make-list @0..75\n\
+         \x20           (await @12..18\n\
+         \x20             (load x#0 @12..18))\n\
+         \x20           (await [a!] @20..31\n\
+         \x20             (load p#1 @20..31))\n\
+         \x20           (await *! @33..48\n\
+         \x20             (load rest#2 @33..48)))))))"
+    );
+    let ir = lower_text("extern fn f() -> {}\nf()");
+    let code = ir.function(crate::ast::FnId::new(0));
+    let IrKind::Block { result, .. } = ir.get(code.body).kind else {
+        panic!("the body is not a block");
+    };
+    // Whatever the host gives, the call is of no kind of its own, and the
+    // test's node of the declared result's.
+    let IrKind::As { value, kind, .. } = ir.get(result).kind else {
+        panic!("the body's result is not a test: {:?}", ir.get(result));
+    };
+    assert_eq!(kind, ValueKind::Record);
+    let IrKind::Call {
+        callee,
+        args,
+        kind: ValueKind::Mixed,
+        ..
+    } = ir.get(value).kind
+    else {
+        panic!("the test is not of a call: {:?}", ir.get(value));
+    };
+    assert_eq!(
+        ir.get(callee).kind,
+        IrKind::Builtin(crate::check::Builtin::Operation)
+    );
+    assert_eq!(ir.items(args).len(), 2);
+    // The built-in's node is simple, and the call around it is not: a
+    // unit in graph mode stops at it.
+    assert!(ir.is_simple(callee));
+    assert!(!ir.is_simple(value));
+    assert!(!ir.is_simple(result));
+    // Its function is not memoised, and reports at its call.
+    assert_eq!(code.kind, FnKind::Function);
+    assert_eq!(code.attributes.len(), 1);
+}

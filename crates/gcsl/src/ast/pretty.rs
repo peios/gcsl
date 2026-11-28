@@ -154,7 +154,12 @@ impl Annotate for NoAnnotation {
 /// `(…)`, as in `#[retry(…)] (fn f ...)`; and a file marked `#![no_prelude]`
 /// has it after `file`, as in `(file #![no_prelude] ...)`; the implicit import
 /// a workspace gives a file is not printed (see
-/// [Attributes](crate::ast#attributes)). There is no trailing newline.
+/// [Attributes](crate::ast#attributes)). An operation prints as the function
+/// item it is, with `extern` and the operation's name quoted before its
+/// keyword, `(extern "vm.boot" fn boot (fn ...))`, and its body as the parser
+/// made it, a block of a `(call ...)` of `(operation ...)`; a handle type as
+/// `(extern type Vm "vm.machine" @0..30)` (see [Host
+/// operations](crate::ast#host-operations)). There is no trailing newline.
 pub struct Pretty<'a, A> {
     pub(super) ast: &'a Ast,
     pub(super) annotation: &'a A,
@@ -246,6 +251,10 @@ impl<A: Annotate> Pretty<'_, A> {
                 self.type_expr(f, ty)?;
                 self.annotation.annotate_type(id, f)
             }
+            ItemKind::Enum { name, .. } if let Some(handle) = ast.extern_type(id) => {
+                let kind = ast.strings().get(handle.kind);
+                write!(f, "extern type {} {kind:?}", ast.names().get(name))
+            }
             ItemKind::Enum { name, bound, .. } => {
                 write!(f, "enum {} extensible", ast.names().get(name))?;
                 match bound {
@@ -321,6 +330,9 @@ impl<A: Annotate> Pretty<'_, A> {
         write!(f, "{:indent$}", "", indent = depth * 2)?;
         self.attributes(f, id)?;
         f.write_str("(")?;
+        if let Some(operation) = ast.extern_fn_of(id) {
+            write!(f, "extern {:?} ", ast.strings().get(operation.name))?;
+        }
         let value = match item.kind {
             ItemKind::Let {
                 path,
@@ -959,6 +971,7 @@ impl<A: Annotate> Pretty<'_, A> {
                 write!(f, "def-type-ref {def_type} {path}")
             }
             ExprKind::ContextRead(name) => write!(f, "context ^{}", self.ast.names().get(name)),
+            ExprKind::Operation => f.write_str("operation"),
             ExprKind::With { .. } => f.write_str("with"),
             ExprKind::Assert { .. } => f.write_str("assert"),
             ExprKind::Recover(id) => match self.ast.recover_decl(id).error {
@@ -1097,6 +1110,7 @@ impl<A: Annotate> Pretty<'_, A> {
             | ExprKind::Variant { .. }
             | ExprKind::DefTypeRef(_)
             | ExprKind::ContextRead(_)
+            | ExprKind::Operation
             | ExprKind::Error => {}
             ExprKind::Unary { operand, .. }
             | ExprKind::Try(operand)

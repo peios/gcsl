@@ -173,6 +173,7 @@ impl Evaluator<'_> {
             | IrKind::Update { .. } => mistyped(node, "list node where a record was expected"),
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
+            | IrKind::Builtin(_)
             | IrKind::Tag { .. }
             | IrKind::Meta(_)
             | IrKind::Arg { .. } => mistyped(node, "function node where a record was expected"),
