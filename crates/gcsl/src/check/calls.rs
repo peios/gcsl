@@ -620,6 +620,7 @@ impl Checker<'_> {
         let (mut erroneous, mut misplaced_spread) = (false, false);
         // Where the rest parameter's arguments are written.
         let (mut next_positional, mut rest_run) = (0, None);
+        let block_after_rest = self.block_after_rest(sig);
         for (index, arg) in site.arg_list.iter().enumerate() {
             let target = match arg.kind {
                 ArgKind::Positional => {
@@ -631,7 +632,9 @@ impl Checker<'_> {
                     self.misplaced_spread(span, label, &mut erroneous)
                 }
                 ArgKind::Spread { .. } => rest,
-                ArgKind::Trailing => (shape.positional < count).then(|| count - 1),
+                ArgKind::Trailing => {
+                    (shape.positional < count || block_after_rest).then(|| count - 1)
+                }
                 ArgKind::Named {
                     name,
                     span,

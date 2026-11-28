@@ -605,7 +605,9 @@ impl Checker<'_> {
         }
         let after_receiver = sig.after(offset);
         let mut untyped: Vec<(ExprId, TyId)> = Vec::new();
-        for (value, param, spread) in argument_targets(ast.args(args), &after_receiver) {
+        let block_after_rest = self.block_after_rest(&after_receiver);
+        let targets = argument_targets(ast.args(args), &after_receiver, block_after_rest);
+        for (value, param, spread) in targets {
             let Some(&(_, param_ty)) = sig.params.get(param + offset) else {
                 continue;
             };
@@ -618,18 +620,23 @@ impl Checker<'_> {
             if !self.types.mentions(param_ty, generic) || self.expects_its_type(value) {
                 continue;
             }
-            // A block's body binds what its result mentions.
-            let found = match self.types.block_sig(param_ty) {
-                Some((_, effect)) if self.is_trailing(args, value) => {
+            // A block's body binds what its result mentions, which is
+            // what an integer literal it ends with must fit.
+            let (found, fits) = match self.types.block_sig(param_ty) {
+                Some((ret, effect)) if self.is_trailing(args, value) => {
                     let callee_span = self.ast.get(callee).span;
                     let how = (super::AwaitSite::Implicit, None);
-                    self.check_block_body(value, (None, effect), (callee_span, ""), how)
+                    let body = (None, effect);
+                    (
+                        self.check_block_body(value, body, (callee_span, ""), how),
+                        ret,
+                    )
                 }
-                _ => self.check_expr(value),
+                _ => (self.check_expr(value), param_ty),
             };
             self.calls.prechecked.insert(value, found);
             if found == TyId::UNTYPED_INT {
-                untyped.push((value, param_ty));
+                untyped.push((value, fits));
             } else {
                 self.bind_argument(&mut binding, (value, param_ty), found);
             }
