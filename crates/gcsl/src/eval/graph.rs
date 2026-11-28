@@ -570,6 +570,24 @@ struct Scope {
     /// How many pieces' scopes it has entered (see
     /// [`GraphRun::enter_piece`]).
     pieces: u32,
+    /// Whether it is an enclosing scope of a task split off, which the task
+    /// never runs in again: it ends inside the scope it was split off in
+    /// ([`GraphRun::fork_state`]). Such a scope keeps only its path.
+    outer: bool,
+}
+
+impl Scope {
+    /// The scope as a task split off inside it keeps it, the task never
+    /// running in it again (see [`Scope::outer`]): its path alone, so that
+    /// a split costs nothing for the scopes the scope has entered, one for
+    /// each iteration of a loop split off before.
+    fn outer(&self) -> Self {
+        Self {
+            path: self.path,
+            outer: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// One run of a unit in graph mode (see [Graph mode](#graph-mode)), shared by
@@ -821,8 +839,20 @@ impl<'g> GraphRun<'g> {
     /// `last` (see [Tasks](crate::eval::machine::tasks#tasks)).
     pub(crate) fn fork_state(&self, kept: usize, last: Option<NodeId>) -> RunState {
         let mut scopes = self.scopes.borrow_mut();
+        // The task split off runs and ends inside the scopes from `kept` on:
+        // those it is split off in, which it keeps whole.
         let state = RunState {
-            scopes: scopes.clone(),
+            scopes: scopes
+                .iter()
+                .enumerate()
+                .map(|(at, scope)| {
+                    if at < kept {
+                        scope.outer()
+                    } else {
+                        scope.clone()
+                    }
+                })
+                .collect(),
             last: self.last.get(),
             watch: None,
         };
@@ -925,6 +955,10 @@ impl<'g> GraphRun<'g> {
         let Some(scope) = scopes.last_mut() else {
             return 0;
         };
+        debug_assert!(
+            !scope.outer,
+            "a node met in a scope a task was split off inside"
+        );
         scope.met += 1;
         hash_of(&(scope.path, scope.met))
     }
@@ -933,6 +967,10 @@ impl<'g> GraphRun<'g> {
     fn enter(&self, key: u64) {
         let mut scopes = self.scopes.borrow_mut();
         let parent_path = scopes.last().map_or(0, |scope| scope.path);
+        debug_assert!(
+            scopes.last().is_none_or(|scope| !scope.outer),
+            "a scope entered in one a task was split off inside"
+        );
         let number = scopes.last_mut().map_or(0, |scope| {
             let entered = scope.entered.entry(key).or_insert(0);
             *entered += 1;
@@ -954,6 +992,10 @@ impl<'g> GraphRun<'g> {
         let Some(scope) = scopes.last_mut() else {
             return;
         };
+        debug_assert!(
+            !scope.outer,
+            "a piece begun in a scope a task was split off inside"
+        );
         scope.pieces += 1;
         let path = mix(scope.path, scope.pieces);
         scopes.push(Scope {

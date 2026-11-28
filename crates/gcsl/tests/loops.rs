@@ -97,6 +97,11 @@ fn run(name: &str, count: i64) -> (i64, Duration) {
 /// [`run`], and the message of the failure the test ended with, if it
 /// failed.
 fn run_to_end(name: &str, count: i64) -> (i64, Duration, Option<String>) {
+    run_sliced(name, count, Duration::from_millis(2))
+}
+
+/// [`run_to_end`], the unit run in slices of `slice`.
+fn run_sliced(name: &str, count: i64, slice: Duration) -> (i64, Duration, Option<String>) {
     let text = PROGRAM.replace("COUNT", &count.to_string());
     let source = SourceFile::new("tests.gcsl", text).unwrap();
     let (_, checked) = check_lone_with_standard(&source, "/");
@@ -112,7 +117,7 @@ fn run_to_end(name: &str, count: i64) -> (i64, Duration, Option<String>) {
             defers: &never,
             effects: &host,
         };
-        match workspace.run_prepared_for(&call, &mut graph, graph_host, Duration::from_millis(2)) {
+        match workspace.run_prepared_for(&call, &mut graph, graph_host, slice) {
             Ok(Turn::Yielded) => {}
             Ok(Turn::Progress(Progress::Done(_))) => break,
             Ok(Turn::Progress(Progress::Paused(nodes))) => {
@@ -141,6 +146,22 @@ fn a_loop_of_operations_asks_for_each_once_in_order() {
         let (asked, _) = run(name, 200);
         assert_eq!(asked, 201, "{name}");
     }
+}
+
+#[test]
+fn a_loop_yielding_at_every_step_asks_for_each_once_in_order() {
+    // With no time to run, the unit yields between steps, its iterations
+    // waiting for their turn set aside each time.
+    for name in ["assigned", "bound", "stepped"] {
+        let (asked, _, failure) = run_sliced(name, 50, Duration::ZERO);
+        assert_eq!((asked, failure), (51, None), "{name}");
+    }
+    let (asked, _, failure) = run_sliced("fails", 50, Duration::ZERO);
+    assert_eq!(
+        failure.as_deref(),
+        Some("assertion failed: the third failed")
+    );
+    assert_eq!(asked, 4);
 }
 
 #[test]

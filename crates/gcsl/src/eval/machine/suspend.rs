@@ -478,7 +478,7 @@ impl Parked {
     /// are its run's to move (see [Charged time](#charged-time)).
     fn charge(&mut self, time: Duration) {
         self.charged = true;
-        for task in &mut self.tasks.0 {
+        for task in self.tasks.0.iter_mut() {
             task.charge(time);
         }
     }
