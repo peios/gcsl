@@ -323,7 +323,7 @@ enum KindStep {
 pub struct IrId(u32);
 
 impl IrId {
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
 }
@@ -710,6 +710,19 @@ pub enum ArgValue {
         capture: u32,
         /// The kind of the parameter's value.
         kind: ValueKind,
+    },
+    /// A block: the trailing block that fills the callee's block parameter
+    /// (see [Blocks](#blocks)). Its node is not evaluated where the call
+    /// is: the parameter is given a [`crate::value::Block`] of it, which
+    /// the callee's [`IrKind::CallBlock`]s run in the caller's frame.
+    Block {
+        /// The block's body, a node of the caller's code.
+        body: IrId,
+        /// The body's height, for the nesting budget (see
+        /// [`crate::MAX_DEPTH`]). Lowering sets it once every node is built;
+        /// a height past `u16::MAX` is stored as `u16::MAX`, as a call's
+        /// depth is.
+        height: u16,
     },
 }
 
@@ -1129,6 +1142,18 @@ pub enum IrKind {
         /// Its value.
         value: ArgValue,
     },
+    /// Calls the block `block` evaluates to, a read of the running
+    /// function's block parameter, and yields what its body gives, of kind
+    /// `kind` (see [Blocks](#blocks)).
+    CallBlock {
+        /// The read of the block parameter.
+        block: IrId,
+        /// The kind of the call's value: the block's result's.
+        kind: ValueKind,
+        /// The call's depth in the body of the frame it is evaluated in,
+        /// as a call's (see [`IrKind::Call`]).
+        depth: u16,
+    },
     /// Reads one of the values the closure being run captured, by its index
     /// in capture order. Carries the value's kind, as a `Load` does.
     LoadCapture(u32, ValueKind),
@@ -1322,6 +1347,7 @@ impl IrKind {
         matches!(
             self,
             IrKind::Call { .. }
+                | IrKind::CallBlock { .. }
                 | IrKind::Arg { .. }
                 | IrKind::For { .. }
                 | IrKind::Loop { .. }
@@ -1414,9 +1440,10 @@ impl IrKind {
             | IrKind::Field { record: child, .. }
             | IrKind::Store(_, child)
             | IrKind::Arg {
-                value: ArgValue::Node(child),
+                value: ArgValue::Node(child) | ArgValue::Block { body: child, .. },
                 ..
             }
+            | IrKind::CallBlock { block: child, .. }
             | IrKind::Spread(child)
             | IrKind::ListLen(child)
             | IrKind::Show(child)
@@ -1586,6 +1613,7 @@ impl IrKind {
             | IrKind::Update { kind, .. }
             | IrKind::Index { kind, .. }
             | IrKind::Call { kind, .. }
+            | IrKind::CallBlock { kind, .. }
             | IrKind::LoadCapture(_, kind)
             | IrKind::Arg {
                 value: ArgValue::Default { kind, .. },
@@ -1600,9 +1628,14 @@ impl IrKind {
             | IrKind::Recover { kind, .. }
             | IrKind::With { kind, .. }
             | IrKind::Top(_, kind) => KindStep::Own(kind),
+            // A block is given as a function is.
             IrKind::MakeClosure { .. }
             | IrKind::LoadCallee
             | IrKind::Meta(_)
+            | IrKind::Arg {
+                value: ArgValue::Block { .. },
+                ..
+            }
             | IrKind::Tag { .. } => KindStep::Own(ValueKind::Fn),
             IrKind::SecretWrap(..) => KindStep::Own(ValueKind::Mixed),
             IrKind::MakeFuture { .. } => KindStep::Own(ValueKind::Deferred),
@@ -1657,6 +1690,7 @@ impl IrKind {
             | IrKind::MakeClosure { .. }
             | IrKind::Call { .. }
             | IrKind::Arg { .. }
+            | IrKind::CallBlock { .. }
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
@@ -1760,6 +1794,7 @@ impl IrKind {
             IrKind::Update { .. } => "update",
             IrKind::MakeClosure { .. } => "make-closure",
             IrKind::Call { .. } => "call",
+            IrKind::CallBlock { .. } => "call-block",
             IrKind::Arg { .. } => "arg",
             IrKind::LoadCapture(..) => "load-capture",
             IrKind::Top(_, ValueKind::Fn) => "fn",
@@ -1879,6 +1914,7 @@ impl IrNode {
             | IrKind::MakeClosure { .. }
             | IrKind::Call { .. }
             | IrKind::Arg { .. }
+            | IrKind::CallBlock { .. }
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
@@ -2938,11 +2974,23 @@ impl IrBuilder {
                         .map_or(0, |steps| steps.len.saturating_mul(2)),
                     _ => 0,
                 };
+                // A block's body is run by a call of the block, which
+                // charges the budget for it then.
+                if let IrKind::Arg {
+                    value: ArgValue::Block { height, .. },
+                    ..
+                } = &mut node.kind
+                {
+                    *height = u16::try_from(tallest).unwrap_or(u16::MAX);
+                }
                 if let Some(entry) = heights.get_mut(id.index()) {
                     *entry = tallest.saturating_add(1).saturating_add(path);
                 }
             } else if height == 0 {
                 if let IrKind::Call {
+                    depth: node_depth, ..
+                }
+                | IrKind::CallBlock {
                     depth: node_depth, ..
                 }
                 | IrKind::Await {
@@ -3039,9 +3087,14 @@ fn independent_nodes(nodes: &[IrNode], pool: &[IrId], mut assignments: Vec<IrId>
     assignments.sort_unstable_by_key(|id| id.index());
     let mut independent = Vec::with_capacity(nodes.len());
     for (index, node) in nodes.iter().enumerate() {
+        // A call of a block may assign the variables of the frame that
+        // gave it (see [Blocks](crate::ir#blocks)).
         let leaves = matches!(
             node.kind,
-            IrKind::Break { .. } | IrKind::Continue { .. } | IrKind::Return { .. }
+            IrKind::Break { .. }
+                | IrKind::Continue { .. }
+                | IrKind::Return { .. }
+                | IrKind::CallBlock { .. }
         );
         let assigns = assignments
             .binary_search_by_key(&index, |id| id.index())
@@ -3397,6 +3450,10 @@ impl Pretty<'_> {
                 param,
                 value: ArgValue::Default { capture, .. },
             } => write!(f, " {param} default {capture}")?,
+            IrKind::Arg {
+                param,
+                value: ArgValue::Block { .. },
+            } => write!(f, " {param} block")?,
             IrKind::Arg { param, .. } | IrKind::LoadCapture(param, _) => write!(f, " {param}")?,
             IrKind::For { slot, parts, .. } => {
                 self.slot(f, slot)?;

@@ -37,6 +37,7 @@ impl Evaluator<'_> {
             | IrKind::With { .. }
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
+            | IrKind::CallBlock { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
             | IrKind::SecretWrap(..)
@@ -273,6 +274,7 @@ impl Evaluator<'_> {
             | IrKind::With { .. }
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
+            | IrKind::CallBlock { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
             | IrKind::SecretWrap(..)
@@ -386,6 +388,7 @@ impl Evaluator<'_> {
             | IrKind::With { .. }
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
+            | IrKind::CallBlock { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
             | IrKind::SecretWrap(..)
@@ -526,6 +529,7 @@ impl Evaluator<'_> {
             | IrKind::With { .. }
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
+            | IrKind::CallBlock { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
             | IrKind::SecretWrap(..)

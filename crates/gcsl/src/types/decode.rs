@@ -165,6 +165,7 @@ impl TypeTable {
             TyKind::File | TyKind::Dir | TyKind::Sandbox => {
                 undecodable("a document can name a file, but not hold one")
             }
+            TyKind::Block { .. } => undecodable("a block has no JSON form"),
             TyKind::Enum { .. } | TyKind::Variant { .. } => {
                 undecodable("an enum's values have no JSON form")
             }

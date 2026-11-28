@@ -164,6 +164,15 @@ impl Lowerer<'_> {
         }
     }
 
+    /// Notes that what is being lowered calls a block, which may assign
+    /// the variables of the frame that gave it (see the checker's
+    /// "Blocks"): no iteration around it is forkable.
+    pub(super) fn calls_block(&mut self) {
+        for (_, _, forkable) in &mut self.forks {
+            *forkable = false;
+        }
+    }
+
     /// Notes that what is being lowered leaves the loops after the
     /// `at`th on [`Lowerer::loops`], and the `at`th itself if it ends it,
     /// `ends`: none of them is forkable.

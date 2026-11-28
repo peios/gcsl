@@ -2794,6 +2794,7 @@ impl<'a> Checker<'a> {
             | TyKind::Partial(_)
             | TyKind::Secret(..)
             | TyKind::Data
+            | TyKind::Block { .. }
             // TEMPORARY (alias rule): see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/).
             | TyKind::Builtin(_) => {
@@ -3179,6 +3180,7 @@ fn explicit_await_error(keyword: Span, marker: Span) -> Diagnostic {
 }
 
 pub(crate) mod attributes;
+pub(crate) mod blocks;
 pub(crate) mod builtin;
 pub(crate) mod calls;
 pub(crate) mod context;

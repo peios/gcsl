@@ -2111,6 +2111,15 @@ pub enum TypeExprKind {
         /// Where the `|` is written.
         bar: Span,
     },
+    /// A block type, `block -> T` or `block: T`, the type of a function's
+    /// block parameter (see the parser's
+    /// [Blocks](crate::parser::functions#blocks)).
+    Block {
+        /// What a call of the block gives.
+        ret: TypeExprId,
+        /// What its body may do, as its marker says: `:` or `->`.
+        effect: Effect,
+    },
     /// The definition of the declared type numbered so in a [`TypeStore`],
     /// which a type expression there refers to by name. Never in a tree.
     Ref(u32),

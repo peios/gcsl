@@ -91,6 +91,17 @@ const ASSERT: &str = "assert";
 /// [Failure](crate::parser::failure#failure)).
 const RECOVER: &str = "recover";
 
+/// The word that starts a block parameter's type, which is no keyword (see
+/// [Blocks](crate::parser::functions#blocks)).
+const BLOCK: &str = "block";
+
+/// The error for a block parameter that is not its function's last.
+const BLOCK_NOT_LAST: &str = "a block is a function's last parameter";
+
+/// The note of [`BLOCK_NOT_LAST`].
+const BLOCK_NOT_LAST_NOTE: &str =
+    "a call gives the block after its other arguments, as `f(x) { ... }`";
+
 /// The error for a `context` item anywhere but at a file's top level, at
 /// its `context`.
 const MISPLACED_CONTEXT: &str = "`context` is declared only at the top level of a file";

@@ -927,6 +927,7 @@ impl Evaluator<'_> {
         };
         let value = match value {
             ArgValue::Node(value) => self.value(value)?,
+            ArgValue::Block { body, height } => self.make_block(body, height),
             ArgValue::Default { capture, .. } => {
                 let earlier = base..base + param as usize;
                 self.default_arg((callee, capture), earlier, (depth, node))?
@@ -1051,12 +1052,13 @@ impl Evaluator<'_> {
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
             IrKind::LoadCallee => self.callee(node).map(Callee::Closure),
             IrKind::Tag { key, of, shown } => Ok(Callee::Tag(self.tag((key, of, shown)))),
-            IrKind::ContextRead { .. } | IrKind::With { .. } | IrKind::Recover { .. } => {
-                match into_callee(self.whole_node(node)?) {
-                    Some(callee) => Ok(callee),
-                    None => mistyped(node, "a context's value that is no function"),
-                }
-            }
+            IrKind::ContextRead { .. }
+            | IrKind::With { .. }
+            | IrKind::Recover { .. }
+            | IrKind::CallBlock { .. } => match into_callee(self.whole_node(node)?) {
+                Some(callee) => Ok(callee),
+                None => mistyped(node, "a context's value that is no function"),
+            },
             IrKind::Top(slot, _) => self.top_function(slot, node),
             IrKind::MakeClosure { function, captures } => {
                 self.make_closure(function, captures).map(Callee::Closure)

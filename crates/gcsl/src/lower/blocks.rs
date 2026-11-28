@@ -57,7 +57,14 @@ impl Lowerer<'_> {
                 vec![expr]
             }
             ExprKind::Call { callee, args } => {
-                let values = self.ast.args(args).iter().map(|arg| arg.value);
+                // A block's body runs when its function calls it, never
+                // where the call is.
+                let values = self
+                    .ast
+                    .args(args)
+                    .iter()
+                    .map(|arg| arg.value)
+                    .filter(|&value| self.resolution.is_block_arg(value).is_none());
                 // A method's callee is a read of its binding, after its
                 // receiver.
                 if let Some(receiver) = self.resolution.method_receiver(id) {

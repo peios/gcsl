@@ -373,6 +373,11 @@ impl Checker<'_> {
     /// function is not): where the purity rule's errors say the function is
     /// pure.
     pub(super) fn pure_marker(&self) -> Option<Span> {
+        // The body of a pure block is pure code, whatever it is written in
+        // (see [Blocks](crate::check::blocks#blocks)).
+        if let Some(callee) = self.block_arg().and_then(|block| block.pure) {
+            return Some(callee);
+        }
         self.functions
             .last()
             .filter(|function| function.effect == Effect::Pure)

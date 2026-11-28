@@ -318,7 +318,19 @@ fn take_up(
     stack.resize(at, Value::Empty);
     stack.extend(segment);
     if at != base {
-        parked.rebase(base, at.wrapping_sub(base));
+        let delta = at.wrapping_sub(base);
+        parked.rebase(base, delta);
+        // A block names the frame it runs in by where it starts (see
+        // [Blocks](crate::eval::blocks#blocks)).
+        for value in stack.iter_mut().skip(at) {
+            if let Value::Block(block) = value
+                && block.base >= base
+            {
+                let mut moved = crate::value::Block::clone(block);
+                moved.base = moved.base.wrapping_add(delta);
+                *value = Value::Block(Rc::new(moved));
+            }
+        }
     }
     let start = Start {
         base: at,

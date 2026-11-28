@@ -264,6 +264,7 @@ fn plain_of(value: &Value, names: &Names, mode: Mode) -> Result<Plain, String> {
                 .collect::<Result<_, _>>()?,
         },
         Value::Fn(_) | Value::Builtin(_) => return refused("a function"),
+        Value::Block(_) => return refused("a block"),
         Value::Sandbox(sandbox) => Plain::Sandbox {
             root: sandbox.root.to_string(),
             cwd: sandbox.cwd.to_string(),

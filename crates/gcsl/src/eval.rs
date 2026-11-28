@@ -549,10 +549,11 @@ impl Evaluator<'_> {
             | IrKind::With { .. }
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
+            | IrKind::CallBlock { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
             | IrKind::SecretWrap(..) => self.whole_node(node),
-            IrKind::ContextBind { .. } => mistyped(node, CONTEXT_BIND),
+            IrKind::ContextBind { .. } | IrKind::Arg { .. } | IrKind::Spread(_) => misplaced(node),
             IrKind::Meta(function) => self.meta_value(function, node),
             IrKind::Call {
                 callee,
@@ -568,7 +569,6 @@ impl Evaluator<'_> {
             IrKind::Await { .. } => self.await_node(node),
             IrKind::As { .. } => self.narrow_node(node),
             IrKind::JsonDecode { .. } => self.decode_node(node),
-            IrKind::Arg { .. } => mistyped(node, "an argument outside a call"),
             IrKind::MakeList { items, spreads } => self.make_list(items, spreads),
             IrKind::EntriesOf { .. } => self.entries_of(node),
             IrKind::Range(inclusive, operands) => self.range(operands, inclusive, node),
@@ -578,7 +578,6 @@ impl Evaluator<'_> {
             }
             IrKind::Catch { .. } => self.catch(node),
             IrKind::Index { list, index, .. } => self.index((list, index), node),
-            IrKind::Spread(_) => mistyped(node, "a spread outside a list"),
             IrKind::Quantity(quantity, amount) => self.quantity_value(quantity, amount),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
@@ -798,6 +797,7 @@ impl Evaluator<'_> {
             IrKind::With { parts, .. } => self.with(parts, node),
             IrKind::Assert { cond, message } => self.assert((cond, message), node),
             IrKind::Recover { body, fallback, .. } => self.recover(body, fallback),
+            IrKind::CallBlock { block, depth, .. } => self.call_block((block, depth), node),
             IrKind::Failure(layout) => self.failure(layout, node),
             IrKind::SecretValue { value, deep, .. } => self.secret_value(value, deep),
             IrKind::SecretWrap(computed, revealed) => self.secret_wrap(computed, revealed, node),
@@ -847,6 +847,10 @@ impl Evaluator<'_> {
                 kind: ValueKind::Deferred,
                 ..
             }
+            | IrKind::CallBlock {
+                kind: ValueKind::Deferred,
+                ..
+            }
             | IrKind::SecretValue {
                 kind: ValueKind::Deferred,
                 ..
@@ -856,6 +860,7 @@ impl Evaluator<'_> {
             | IrKind::With { .. }
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
+            | IrKind::CallBlock { .. }
             | IrKind::Failure(_)
             | IrKind::SecretValue { .. }
             | IrKind::SecretWrap(..) => match (taken.owned)(self.whole_node(node)?) {
@@ -1427,6 +1432,7 @@ fn source_of(value: &Value, node: &IrNode) -> Flow<Rc<str>> {
                 )
                 .into());
             }
+            Value::Block(_) => return mistyped(node, "a block shown as source"),
             // A variant's source is how it is shown, `Toolchain::C`, and a
             // value of an enum the call of it on its payload's.
             Value::Variant(variant) => pending.push(&variant.payload),
@@ -1445,6 +1451,19 @@ fn source_of(value: &Value, node: &IrNode) -> Flow<Rc<str>> {
         }
     }
     Ok(Rc::from(value.repr().to_string()))
+}
+
+/// Fails with the internal error of `node`, one that is only ever part of
+/// another: an argument, a spread or a binding of a `with`.
+fn misplaced<T>(node: &IrNode) -> Flow<T> {
+    mistyped(
+        node,
+        match node.kind {
+            IrKind::Arg { .. } => "an argument outside a call",
+            IrKind::Spread(_) => "a spread outside a list",
+            _ => CONTEXT_BIND,
+        },
+    )
 }
 
 /// Fails with the internal error `message` at `node`: a node of a type its
@@ -1470,6 +1489,7 @@ pub(crate) mod system;
 pub(crate) mod text;
 pub(crate) mod unions;
 
+pub(crate) mod blocks;
 pub(crate) mod callers;
 pub(crate) mod calls;
 pub(crate) mod context;

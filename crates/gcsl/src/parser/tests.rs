@@ -373,6 +373,14 @@ fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
         | TypeExprKind::Param(_)
         | TypeExprKind::Enum { .. }
         | TypeExprKind::Invalid => out.push('?'),
+        TypeExprKind::Block { ret, effect } => {
+            out.push_str(if effect == Effect::Pure {
+                "block: "
+            } else {
+                "block -> "
+            });
+            type_name(ast, ret, out);
+        }
         TypeExprKind::Fn {
             params,
             needs,

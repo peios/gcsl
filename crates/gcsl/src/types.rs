@@ -602,6 +602,15 @@ pub enum TyKind {
     /// `*`, [`TyId::DATA`], any data, which only a rest-field's type can be
     /// (see [Open records](#open-records)).
     Data,
+    /// `block -> T` or `block: T`, the type of a function's block parameter
+    /// (see [Blocks](#blocks)): what a call of the block gives, and what
+    /// its body may do. A subtype only of itself.
+    Block {
+        /// What a call of it gives.
+        ret: TyId,
+        /// What its body may do: [`Effect::Pure`] or [`Effect::Impure`].
+        effect: Effect,
+    },
 }
 
 /// What a generic function's type parameters belong to: one of its own,
@@ -983,7 +992,8 @@ impl TypeTable {
             | TyKind::List(inner)
             | TyKind::Variant { payload: inner, .. }
             | TyKind::Partial(inner)
-            | TyKind::Secret(inner, _) => self.has_provisional(*inner),
+            | TyKind::Secret(inner, _)
+            | TyKind::Block { ret: inner, .. } => self.has_provisional(*inner),
             TyKind::Union(members) => members.iter().any(|&member| self.has_provisional(member)),
             TyKind::Int
             | TyKind::Float
@@ -1067,6 +1077,7 @@ impl TypeTable {
             | TyKind::Variant { payload: inner, .. }
             | TyKind::Partial(inner)
             | TyKind::Secret(inner, _)
+            | TyKind::Block { ret: inner, .. }
             | TyKind::Provisional { inner, .. } => self.special_builtin(*inner),
             TyKind::Union(members) => members
                 .iter()
@@ -1333,6 +1344,7 @@ impl TypeTable {
             | TyKind::List(inner)
             | TyKind::Partial(inner)
             | TyKind::Secret(inner, _)
+            | TyKind::Block { ret: inner, .. }
             | TyKind::Provisional { inner, .. }) => self.any_param(inner, of),
             TyKind::Union(members) => members.iter().any(|&member| self.any_param(member, of)),
             &TyKind::Variant {
@@ -1442,6 +1454,10 @@ impl TypeTable {
                 let inner = self.substitute(inner, generic, args);
                 self.secret_of(inner, revealed)
             }
+            TyKind::Block { ret, effect } => {
+                let ret = self.substitute(ret, generic, args);
+                self.block(ret, effect)
+            }
             _ => ty,
         }
     }
@@ -1532,6 +1548,8 @@ impl TypeTable {
                 let given = self.secret_value(present).unwrap_or(present);
                 self.bind(inner, given, generic, bound)
             }
+            // A block binds from its body's value.
+            TyKind::Block { ret, .. } => self.bind(ret, arg, generic, bound),
             _ => None,
         }
     }
@@ -1831,6 +1849,26 @@ impl TypeTable {
         self.intern(TyKind::Variant { of, payload, call })
     }
 
+    /// `block -> T` or `block: T`, as `effect` says, of the result `ret`,
+    /// `T` (see [Blocks](#blocks)), adding it to the table if it is new;
+    /// `Error` for an erroneous result.
+    pub fn block(&mut self, ret: TyId, effect: Effect) -> TyId {
+        if ret == TyId::ERROR {
+            return ret;
+        }
+        self.intern(TyKind::Block { ret, effect })
+    }
+
+    /// What a call of the block type `id` gives, and what its body may do,
+    /// if it is one (see [Blocks](#blocks)).
+    #[must_use]
+    pub fn block_sig(&self, id: TyId) -> Option<(TyId, Effect)> {
+        match *self.kind(id) {
+            TyKind::Block { ret, effect } => Some((ret, effect)),
+            _ => None,
+        }
+    }
+
     /// `Partial<T>` of the record type `record` (see [Partial
     /// records](#partial-records)), adding it to the table if it is new.
     pub fn partial(&mut self, record: TyId) -> TyId {
@@ -2013,7 +2051,7 @@ impl TypeTable {
         match self.kinds.get(id.index()) {
             // TEMPORARY (alias rule): a special built-in's opaque type is a function's (see the
             // [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
-            Some(TyKind::Fn(_) | TyKind::Builtin(_)) => true,
+            Some(TyKind::Fn(_) | TyKind::Builtin(_) | TyKind::Block { .. }) => true,
             Some(TyKind::Record(record)) => record
                 .fields
                 .iter()
@@ -2238,6 +2276,10 @@ impl TypeTable {
             TyKind::Secret(value, revealed) => {
                 let value = self.settle(value, function, decisions);
                 self.secret_of(value, revealed)
+            }
+            TyKind::Block { ret, effect } => {
+                let ret = self.settle(ret, function, decisions);
+                self.block(ret, effect)
             }
             TyKind::Provisional { .. }
             | TyKind::Int
@@ -3300,7 +3342,10 @@ impl TypeTable {
             // TEMPORARY (alias rule): a special built-in's opaque type is a function's kind (see
             // the [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
             // A variant is called as a function is.
-            TyKind::Fn(_) | TyKind::Builtin(_) | TyKind::Variant { .. } => Some(ValueKind::Fn),
+            // A block is called as a function is.
+            TyKind::Fn(_) | TyKind::Builtin(_) | TyKind::Variant { .. } | TyKind::Block { .. } => {
+                Some(ValueKind::Fn)
+            }
             // A type parameter's: any value at all, what a call binds it to.
             TyKind::Future(_) | TyKind::Either(_) | TyKind::Param { .. } => {
                 Some(ValueKind::Deferred)

@@ -122,6 +122,9 @@ impl Checker<'_> {
             return (self.builtin_use(id, ty, span), None);
         }
         if let Some((index, binding)) = found {
+            if self.block_misused(id, (index, binding), span) {
+                return (TyId::ERROR, None);
+            }
             if binding.kind == BindingKind::Mutable {
                 self.leaf_reads_mutable(index, binding.name);
             }

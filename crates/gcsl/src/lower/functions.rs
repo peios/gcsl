@@ -52,6 +52,17 @@ impl Lowerer<'_> {
                     span: expr.span,
                 }),
                 _ if self.resolution.method_receiver(id).is_some() => self.lower_method_call(id),
+                // A call of a block, the read of this function's block
+                // parameter (see the checker's "Blocks").
+                _ if self.resolution.is_block_call(id) => {
+                    self.calls_block();
+                    Ok(IrKind::CallBlock {
+                        block: self.lower_operand(callee, ValueKind::Fn)?,
+                        kind,
+                        // Set by `IrBuilder::measure` once every node is built.
+                        depth: 0,
+                    })
+                }
                 _ => Ok(IrKind::Call {
                     callee: self.lower_operand(callee, ValueKind::Fn)?,
                     args: self.lower_args(id, args, expr.span)?,

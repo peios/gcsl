@@ -413,6 +413,7 @@ const fn variant_name(value: &Value) -> &'static str {
         Value::File(_) => "a File",
         Value::Dir(_) => "a Dir",
         Value::Sandbox(_) => "a Sandbox",
+        Value::Block(_) => "a block",
     }
 }
 

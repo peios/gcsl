@@ -614,6 +614,14 @@ impl WrittenType<'_> {
                     f.write_str("[]")
                 }
             }
+            TypeExprKind::Block { ret, effect } => {
+                f.write_str(if effect == Effect::Pure {
+                    "block: "
+                } else {
+                    "block -> "
+                })?;
+                self.type_expr(f, ret)
+            }
             // Never written: the store's references and the expansion's
             // errors are kept apart from what a tree prints.
             TypeExprKind::Ref(_)

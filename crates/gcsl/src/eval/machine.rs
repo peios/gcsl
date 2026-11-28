@@ -220,6 +220,10 @@ enum Frame {
     /// whether it is revealed, evaluated above, the identities recorded
     /// before it this many.
     SecretWrap(IrId, (IrId, bool), usize),
+    /// The body of a block, run above for the `CallBlock` node, in an
+    /// activation of the frame of the call that gave the block (see
+    /// [Blocks](crate::eval::blocks#blocks)).
+    BlockBody(IrId),
     /// An operand of an assertion's condition, evaluated above.
     Assert(Box<AssertState>),
     /// The message of a failed assertion, evaluated above.
@@ -668,6 +672,7 @@ impl<'r> Machine<'r> {
             IrKind::SecretValue { value, deep, .. } => self.secret_value(value, deep),
             IrKind::SecretWrap(computed, revealed) => self.secret_wrap(id, computed, revealed),
             IrKind::Assert { cond, message } => self.assert(id, (cond, message)),
+            IrKind::CallBlock { block, depth, .. } => self.call_block(id, (block, depth)),
             kind if Self::applies(kind) => self.operands(id),
             _ => give(self.walker(|walker| walker.value(id))),
         }
@@ -772,6 +777,7 @@ impl<'r> Machine<'r> {
             }
             Frame::Assert(state) => self.assert_operand(state, result),
             Frame::AssertMessage(state) => self.assert_failed(&state, result),
+            Frame::BlockBody(id) => self.block_done(id, result),
         }
     }
 

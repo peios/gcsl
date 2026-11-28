@@ -7,7 +7,7 @@ use crate::names::{Name, Names, key_context};
 use crate::strings::{FieldName, Quoted};
 use crate::value::write_quantity;
 
-use super::{RecordTy, TyId, TyKind, TypeTable};
+use super::{Effect, RecordTy, TyId, TyKind, TypeTable};
 
 /// A type shown as it is written in source. Returned by
 /// [`TypeTable::display`].
@@ -106,6 +106,15 @@ impl Display<'_> {
     }
 }
 
+impl Display<'_> {
+    /// Writes the block type of the result `ret` and the effect `effect`,
+    /// `block -> T` or `block: T`.
+    fn block(&self, f: &mut fmt::Formatter<'_>, ret: TyId, effect: Effect) -> fmt::Result {
+        let marker = if effect == Effect::Pure { ":" } else { " ->" };
+        write!(f, "block{marker} {}", self.nested(ret))
+    }
+}
+
 impl fmt::Display for Display<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.table.kind(self.id) {
@@ -117,6 +126,7 @@ impl fmt::Display for Display<'_> {
             TyKind::File => f.write_str("File"),
             TyKind::Dir => f.write_str("Dir"),
             TyKind::Sandbox => f.write_str("Sandbox"),
+            &TyKind::Block { ret, effect } => self.block(f, ret, effect),
             TyKind::Data => f.write_str("*"),
             TyKind::Error => f.write_str("<error>"),
             TyKind::Never => f.write_str("Never"),

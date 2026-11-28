@@ -127,12 +127,23 @@ use crate::names::Name;
 use crate::source::Span;
 
 use super::{
-    Braces, LEAF_HEIGHT, META, MISPLACED_DEFAULT, MISSING_RETURN_TYPE, Nesting, Open, ParseResult,
-    Parser, RETURN_TYPE_NOTE, Reported, TYPE, error_span, nest,
+    BLOCK, BLOCK_NOT_LAST, BLOCK_NOT_LAST_NOTE, Braces, LEAF_HEIGHT, META, MISPLACED_DEFAULT,
+    MISSING_RETURN_TYPE, Nesting, Open, ParseResult, Parser, RETURN_TYPE_NOTE, Reported, TYPE,
+    error_span, nest,
 };
 
 /// A parameter after a need of a function type.
 const NEEDS_AFTER_PARAMS: &str = "a function type's needs come after its parameters";
+
+/// A rest parameter whose type is a block's.
+pub(super) const REST_BLOCK: &str = "a rest parameter is not a block";
+
+/// A memoised function with a block parameter, at its marker.
+pub(super) const MEMO_BLOCK: &str = "a memoised function cannot take a block";
+
+/// The note of [`MEMO_BLOCK`].
+pub(super) const MEMO_BLOCK_NOTE: &str = "a memoised call is found by its arguments, and a block is no value to find it by; declare \
+     the function with `->`";
 
 impl Parser<'_> {
     /// Whether the current token begins a `type` item: the identifier
@@ -245,6 +256,73 @@ impl Parser<'_> {
             });
         }
         Ok((ty, height))
+    }
+
+    /// Whether the tokens here start a block parameter's type: the word
+    /// `block`, directly followed by a marker, `:`, `->` or `->>` (see
+    /// [Blocks](crate::parser::functions#blocks)).
+    pub(super) fn starts_block_type(&self) -> bool {
+        matches!(self.peek().kind, TokenKind::Ident(name) if self.names.get(name) == BLOCK)
+            && matches!(
+                self.peek_at(1).kind,
+                TokenKind::Colon | TokenKind::Arrow | TokenKind::MemoArrow
+            )
+    }
+
+    /// Parses a parameter's type, of a function expression or of a function
+    /// type: a block type, `block -> T` or `block: T`, where one starts
+    /// ([`Parser::starts_block_type`]), and any other type as
+    /// [`Parser::parse_type`] does. A block marked `->>` is "a block is not
+    /// memoised".
+    pub(super) fn parse_param_type(&mut self) -> ParseResult<(TypeExprId, u32)> {
+        if !self.starts_block_type() {
+            return self.parse_type();
+        }
+        let keyword = self.peek();
+        self.advance();
+        let (effect, marker) = self.return_marker()?;
+        if effect == Effect::Memo {
+            return Err(self.report(
+                Diagnostic::error("a block is not memoised", marker).with_note(
+                    "a block runs each time its function calls it; write `block -> T`, or \
+                     `block: T` for one that is pure",
+                ),
+            ));
+        }
+        self.enter()?;
+        let ret = self.parse_type();
+        self.depth -= 1;
+        let (ret, height) = ret?;
+        let id = self.builder.alloc_type(TypeExpr {
+            kind: TypeExprKind::Block { ret, effect },
+            span: Span::join(keyword.span, self.type_span(ret)),
+        });
+        Ok((id, height + 1))
+    }
+
+    /// Whether the type expression `id` is a block's (see
+    /// [Blocks](crate::parser::functions#blocks)).
+    pub(super) fn is_block_type(&self, id: TypeExprId) -> bool {
+        matches!(self.builder.type_expr(id).kind, TypeExprKind::Block { .. })
+    }
+
+    /// Reports the first of the parameter types `params`, in order, that is
+    /// a block's and not the last: "a block is a function's last
+    /// parameter".
+    pub(super) fn check_block_last(
+        &mut self,
+        params: impl ExactSizeIterator<Item = TypeExprId>,
+    ) -> ParseResult<()> {
+        let count = params.len();
+        for (index, ty) in params.enumerate() {
+            if index + 1 < count && self.is_block_type(ty) {
+                let span = self.type_span(ty);
+                return Err(self.report(
+                    Diagnostic::error(BLOCK_NOT_LAST, span).with_note(BLOCK_NOT_LAST_NOTE),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Parses a type that is neither a union nor a list type written `T[]`,
@@ -481,10 +559,20 @@ impl Parser<'_> {
         if let Some(reported) = failed {
             return Err(reported);
         }
+        let written: Vec<TypeExprId> = self.param_ty_stack[base..]
+            .iter()
+            .map(|param| param.ty)
+            .collect();
         let params = self.builder.push_param_tys(&self.param_ty_stack[base..]);
         self.param_ty_stack.truncate(base);
+        self.check_block_last(written.iter().copied())?;
         let needs = self.builder.push_need_tys(&needs);
-        let (effect, _) = self.return_marker()?;
+        let (effect, marker) = self.return_marker()?;
+        if effect == Effect::Memo && written.last().is_some_and(|&ty| self.is_block_type(ty)) {
+            return Err(
+                self.report(Diagnostic::error(MEMO_BLOCK, marker).with_note(MEMO_BLOCK_NOTE))
+            );
+        }
         let (ret, ret_height) = self.parse_type()?;
         // The return type, a union included, and then its meta, if `META`
         // and a marker follow it.
@@ -534,8 +622,12 @@ impl Parser<'_> {
             }
             _ => None,
         };
-        let (ty, height) = self.parse_type()?;
+        let (ty, height) = self.parse_param_type()?;
         *tallest = (*tallest).max(height);
+        if rest && self.is_block_type(ty) {
+            let span = self.type_span(ty);
+            return Err(self.error(REST_BLOCK, span));
+        }
         // Only a function expression's parameter has a default.
         let eq = self.peek();
         if eq.kind == TokenKind::Eq {

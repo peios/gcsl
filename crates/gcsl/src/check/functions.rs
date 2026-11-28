@@ -313,7 +313,7 @@ use crate::types::{FnTy, Laziness, Need, TyId, TyKind};
 use super::needs::NeedWhy;
 use super::{
     Bareness, Binding, BindingKind, Checker, Constant, DefaultFn, Expecting, FnResolution,
-    Function, PURE_CONTEXT, RESULT_WHY, Reach, Slot, bareness_of, merged_defaults, position,
+    Function, RESULT_WHY, Reach, Slot, bareness_of, merged_defaults, position,
 };
 
 impl Checker<'_> {
@@ -870,6 +870,9 @@ impl Checker<'_> {
         if let TyKind::Builtin(builtin) = *self.types.kind(callee_ty) {
             return self.check_builtin_call(id, (callee, builtin), args);
         }
+        if let Some(block) = self.types.block_sig(callee_ty) {
+            return self.check_block_call(id, callee, block, args);
+        }
         let callee_ty = self.measure(callee, callee_ty);
         let Some(sig) = self.types.fn_sig(callee_ty).cloned() else {
             return self.call_of_no_function(id, (callee, callee_ty), args);
@@ -903,14 +906,16 @@ impl Checker<'_> {
         let why = NeedWhy::Call(self.callee_written_name(callee));
         let needs = self.types.need_set(sig.needs).to_vec();
         self.charge_needs(&needs, self.ast.get(id).span, why);
-        if let Some(function) = self.functions.last()
-            && function.effect == Effect::Pure
-            && sig.effect != Effect::Pure
+        if sig.effect != Effect::Pure
+            && let Some(marker) = self.pure_marker()
         {
-            let (marker, function) = (function.marker, function.fn_id);
+            let context = self.pure_context();
             let label = format!("this is {}", self.in_label(callee_ty));
             // A context's default, which has no marker of its own to change.
-            if self.is_context_default(function) {
+            if let Some(function) = self.functions.last().map(|function| function.fn_id)
+                && self.block_arg().is_none()
+                && self.is_context_default(function)
+            {
                 self.errors.push(
                     Diagnostic::error(
                         "the default of a context must be pure",
@@ -930,7 +935,7 @@ impl Checker<'_> {
                     self.ast.get(id).span,
                 )
                 .with_context(self.ast.get(callee).span, label)
-                .with_context(marker, PURE_CONTEXT)
+                .with_context(marker, context)
                 .with_note(
                     "a pure function, declared with `:`, may call only pure functions; declare \
                      it with `->` to make it impure",

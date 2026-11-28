@@ -316,7 +316,7 @@ impl Ast {
                     take(self.first_default(arg));
                 }
             }
-            TypeExprKind::List(element) => {
+            TypeExprKind::List(element) | TypeExprKind::Block { ret: element, .. } => {
                 take(self.first_default(element));
             }
             TypeExprKind::Union { lhs, rhs, .. } => {

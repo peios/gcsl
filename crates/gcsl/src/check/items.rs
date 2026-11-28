@@ -31,7 +31,7 @@
 //! input's record and, in a workspace, of its directory, which commits
 //! only fields ([`Scope`](super::Scope)'s `commit`): a `let` or `fn` is the file's own.
 
-use crate::ast::{Effect, ExprId, ExprKind, ItemId, ItemKind, UnaryOp};
+use crate::ast::{ExprId, ExprKind, ItemId, ItemKind, UnaryOp};
 use crate::diagnostic::Diagnostic;
 use crate::names::Name;
 use crate::source::Span;
@@ -341,12 +341,7 @@ impl Checker<'_> {
         let present = self.types.present(ty);
         if self.types.is_unit_like(present) {
             self.measure_deep(value, ty);
-        } else if self.impure_calls.contains(&value)
-            && self
-                .functions
-                .last()
-                .is_none_or(|function| function.effect != Effect::Pure)
-        {
+        } else if self.impure_calls.contains(&value) && self.pure_marker().is_none() {
             // In a pure function the call is an error already.
             self.measure_deep(value, ty);
             self.discarded.insert(value);

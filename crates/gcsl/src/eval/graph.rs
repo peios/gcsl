@@ -1717,6 +1717,14 @@ fn encode_one(value: Value, out: &mut Vec<u8>, pending: &mut Vec<Value>) {
             out.push(b'x');
             write_text(out, &sandbox.root);
         }
+        // Never an argument of a deferred call, which takes no block: by
+        // where it is, as nothing else is encoded.
+        Value::Block(block) => {
+            out.push(b'k');
+            out.extend_from_slice(&(Rc::as_ptr(&block.code) as usize).to_le_bytes());
+            out.extend_from_slice(&block.body.index().to_le_bytes());
+            out.extend_from_slice(&block.base.to_le_bytes());
+        }
     }
 }
 

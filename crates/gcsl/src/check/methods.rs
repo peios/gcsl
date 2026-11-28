@@ -618,7 +618,15 @@ impl Checker<'_> {
             if !self.types.mentions(param_ty, generic) || self.expects_its_type(value) {
                 continue;
             }
-            let found = self.check_expr(value);
+            // A block's body binds what its result mentions.
+            let found = match self.types.block_sig(param_ty) {
+                Some((_, effect)) if self.is_trailing(args, value) => {
+                    let callee_span = self.ast.get(callee).span;
+                    let how = (super::AwaitSite::Implicit, None);
+                    self.check_block_body(value, (None, effect), (callee_span, ""), how)
+                }
+                _ => self.check_expr(value),
+            };
             self.calls.prechecked.insert(value, found);
             if found == TyId::UNTYPED_INT {
                 untyped.push((value, param_ty));
@@ -672,6 +680,14 @@ impl Checker<'_> {
             rest: sig.rest,
             needs: sig.needs,
         })
+    }
+
+    /// Whether `value` is the trailing block of the arguments `args`.
+    fn is_trailing(&self, args: ArgRange, value: ExprId) -> bool {
+        self.ast
+            .args(args)
+            .iter()
+            .any(|arg| arg.kind == crate::ast::ArgKind::Trailing && arg.value == value)
     }
 
     /// Binds what `param_ty`, the type of the parameter that `value` fills,

@@ -1009,6 +1009,19 @@ impl Checker<'_> {
             None => frame.id.is_some(),
         };
         let found = self.loops.iter().rposition(names);
+        // A trailing block that fills a block parameter is left by no jump
+        // (see [Blocks](crate::check::blocks#blocks)).
+        if let Some(block) = self.block_arg()
+            && let Some(outer) = found.filter(|&index| index < block.loops)
+            && self
+                .loops
+                .get(outer)
+                .is_some_and(|frame| frame.depth == depth)
+        {
+            self.errors
+                .push(Self::leave_block_error(keyword, at, block.callee));
+            return None;
+        }
         let found = match found.and_then(|index| Some((index, self.loops.get(index)?))) {
             Some((index, frame)) if frame.depth == depth => {
                 if returning || frame.id.is_some() {
@@ -1051,6 +1064,20 @@ impl Checker<'_> {
         Diagnostic::error(format!("`'{text}` labels a block, not a loop"), at)
             .with_context(label.span, "the block is labelled here")
             .with_note(format!("use `return'{text}` to leave a block"))
+    }
+
+    /// The error for the `break`, `continue` or `return`, as `keyword`
+    /// says, written at `at`, whose target is outside the trailing block
+    /// it is in, which fills a block parameter of the call of `callee`
+    /// (see [Blocks](crate::check::blocks#blocks)): "`break` cannot leave
+    /// a block".
+    pub(super) fn leave_block_error(keyword: &str, at: Span, callee: Span) -> Diagnostic {
+        Diagnostic::error(format!("`{keyword}` cannot leave a block"), at)
+            .with_context(callee, "inside the block given to this call")
+            .with_note(
+                "the block runs when the function it is given to calls it, which the function \
+                 goes on from; end the block with a value the function can act on instead",
+            )
     }
 
     /// The error for the `break`, `continue` or `return`, as `keyword`
@@ -1117,6 +1144,11 @@ impl Checker<'_> {
                          block or a loop labelled `'L` is left with `return'L`",
                         ),
                     );
+                    None
+                }
+                None if let Some(block) = self.block_arg() => {
+                    self.errors
+                        .push(Self::leave_block_error("return", at, block.callee));
                     None
                 }
                 None => Some(None),

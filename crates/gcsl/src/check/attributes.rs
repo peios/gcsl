@@ -388,6 +388,7 @@ impl Checker<'_> {
         ret: TyId,
         written: Option<TypeExprId>,
     ) {
+        self.check_block_param(function);
         if !self.lowering.deferred.contains(&function)
             || ret == TyId::ERROR
             || self.types.laziness(ret) != Laziness::Present
@@ -748,11 +749,9 @@ impl Checker<'_> {
         } = self.meta_of(id, record);
         let mut impure = false;
         if meta.effect != Effect::Pure
-            && let Some(function) = self.functions.last()
-            && function.effect == Effect::Pure
+            && let Some(marker) = self.pure_marker()
         {
             impure = true;
-            let marker = function.marker;
             let label = format!(
                 "reading {subject} is impure (`{}`)",
                 meta.effect.meta_marker()

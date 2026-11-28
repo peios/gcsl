@@ -353,7 +353,18 @@ impl Lowerer<'_> {
                 rest_items.push(item);
                 continue;
             }
-            let value = ArgValue::Node(self.lower_expr(arg.value)?);
+            // A trailing block that fills a block parameter is its body,
+            // which the callee's calls of the block run (see the checker's
+            // "Blocks").
+            let value = if resolution.is_block_arg(arg.value).is_some() {
+                ArgValue::Block {
+                    body: self.lower_expr(arg.value)?,
+                    // Set by `IrBuilder::measure` once every node is built.
+                    height: 0,
+                }
+            } else {
+                ArgValue::Node(self.lower_expr(arg.value)?)
+            };
             let node = self
                 .builder
                 .alloc(IrKind::Arg { param, value }, arg.span(ast));

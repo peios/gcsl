@@ -554,6 +554,7 @@ impl Checker<'_> {
             TypeExprKind::Applied { .. }
             | TypeExprKind::Union { .. }
             | TypeExprKind::Fn { .. }
+            | TypeExprKind::Block { .. }
             | TypeExprKind::Path(_)
             | TypeExprKind::PathApplied { .. }
             | TypeExprKind::Ref(_)

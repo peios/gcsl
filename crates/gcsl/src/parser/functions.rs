@@ -107,6 +107,7 @@ use crate::lexer::{Token, TokenKind};
 use crate::names::Name;
 use crate::source::Span;
 
+use super::types::{MEMO_BLOCK, MEMO_BLOCK_NOTE, REST_BLOCK};
 use super::{
     Braces, Entry, MISPLACED_META, MUT_PARAM_NOTE, PLAIN_VARIABLE_NAME, ParseResult, Parser, Stop,
     error_span,
@@ -284,6 +285,10 @@ impl Parser<'_> {
         if let Some(default) = receiver.default {
             return Err(self.error("a receiver takes no default", self.span_of(default)));
         }
+        if self.is_block_type(receiver.ty) {
+            let span = self.type_span(receiver.ty);
+            return Err(self.error("a method's receiver is not a block", span));
+        }
         Ok(receiver)
     }
 
@@ -397,7 +402,13 @@ impl Parser<'_> {
             return Err(reported);
         }
         let own: Vec<Param> = self.param_stack.drain(base..).collect();
+        self.check_block_last(own.iter().map(|param| param.ty))?;
         let (effect, marker) = self.return_marker()?;
+        if effect == Effect::Memo && own.last().is_some_and(|param| self.is_block_type(param.ty)) {
+            return Err(
+                self.report(Diagnostic::error(MEMO_BLOCK, marker).with_note(MEMO_BLOCK_NOTE))
+            );
+        }
         let own = self.with_default_fns(own, (effect, marker));
         let params = self.builder.push_params(&own);
         let (ret, ret_height) = self.parse_type()?;
@@ -519,8 +530,20 @@ impl Parser<'_> {
             ));
         }
         self.advance();
-        let (ty, height) = self.parse_type()?;
+        let (ty, height) = self.parse_param_type()?;
         *tallest = (*tallest).max(height);
+        if self.is_block_type(ty) {
+            let span = self.type_span(ty);
+            if dots.is_some() {
+                return Err(self.error(REST_BLOCK, span));
+            }
+            if self.peek().kind == TokenKind::Eq {
+                return Err(self.report(
+                    Diagnostic::error("a block parameter has no default", self.peek().span)
+                        .with_note("every call gives the block, as `f(x) { ... }`"),
+                ));
+            }
+        }
         if dots.is_some() && self.peek().kind == TokenKind::Eq {
             return Err(self.report(
                 Diagnostic::error("a rest parameter has no default", self.peek().span)

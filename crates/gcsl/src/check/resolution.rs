@@ -133,6 +133,9 @@ pub(super) struct CallsChecked {
     /// The methods of the earlier inputs of a session, by their names, each
     /// with its binding's.
     pub(super) earlier_methods: HashMap<Name, Vec<Name>>,
+    /// The trailing blocks that fill a block parameter whose bodies are
+    /// being checked, innermost last (see [Blocks](crate::check::blocks#blocks)).
+    pub(super) block_args: Vec<super::blocks::BlockArg>,
 }
 
 /// What the check gives lowering besides types and slots, as
@@ -193,6 +196,12 @@ pub(super) struct ForLowering {
     /// Each read of a file's `path`, `f.path`, by its id (see
     /// [Files](crate::check::files#files)).
     pub(super) file_paths: HashSet<ExprId>,
+    /// Each trailing block that fills a block parameter, by its id (see
+    /// [Blocks](crate::check::blocks#blocks)), with whether its last
+    /// expression is a statement, its value discarded.
+    pub(super) block_args: HashMap<ExprId, bool>,
+    /// Each call of a block, by its id (see [Blocks](crate::check::blocks#blocks)).
+    pub(super) block_calls: HashSet<ExprId>,
 }
 
 /// A parameter's default function, as its check found it (see "Calls"
@@ -637,6 +646,21 @@ impl Resolution {
     #[must_use]
     pub fn with_keys(&self, id: ExprId) -> Option<&[Name]> {
         self.lowered.withs.get(&id).map(|keys| &keys[..])
+    }
+
+    /// Whether `id` is a trailing block that fills a block parameter (see
+    /// [Blocks](crate::check::blocks#blocks)), and then whether its last
+    /// expression is a statement, its value discarded.
+    #[must_use]
+    pub fn is_block_arg(&self, id: ExprId) -> Option<bool> {
+        self.lowered.block_args.get(&id).copied()
+    }
+
+    /// Whether the call `id` is of a block (see
+    /// [Blocks](crate::check::blocks#blocks)).
+    #[must_use]
+    pub fn is_block_call(&self, id: ExprId) -> bool {
+        self.lowered.block_calls.contains(&id)
     }
 
     /// The receiver of the call `id`, if it is a method's (see
