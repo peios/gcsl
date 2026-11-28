@@ -2,7 +2,7 @@
 # was last set or confirmed for (see tests/semantics.rs). Each line after
 # the digest says why it was written again without raising SEMANTICS.
 semantics 1
-digest 294653ab219a5abc5339c77577296368edb7754fd69c80b699469e280a9641f5
+digest 12303e62ede080f8386bd6be632b211ecb6df78dd2483b30f195130658bd1cd9
 
 PEI-1775: recording of what a run used (functions, top-level cells, contexts), for tests only (cfg test or the coverage feature); what code means is unchanged.
 PEI-1786: block parameters, a new form: a trailing block where a function was expected was a check error, so what every program that checked means is unchanged.
@@ -15,3 +15,4 @@ PEI-1786: the body of a definition whose def-type's definitions return `{}` ends
 PEI-1788: in graph mode only the tasks that may have their turn are woken to look for it, and a task's path is found once while it is set aside; which effects are made, in what order, and what code means are unchanged.
 PEI-1788: in graph mode the tasks waiting for their turn are kept apart in program order, and a task split off keeps only the paths of the scopes it was split off inside; which effects are made, in what order, and what every node is named are unchanged.
 PEI-1789: a loop that stands as a statement collects nothing when its body ends with a call of an impure function, which was an unused-value error; every loop that checked before means what it meant.
+PEI-1788: in graph mode code waiting for a host operation's result, one the host does not isolate, is no longer split off, so a unit with an operation pending asks for nothing else; operations reach the host in the order they did, and no other effect, step or program is affected.

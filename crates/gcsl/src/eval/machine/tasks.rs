@@ -71,6 +71,20 @@
 //! the host was not asked anything by, wakes none until every task waits
 //! (see [Yielding](super#yielding)).
 //!
+//! # Tasks and operations
+//!
+//! A host operation ([`Builtin::Operation`](crate::check::Builtin::Operation))
+//! that the host does not isolate is the exception to splitting: a task
+//! that would wait for one's result waits whole, and nothing is split off
+//! it ([`Machine::awaits_operation`]). Such operations are made one at a
+//! time and in program order anyway, so the next iteration of a loop could
+//! only go as far as its own operation and wait its turn there; split off,
+//! a loop of N of them would be N tasks waiting their turn, each a copy of
+//! its parent's values. So while an operation of a unit is pending, the
+//! unit asks its host for nothing else, and a loop of operations is one
+//! task, however its body is written. Every other effect, an isolated one,
+//! a deferred step, and a wait for a turn, splits as before.
+//!
 //! # Wound-wait
 //!
 //! Tasks that wait for each other's memoised calls or `lazy`s can wait in
@@ -986,6 +1000,18 @@ impl Machine<'_> {
             .iter()
             .chain(turns)
             .any(|task| holds(task, &demanded) && task.path() < mine.as_slice())
+    }
+
+    /// Whether `wait` is for the result of a host operation the host does
+    /// not isolate, which the task waits for whole, splitting nothing off
+    /// (see [Tasks and operations](#tasks-and-operations)).
+    pub(super) fn awaits_operation(&self, wait: Wait) -> bool {
+        let Wait::Node(id) = wait else {
+            return false;
+        };
+        self.shared
+            .graph
+            .is_some_and(|graph| graph.is_ordered_operation(id, self.shared.effects))
     }
 
     /// Whether a task other than the one running waits for the result of

@@ -824,6 +824,17 @@ impl<'g> GraphRun<'g> {
         })
     }
 
+    /// Whether the node `id` is a host operation's ([`Builtin::Operation`])
+    /// that the host does not isolate: one the code that waits for its
+    /// result waits for whole, splitting nothing off (see [Tasks
+    /// and operations](crate::eval::machine::tasks#tasks-and-operations)).
+    pub(crate) fn is_ordered_operation(&self, id: NodeId, effects: &dyn super::Effects) -> bool {
+        self.graph.borrow().node(id).is_some_and(|node| {
+            node.kind == NodeKind::Effect(Builtin::Operation)
+                && !effects.isolates(Builtin::Operation)
+        })
+    }
+
     /// How many scopes are being run.
     pub(crate) fn scope_depth(&self) -> usize {
         self.scopes.borrow().len()

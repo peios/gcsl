@@ -1473,3 +1473,86 @@ fn a_loop_statement_that_ends_with_an_operation_runs_it_each_time_and_collects_n
         ]
     );
 }
+
+#[test]
+fn a_unit_with_an_operation_pending_asks_for_nothing_else_until_it_is_answered() {
+    // A step in the iteration after an operation's, which could be split
+    // off: while the operation is pending, the unit waits for it whole, and
+    // the step is met only once it is answered.
+    let (mut workspace, mut engine) = machines(
+        "#[attribute] #[defers] type step = {}\n\
+         #[step] fn make(n: Int) -> String { \"made {n}\" }\n\
+         def test one() {\n\
+         \x20   let both = for i in 0..2 { if i == 0 { say(\"first\") } else { make(i) } }\n\
+         \x20   = \"{both[0]} {both[1]}\"\n\
+         }",
+    );
+    let call = workspace.prepare_call(("test", "one"), &[], &[]).unwrap();
+    let mut graph = Graph::new();
+    let Progress::Paused(nodes) = workspace.run_prepared(&call, &mut graph, every()).unwrap()
+    else {
+        panic!("the unit did not stop at its operation");
+    };
+    assert_eq!(nodes.len(), 1, "{nodes:?}");
+    assert_eq!(graph.len(), 1, "nothing but the operation was met");
+    let operation = workspace.operation(&graph, nodes[0]).unwrap();
+    assert_eq!(operation.name, "say");
+    let answer = perform(&operation.name, &operation.args, &mut engine.made)
+        .map(|plain| workspace.from_plain(&plain))
+        .map_err(|failure| Diagnostic::error(failure.message, Span::new(0, 0)));
+    assert!(graph.resolve(nodes[0], answer));
+    // Answered, the unit goes on to the step.
+    let Progress::Paused(nodes) = workspace.run_prepared(&call, &mut graph, every()).unwrap()
+    else {
+        panic!("the unit did not stop at its step");
+    };
+    assert_eq!(nodes.len(), 1, "{nodes:?}");
+    assert_eq!(
+        graph.node(nodes[0]).unwrap().kind(),
+        crate::eval::graph::NodeKind::Deferred
+    );
+    assert!(graph.resolve(nodes[0], Ok(Value::Str(std::rc::Rc::from("made 1")))));
+    assert_eq!(
+        workspace.run_prepared(&call, &mut graph, every()).unwrap(),
+        Progress::Done(Value::Str(std::rc::Rc::from("first made 1")))
+    );
+}
+
+#[test]
+fn an_isolated_operation_is_still_split_off() {
+    // A host that isolates operations has the step met while the
+    // operation is pending, as for any isolated effect.
+    #[derive(Debug)]
+    struct Isolating;
+    impl Effects for Isolating {
+        fn temp_dir(&self) -> Option<Result<String, String>> {
+            None
+        }
+        fn isolates(&self, builtin: crate::check::Builtin) -> bool {
+            builtin == crate::check::Builtin::Operation
+        }
+    }
+    let never = |_: &[crate::check::Attribute]| true;
+    let (mut workspace, _) = machines(
+        "#[attribute] #[defers] type step = {}\n\
+         #[step] fn make(n: Int) -> String { \"made {n}\" }\n\
+         def test one() {\n\
+         \x20   let both = for i in 0..2 { if i == 0 { say(\"first\") } else { make(i) } }\n\
+         \x20   = \"{both[0]} {both[1]}\"\n\
+         }",
+    );
+    let call = workspace.prepare_call(("test", "one"), &[], &[]).unwrap();
+    let mut graph = Graph::new();
+    let host = GraphHost {
+        defers: &never,
+        effects: &Isolating,
+    };
+    let Progress::Paused(_) = workspace.run_prepared(&call, &mut graph, host).unwrap() else {
+        panic!("the unit did not stop");
+    };
+    assert_eq!(
+        graph.len(),
+        2,
+        "the step was met while the operation was pending"
+    );
+}
