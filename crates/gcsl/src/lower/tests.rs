@@ -3013,8 +3013,7 @@ fn a_block_that_ends_with_a_statement_gives_the_empty_record() {
         ),
         "{dumped}"
     );
-    // A block that gives `{}` itself keeps its last expression as its
-    // result.
+    // So is a last expression that is `{}` itself.
     let text = "fn step(body: block -> {}) -> {} { body(); = {} }\nstep { {} }";
     let dumped = dump(text);
     assert!(
@@ -3022,7 +3021,8 @@ fn a_block_that_ends_with_a_statement_gives_the_empty_record() {
             "\x20   (arg 0 block @55..61\n\
              \x20     (block @55..61\n\
              \x20       (block @57..59\n\
-             \x20         (empty @57..59))))))\n"
+             \x20         (empty @57..59))\n\
+             \x20       (empty @55..61)))))\n"
         ),
         "{dumped}"
     );

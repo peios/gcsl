@@ -31,10 +31,13 @@
 //! result as a function's body is against its return type: it is in its
 //! caller's scope, so it reads the caller's variables, declares its own in
 //! the caller's frame, and rebinds the caller's mutable variables with
-//! `:=`, which a function expression there could not. Its last expression,
-//! where the block's result is `{}`, may be a call of an impure function
-//! whose value is discarded, as a call statement's is, so that a block
-//! that ends with a call needs no `{}` after it. The body of a pure block,
+//! `:=`, which a function expression there could not. Where the block's
+//! result is `{}`, its last expression is a statement, as the others are
+//! (`Checker::ends_with_statement`): a call of an impure function, whose
+//! value is discarded, or a loop, which collects nothing, so that a block
+//! that ends with a call or a loop needs no `{}` after it, and any other
+//! value there is an unused value. A result written `= EXPR` is the
+//! block's value still. The body of a pure block,
 //! `block: T`, is pure code whatever its caller is: a call of an impure
 //! function or an await in it is the usual error, labelled at the call
 //! the block is given to.
@@ -50,7 +53,7 @@
 //! which calls are of a block
 //! ([`Resolution::is_block_call`](super::Resolution::is_block_call)).
 
-use crate::ast::{Arg, ArgKind, ArgRange, Effect, ExprId, ExprKind, FnId, ItemKind};
+use crate::ast::{Arg, ArgKind, ArgRange, Effect, ExprId, ExprKind, FnId, ItemKind, ItemRange};
 use crate::diagnostic::Diagnostic;
 use crate::source::Span;
 use crate::types::{FnTy, TyId};
@@ -319,17 +322,19 @@ impl Checker<'_> {
             callee,
         });
         let errors = self.errors.len();
-        let last = ret.and_then(|ret| Some((ret, self.ends_with_call(value, ret)?)));
-        let found = if let Some((ret, last)) = last {
-            let found = self.check_block_end(value, last);
-            self.expect_at(value, found, ret, (callee, label), how);
-            found
-        } else {
-            self.lowering.block_args.insert(value, false);
-            match ret {
-                Some(ret) => self.check_expr_expecting_at(value, ret, (callee, label), how),
-                None => self.check_expr(value),
+        // A block whose result is `{}` ends as a statement list does.
+        let statements = ret.and_then(|ret| self.ends_with_statement(value, ret));
+        self.lowering.block_args.insert(value, statements.is_some());
+        let found = match (ret, statements) {
+            (Some(ret), Some(items)) => {
+                self.calls.statements = Some(items);
+                let found = self.check_expr(value);
+                self.calls.statements = None;
+                self.expect_at(value, found, ret, (callee, label), how);
+                found
             }
+            (Some(ret), None) => self.check_expr_expecting_at(value, ret, (callee, label), how),
+            (None, _) => self.check_expr(value),
         };
         self.calls.block_args.pop();
         // The purity rule's errors name the function, written before a
@@ -346,12 +351,12 @@ impl Checker<'_> {
         found
     }
 
-    /// The last expression of the trailing block `value`, which fills a
-    /// block parameter of the result `ret`, if the block may end as a
-    /// statement list does (see [Blocks](self#blocks)): if `ret`, once
-    /// awaited, is `{}`, the block is no record block, and its last item
-    /// is an expression that is a call.
-    fn ends_with_call(&mut self, value: ExprId, ret: TyId) -> Option<ExprId> {
+    /// The items of the trailing block `value`, which fills a block
+    /// parameter of the result `ret`, if the block ends as a statement
+    /// list does (see [Blocks](self#blocks)): if `ret`, once awaited, is
+    /// `{}`, the block is no record block, and its last item is an
+    /// expression, not a result written `= EXPR`.
+    fn ends_with_statement(&mut self, value: ExprId, ret: TyId) -> Option<ItemRange> {
         let ExprKind::Block { items, .. } = self.ast.get(value).kind else {
             return None;
         };
@@ -359,36 +364,17 @@ impl Checker<'_> {
             return None;
         }
         let last = self.ast.items(items).last().copied()?;
-        match self.ast.item(last).kind {
-            ItemKind::Expr(last) if matches!(self.ast.get(last).kind, ExprKind::Call { .. }) => {
-                Some(last)
-            }
-            _ => None,
-        }
+        matches!(self.ast.item(last).kind, ItemKind::Expr(_)).then_some(items)
     }
 
-    /// Checks the trailing block `value`, whose last expression is the
-    /// call `last` and which fills a block parameter whose result is `{}`,
-    /// and returns its type: if the call is of an impure function and its
-    /// value is not `{}`, it is made a statement, its value discarded as
-    /// [`Checker::check_statement`] discards one, and the block is `{}`
-    /// (see [Blocks](self#blocks)). Whether it was is recorded for
-    /// lowering.
-    fn check_block_end(&mut self, value: ExprId, last: ExprId) -> TyId {
-        let found = self.check_expr(value);
-        let ty = self.expr_types[last.index()];
-        let kept = self.types.present(ty);
-        let discards = ty != TyId::ERROR
-            && kept != TyId::EMPTY
-            && kept != self.never
-            && self.impure_calls.contains(&last)
-            && self.pure_marker().is_none();
-        self.lowering.block_args.insert(value, discards);
-        if !discards {
-            return found;
-        }
-        self.check_statement(last, ty);
-        self.expr_types[value.index()] = TyId::EMPTY;
-        TyId::EMPTY
+    /// Whether `body` is the items of the trailing block being checked
+    /// whose last expression is a statement, as
+    /// [`Checker::ends_with_statement`] found: asked once, as its items
+    /// are checked.
+    pub(super) fn is_statements(&mut self, body: ItemRange) -> bool {
+        self.calls
+            .statements
+            .take_if(|items| *items == body)
+            .is_some()
     }
 }

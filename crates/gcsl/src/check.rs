@@ -2429,7 +2429,7 @@ impl<'a> Checker<'a> {
                 ItemKind::Field { .. } | ItemKind::Spread(_)
             )
         });
-        let mut result = TyId::EMPTY;
+        let (mut result, statements) = (TyId::EMPTY, self.is_statements(body));
         // Whether this is the input's outermost block, whose top-level
         // functions are order-free.
         let root = body == self.ast.root() && self.functions.is_empty();
@@ -2509,7 +2509,7 @@ impl<'a> Checker<'a> {
                 ItemKind::Expr(value) => {
                     // In a record block, even the final expression is a
                     // statement.
-                    let is_result = next.is_none() && first_field.is_none();
+                    let is_result = next.is_none() && first_field.is_none() && !statements;
                     let ty = self.expression_item(value, is_result, result_expected);
                     if is_result {
                         result = ty;

@@ -85,11 +85,16 @@ fn a_trailing_block_is_checked_against_the_block_s_result() {
             "the function is fn(n: Int, body: block: Int): Int"
         )]
     );
-    // An impure block of `{}` whose body gives a value.
+    // A block of `{}` ends as a statement list does, so a value there is
+    // unused; one written as its result is the block's, of the wrong type.
     let text = steps("step(\"a\") { 1 }");
     let error = only(&text);
+    assert_eq!(error.message, "unused value of type Int");
+    assert_eq!(error.span, last(&text, "1"));
+    let text = steps("step(\"a\") { = 1 }");
+    let error = only(&text);
     assert_eq!(error.message, "mismatched types");
-    assert_eq!(error.span, last(&text, "{ 1 }"));
+    assert_eq!(error.span, last(&text, "{ = 1 }"));
     assert_eq!(
         error.label.as_deref(),
         Some("expected {} | Future<{}>, found Int")
@@ -600,20 +605,47 @@ fn a_block_of_the_empty_record_may_end_with_an_impure_call() {
     }
     // The call of the function is still `{}`.
     assert_eq!(shown_result(&steps("= step(\"a\") { op() }")), "{}");
-    // Only a call of an impure function: a pure one's value, any other
-    // expression's and an `if`'s are the block's value, of the wrong type.
+    // Its last expression is a statement like the others: a pure call's
+    // value and any other expression's are unused values, and a bare
+    // `await` is run and discarded.
     for text in [
         "step(\"a\") { pure_op() }",
         "step(\"a\") { 1 }",
-        "step(\"a\") { await lazy op() }",
         "step(\"a\") { op() + 1 }",
     ] {
-        assert_eq!(messages(&steps(text)), vec!["mismatched types"], "{text}");
+        assert_eq!(
+            messages(&steps(text)),
+            vec!["unused value of type Int"],
+            "{text}"
+        );
     }
+    assert!(diagnostics_or_none(&steps("step(\"a\") { await lazy op() }")).is_empty());
     assert_eq!(
         messages(&steps("step(\"a\") { if true { op() } }")),
         vec!["`if` without `else` must be `{}`"]
     );
+    // A value that holds nothing but `{}`, as a loop's list does, is a
+    // statement too, whatever its loop.
+    for text in [
+        "let mut n = 0\nstep(\"a\") { for i in [1, 2] { n := n + i } }",
+        "let mut n = 0\nstep(\"a\") { for n < 3 { n := n + 1 } }",
+        "step(\"a\") { for i in [1, 2] { op(); {} } }",
+    ] {
+        let found = diagnostics_or_none(&steps(text));
+        assert!(found.is_empty(), "{text}: {found:?}");
+    }
+    // A loop that collects values is an unused value there, as it is in
+    // any statement.
+    for text in [
+        "step(\"a\") { for i in [1, 2] { i } }",
+        "step(\"a\") { for i in [1, 2] { op() } }",
+    ] {
+        assert_eq!(
+            messages(&steps(text)),
+            vec!["unused value of type `List<Int>`"],
+            "{text}"
+        );
+    }
     // Only where the block's result is `{}`: elsewhere the call is the
     // block's value.
     assert_eq!(shown_result(&steps("= measure { op() }")), "Int");
@@ -631,12 +663,12 @@ fn a_block_of_the_empty_record_may_end_with_an_impure_call() {
         .is_empty()
     );
     // In a pure block nothing is discarded: the impure call is an error,
-    // and its value the block's.
+    // and its value unused.
     assert_eq!(
         messages("fn f(body: block: {}): {} { body() }\nfn op() -> Int { 1 }\nf { op() }"),
         vec![
-            "mismatched types",
-            "cannot call an impure function from a pure function"
+            "cannot call an impure function from a pure function",
+            "unused value of type Int"
         ]
     );
 }
@@ -671,9 +703,9 @@ fn what_lowering_is_told_of_blocks() {
         block_args,
         [
             ("{ 2 }", false),
-            ("{ body() }", false),
+            ("{ body() }", true),
             ("{ op() }", true),
-            ("{ {} }", false),
+            ("{ {} }", true),
         ]
     );
     // Each call of a block parameter, and no other call.

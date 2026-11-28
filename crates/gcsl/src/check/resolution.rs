@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::ast::{ArgRange, ExprId, FnId, ForId, GenericOwner, ItemId, RecoverId};
+use crate::ast::{ArgRange, ExprId, FnId, ForId, GenericOwner, ItemId, ItemRange, RecoverId};
 use crate::names::Name;
 use crate::source::Span;
 use crate::types::{AwaitKind, Decode, GenericId, Need, TyId, ValueTest};
@@ -140,6 +140,9 @@ pub(super) struct CallsChecked {
     /// The trailing blocks that fill a block parameter whose bodies are
     /// being checked, innermost last (see [Blocks](crate::check::blocks#blocks)).
     pub(super) block_args: Vec<super::blocks::BlockArg>,
+    /// The items of the trailing block about to be checked whose last
+    /// expression is a statement (see [Blocks](crate::check::blocks#blocks)).
+    pub(super) statements: Option<ItemRange>,
     /// The `recover`s whose fallbacks are being checked, innermost last
     /// (see [Failure](crate::check::failure#failure)).
     pub(super) fallbacks: Vec<super::failure::Fallback>,

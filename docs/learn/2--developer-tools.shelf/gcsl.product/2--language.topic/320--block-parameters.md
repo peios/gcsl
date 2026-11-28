@@ -186,11 +186,12 @@ tag = bracketed { "release" }
 
 A pure block can still rebind the variables of the code around it.
 
-## Ending a block with a call
+## Ending a block with a call or a loop
 
-A block that gives `{}`, such as the block of a `step`, can end with a call
-of an impure function. The call's value is discarded, as it is when a call
-stands alone as a statement, so the block doesn't need a `{}` after it:
+A block that gives `{}`, such as the block of a `step`, can end with
+anything that can stand alone as a statement. A call of an impure function
+is one: its value is discarded, as it is when the call is a statement, so
+the block doesn't need a `{}` after it:
 
 ```gcsl
 fn step(name: String, body: block -> {}) -> {} {
@@ -200,10 +201,23 @@ fn step(name: String, body: block -> {}) -> {} {
 step("reload") { sh("echo reload") }
 ```
 
-Only a call is discarded this way. A block that ends with anything else
-that has a value, such as a loop, which collects its results into a list,
-needs `= {}` as its last line. A function's own body never discards its
-last expression, which is why the `step` in
+A loop whose body gives `{}` is another, since its list holds nothing:
+
+```gcsl
+fn step(name: String, body: block -> {}) -> {} {
+    body()
+}
+
+let mut total = 0
+step("count") {
+    for n in [1, 2, 3] { total := total + n }
+}
+```
+
+A block that ends with any other value, such as a number or the result of
+a pure function, doesn't fit `{}`, as an unused value is an error in a
+statement. A function's own body never discards its last expression, which
+is why the `step` in
 [Declaring and giving a block](#declaring-and-giving-a-block) ends with
 `= {}`.
 
