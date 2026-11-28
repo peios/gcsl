@@ -1,7 +1,7 @@
 //! Inlay hints: the types a file does not write, shown where they would be
 //! written (see the documentation of [`crate::index`], "Inlay hints").
 
-use crate::ast::{Ast, ExprId, ExprKind, ForHead, ItemKind, UnaryOp};
+use crate::ast::{Ast, ExprId, ExprKind, FnId, ForHead, ItemKind, TypeExprKind, UnaryOp};
 use crate::source::Span;
 use crate::types::{TyId, TyKind};
 
@@ -90,17 +90,39 @@ impl Index {
                     for param in ast.params(decl.params) {
                         hints.extend(binding(param.span));
                     }
-                    let (dt, body) = (ast.def_type(def).dt, ast.get(decl.body).span);
+                    let use_ = ast.def_type(def);
+                    // Its own, written with no type, whose defaults are the
+                    // arguments of its body's function's call.
+                    for (param, default) in own_untyped(ast, use_.body, decl.body) {
+                        if !spelled(ast, default) {
+                            hints.extend(binding(param));
+                        }
+                    }
+                    let (dt, body) = (use_.dt, ast.get(decl.body).span);
                     hints.extend(self.result(file, (dt, value), body));
                 }
                 _ => {}
             }
         }
         for id in ast.expr_ids() {
-            if let ExprKind::For(at) = ast.get(id).kind
-                && let ForHead::Each { name_span, .. } = ast.for_decl(at).head
-            {
-                hints.extend(binding(name_span));
+            match ast.get(id).kind {
+                ExprKind::For(at) => {
+                    if let ForHead::Each { name_span, .. } = ast.for_decl(at).head {
+                        hints.extend(binding(name_span));
+                    }
+                }
+                // A parameter written with no type, as a `let` is.
+                ExprKind::Fn(function) => {
+                    for param in ast.params(ast.fn_decl(function).params) {
+                        if ast.written_type(param.ty) == TypeExprKind::Inferred
+                            && let Some(default) = param.default
+                            && !spelled(ast, default)
+                        {
+                            hints.extend(binding(param.span));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         hints
@@ -192,6 +214,35 @@ impl Index {
             _ => ty,
         }
     }
+}
+
+/// The parameters of a definition's own written with no type, each by where
+/// its name is written, with its default: those of `inner`, its body's
+/// function, if it has one, whose defaults are the arguments of the call
+/// its body `body` results in (see the parser's
+/// [Def-types](crate::parser::deftypes#def-types)).
+fn own_untyped(ast: &Ast, inner: Option<FnId>, body: ExprId) -> Vec<(Span, ExprId)> {
+    let Some(inner) = inner else {
+        return Vec::new();
+    };
+    let ExprKind::Block { items, .. } = ast.get(body).kind else {
+        return Vec::new();
+    };
+    let [item] = ast.items(items) else {
+        return Vec::new();
+    };
+    let ItemKind::Result(call) = ast.item(*item).kind else {
+        return Vec::new();
+    };
+    let ExprKind::Call { args, .. } = ast.get(call).kind else {
+        return Vec::new();
+    };
+    ast.params(ast.fn_decl(inner).params)
+        .iter()
+        .zip(ast.args(args))
+        .filter(|(param, _)| ast.written_type(param.ty) == TypeExprKind::Inferred)
+        .map(|(param, arg)| (param.span, arg.value))
+        .collect()
 }
 
 /// Whether `ty` is `Error` or has it in it, `depth` levels into it: in a
@@ -348,6 +399,32 @@ mod tests {
                 "{marker}"
             );
         }
+    }
+
+    #[test]
+    fn a_parameter_written_with_no_type_has_its_default_s() {
+        // As a `let` has: none where the default spells its type.
+        let text = "fn machine(): {name: String} { name = \"vm\" }\n\
+                    fn f(a = 2, m = machine(), xs = [1], b = a + 1, c: Int = a) -> Int { a + b }\n\
+                    let g = fn(k = f()): Int { 1 }\n\
+                    fn (x: Int) add(n = f()): Int { x }\n";
+        assert_eq!(
+            hinted(text, &[], None),
+            "fn machine(): {name: String} { name = \"vm\" }\n\
+             fn f(a = 2, m⟨: {name: String}⟩ = machine(), xs = [1], b⟨: Int⟩ = a + 1, c: Int = a) \
+             -> Int { a + b }\n\
+             let g = fn(k⟨: Int⟩ = f()): Int { 1 }\n\
+             fn (x: Int) add(n⟨: Int⟩ = f()): Int { x }\n"
+        );
+        // A definition's own, beside those its def-type gives.
+        let workspace = "#[def_type]\ndef test(name: String, f: fn(v: Int) -> String) -> String \
+                         { f(1) }\ndef machine() -> {name: String} { name = \"vm\" }\n";
+        let text = "def test t(v, m = machine(), n = 2, s: String = \"x\") {\n    m.name\n}\n";
+        assert_eq!(
+            hinted(text, &[("workspace.gcsl", workspace)], None),
+            "def test t(v⟨: Int⟩, m⟨: {name: String}⟩ = machine(), n = 2, s: String = \"x\")⟨ -> \
+             String⟩ {\n    m.name\n}\n"
+        );
     }
 
     #[test]

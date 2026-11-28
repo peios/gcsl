@@ -681,12 +681,38 @@ impl Workspace {
         }
     }
 
+    /// The type of `param`, a parameter of `ast`, as it is written; or, if
+    /// it is written with no type, its default's (see the checker's
+    /// [Untyped parameters](crate::check::untyped#untyped-parameters)), as
+    /// the check found it: that of parameter number `at` of the function
+    /// type `function`, if it is one, shown as a source would write it
+    /// there ([`TypeTable::display_written`](crate::types::TypeTable::display_written)).
+    pub(super) fn shown_param(
+        &self,
+        ast: &Ast,
+        param: &Param,
+        (function, at): (Option<TyId>, usize),
+    ) -> String {
+        let names = &self.scan.names;
+        if ast.written_type(param.ty) != ast::TypeExprKind::Inferred {
+            return ast.show_type_with(param.ty, names);
+        }
+        function
+            .and_then(|ty| self.types.fn_sig(self.types.strip(ty)))
+            .and_then(|sig| sig.params.get(at))
+            .map_or_else(
+                || ast.show_type_with(param.ty, names),
+                |&(_, ty)| self.types.display_written(ty, names).to_string(),
+            )
+    }
+
     /// The type of the top-level item `item` of file `file`, whose type is
     /// `ty`, as [`TopLevel::ty`] shows it: its annotation as it is written,
     /// if it has one; else, for a function expression (a `def`'s), `fn(`,
     /// its parameters, each `NAME: TYPE`, and its marker and return type as
-    /// they are written, `fn(env: Vm) -> {}`; else its type as a diagnostic
-    /// shows it.
+    /// they are written, `fn(env: Vm) -> {}`, a parameter written with no
+    /// type as [`Workspace::shown_param`] shows it; else its type as a
+    /// diagnostic shows it.
     pub(super) fn shown_top_level(&self, file: u32, item: ItemId, ty: TyId) -> String {
         let names = &self.scan.names;
         let shown = || self.types.display(ty, names).to_string();
@@ -715,8 +741,9 @@ impl Workspace {
         let params: Vec<String> = ast
             .params(decl.params)
             .iter()
-            .map(|param| {
-                let ty = ast.show_type_with(param.ty, names);
+            .enumerate()
+            .map(|(at, param)| {
+                let ty = self.shown_param(ast, param, (Some(ty), at));
                 format!("{}: {ty}", names.get(param.name))
             })
             .collect();
@@ -880,6 +907,7 @@ impl Workspace {
                         let key = names::namespace_key(&path, index, number);
                         by_key.insert(key, found.len());
                         let params = invocation_params(ast, item);
+                        let checked = self.leaf_cell(index, item).map(|(_, ty)| ty);
                         found.push(FoundDefType {
                             listed: DefType {
                                 path,
@@ -898,7 +926,8 @@ impl Workspace {
                             item,
                             written: params
                                 .iter()
-                                .map(|param| ast.show_type_with(param.ty, names))
+                                .enumerate()
+                                .map(|(at, param)| self.shown_param(ast, param, (checked, at + 2)))
                                 .collect(),
                             items: Vec::new(),
                         });

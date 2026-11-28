@@ -1341,6 +1341,37 @@ mod tests {
     }
 
     #[test]
+    fn a_parameter_written_with_no_type_is_kept_so() {
+        let cases = [
+            (
+                "fn  f( n=3,m   =  n+1 ): Int { n }\n",
+                "fn f(n = 3, m = n + 1): Int { n }\n",
+            ),
+            (
+                "def f(a:Int,xs=[1,2],o={a=1}) -> Int { a }\n",
+                "def f(a: Int, xs = [1, 2], o = {a = 1}) -> Int { a }\n",
+            ),
+            (
+                "f = fn (m=machine( )): Int { 1 }\n",
+                "f = fn(m = machine()): Int { 1 }\n",
+            ),
+            (
+                "fn (x:Int)add(n=1):Int { x+n }\n",
+                "fn (x: Int) add(n = 1): Int { x + n }\n",
+            ),
+            (
+                "def test t( m=fixture machine( ),s:String=\"x\" ) { m }\n",
+                "def test t(m = fixture machine(), s: String = \"x\") { m }\n",
+            ),
+        ];
+        check(&cases);
+        // Formatted, it is left as it is.
+        for (_, formatted) in cases {
+            assert_eq!(fmt(formatted), formatted);
+        }
+    }
+
+    #[test]
     fn type_parameters_are_bracketed_as_type_arguments() {
         check(&[
             ("fn id< T >(x: T): T { x }\n", "fn id<T>(x: T): T { x }\n"),

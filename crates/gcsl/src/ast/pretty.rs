@@ -549,6 +549,8 @@ impl WrittenType<'_> {
             }
             TypeExprKind::Context(name) => write!(f, "^{}", self.names.get(name)),
             TypeExprKind::Data => f.write_str("*"),
+            // Written nowhere: its parameter's default says what it is.
+            TypeExprKind::Inferred => f.write_str("_"),
             TypeExprKind::Path(path) => self.path(f, path),
             TypeExprKind::Record(fields) => {
                 f.write_str("{")?;

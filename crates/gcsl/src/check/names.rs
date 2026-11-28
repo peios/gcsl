@@ -138,6 +138,9 @@ impl Checker<'_> {
             // A use of a function whose needs are not known yet (see
             // [Needs](crate::check::needs#needs)).
             if let VarRef::Fn(slot) = source {
+                if self.pending_use(id, slot) {
+                    return (TyId::ERROR, None);
+                }
                 self.note_member_use(id, slot);
             } else if binding.kind == BindingKind::Callee {
                 self.note_callee_use(id, (index, binding.name));

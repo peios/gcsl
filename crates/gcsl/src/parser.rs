@@ -250,6 +250,10 @@ const MUT_FIELD_NOTE: &str = "a field is defined once; declare a variable with `
 /// The note on [`MISPLACED_MUT`] before a parameter.
 const MUT_PARAM_NOTE: &str = "copy the parameter into a mutable variable, as in `let mut n = n`";
 
+/// The note on a parameter written with neither a type nor a default.
+const UNTYPED_NOTE: &str = "a parameter is written with its type, as in `n: Int`, or with a \
+     default its type is inferred from, as in `n = 3`";
+
 /// The note on [`MISSING_RETURN_TYPE`].
 const RETURN_TYPE_NOTE: &str = "a function declares its return type: `: T` for a pure function, `-> T` for an impure one, \
      `->> T` for a memoised one";

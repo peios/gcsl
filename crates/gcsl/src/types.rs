@@ -3624,6 +3624,25 @@ impl TypeTable {
             table: self,
             names,
             id,
+            written: false,
+        }
+    }
+
+    /// Type `id` shown as [`TypeTable::display`] shows it, but as a source
+    /// writes it where a bare type means the either shape, an impure
+    /// function's parameter: an either shape, `T | Future<T>`, and a
+    /// provisional type as the `T` written, at its top and at every
+    /// position inside it, through record and list types and a union's
+    /// members, but not in a function type, which is shown as it is. So the
+    /// type of a parameter written `xs: List<Int>` there shows as
+    /// `List<Int>`.
+    #[must_use]
+    pub fn display_written<'a>(&'a self, id: TyId, names: &'a Names) -> impl fmt::Display + 'a {
+        Display {
+            table: self,
+            names,
+            id,
+            written: true,
         }
     }
 

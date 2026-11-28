@@ -866,6 +866,57 @@ fn a_parameter_read_in_a_later_default_is_one_symbol() {
     assert!(hover.text.contains("Int"), "{}", hover.text);
 }
 
+#[test]
+fn a_parameter_written_with_no_type_is_a_symbol_of_its_default_s_type() {
+    let text = "fn machine(): {name: String} { name = \"vm\" }\n\
+                fn f(a = 2, m = machine(), b = a + 1): Int { a * b + len([m.name]) }\nr = f(3)\n";
+    let files = [("app.gcsl", text)];
+    // Its declaration, a read in a later default and one in the body.
+    let all = places(
+        &files,
+        &[
+            ("app.gcsl", "fn f(|a"),
+            ("app.gcsl", "= |a + 1"),
+            ("app.gcsl", "{ |a * b"),
+        ],
+    );
+    assert_eq!(references(&files, ("app.gcsl", "fn f(|a"), true), all);
+    assert_eq!(references(&files, ("app.gcsl", "{ |a * b"), true), all);
+    assert_eq!(
+        renamed(&files, ("app.gcsl", "= |a + 1"), "first"),
+        Ok(vec![(
+            "app.gcsl".to_owned(),
+            text.replace("f(a = 2", "f(first = 2")
+                .replace("= a + 1", "= first + 1")
+                .replace("{ a * b", "{ first * b")
+        )])
+    );
+    let (mut index, file) = index_of(&files, "app.gcsl");
+    // The hover of the parameter, and of its function, show the type its
+    // default gave it.
+    let hover = index.hover(file, offset(text, "m = |machine")).unwrap();
+    assert!(hover.text.contains("fn machine()"), "{}", hover.text);
+    let hover = index.hover(file, offset(text, "|m = machine")).unwrap();
+    assert!(hover.text.contains("m: {name: String}"), "{}", hover.text);
+    let hover = index.hover(file, offset(text, "{ |a * b")).unwrap();
+    assert!(hover.text.contains("a: Int"), "{}", hover.text);
+    let hover = index.hover(file, offset(text, "r = |f")).unwrap();
+    assert!(
+        hover
+            .text
+            .contains("fn f(a: Int, m: {name: String}, b: Int): Int"),
+        "{}",
+        hover.text
+    );
+    // Signature help, with the defaults as written.
+    let signature = index.signature(file, offset(text, "f(|3)")).unwrap();
+    assert_eq!(
+        signature.label,
+        "fn f(a: Int = 2, m: {name: String} = machine(), b: Int = a + 1): Int"
+    );
+    assert_eq!(signature.active, Some(0));
+}
+
 fn renamed_err(files: &[(&str, &str)], at: (&str, &str), new: &str) -> String {
     renamed(files, at, new).unwrap_err()
 }

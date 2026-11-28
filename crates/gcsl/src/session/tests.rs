@@ -56,6 +56,35 @@ fn a_default_that_is_no_constant_reaches_later_inputs() {
 }
 
 #[test]
+fn a_parameter_written_with_no_type_reaches_later_inputs() {
+    // A later input's call gives the default, a constant or a default
+    // function, and is checked against the type the default gave.
+    let mut session = Session::new();
+    value(
+        &mut session,
+        "let base = 5\nfn f(a = 1, b = a + base): Int { a + b }\nfn g(s = \"x\") -> String { s }",
+    );
+    assert_eq!(value(&mut session, "f()").to_string(), "7");
+    assert_eq!(value(&mut session, "f(2)").to_string(), "9");
+    assert_eq!(value(&mut session, "f(b = 0)").to_string(), "1");
+    assert_eq!(value(&mut session, "let base = 50\nf(2)").to_string(), "9");
+    assert_eq!(value(&mut session, "g() + g(\"y\")").to_string(), "xy");
+    assert_eq!(messages(&mut session, "f(\"s\")"), ["mismatched types"]);
+    value(&mut session, "f");
+    assert_eq!(value_type(&session), "fn(a: Int, b: Int): Int");
+    // A later input's function, whose default calls an earlier input's.
+    value(&mut session, "fn h(n = f()): Int { n * 2 }");
+    assert_eq!(value(&mut session, "h()").to_string(), "14");
+    // An input whose default needs its own function's type commits
+    // nothing.
+    assert_eq!(
+        messages(&mut session, "fn k(x = k()): Int { 1 }"),
+        ["cannot infer the type of `x`: its default needs the type of `k`, which needs it"]
+    );
+    assert_eq!(messages(&mut session, "k()"), ["undefined variable `k`"]);
+}
+
+#[test]
 fn an_input_with_syntax_errors_reports_them_all_and_commits_nothing() {
     let mut session = Session::new();
     // Every syntax error, and nothing of the input runs or is kept: not

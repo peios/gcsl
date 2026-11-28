@@ -38,11 +38,14 @@
 //! is F exactly. Parameters not as many as F's are "`package` defines
 //! functions of no parameters" ("of 1 parameter, `x`", "of 2 parameters,
 //! `a` and `b`", naming them if F names them all), at its parameter list.
-//! A definition's parameters of its own, written with a type and a default
-//! after F's (see the parser's "Def-types"), are those of its body's
+//! A definition's parameters of its own, written with a default, and a type
+//! or none, after F's (see the parser's "Def-types"), are those of its body's
 //! function, which its own function calls with their defaults, so that its
 //! type is still F's: the body's function is checked with F's result and
-//! F's effect, its parameters typed as written, and known by the
+//! F's effect, its parameters typed as written, one written with no type,
+//! `def test t(m = machine())`, by its default, the argument of that call
+//! (see [Untyped parameters](crate::check::untyped#untyped-parameters)),
+//! and known by the
 //! definition's last segment (`Checker::note_definition_body`); and it
 //! takes the definition's attributes, so that a deferring one makes it the
 //! step, given what its defaults came to where the def-type called the
@@ -196,6 +199,10 @@ pub(super) struct DefTypesChecked {
     /// effect its def-type gives it and the name it is known by, its
     /// definition's.
     pub(super) bodies: HashMap<FnId, (TyId, Effect, Option<Name>)>,
+    /// The call of the function of the body of each definition with
+    /// parameters of its own, whose arguments are their defaults (see
+    /// [Untyped parameters](crate::check::untyped#untyped-parameters)).
+    pub(super) own_calls: HashMap<FnId, ExprId>,
     /// The definition's meta each function expression is, if it is one (see
     /// [Metas](crate::check::attributes#metas)).
     pub(super) metas: HashMap<FnId, DefTypeId>,
@@ -672,6 +679,7 @@ impl Checker<'_> {
         let dt_span = self.ast.get(use_.dt).span;
         if let Some(body) = use_.body {
             self.note_definition_body(body, (ret, sig.effect), def);
+            self.note_own_call(body, decl.body);
         }
         self.functions.push(Function {
             fn_id: function,
@@ -734,6 +742,20 @@ impl Checker<'_> {
         let use_ = *self.ast.def_type(def);
         let name = self.ast.path(use_.path).last().and_then(PathSegment::name);
         self.def_types.bodies.insert(body, (ret, effect, name));
+    }
+
+    /// Records the call of `body`, the function of the body of a definition
+    /// with parameters of its own, that the definition's body `block` is,
+    /// as the parser makes it: the result of a block of that one item.
+    fn note_own_call(&mut self, body: FnId, block: ExprId) {
+        let ExprKind::Block { items, .. } = self.ast.get(block).kind else {
+            return;
+        };
+        if let [item] = self.ast.items(items)
+            && let ItemKind::Result(call) = self.ast.item(*item).kind
+        {
+            self.def_types.own_calls.insert(body, call);
+        }
     }
 
     /// Records the definition `def`, of function `function`, whose function

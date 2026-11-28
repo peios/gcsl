@@ -10,6 +10,7 @@ use crate::names::Name;
 use crate::source::Span;
 use crate::types::{AwaitKind, Decode, GenericId, Need, TyId, ValueTest};
 
+use super::untyped::UntypedChecked;
 use super::{
     Attribute, Constant, FieldSchedule, ImportedRecord, ImportedRecords, MadeAt, ParamDefault,
     Place, RecordFills, SharedChildren, Slot, VarRef, VariantTag, ViewRecord,
@@ -127,6 +128,9 @@ pub(super) struct CallsChecked {
     /// type parameters, each with its type: checked once, then only
     /// expected to fit its substituted parameter.
     pub(super) prechecked: HashMap<ExprId, TyId>,
+    /// The parameters written with no type, which their defaults type (see
+    /// [Untyped parameters](crate::check::untyped#untyped-parameters)).
+    pub(super) untyped: UntypedChecked,
     /// The callee of the call being checked, through any parentheses: the
     /// one place a generic function's name may be read.
     pub(super) callee: Option<ExprId>,

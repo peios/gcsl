@@ -345,6 +345,7 @@ fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
         TypeExprKind::Named(name) => out.push_str(ast.names().get(name)),
         TypeExprKind::Context(name) => write!(out, "^{}", ast.names().get(name)).unwrap(),
         TypeExprKind::Data => out.push('*'),
+        TypeExprKind::Inferred => out.push('_'),
         TypeExprKind::Path(path) => out.push_str(&ast.show_path(ast.path(path)).to_string()),
         TypeExprKind::Record(fields) => {
             out.push('{');
@@ -684,7 +685,9 @@ fn list_shape(ast: &Ast, elements: crate::ast::ElementRange, out: &mut String) {
 
 /// A function expression as `fn(x: Int): Int {..}`, `->> Int` if
 /// memoised and `-> Int` if impure, a parameter with a default as `x:
-/// Int = 1`.
+/// Int = 1`, and one written with no type as `x = 1`, or as `x: _` where
+/// its default is written elsewhere, as a definition's own is; the body's
+/// function of a definition, which has no return type, as `fn(x: _) {..}`.
 fn fn_shape(ast: &Ast, function: crate::ast::FnId, out: &mut String) {
     let decl = ast.fn_decl(function);
     out.push_str("fn(");
@@ -693,16 +696,24 @@ fn fn_shape(ast: &Ast, function: crate::ast::FnId, out: &mut String) {
             out.push_str(", ");
         }
         out.push_str(ast.names().get(param.name));
-        out.push_str(": ");
-        type_name(ast, param.ty, out);
+        let untyped = ast.type_expr(param.ty).kind == TypeExprKind::Inferred;
+        if !untyped || param.default.is_none() {
+            out.push_str(": ");
+            type_name(ast, param.ty, out);
+        }
         if let Some(default) = param.default {
             out.push_str(" = ");
             expr(ast, default, out);
         }
     }
-    out.push_str(decl.effect.params_end());
-    type_name(ast, decl.ret.unwrap(), out);
-    out.push(' ');
+    match decl.ret {
+        Some(ret) => {
+            out.push_str(decl.effect.params_end());
+            type_name(ast, ret, out);
+            out.push(' ');
+        }
+        None => out.push_str(") "),
+    }
     expr(ast, decl.body, out);
 }
 

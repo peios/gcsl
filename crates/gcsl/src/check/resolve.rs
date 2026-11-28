@@ -271,6 +271,9 @@ impl Checker<'_> {
                 Some(context) => self.types.context_type(context.key).unwrap_or(TyId::ERROR),
                 None => TyId::ERROR,
             },
+            // A parameter written with no type, as its default types it,
+            // in its own function's mode already.
+            TypeExprKind::Inferred => self.untyped_param(id, ty.span),
             // A type parameter in scope, which no bareness wraps.
             TypeExprKind::Named(name)
                 if let Some((owner, index)) = self.ast.type_param(id, name) =>
@@ -661,6 +664,7 @@ impl Checker<'_> {
             ]
             .contains(&Some(name)),
             TypeExprKind::Union { .. } => !self.has_future_member(ty),
+            TypeExprKind::Inferred => self.untyped_is_bare(ty),
             // A context's type is what it is declared to be.
             TypeExprKind::Fn { .. }
             | TypeExprKind::Block { .. }

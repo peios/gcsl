@@ -155,13 +155,131 @@ fn a_default_is_written_only_in_a_function_expression() {
         shape("fn(f: fn(Int): Int = g): Int { 1 }"),
         "fn(f: fn(Int): Int = g): Int {1}"
     );
-    // A definition's parameters are names alone, as before.
+    // A definition's parameter with a default is one of its own, and
+    // those its def-type gives come before it.
     assert_eq!(
-        error("def p x(v = \"x\") { 1 }"),
+        error("def p x(v = \"x\", w) { 1 }"),
         (
-            "expected `,` or `)`, found `=`".to_owned(),
-            Span::new(10, 11)
+            "the parameters `p` gives a definition come before its own, which have a default"
+                .to_owned(),
+            Span::new(17, 18)
         )
+    );
+}
+
+#[test]
+fn a_parameter_with_a_default_may_have_no_type() {
+    // In a function expression, a named function, a `def` and a method, in
+    // any position, beside parameters written with their types.
+    assert_eq!(shape("fn(n = 3): Int { n }"), "fn(n = 3): Int {n}");
+    assert_eq!(
+        shape("fn f(a: Int, b = a * 2, c: Int = 1) -> Int { b }"),
+        "fn f(a: Int, b = (a * 2), c: Int = 1) -> Int {b}"
+    );
+    assert_eq!(
+        shape("def f(m = machine()) ->> Int { 1 }"),
+        "def f(m = machine()) ->> Int {1}"
+    );
+    assert_eq!(
+        shape("fn (x: Int) add(n = 1): Int { x + n }"),
+        shape("fn (x: Int) add(n: Int = 1): Int { x + n }").replace("n: Int = 1", "n = 1")
+    );
+    // Its type expression says nothing, at its name, which is all the
+    // parameter spans; a default that is no constant has its default
+    // function, which declares no type either.
+    let text = "fn(a: Int, b = a * 2, c = [1]): Int { a }";
+    let ast = parse_text(text).unwrap();
+    let ExprKind::Fn(function) = ast.get(only_value(&ast)).kind else {
+        panic!("expected a function");
+    };
+    let params = ast.params(ast.fn_decl(function).params);
+    let kinds: Vec<bool> = params
+        .iter()
+        .map(|param| ast.type_expr(param.ty).kind == TypeExprKind::Inferred)
+        .collect();
+    assert_eq!(kinds, vec![false, true, true]);
+    assert_eq!(params[1].span, Span::new(11, 12));
+    assert_eq!(ast.type_expr(params[1].ty).span, Span::new(11, 12));
+    assert_eq!(params[2].span, Span::new(22, 23));
+    let default_fn = ast.fn_decl(params[1].default_fn.unwrap());
+    assert_eq!(default_fn.ret, Some(params[1].ty));
+    assert_eq!(default_fn.body, params[1].default.unwrap());
+    assert_eq!(ast.params(default_fn.params).len(), 1);
+    assert!(params[2].default_fn.is_none());
+    // The tree dump shows the type as `_`.
+    assert_eq!(
+        parse_text("fn(n = 3): Int { n }")
+            .unwrap()
+            .pretty()
+            .to_string(),
+        "(file\n  (expr @0..20\n    (fn @0..20\n      (params (n _\n        \
+             (int 3 @7..8)))\n      (ret pure Int)\n      (block @15..20\n        \
+             (expr @17..18\n          (name n @17..18))))))"
+    );
+}
+
+#[test]
+fn a_definition_s_own_parameter_may_have_no_type() {
+    // One of the definition's own, beside those written with a type, after
+    // those its def-type gives: a parameter of its body's function, which
+    // its body calls with the defaults.
+    assert_eq!(
+        shape("def test t(m = machine()) { m }"),
+        "def test t() {= fn(m: _) {m}(machine())}"
+    );
+    assert_eq!(
+        shape("def test t(v, m = 1, s: String = \"x\") { m }"),
+        "def test t(v) {= fn(m: _, s: String) {m}(1, \"x\")}"
+    );
+    // A name alone is still one its def-type gives.
+    assert_eq!(shape("def test t(v) { v }"), "def test t(v) {v}");
+}
+
+#[test]
+fn what_cannot_be_written_with_no_type() {
+    // A rest parameter, at its `=`.
+    let diagnostic = parse_text("fn(...xs = [1]): Int { 1 }").unwrap_err();
+    assert_eq!(
+        diagnostic.message,
+        "a rest parameter's type is not inferred"
+    );
+    assert_eq!(diagnostic.span, Span::new(9, 10));
+    assert_eq!(
+        diagnostic.notes,
+        vec![
+            "a rest parameter has no default: write the type of its elements, as in `...words: \
+             String`"
+        ]
+    );
+    // A method's receiver, at its default.
+    let diagnostic = parse_text("fn (x = 1) m(): Int { 1 }").unwrap_err();
+    assert_eq!(diagnostic.message, "a receiver takes no default");
+    assert_eq!(diagnostic.span, Span::new(8, 9));
+    assert_eq!(
+        diagnostic.notes,
+        vec!["a receiver is written with its type, as in `(xs: List<Int>)`"]
+    );
+    // One written with its type has no note.
+    let diagnostic = parse_text("fn (x: Int = 1) m(): Int { 1 }").unwrap_err();
+    assert_eq!(diagnostic.message, "a receiver takes no default");
+    assert!(diagnostic.notes.is_empty());
+    // A function type's parameter, where the name is read as a type.
+    assert_eq!(
+        error("let f: fn(x = 1): Int = g"),
+        (MISPLACED_DEFAULT.to_owned(), Span::new(12, 13))
+    );
+    // A parameter with neither a type nor a default, as before.
+    assert_eq!(
+        error("fn f(n, m = 1): Int { 1 }"),
+        (
+            "expected `:` and a type after parameter `n`".to_owned(),
+            Span::new(6, 7)
+        )
+    );
+    // The default is still needed after the `=`.
+    assert_eq!(
+        error("fn f(n = ): Int { 1 }").0,
+        "expected expression, found `)`"
     );
 }
 
@@ -244,7 +362,13 @@ fn function_expression_errors() {
         "expected `:` and a type after parameter `x`"
     );
     assert_eq!(diagnostic.span, Span::new(4, 5));
-    assert_eq!(diagnostic.notes, vec!["parameters must be annotated"]);
+    assert_eq!(
+        diagnostic.notes,
+        vec![
+            "a parameter is written with its type, as in `n: Int`, or with a default its type is \
+             inferred from, as in `n = 3`"
+        ]
+    );
     assert_eq!(
         error("fn(x, y: Int): Int { x }"),
         (
