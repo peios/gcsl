@@ -50,7 +50,9 @@ keep the values they already held.
 
 A closure captures values when it is created. It cannot update a mutable
 variable belonging to its enclosing function. Pass in a value and return
-an updated value when you need that communication.
+an updated value when you need that communication, or give the code to a
+function as a block, which does update the variables around it (see
+[Block Parameters](~gcsl/block-parameters)).
 
 ## Names and arithmetic
 

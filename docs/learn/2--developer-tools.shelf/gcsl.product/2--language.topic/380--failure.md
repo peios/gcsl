@@ -57,3 +57,30 @@ the `recover`: that timeout belongs to the enclosing call, which ends as
 if the `recover` weren't there. A `break`, `continue` or `return` inside
 the body is not a failure, and leaves through it as usual. Anything the
 body did before it failed stays done.
+
+## Recovering a caller's block
+
+A function that takes a [block parameter](~gcsl/block-parameters) can put
+its call of the block in a `recover`. A failure in the block comes out of
+that call like the failure of any call, so the function decides what a
+failure of its caller's code means:
+
+```gcsl
+fn attempt(body: block -> {}) -> String {
+    recover { body(); = "passed" } else (failure) { "failed: {failure.message}" }
+}
+
+let mut reached = ""
+first = attempt {
+    reached := "boot"
+    assert sh("echo down").trim() == "up", "the service is down"
+    reached := "check"
+}
+second = attempt { reached := "{reached}, then cleanup" }
+progress = reached
+```
+
+Here `first` is `"failed: assertion failed: the service is down"` and
+`second` is `"passed"`. The block's assignment before the failure stays
+done, so `progress` is `"boot, then cleanup"`. A failure that the function
+doesn't recover ends the run, reported where it happened in the block.

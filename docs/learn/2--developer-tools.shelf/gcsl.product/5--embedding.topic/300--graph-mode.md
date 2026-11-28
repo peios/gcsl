@@ -95,6 +95,18 @@ a block's value waits for all of them. An element, argument or statement
 is set aside only if it assigns no variable with `:=` and has no
 `break`, `continue` or `return` in it.
 
+Code that calls a [block parameter](~gcsl/block-parameters) is never set
+aside, whether it is an iteration, an element, an argument or a
+statement. The block can assign variables of the code that gave it, which
+the function calling it can't see, so a function's calls of its block
+always run in order. A call that gives a block follows the rules for any
+other code: what its block assigns counts as the call's own assignments.
+An iteration that declares a variable, gives a block that assigns it, and
+assigns nothing outside the loop is still set aside, with its own copy of
+the variable. A unit can stop inside a block as it can anywhere else, and
+carries on from there with the caller's variables as the block left them.
+A block's effects stay in program order like any others.
+
 If two parts set aside need the same memoised call or `lazy` value, it
 runs once. Should a later part have begun it and then had to wait for an
 earlier one, the later part gives up its run and the earlier part runs

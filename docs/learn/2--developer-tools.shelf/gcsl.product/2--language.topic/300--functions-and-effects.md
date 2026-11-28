@@ -33,7 +33,9 @@ scale(value = 21)
 
 Positional and named arguments are evaluated in source order. A trailing
 block supplies the last parameter, which is useful for functions that
-accept a configuration record.
+accept a configuration record. If the last parameter is declared as a
+block, the trailing block isn't evaluated as an argument: the function
+runs it when it chooses (see [Block Parameters](~gcsl/block-parameters)).
 
 A default can be any expression. It can use the parameters before it and
 anything visible where the function is written:
@@ -198,7 +200,9 @@ result with `= ...`, bind it with `let`, or remove it.
 
 Closures hold copies of the values they capture. Rebinding a variable
 later doesn't change an existing closure. An inner function cannot rebind
-an outer function's variable.
+an outer function's variable. A block given to a
+[block parameter](~gcsl/block-parameters) is not a closure: it runs in the
+scope it is written in, and rebinds the `let mut` variables there.
 
 Top-level named functions are available regardless of textual order and
 can refer to each other within the file. Workspace files still need an
