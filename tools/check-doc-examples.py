@@ -47,8 +47,9 @@ EXPECTED = {
     ("400--deferred-work.md", 0): "42\n",
     ("500--lists-and-control-flow.md", 0): "8\n",
     ("500--lists-and-control-flow.md", 1): "[4, 6]\n",
-    ("500--lists-and-control-flow.md", 2): "[0, 2, 4]\n",
-    ("500--lists-and-control-flow.md", 3): "300\n",
+    ("500--lists-and-control-flow.md", 2): "{greeted = true}\n",
+    ("500--lists-and-control-flow.md", 3): "[0, 2, 4]\n",
+    ("500--lists-and-control-flow.md", 4): "300\n",
     ("300--file-and-process-effects.md", 0): "GCSL\n",
     ("395--host-operations.md", 3): ('{outcome = "this host has no operation `vm.boot`"}\n'),
 }

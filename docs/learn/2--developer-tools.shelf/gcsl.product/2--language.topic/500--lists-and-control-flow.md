@@ -40,10 +40,26 @@ let doubled = for n in [1, 2, 3] if n > 1 { n * 2 }
 doubled
 ```
 
-A loop used as a statement discards its results. Use `for condition` for
-repetition while a condition holds, `for { ... }` without a condition,
-or `do { ... } for condition` to test after the body. A header can contain
-initialization and an update:
+A loop used as a statement runs for its effects. Its body can end with a
+call of an impure function, and the call's value is discarded each time,
+so the loop collects nothing:
+
+```gcsl
+for name in ["alpha", "beta"] {
+    sh("echo hello {name}")
+}
+greeted = true
+```
+
+A loop whose body ends with any other value, such as `for n in [1, 2] { n
+* 2 }`, is the error "unused value of type `List<Int>`" as a statement,
+because what it collects would be lost. So is a loop that a `break` or
+`continue` gives a value. Bind the loop with `let` if you want its list.
+
+Use `for condition` for repetition while a condition holds, `for { ... }`
+without a condition, or `do { ... } for condition` to test after the
+body. Each form follows the same rule as a statement. A header can
+contain initialization and an update:
 
 ```gcsl
 let values = for let i = 0; i < 3; i := i + 1 { i * 2 }

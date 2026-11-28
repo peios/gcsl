@@ -143,6 +143,10 @@ pub(super) struct CallsChecked {
     /// The items of the trailing block about to be checked whose last
     /// expression is a statement (see [Blocks](crate::check::blocks#blocks)).
     pub(super) statements: Option<ItemRange>,
+    /// The loops that a `break` or `continue` with a value is for, which,
+    /// as statements, cannot discard what they collect (see the loops' "A
+    /// loop as a statement").
+    pub(super) valued_loops: HashSet<ForId>,
     /// The items and the block of the body about to be checked of a
     /// definition whose def-type's definitions return `{}`, whose last
     /// expression is a statement if it is no `{}` (see
@@ -539,6 +543,10 @@ pub struct LoopResolution {
     /// Whether some `return'L` leaves it, so that it evaluates to the
     /// value returned.
     pub returned: bool,
+    /// Whether it is a statement that collects nothing, its body ending
+    /// with a call of an impure function whose value it discards (see the
+    /// checker's "A loop as a statement").
+    pub discards: bool,
 }
 
 impl Resolution {

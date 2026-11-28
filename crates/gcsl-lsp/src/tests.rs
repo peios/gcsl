@@ -666,6 +666,43 @@ fn a_document_not_on_disk_yet_is_a_file_of_its_workspace() {
 }
 
 #[test]
+fn a_host_s_file_is_checked_with_its_prelude() {
+    let scratch = Scratch::workspace("hosted", "");
+    let text = "def test boots() { step(\"a\") { } }\n";
+    let uri = scratch.write("tests/boot.prvm", text);
+    let (mut client, _) = Client::start(&["utf-8"]);
+    // Provium is not installed: one error, that says so.
+    client.open(&uri, text);
+    let published = client.published(&uri);
+    let [diagnostic] = published.diagnostics.as_slice() else {
+        panic!("{published:?}");
+    };
+    assert_eq!(
+        diagnostic.message,
+        "Provium is not installed, so the prelude of this `.prvm` file cannot be found\n\
+         note: run `provium prelude --write` in this workspace, or install Provium"
+    );
+    // Installed in the workspace, which the client reports: its prelude's
+    // names are found, and an error of the file's own is published.
+    scratch.write(".gcsl/hosts/prvm/prelude", "import * from \"provium\"\n");
+    let core = scratch.write(
+        ".gcsl/hosts/prvm/provium/core.gcsl",
+        "#[def_type]\ndef test(name: String, f: fn() -> {}) -> {} { f() }\n\
+         def step(name: String, body: block -> {}) -> {} { body() }\n",
+    );
+    let changes = json!({ "changes": [{ "uri": core, "type": 1 }] });
+    client.notify("workspace/didChangeWatchedFiles", changes);
+    assert_eq!(client.published(&uri).diagnostics, []);
+    client.change(&uri, 2, ((0, 31), (0, 31)), "nope()");
+    let published = client.published(&uri);
+    let [diagnostic] = published.diagnostics.as_slice() else {
+        panic!("{published:?}");
+    };
+    assert_eq!(diagnostic.message, "undefined variable `nope`");
+    client.shut_down().unwrap();
+}
+
+#[test]
 fn watched_files_are_registered_for_and_read_again() {
     let scratch = Scratch::workspace("watched", "");
     let a = scratch.write("a.gcsl", "z = y + 1\n");
@@ -682,9 +719,21 @@ fn watched_files_are_registered_for_and_read_again() {
     assert_eq!(request.method, "client/registerCapability");
     let registration = &request.params["registrations"][0];
     assert_eq!(registration["method"], "workspace/didChangeWatchedFiles");
+    let globs: Vec<&str> = registration["registerOptions"]["watchers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|watcher| watcher["globPattern"].as_str())
+        .collect();
     assert_eq!(
-        registration["registerOptions"]["watchers"][0]["globPattern"],
-        "**/*.gcsl"
+        globs,
+        [
+            "**/*.gcsl",
+            "**/*.pekit",
+            "**/*.prvm",
+            "**/.gcsl/hosts/**",
+            "/usr/share/gcsl/hosts/**"
+        ]
     );
     let response = Response::new_ok(request.id, Value::Null);
     client.connection.sender.send(response.into()).unwrap();

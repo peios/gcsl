@@ -194,7 +194,7 @@ The parameter can only be called: binding it, storing it, returning it or passin
 To pass a block on, call it in another call's trailing block, as in inner(x) { body() }.
 The body of a pure block is pure code, whatever the code around it is.
 A pure function takes only a pure block.
-A trailing block given to a block whose result type is {} can end with what a statement can be: a call of an impure or memoized function, whose value is discarded as a call statement's is, or a value that holds nothing but {}, as a loop's list does.
+A trailing block given to a block whose result type is {} can end with what a statement can be: a call of an impure or memoized function, whose value is discarded as a call statement's is, or a value that holds nothing but {}, as a loop's list does, or a loop whose body ends with such a call.
 A function body cannot end that way, but the body of a definition can, where its definition type's definitions return {}.
 Only the last parameter can be a block.
 A block parameter has no default, and is neither a rest parameter nor a method's receiver.
@@ -240,7 +240,9 @@ Supported loops include:
     do { BODY } for CONDITION
 .fi
 .PP
-A loop in value position collects body results; one in statement position discards them.
+A loop in value position collects body results.
+A loop of any form standing as a statement must collect nothing that matters: its body's value must be {}, or its body must end with a call of an impure or memoized function, or with a loop that does, outside a pure function; that call is awaited deeply each time, and its value and the loop's list are discarded, as in for i in 0..3 { m.run("x") }.
+A loop whose body ends with any other value, such as for i in 0..3 { i * 2 }, or that a break or continue with a value is for, is an unused value when it stands as a statement.
 Break and continue can contribute a value before ending the loop or iteration.
 A plain header variable can be rebound by the header; use let mut when the body must update it.
 .PP
@@ -432,7 +434,15 @@ Two of those directories defining one name is an error at the import; finding no
 For a definition type whose definitions are made with a variant, import DT::V * from PATH imports those made with the variant V, and import DT::* from PATH those made with any; import DT * from PATH is then an error, as is a variant for a definition type that takes none.
 A definition's path in place of the *, as in import build greet from app/greet or import Toolchain::C gcc from lib/tools, imports that one definition and no other; finding it nowhere PATH names is an error.
 A file and directory with the same module name are ambiguous.
+A file's module name is its path without the last extension of its name, so a host's file such as tests/boot.prvm is imported as tests/boot, as a .gcsl file is; two files of one directory that differ only by extension are an error.
 A file outside any workspace can import standard modules only.
+.PP
+A host that embeds GCSL can give any file a prelude of its own: import items of libraries, such as import * from "provium" and import "provium/vm", in order.
+That file is checked as if, after the standard prelude's import, it began with each of them marked #[shadowable], written nowhere: what they bind shadows the standard prelude's names, a later one an earlier one's, and the file's own declarations and imports, and those of directories above it, shadow them all.
+A prelude imports only libraries, whole, with *, or by name; any other import given is an error at the start of the file.
+#![no_prelude] turns both off.
+A prelude's library the host did not supply is one error at the start of the file.
+The gcsl tools give a host's files their host's prelude by their extension; see gcsl(1), HOSTS.
 Hidden names, symbolic-link directories, and nested workspace trees are excluded from workspace discovery.
 .PP
 Files are checked and run in dependency order, with path order breaking ties.
@@ -491,7 +501,7 @@ Parameter types and the result contract come from the definition type.
 After the names the definition type gives, a definition can declare parameters of its own, each NAME: TYPE = DEFAULT or NAME = DEFAULT, whose type is its default's, as in def test boots(m = machine(), retries = 3) { ... }.
 Each has a default, because the definition type calls the definition with none; the defaults are evaluated where the definition type calls it.
 A name alone after a parameter of the definition's own is an error.
-Where the definition type's definitions return {}, the body's last expression, if it is not {} itself, is a statement, as in a trailing block whose result type is {}: a call of an impure or memoized function, whose value is discarded, or a value that holds nothing but {}; any other value there is an unused value.
+Where the definition type's definitions return {}, the body's last expression, if it is not {} itself, is a statement, as in a trailing block whose result type is {}: a call of an impure or memoized function, whose value is discarded, a value that holds nothing but {}, or a loop whose body ends with such a call; any other value there is an unused value.
 Definitions occupy that type's namespace and do not bind an ordinary value of PATH.
 Declaration does not run the body.
 Definition paths support additional package-name characters and digit-starting segments after the first; ordinary identifiers retain their own rules.

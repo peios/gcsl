@@ -16,6 +16,9 @@ gcsl \- run, check, and format GCSL programs
 .RB [ --check ]
 .RI [ PATH ...]
 .br
+.B gcsl hosts
+.RB [ --json ]
+.br
 .B gcsl lsp
 .SH DESCRIPTION
 GCSL is a statically typed language for configuration and scripting.
@@ -58,6 +61,11 @@ Changed files are replaced through a newly created adjacent temporary file with 
 Temporary-name collisions are skipped without modifying the colliding file.
 A symbolic-link file argument updates its target and preserves the link.
 Line endings become LF.
+.SS hosts
+List the hosts whose files the tools read, one line each: the extension of its files, where it was found, the libraries its prelude imports or "no prelude", and its directory if it has one.
+Where it was found is workspace, system, built in, or not installed.
+Hosts are looked for in the workspace containing the working directory, if there is one, and in the system's place; see HOSTS.
+With --json, print the hosts as one JSON list of objects with extension, place, prelude, and path fields; prelude is the list of the prelude's imports, and path is null where there is none.
 .SS lsp
 Serve the Language Server Protocol on standard input and standard output.
 Logs go to standard error.
@@ -107,6 +115,18 @@ The default is human.
 .B --check
 For fmt, write nothing and list files that would change on standard output.
 For standard input, list <stdin> if it would change and do not print formatted source.
+.TP
+.B --json
+For hosts, print the hosts as one JSON list.
+.SH HOSTS
+A host is a program whose files are GCSL with a prelude of their own, such as a test harness whose test files declare tests with no imports.
+A host is named by the extension of its files and found by a directory of that name, in the workspace's .gcsl/hosts/ and then in /usr/share/gcsl/hosts/; the first found stands.
+A host directory is a library root holding the libraries of the host's prelude, and a file named prelude whose lines are the prelude's imports, such as import * from "provium"; blank lines and lines starting with # are ignored.
+.PP
+run, check, fmt, and lsp read the files of every host found as files of the workspace, each checked as if it began with its host's prelude's imports.
+Two hosts are known by name, so that their files are read when the host is not installed: pekit, for .pekit files, built in with no prelude, and Provium, for .prvm files, whose prelude is import * from "provium".
+A file of a known host that is not installed has one error saying which host to install.
+A file of any other extension is not a GCSL file and is not read.
 .SH DIAGNOSTIC FORMAT
 Each JSON diagnostic has path, severity, message, line, column, end_line, end_column, labels, and notes fields.
 Severity is error or warning.
@@ -150,6 +170,15 @@ The closest enclosing marker determines a file's workspace.
 .B *.gcsl
 GCSL source files.
 Hidden names and nested workspace trees are excluded when reading one workspace.
+.TP
+.BI *. EXT
+The files of the host of extension EXT, when one is found or known; see HOSTS.
+.TP
+.B .gcsl/hosts/EXT/
+A host the host program wrote into the workspace.
+.TP
+.B /usr/share/gcsl/hosts/EXT/
+A host installed with its package.
 .TP
 .B <stdlib>/NAME.gcsl
 Diagnostic name for an embedded standard module; not a required installed file.

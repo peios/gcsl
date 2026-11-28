@@ -2,7 +2,8 @@
 //!
 //! With no arguments it starts a REPL; `gcsl run FILE` runs a file; `gcsl
 //! check` checks workspaces and files and runs nothing; `gcsl
-//! fmt` formats files, or checks that they are formatted; `gcsl lsp` is a
+//! fmt` formats files, or checks that they are formatted; `gcsl hosts`
+//! lists the hosts whose files the tools read; `gcsl lsp` is a
 //! language server, speaking LSP on stdin and stdout, which is the
 //! `gcsl-lsp` crate's. All language work is done by the `gcsl` library,
 //! and finding and reading a workspace's files by the `gcsl-disk` crate,
@@ -22,6 +23,7 @@
 
 mod check;
 mod fmt;
+mod hosts;
 mod output;
 mod repl;
 mod run;
@@ -55,6 +57,10 @@ enum Command {
     /// Format GCSL files in place, or with `--check` list those that are
     /// not formatted. A file with a syntax error is left alone.
     Fmt(fmt::FmtArgs),
+    /// List the hosts whose files GCSL's tools read, each by the extension
+    /// of its files: where it was found, its prelude and its directory.
+    /// With `--json`, as one JSON list.
+    Hosts(hosts::HostsArgs),
     /// Serve the Language Server Protocol on stdin and stdout, reporting
     /// each file's errors and warnings as it is edited, answering hover,
     /// go-to-definition, references, highlights, rename (checked before it
@@ -80,6 +86,7 @@ fn main() -> ExitCode {
             Some(Command::Run(args)) => run::main(&args),
             Some(Command::Check(args)) => check::main(&args),
             Some(Command::Fmt(args)) => fmt::main(&args),
+            Some(Command::Hosts(args)) => hosts::main(&args),
             Some(Command::Lsp) => gcsl_lsp::stdio(),
         });
     match worker.map(std::thread::JoinHandle::join) {

@@ -80,6 +80,9 @@ pub struct SourceFile {
     /// Where the host found the file's directory, for a library's file
     /// ([`SourceFile::with_dir`]); `None` otherwise.
     dir: Option<String>,
+    /// The imports of the prelude its host gave it, in order, none if it
+    /// gave none ([`SourceFile::with_prelude`]).
+    prelude: Vec<String>,
     /// Byte offset at which each line starts. Always non-empty: line 1 starts
     /// at offset 0, and every `\n` starts a new line after it.
     line_starts: Vec<u32>,
@@ -117,6 +120,7 @@ impl SourceFile {
             text,
             line_starts,
             dir: None,
+            prelude: Vec::new(),
         })
     }
 
@@ -135,6 +139,30 @@ impl SourceFile {
     pub fn with_dir(mut self, dir: impl Into<String>) -> Self {
         self.dir = Some(dir.into());
         self
+    }
+
+    /// The file, given a prelude of its host's: `imports`, import items of
+    /// libraries, each as it is written in a file, in order, such as
+    /// `import * from "provium"` and `import "provium/vm"`. The file is
+    /// checked as if, after its `import * from prelude`, it began with each
+    /// of them marked `#[shadowable]`, written nowhere: so it sees what they
+    /// bind with no import, one of their names shadowing the prelude's of
+    /// its name, and a later one an earlier one's, and any declaration or
+    /// import of its own shadowing them all (see the workspace's [Given
+    /// preludes](crate::workspace#given-preludes)). The host gives the
+    /// libraries' files with the workspace's, as it gives any library's. A
+    /// file marked `#![no_prelude]` has none of them.
+    #[must_use]
+    pub fn with_prelude<I: Into<String>>(mut self, imports: impl IntoIterator<Item = I>) -> Self {
+        self.prelude = imports.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The imports of the prelude its host gave it, in order
+    /// ([`SourceFile::with_prelude`]).
+    #[must_use]
+    pub fn prelude(&self) -> &[String] {
+        &self.prelude
     }
 
     /// Where the host found the file's directory, if it said

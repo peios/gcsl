@@ -8,14 +8,15 @@
 //! since clients match diagnostics to documents by it; [`uri_of`] names
 //! only the files that are not open.
 //!
-//! A `.gcsl` file is a file of the workspace whose root
-//! [`gcsl_disk::find_workspace`] finds above it ([`locate`]). That needs the
+//! A `.gcsl` file, or a file of one of the workspace's hosts by its
+//! extension, a `.prvm` test say, is a file of the workspace whose root
+//! [`gcsl_disk::find_hosted_workspace`] finds above it ([`locate`]). That needs the
 //! file on disk, to canonicalise it; a file that is not on disk yet, a new
 //! buffer not written, is placed from its directory's canonical path, by
 //! the same rules: under the nearest directory holding a `workspace.gcsl`,
-//! no name on its way starting with `.`, and ending in `.gcsl`. Any other
-//! document, a file in no workspace or a URI that is no file, is checked
-//! alone.
+//! no name on its way starting with `.`, and ending in `.gcsl` or a host's
+//! extension. Any other document, a file in no workspace or a URI that is
+//! no file, is checked alone.
 
 use std::ffi::OsStr;
 use std::fmt::Write;
@@ -113,7 +114,7 @@ pub enum Place {
 }
 
 /// Where the document named `uri` is checked: in the workspace
-/// [`gcsl_disk::find_workspace`] finds for its file, or, for a file not on
+/// [`gcsl_disk::find_hosted_workspace`] finds for its file, or, for a file not on
 /// disk yet, the workspace its directory is in, by the same rules (see the
 /// module documentation); else alone.
 #[must_use]
@@ -121,7 +122,9 @@ pub fn locate(uri: &Uri) -> Place {
     let Some(path) = path_of(uri) else {
         return Place::Lone { path: None };
     };
-    let found = gcsl_disk::find_workspace(&path).or_else(|| unwritten(&path));
+    let found = gcsl_disk::find_hosted_workspace(&path)
+        .map(|(root, relative, _)| (root, relative))
+        .or_else(|| unwritten(&path));
     match found {
         Some((root, relative)) => Place::Workspace { root, relative },
         None => Place::Lone { path: Some(path) },
@@ -151,7 +154,10 @@ fn unwritten(file: &Path) -> Option<(PathBuf, String)> {
         }
         parts.push(part);
     }
-    if file.extension().and_then(OsStr::to_str) != Some("gcsl") {
+    let hosts = gcsl_disk::find_hosts(Some(root));
+    if file.extension().and_then(OsStr::to_str) != Some("gcsl")
+        && gcsl_disk::host_of(&hosts, &file).is_none()
+    {
         return None;
     }
     Some((root.to_path_buf(), parts.join("/")))

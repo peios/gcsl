@@ -392,6 +392,7 @@ pub(super) fn scan_trees(
         Placing::Workspace(nested) => (nested, &[][..]),
         Placing::Lone(inherited, _) => (&[][..], inherited),
     };
+    super::imports::same_module(scan, errors);
     imports(scan, dirs, (nested, inherited), errors);
     views(scan, errors);
 }

@@ -110,7 +110,7 @@ use std::mem;
 use std::collections::{HashMap, HashSet};
 
 use crate::parser;
-use crate::ast::{self, Ast, ItemKind, PathSegment};
+use crate::ast::{self, Ast, GivenForm, ItemKind, PathSegment};
 use crate::check::{Builtin, Fileroot};
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, TokenKind};
@@ -118,6 +118,7 @@ use crate::mentions::{self, Sweep};
 use crate::names::{Name, Names};
 use crate::source::{SourceFile, Span};
 
+use super::preludes::PreludeForm;
 use super::{
     BUILTINS, Dir, File, FileScope, LIBRARIES, Library, Node, PRELUDE, Placing, ROOT, STANDARD_DIR,
     Scan, count, parent_path, standard_source,
@@ -294,7 +295,7 @@ pub(super) fn reserved(scan: &Scan, library: Library, errors: &mut Vec<Diagnosti
         let name = if file.path.contains('/') {
             first
         } else {
-            first.strip_suffix(".gcsl").unwrap_or(first)
+            super::imports::module_path(first)
         };
         let message = if name == BUILTINS || name == Fileroot::MODULE {
             format!("`{name}` is the name of a built-in module")
@@ -458,7 +459,54 @@ pub(super) fn parse(source: &SourceFile, names: &mut Names) -> Parsed {
     if ast.no_prelude().is_none() {
         ast.add_implicit_import(names.intern(PRELUDE));
     }
+    // And, after it, those of the prelude its host gave it (see [Given
+    // preludes](crate::workspace#given-preludes)).
+    let mut errors = errors;
+    if ast.no_prelude().is_none() {
+        let given = given_imports(source, names, &mut errors);
+        ast.add_given_imports(&given);
+    }
     (ast, spelled, errors)
+}
+
+/// The imports of the prelude the host gave `source`, read
+/// ([`super::preludes::prelude_imports`]), their names interned into
+/// `names`; with an error at the file's start, in `errors`, for each that
+/// is none a prelude takes.
+fn given_imports(
+    source: &SourceFile,
+    names: &mut Names,
+    errors: &mut Vec<Diagnostic>,
+) -> Vec<(Vec<Name>, GivenForm)> {
+    let mut given = Vec::new();
+    for (read, text) in super::preludes::prelude_imports(source.prelude())
+        .into_iter()
+        .zip(source.prelude())
+    {
+        let Ok(import) = read else {
+            errors.push(Diagnostic::error(
+                super::preludes::not_a_prelude_import(text),
+                Span::new(0, 0),
+            ));
+            continue;
+        };
+        let path = super::preludes::library_path(&import)
+            .map(|segment| names.intern(segment))
+            .collect();
+        let mut name = |text: &String| names.intern(text);
+        let form = match &import.form {
+            PreludeForm::Whole(alias) => GivenForm::Whole(alias.as_ref().map(&mut name)),
+            PreludeForm::All => GivenForm::All,
+            PreludeForm::Members(members) => GivenForm::Members(
+                members
+                    .iter()
+                    .map(|(member, alias)| (name(member), alias.as_ref().map(&mut name)))
+                    .collect(),
+            ),
+        };
+        given.push((path, form));
+    }
+    given
 }
 
 /// Whether `path`, a directory's or a file's, is a library's, under

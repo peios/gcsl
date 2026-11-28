@@ -142,11 +142,68 @@ pub(super) fn context_in(error: Diagnostic, input: u32, span: Span, text: &str) 
     }
 }
 
+/// The module a file at `path` is, its path without its name's last
+/// extension, whatever that is: `a/b` for `a/b.gcsl`, `a/b.prvm` and
+/// `a/b.pekit` alike, so that a file of any extension a host gives is
+/// imported as a `.gcsl` file is (see [Given
+/// preludes](crate::workspace#given-preludes)). A name with no extension is
+/// the module of its whole name.
+#[must_use]
+pub(crate) fn module_path(path: &str) -> &str {
+    let name_at = path.rfind('/').map_or(0, |at| at + 1);
+    match path[name_at..].rfind('.') {
+        Some(dot) if dot > 0 => &path[..name_at + dot],
+        _ => path,
+    }
+}
+
+/// The files of `scan` by the module each is ([`module_path`]), the first
+/// in path order of two of one module.
+fn modules_of(scan: &Scan) -> HashMap<&str, u32> {
+    let mut files = HashMap::with_capacity(scan.files.len());
+    for (index, file) in (0u32..).zip(&scan.files) {
+        files.entry(module_path(&file.path)).or_insert(index);
+    }
+    files
+}
+
+/// Reports each file of `scan` that is the module of a file before it in
+/// path order, as only files of one directory and stem but different
+/// extensions are: "`a.gcsl` and `a.prvm` are both the module `a`", at the
+/// later file's start.
+pub(super) fn same_module(scan: &Scan, errors: &mut Vec<Diagnostic>) {
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for (index, file) in (0u32..).zip(&scan.files) {
+        let module = module_path(&file.path);
+        match seen.get(module) {
+            Some(first) => {
+                let name = |path: &str| path.rsplit('/').next().unwrap_or("").to_owned();
+                let shown = name(module);
+                errors.push(
+                    Diagnostic::error(
+                        format!(
+                            "`{}` and `{}` are both the module `{shown}`",
+                            name(first),
+                            name(&file.path)
+                        ),
+                        Span::new(0, 0),
+                    )
+                    .in_input(index),
+                );
+            }
+            None => {
+                seen.insert(module, &file.path);
+            }
+        }
+    }
+}
+
 /// What [`imports`] looks modules up in.
 pub(crate) struct Modules<'a> {
     /// The directories by path.
     pub(super) dirs: &'a HashMap<String, u32>,
-    /// The files by path.
+    /// The files by the module each is ([`module_path`]), the first in
+    /// path order of two of one module.
     pub(super) files: HashMap<&'a str, u32>,
     /// The directories that are workspaces of their own.
     pub(super) nested: &'a [String],
@@ -160,12 +217,15 @@ impl<'a> Modules<'a> {
     pub(crate) fn of(scan: &'a Scan, dirs: &'a HashMap<String, u32>) -> Self {
         Self {
             dirs,
-            files: (0u32..)
-                .zip(&scan.files)
-                .map(|(index, file)| (file.path.as_str(), index))
-                .collect(),
+            files: modules_of(scan),
             nested: &[],
         }
+    }
+
+    /// The modules, with the directories `nested` left out, each a
+    /// workspace of its own, as [`imports`] resolves a path among them.
+    fn leaving_out(self, nested: &'a [String]) -> Self {
+        Self { nested, ..self }
     }
 }
 
@@ -185,14 +245,7 @@ pub(super) fn imports(
     (nested, inherited): (&[String], &[Alias]),
     errors: &mut Vec<Diagnostic>,
 ) {
-    let modules = Modules {
-        dirs,
-        files: (0u32..)
-            .zip(&scan.files)
-            .map(|(index, file)| (file.path.as_str(), index))
-            .collect(),
-        nested,
-    };
+    let modules = Modules::of(scan, dirs).leaving_out(nested);
     let mut both: Vec<String> = Vec::new();
     let mut found = Vec::with_capacity(scan.files.len());
     // The prelude is loaded by every scan, but for a test's table without
@@ -268,10 +321,15 @@ pub(super) fn imports(
         }
         // The implicit `import * from prelude` is first of all in the
         // static order whatever its place among the aliases, which is last,
-        // so that every other keeps its number.
+        // so that every other keeps its number; that of the prelude its
+        // host gave it is next.
         if let Some(item) = file.ast.implicit_import().filter(|_| prelude) {
             import(item, (&mut aliases, &mut types));
         }
+        for &item in file.ast.given_imports() {
+            import(item, (&mut aliases, &mut types));
+        }
+        prelude_not_given(scan, &file.ast, &failed_imports, &mut own_errors);
         clashes(scan, index, &aliases, (&mut own_errors, &mut poisoned));
         errors.extend(own_errors.into_iter().map(|e| e.in_input(index)));
         found.push((
@@ -482,12 +540,7 @@ pub(crate) fn module(
         let dir = modules.dirs.get(&candidate).copied();
         let last = position + 1 == shown.len();
         let file = last
-            .then(|| {
-                modules
-                    .files
-                    .get(format!("{candidate}.gcsl").as_str())
-                    .copied()
-            })
+            .then(|| modules.files.get(candidate.as_str()).copied())
             .flatten();
         match (dir, file) {
             (Some(_), Some(_)) => {
@@ -557,10 +610,7 @@ pub(super) fn slashed_module(modules: &Modules<'_>, shown: &[&str]) -> Option<St
         return None;
     }
     let slashed = joined.replace('.', "/");
-    let names = modules.dirs.contains_key(&slashed)
-        || modules
-            .files
-            .contains_key(format!("{slashed}.gcsl").as_str());
+    let names = modules.dirs.contains_key(&slashed) || modules.files.contains_key(slashed.as_str());
     names.then_some(slashed)
 }
 
@@ -594,11 +644,10 @@ pub(super) fn module_suggestion(
     }
     if last {
         for &path in modules.files.keys() {
-            if path.starts_with(STANDARD_DIR) || path == WORKSPACE_FILE {
+            if path.starts_with(STANDARD_DIR) || path == module_path(WORKSPACE_FILE) {
                 continue;
             }
-            let stem = child(path).and_then(|file| Some(file.strip_suffix(".gcsl")?.to_owned()));
-            candidates.extend(stem.map(|stem| (stem, 0)));
+            candidates.extend(child(path).map(|stem| (stem, 0)));
         }
     }
     if only {
@@ -633,8 +682,8 @@ pub(super) fn value_cells(scan: &mut Scan) {
     imported.dedup();
     for file in imported {
         let stem = scan.files.get(file as usize).map_or("", |f| {
-            let name = f.path.rsplit('/').next().unwrap_or("");
-            name.strip_suffix(".gcsl").unwrap_or(name)
+            let module = module_path(&f.path);
+            module.rsplit('/').next().unwrap_or(module)
         });
         let name = scan.names.intern(stem);
         scan.values.push((file, name));
@@ -666,13 +715,64 @@ pub(super) fn contents(scan: &Scan, dir: Option<u32>) -> String {
         .files
         .iter()
         .filter(|file| file.dir == dir)
-        .map(|file| format!("`{}`", last(&file.path).trim_end_matches(".gcsl")));
+        .map(|file| format!("`{}`", last(module_path(&file.path))));
     subdirs.extend(stems);
     if subdirs.is_empty() {
         "nothing".to_owned()
     } else {
         subdirs.join(", ")
     }
+}
+
+/// Replaces the errors in `errors` of each import of the prelude the host
+/// of the file of tree `ast` gave it that is among the file's `failed`
+/// imports, written nowhere as they are, with one error for each of them,
+/// of a library not among the files the host gave or one the file cannot
+/// import: "the prelude `provium` given for this file is not found", at
+/// the file's start, the names in `scan`'s table (see [Given
+/// preludes](crate::workspace#given-preludes)).
+fn prelude_not_given(
+    scan: &Scan,
+    ast: &Ast,
+    failed: &[(ItemId, Option<Target>)],
+    errors: &mut Vec<Diagnostic>,
+) {
+    let missing: Vec<ItemId> = ast
+        .given_imports()
+        .iter()
+        .copied()
+        .filter(|&item| failed.iter().any(|&(at, _)| at == item))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    errors.retain(|error| error.span != Span::new(0, 0));
+    for item in missing {
+        let ItemKind::Import(id) = ast.item(item).kind else {
+            continue;
+        };
+        let library = ast
+            .path(ast.import_decl(id).path)
+            .iter()
+            .skip(1)
+            .filter_map(PathSegment::name)
+            .map(|name| scan.names.get(name))
+            .collect::<Vec<_>>()
+            .join("/");
+        errors.push(Diagnostic::error(
+            prelude_not_given_message(&library),
+            Span::new(0, 0),
+        ));
+    }
+}
+
+/// The message of the error of a file whose host gave it the library
+/// `library` as a prelude, which is not among the files the host gave: what
+/// a host that knows why, a tool whose host is not installed say, finds
+/// the error by, to say more.
+#[must_use]
+pub fn prelude_not_given_message(library: &str) -> String {
+    format!("the prelude `{library}` given for this file is not found")
 }
 
 /// Binds the names the import `item` of `file`, `decl`, makes of `target`,
@@ -690,7 +790,7 @@ pub(super) fn members(
     errors: &mut Vec<Diagnostic>,
 ) {
     let path = file.ast.path(decl.path);
-    let implicit = file.ast.implicit_import() == Some(item);
+    let implicit = file.ast.is_implicit_import(item);
     match decl.form {
         ImportForm::Whole(alias) => {
             let bound = alias.map(|a| (a.name, a.span)).or_else(|| {
@@ -767,7 +867,8 @@ pub(super) fn members(
 
 /// Binds every root of `target` into `aliases`, and every type of it into
 /// `types`, for the `*`, written at `star`, of the import `item`, implicit
-/// if it is the prelude's, shadowable if it is `#[shadowable]`: a value file
+/// if it is the prelude's or a given prelude's, shadowable if it is
+/// `#[shadowable]`: a value file
 /// has none, "a value file has no members to import".
 fn star_aliases(
     scan: &Scan,

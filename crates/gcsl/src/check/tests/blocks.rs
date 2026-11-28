@@ -635,17 +635,14 @@ fn a_block_of_the_empty_record_may_end_with_an_impure_call() {
         assert!(found.is_empty(), "{text}: {found:?}");
     }
     // A loop that collects values is an unused value there, as it is in
-    // any statement.
-    for text in [
-        "step(\"a\") { for i in [1, 2] { i } }",
-        "step(\"a\") { for i in [1, 2] { op() } }",
-    ] {
-        assert_eq!(
-            messages(&steps(text)),
-            vec!["unused value of type `List<Int>`"],
-            "{text}"
-        );
-    }
+    // any statement; one whose body ends with a call of an impure function
+    // collects nothing, as it does in any statement (see the loops' "A loop
+    // as a statement").
+    assert_eq!(
+        messages(&steps("step(\"a\") { for i in [1, 2] { i } }")),
+        vec!["unused value of type `List<Int>`"]
+    );
+    assert!(diagnostics_or_none(&steps("step(\"a\") { for i in [1, 2] { op() } }")).is_empty());
     // Only where the block's result is `{}`: elsewhere the call is the
     // block's value.
     assert_eq!(shown_result(&steps("= measure { op() }")), "Int");
@@ -997,9 +994,10 @@ fn a_definition_of_a_def_type_of_nothing_ends_as_a_block_of_nothing_does() {
         );
     }
     assert_eq!(
-        messages(&of("def check t() { for i in [1, 2] { op() } }")),
+        messages(&of("def check t() { for i in [1, 2] { i } }")),
         vec!["unused value of type `List<Int>`"]
     );
+    assert!(diagnostics_or_none(&of("def check t() { for i in [1, 2] { op() } }")).is_empty());
     // In a pure definition nothing is discarded.
     assert_eq!(
         messages(&of("def pure t() { op() }")),

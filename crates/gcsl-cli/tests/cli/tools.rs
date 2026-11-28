@@ -504,3 +504,82 @@ fn piped_repl_input_never_prints_terminal_prompts() {
         assert!(output.status.success(), "TERM={term}");
     }
 }
+
+/// A host's files are a workspace's: `gcsl check`, `gcsl run` and `gcsl
+/// fmt` read a `.prvm` file with its host's prelude, `gcsl hosts` lists
+/// the host, and a file of a known host that is not installed is one error
+/// that says so. Assumes no host is installed in `/usr/share/gcsl/hosts`.
+#[test]
+fn host_files_are_read_with_their_preludes() {
+    let scratch = FmtScratch::new("hosts");
+    scratch.write("workspace.gcsl", "");
+    scratch.write(
+        "tests/boot.prvm",
+        "def test boots() { step(\"a\") { } }\nx = test boots()\n",
+    );
+    scratch.write("notes.txt", "not GCSL\n");
+    // Provium is not installed.
+    let output = gcsl_in(&scratch.0, &["check"], "");
+    assert!(
+        stderr(&output).contains(
+            "error: Provium is not installed, so the prelude of this `.prvm` file cannot be found"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("--> tests/boot.prvm:1:1"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).ends_with("1 error, 0 warnings in 2 files checked\n"),
+        "{}",
+        stderr(&output)
+    );
+    let output = gcsl_in(&scratch.0, &["hosts"], "");
+    assert_eq!(
+        stdout(&output),
+        "pekit  built in       no prelude\nprvm   not installed  provium\n"
+    );
+    // Installed in the workspace.
+    scratch.write(".gcsl/hosts/prvm/prelude", "import * from \"provium\"\n");
+    scratch.write(
+        ".gcsl/hosts/prvm/provium/core.gcsl",
+        "#[def_type]\ndef test(name: String, f: fn() -> {}) -> String { f(); = \"ran {name}\" }\n\
+         def step(name: String, body: block -> {}) -> {} { body() }\n",
+    );
+    let output = gcsl_in(&scratch.0, &["check"], "");
+    assert_eq!(stderr(&output), "no problems in 3 files checked\n");
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl_in(&scratch.0, &["check", "tests/boot.prvm"], "");
+    assert_eq!(stderr(&output), "no problems in 3 files checked\n");
+    let output = gcsl_in(&scratch.0, &["run", "tests/boot.prvm"], "");
+    assert_eq!(
+        stdout(&output),
+        "{x = \"ran boots\"}\n",
+        "{}",
+        stderr(&output)
+    );
+    let output = gcsl_in(&scratch.0, &["hosts", "--json"], "");
+    assert_eq!(
+        stdout(&output),
+        "[{\"extension\":\"pekit\",\"path\":null,\"place\":\"built in\",\"prelude\":[]},\
+         {\"extension\":\"prvm\",\"path\":\".gcsl/hosts/prvm\",\"place\":\"workspace\",\
+         \"prelude\":[\"import * from \\\"provium\\\"\"]}]\n"
+    );
+    // A host of a third party, found by its directory alone.
+    scratch.write(".gcsl/hosts/kit/prelude", "import * from \"kit\"\n");
+    scratch.write(".gcsl/hosts/kit/kit/kit.gcsl", "def limit(): Int { 3 }\n");
+    scratch.write("a.kit", "y = limit()\n");
+    let output = gcsl_in(&scratch.0, &["run", "a.kit"], "");
+    assert_eq!(stdout(&output), "{y = 3}\n", "{}", stderr(&output));
+    // The formatter formats a host's files, prelude or not.
+    scratch.write("tests/messy.prvm", "z   =  1\n");
+    let output = gcsl_in(&scratch.0, &["fmt", "--check"], "");
+    assert!(
+        stdout(&output).contains("tests/messy.prvm"),
+        "{}",
+        stdout(&output)
+    );
+}
