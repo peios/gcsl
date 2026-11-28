@@ -29,6 +29,13 @@ pub(in crate::eval) struct BuiltinCall {
     pub(super) pieces: Pieces,
 }
 
+impl BuiltinCall {
+    /// The call node.
+    pub(super) const fn node(&self) -> IrId {
+        self.node
+    }
+}
+
 impl Machine<'_> {
     /// Evaluates the call node `id` of `builtin` with the arguments `args`,
     /// as [`Evaluator::call_builtin`](super::Evaluator::call_builtin) does.

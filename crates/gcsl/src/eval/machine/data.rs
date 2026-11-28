@@ -36,6 +36,13 @@ pub(in crate::eval) struct OperandsState {
     pub(super) pieces: Pieces,
 }
 
+impl OperandsState {
+    /// The node.
+    pub(super) const fn node(&self) -> IrId {
+        self.node
+    }
+}
+
 impl Machine<'_> {
     /// Whether the machine applies node `kind` itself, its operands
     /// evaluated here ([`apply`]).

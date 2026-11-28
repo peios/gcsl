@@ -36,6 +36,16 @@
 //! that set the deadline clears the mark, which makes it that call's own
 //! failure, which its own `#[retry]` may retry, timed afresh, and any call
 //! around it too.
+//!
+//! **Stopped units.** A deadline measures the time its unit runs. While a
+//! unit in graph mode is stopped, to wait or because its slice is spent,
+//! its deadlines stand still: they are moved on by the time stopped when
+//! it is taken up (see [Suspension](crate::eval::machine#suspension)). A
+//! host may say that some of that time is the unit's own, an operation it
+//! ran for the unit, say: a deadline that has passed by that charge is
+//! raised where the unit takes up, with the same error and mark as one
+//! that passes while the unit runs (see [Charged
+//! time](crate::eval::machine::suspend#charged-time)).
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -43,6 +53,7 @@ use std::time::{Duration, Instant};
 use crate::MAX_DEPTH;
 use crate::diagnostic::{Diagnostic, Mark as ErrorMark};
 use crate::ir::{FnCode, IrNode};
+use crate::source::Span;
 use crate::value::{Caller, Closure, Value};
 
 use super::{Deadline, Evaluator, Flow, GUARD_LEVELS, mistyped, nested_too_deeply, shown_duration};
@@ -207,13 +218,21 @@ impl Evaluator<'_> {
     #[cold]
     #[inline(never)]
     pub(super) fn timed_out<T>(&self, node: &IrNode) -> Flow<T> {
+        match self.passed_deadline(node.span) {
+            Some(error) => Err(error.into()),
+            None => mistyped(node, "a deadline passed that no running call has"),
+        }
+    }
+
+    /// The error of the passing of the outermost running deadline that has
+    /// passed, at `span`, as [`Evaluator::timed_out`] makes it; `None` if
+    /// none has passed.
+    pub(super) fn passed_deadline(&self, span: Span) -> Option<Diagnostic> {
         let now = Instant::now();
         let deadlines = self.shared.deadlines.borrow();
-        let Some(passed) = deadlines.iter().find(|deadline| deadline.own <= now) else {
-            return mistyped(node, "a deadline passed that no running call has");
-        };
-        let mut error = Diagnostic::error(&*passed.message, node.span);
+        let passed = deadlines.iter().find(|deadline| deadline.own <= now)?;
+        let mut error = Diagnostic::error(&*passed.message, span);
         error.mark = ErrorMark::deadline(passed.number);
-        Err(error.into())
+        Some(error)
     }
 }

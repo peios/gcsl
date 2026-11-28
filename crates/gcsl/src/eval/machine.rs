@@ -46,6 +46,55 @@
 //! unwinding passes through does what the Rust function it stands for does
 //! on its way out, a call's frame truncating the value stack and reporting
 //! the error as the call does.
+//!
+//! # Yielding
+//!
+//! A host that runs many units on one thread cannot let one that only
+//! computes keep the thread. So a host may give a run a *slice*
+//! ([`Workspace::run_prepared_for`](crate::workspace::Workspace::run_prepared_for)):
+//! once the run has gone on for that long, the machine stops between two
+//! of its steps ([`Ran::Yielded`]), and the unit's evaluation is set aside
+//! exactly as one that waits is (see [Suspension](#suspension)), waiting
+//! for nothing. A run with no slice never looks at the clock and never
+//! yields.
+//!
+//! The machine's loop takes one step each time round: it evaluates a node
+//! or gives a frame what the node above it came to. It looks at the clock
+//! every [`YIELD_STEPS`] steps. A `for` whose guard and body are simple
+//! runs its iterations at once, in one step; each of them counts as a
+//! step, and when the count is spent, in a run with a slice, the loop
+//! runs its next iteration through its frames, as it runs one that is not
+//! simple, which brings the machine's loop round to the clock. Every run
+//! takes [`YIELD_STEPS`] steps before its first look, so a run always
+//! moves its unit on, however short its slice, a slice of zero included.
+//!
+//! The task running is set aside to do next what it was about to do
+//! ([`Status::Ready`]), the root is made the task running, and the unit
+//! is set aside whole. The next run puts back the task that was running,
+//! and the root where it was among the others
+//! ([`Machine::take_up_yielded`]), so the unit goes on step for step as
+//! it would have with no yield. Nothing can observe a yield: no frame is
+//! unwound, so no `recover` sees it and no cleanup runs; `with` keeps its
+//! context, a `#[retry]` its attempt, a memoised call its entry, which
+//! another unit that needs it waits for as it does when the unit waits
+//! for the host; and the time until the next run is none of the unit's,
+//! as for any stop, so a `#[timeout]` counts only the time the unit runs.
+//!
+//! A unit taken up after a yield wakes none of its waiting tasks, as one
+//! taken up after a stop does ([`Machine::take_up_tasks`]): the host was
+//! not asked for anything, and tasks that looked again at each of many
+//! short runs could use up every one of them. Once every task waits, the
+//! machine wakes them if something one of them waits for is there
+//! ([`Machine::wake_due`]), as if it had stopped and been run again at
+//! once; if nothing is, it stops, and its next run wakes them.
+//!
+//! What cannot yield is what the machine does in one step: one call of a
+//! built-in, however long it runs, and one simple subtree, which a walker
+//! evaluates by recursion and which holds no call and no loop, so that
+//! its time is bounded by its size and by the values it works on. No
+//! other node is a walker's: [`Machine::eval`] hands one of any kind it
+//! has no frame for to a walker, but lowering makes none that is not
+//! simple.
 
 mod builtins;
 mod control;
@@ -60,6 +109,7 @@ pub(crate) use suspend::give_up;
 pub(crate) use tasks::{Need, Needed, circle};
 
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::diagnostic::Mark as ErrorMark;
 use crate::ir::{ArgValue, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, Operands};
@@ -82,7 +132,7 @@ use pieces::{ItemsSplit, Joining, Pieces, PiecesJoin};
 use super::kinds::into_callee;
 use super::memo::{Mark, MemoBegin, MemoTables};
 use super::profile;
-use super::graph::{StepCall, Wait};
+use super::graph::{GraphRun, StepCall, Wait};
 use super::{
     Callee, Evaluator, Flow, GUARD_LEVELS, Shared, Unwind, mistyped, nested_too_deeply,
     shown_duration,
@@ -120,6 +170,42 @@ impl Activation {
             levels: 0,
         }
     }
+}
+
+/// How many steps the machine takes between two looks at the clock, in a
+/// run with a slice (see [Yielding](#yielding)): few enough that a slice
+/// is overrun by little, and enough that the looks cost nothing that can
+/// be measured. An iteration of a `for` that the machine runs at once
+/// counts as a step.
+const YIELD_STEPS: u32 = 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// The steps between two looks at the clock that a test set for its
+    /// thread, in place of [`YIELD_STEPS`].
+    static YIELD_STEPS_SET: std::cell::Cell<u32> = const { std::cell::Cell::new(YIELD_STEPS) };
+}
+
+/// Sets how many steps the machines of this thread take between two looks
+/// at the clock, for a test that yields more often than a host can make a
+/// run yield: with one step and a slice of zero, between every two steps.
+#[cfg(test)]
+pub(crate) fn set_yield_steps(steps: u32) {
+    YIELD_STEPS_SET.with(|set| set.set(steps));
+}
+
+/// How many steps a machine takes between two looks at the clock:
+/// [`YIELD_STEPS`], but in a test that set another.
+#[cfg(test)]
+fn yield_steps() -> u32 {
+    YIELD_STEPS_SET.with(std::cell::Cell::get)
+}
+
+/// How many steps a machine takes between two looks at the clock:
+/// [`YIELD_STEPS`].
+#[cfg(not(test))]
+const fn yield_steps() -> u32 {
+    YIELD_STEPS
 }
 
 /// How many boxes of blocks' splits the machine keeps for reuse: one per
@@ -317,6 +403,19 @@ pub(super) enum Ran {
     /// Stopped, every task waiting, for what the tasks wait for, its frames
     /// and tasks kept (see [Suspension](#suspension)).
     Blocked(Vec<Wait>),
+    /// Stopped between two steps, its slice spent, waiting for nothing,
+    /// its frames and tasks kept (see [Yielding](#yielding)).
+    Yielded(Yield),
+}
+
+/// How a machine whose slice was spent stopped (see [Yielding](#yielding)).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Yield {
+    /// Where among the tasks set aside the root was, if the task that was
+    /// running is another: that task is then the last of them, and the
+    /// root is put back there when the unit is taken up, so that the tasks
+    /// are in the order they were in.
+    root: Option<usize>,
 }
 
 /// What a machine that stopped keeps of itself: its frames, activations
@@ -337,6 +436,16 @@ pub(super) struct Parked {
     /// The runs of memoised calls and `lazy`s that tasks set aside wait
     /// for, each once (see [Tasks](tasks#tasks)).
     waited: Vec<tasks::Held>,
+    /// How it stopped, if it stopped because its slice was spent, not to
+    /// wait (see [Yielding](#yielding)).
+    yielded: Option<Yield>,
+    /// Whether a host has charged the unit time it was stopped (see
+    /// [Charged time](suspend#charged-time)).
+    charged: bool,
+    /// How often each memoised call and `lazy` had been abandoned, and the
+    /// most tasks the unit had had set aside at once, when it stopped:
+    /// what a machine that takes up after a yield goes on counting from.
+    abandons: (Vec<(tasks::Abandoned, usize)>, usize),
 }
 
 impl Parked {
@@ -398,6 +507,19 @@ pub(super) struct Machine<'r> {
     /// which [`Machine::abandoned_too_often`] bases its limit, so that the
     /// limit never falls as tasks end.
     most_tasks: usize,
+    /// When the run's slice is spent, if it has one (see
+    /// [Yielding](#yielding)).
+    slice: Option<Instant>,
+    /// How many steps are left before the next look at the clock.
+    steps: u32,
+    /// Whether the unit was taken up after a yield and has not stopped
+    /// since, so that its waiting tasks have yet to be woken (see
+    /// [Yielding](#yielding)).
+    unwoken: bool,
+    /// Whether a host has charged the unit time it was stopped: a task
+    /// that takes up after waiting then looks at its deadlines first (see
+    /// [Charged time](suspend#charged-time)).
+    charged: bool,
 }
 
 impl<'r> Machine<'r> {
@@ -425,6 +547,10 @@ impl<'r> Machine<'r> {
             spare: Vec::new(),
             abandons: Vec::new(),
             most_tasks: 0,
+            slice: shared.graph.and_then(GraphRun::slice),
+            steps: yield_steps(),
+            unwoken: false,
+            charged: false,
         }
     }
 
@@ -438,7 +564,12 @@ impl<'r> Machine<'r> {
         profiled_base: usize,
     ) -> Self {
         let (tasks, meta, status) = parked.tasks;
-        let most_tasks = tasks.len();
+        // A yield is no stop of the host's: the counts go on.
+        let (abandons, most_tasks) = if parked.yielded.is_some() {
+            (parked.abandons.0, parked.abandons.1.max(tasks.len()))
+        } else {
+            (Vec::new(), tasks.len())
+        };
         Self {
             stack,
             memo,
@@ -453,8 +584,12 @@ impl<'r> Machine<'r> {
             waited: parked.waited,
             profiled_base,
             spare: Vec::new(),
-            abandons: Vec::new(),
+            abandons,
             most_tasks,
+            slice: shared.graph.and_then(GraphRun::slice),
+            steps: yield_steps(),
+            unwoken: parked.yielded.is_some(),
+            charged: parked.charged,
         }
     }
 
@@ -467,6 +602,9 @@ impl<'r> Machine<'r> {
             tasks: (self.tasks, self.meta, self.status),
             next_task: self.next_task,
             waited: self.waited,
+            yielded: None,
+            charged: self.charged,
+            abandons: (self.abandons, self.most_tasks),
         }
     }
 
@@ -515,10 +653,17 @@ impl<'r> Machine<'r> {
     }
 
     /// Runs from `next` on, until the root is evaluated or the machine
-    /// stops.
+    /// stops, to wait or because its slice is spent.
     fn run_from(&mut self, next: Next) -> Ran {
         let mut next = next;
         loop {
+            if self.steps == 0 {
+                if self.slice_spent(&next) {
+                    return self.yielded(next);
+                }
+            } else {
+                self.steps -= 1;
+            }
             next = match next {
                 Next::Eval(id) => self.eval(id),
                 Next::Give(result) => match self.frames.pop() {
@@ -546,14 +691,77 @@ impl<'r> Machine<'r> {
                         Err(status) => self.park(status).unwrap_or(Next::Stop),
                     }
                 }
-                // Unless a circle of its tasks through a demanded run can
-                // be broken (see [Across units](tasks#across-units)).
-                Next::Stop => match self.unstick() {
-                    Some(next) => next,
-                    None => return self.stopped(),
-                },
+                // Unless a task taken up after a yield has yet to be woken
+                // for what was given meanwhile (see [Yielding](#yielding)),
+                // or a circle of its tasks through a demanded run can be
+                // broken (see [Across units](tasks#across-units)).
+                Next::Stop => {
+                    if std::mem::take(&mut self.unwoken) && self.wake_due() {
+                        self.root_running();
+                        self.take_up_tasks()
+                    } else {
+                        match self.unstick() {
+                            Some(next) => next,
+                            None => return self.stopped(),
+                        }
+                    }
+                }
             };
         }
+    }
+
+    /// Whether the run's slice is spent, the steps between two looks at
+    /// the clock taken and `next` what the machine does next: only between
+    /// two steps of a task, one that evaluates a node or gives a frame a
+    /// result, where the task keeps everything it has (see
+    /// [Yielding](#yielding)). A run with no slice never looks at the
+    /// clock.
+    fn slice_spent(&mut self, next: &Next) -> bool {
+        let Some(until) = self.slice else {
+            self.steps = yield_steps();
+            return false;
+        };
+        let between = match next {
+            Next::Eval(_) => true,
+            // The root's result ends the run.
+            Next::Give(_) => !self.frames.is_empty(),
+            // Looked at again at the next step.
+            Next::Block(..) | Next::Park(_) | Next::Stop => false,
+        };
+        if !between {
+            return false;
+        }
+        if Instant::now() < until {
+            self.steps = yield_steps();
+            return false;
+        }
+        true
+    }
+
+    /// Whether the machine has run a `for`'s iterations at once for as
+    /// long as it may without a look at the clock, in a run with a slice:
+    /// the loop then runs its next iteration through its frames, as it
+    /// runs one whose body is not simple, so that the machine's loop looks
+    /// at the clock (see [Yielding](#yielding)). Counts an iteration.
+    fn steps_spent(&mut self) -> bool {
+        if self.steps == 0 {
+            return self.slice.is_some();
+        }
+        self.steps -= 1;
+        false
+    }
+
+    /// How the run ends once its slice is spent: the task running set
+    /// aside to do `next` when it runs again, and the root running, so
+    /// that the unit's evaluation can be set aside whole (see
+    /// [Yielding](#yielding)).
+    fn yielded(&mut self, next: Next) -> Ran {
+        self.pause_profile();
+        let root = self.tasks.iter().position(|task| task.meta.id == 0);
+        self.status = Some(Status::Ready(next));
+        self.root_running();
+        self.unpause_profile();
+        Ran::Yielded(Yield { root })
     }
 
     /// How the run ends once every task waits: the root running, what the

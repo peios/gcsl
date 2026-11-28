@@ -28,7 +28,10 @@
 //! unit's evaluation aside, the run's `paused` the node it waits on, and
 //! the run ends with an error marked [`Mark::PENDING`]. Once the host gives
 //! that node's result ([`Graph::resolve`]), the unit's next run takes up
-//! where it stopped: nothing before the stop runs again. A unit that needs
+//! where it stopped: nothing before the stop runs again. A run that a host
+//! gave a slice also stops once the slice is spent, waiting for nothing,
+//! to take up the same way (see
+//! [Yielding](crate::eval::machine#yielding)). A unit that needs
 //! a memoised call or a `lazy` another unit is running stops for that
 //! unit's run instead ([`Wait::Unit`]), and that run is then *demanded*:
 //! inside it, effects keep only its own order (see [Across
@@ -565,6 +568,11 @@ pub(crate) struct GraphRun<'g> {
     /// Where the unit's own top-level slots begin, for a prepared call,
     /// whose slots others share; `None` for a file or a step.
     own: Option<usize>,
+    /// When the run's slice is spent, if the host gave it one (see
+    /// [Yielding](crate::eval::machine#yielding)).
+    slice: Option<Instant>,
+    /// Whether the run stopped because its slice was spent.
+    yielded: Cell<bool>,
 }
 
 /// What a run of a unit in graph mode keeps of itself while the unit is
@@ -635,7 +643,32 @@ impl<'g> GraphRun<'g> {
             texts: HashMap::new(),
             suspended: RefCell::new(None),
             own: None,
+            slice: None,
+            yielded: Cell::new(false),
         }
+    }
+
+    /// The run, which yields once `until` has passed, if it is an instant
+    /// (see [Yielding](crate::eval::machine#yielding)).
+    pub(crate) const fn sliced(mut self, until: Option<Instant>) -> Self {
+        self.slice = until;
+        self
+    }
+
+    /// When the run's slice is spent, if it has one.
+    pub(crate) const fn slice(&self) -> Option<Instant> {
+        self.slice
+    }
+
+    /// Notes that the run stopped because its slice was spent, waiting
+    /// for nothing.
+    pub(crate) fn note_yield(&self) {
+        self.yielded.set(true);
+    }
+
+    /// Whether the run stopped because its slice was spent.
+    pub(crate) const fn yielded(&self) -> bool {
+        self.yielded.get()
     }
 
     /// The run, of a prepared call whose own top-level slots begin at
