@@ -2,7 +2,7 @@
 //! among, and the parameter it is at (see the documentation of
 //! [`crate::index`], "Signature help").
 
-use crate::ast::{ArgKind, Ast, ExprId, ExprKind};
+use crate::ast::{ArgKind, Ast, Effect, ExprId, ExprKind};
 use crate::check::Builtin;
 use crate::lexer::TokenKind;
 use crate::types::{TyId, TyKind};
@@ -46,6 +46,9 @@ pub(super) struct Shown {
     pub(super) default: Option<String>,
     /// Whether it is the rest parameter, shown `...name: T`.
     pub(super) rest: bool,
+    /// Whether it is a block, which only a trailing block gives, never a
+    /// named argument.
+    pub(super) block: bool,
 }
 
 /// What a signature shows of a callee ([`Index::callee`]).
@@ -184,6 +187,7 @@ impl Index {
                 ty: ty.to_owned(),
                 default: None,
                 rest: false,
+                block: false,
             }],
             tail: format!("): {ret}"),
             generic: "<T>",
@@ -214,12 +218,10 @@ impl Index {
                         };
                         Shown {
                             name: name.map(|name| names.get(name).to_owned()),
-                            ty: self
-                                .types
-                                .display(self.as_written(param), names)
-                                .to_string(),
+                            ty: self.shown_as_written(param),
                             default,
                             rest: sig.rest.map(usize::from) == Some(at),
+                            block: self.types.block_sig(self.as_written(param)).is_some(),
                         }
                     })
                     .collect();
@@ -246,6 +248,23 @@ impl Index {
             ty = inner;
         }
         ty
+    }
+
+    /// The parameter type `ty` shown as its source writes it
+    /// ([`Index::as_written`]): a block's with its result as written too,
+    /// `block -> Int`, not the either shape a bare result of an impure
+    /// block is, `block -> Int | Future<Int>`.
+    fn shown_as_written(&self, ty: TyId) -> String {
+        let names = &self.scan.names;
+        let ty = self.as_written(ty);
+        match self.types.block_sig(ty) {
+            Some((ret, effect)) => {
+                let marker = if effect == Effect::Pure { ":" } else { " ->" };
+                let ret = self.types.display(self.as_written(ret), names);
+                format!("block{marker} {ret}")
+            }
+            None => self.types.display(ty, names).to_string(),
+        }
     }
 
     /// The type `symbol` is declared with, if the check found it: a node's
@@ -600,6 +619,120 @@ mod tests {
         assert_eq!(help(&text, &[]).unwrap().1.as_deref(), Some("n: Int"));
     }
 
+    /// A function with an impure block, documented, one with a pure block,
+    /// a generic one and a method.
+    const BLOCKS: &str = "w = 0\n# Runs a step.\n\
+                          fn step(name: String, body: block -> {}) -> {} {\n    body()\n    = {}\n}\n\
+                          fn twice(n: Int, body: block: Int): Int { body() + n }\n\
+                          fn measure<T>(name: String, body: block -> T) -> T { body() }\n\
+                          fn (n: Int) times(body: block -> {}) -> {} { body() }\n";
+
+    #[test]
+    fn a_block_parameter_is_shown_as_written_and_filled_by_the_trailing_block() {
+        let step = "fn step(name: String, body: block -> {}) -> {}";
+        for (call, label, active) in [
+            // In the parentheses, the block fills the last: the first is next.
+            ("step(|\"a\") { seen := 1 }", step, "name: String"),
+            // In the trailing block, anywhere in it.
+            ("step(\"a\") {| seen := 1 }", step, "body: block -> {}"),
+            ("step(\"a\") { seen := |1 }", step, "body: block -> {}"),
+            (
+                "step(\"a\") {\n        let inner = 2\n        seen := |inner\n    }",
+                step,
+                "body: block -> {}",
+            ),
+            // A pure block, as it is written.
+            (
+                "let v = twice(|1) { seen }",
+                "fn twice(n: Int, body: block: Int): Int",
+                "n: Int",
+            ),
+            (
+                "let v = twice(1) { seen| }",
+                "fn twice(n: Int, body: block: Int): Int",
+                "body: block: Int",
+            ),
+            // A generic function's block, whose result is a type parameter.
+            (
+                "let v = measure(\"m\") { |seen }",
+                "fn measure(name: String, body: block -> T) -> T",
+                "body: block -> T",
+            ),
+            // A method's, with and without parentheses, after its receiver.
+            (
+                "3.times { seen := |2 }",
+                "fn times(n: Int, body: block -> {}) -> {} | Future<{}>",
+                "body: block -> {}",
+            ),
+            (
+                "3.times() { seen := |2 }",
+                "fn times(n: Int, body: block -> {}) -> {} | Future<{}>",
+                "body: block -> {}",
+            ),
+        ] {
+            let text = format!(
+                "{BLOCKS}fn main() -> Int {{\n    let mut seen = 0\n    {call}\n    = seen\n}}\n"
+            );
+            let (found, at, _) = help(&text, &[]).unwrap_or_else(|| panic!("{call}"));
+            assert_eq!(found, label, "{call}");
+            assert_eq!(at.as_deref(), Some(active), "{call}");
+        }
+        // The callee's doc comment comes with it.
+        let text = format!("{BLOCKS}fn main() -> {{}} {{\n    step(\"a\") {{ |{{}} }}\n}}\n");
+        assert_eq!(help(&text, &[]).unwrap().2.as_deref(), Some("Runs a step."));
+    }
+
+    #[test]
+    fn the_innermost_call_wins_in_a_trailing_block_too() {
+        let wrap = |body: &str| format!("{BLOCKS}fn main() -> Int {{\n    {body}\n    = 1\n}}\n");
+        // A block in a block: the inner call's.
+        let text = wrap("step(\"a\") { let v = twice(1) { |2 } }");
+        let (label, active, _) = help(&text, &[]).unwrap();
+        assert_eq!(label, "fn twice(n: Int, body: block: Int): Int");
+        assert_eq!(active.as_deref(), Some("body: block: Int"));
+        // A call's parentheses in a block: that call's.
+        let text = wrap("step(\"a\") { let v = twice(|1) { 2 } }");
+        assert_eq!(help(&text, &[]).unwrap().1.as_deref(), Some("n: Int"));
+        // After the inner block, the outer one's again.
+        let text = wrap("step(\"a\") { let v = twice(1) { 2 }; |{} }");
+        let (label, active, _) = help(&text, &[]).unwrap();
+        assert_eq!(label, "fn step(name: String, body: block -> {}) -> {}");
+        assert_eq!(active.as_deref(), Some("body: block -> {}"));
+        // An argument that is a call with a block.
+        let text = wrap("let v = twice(twice(1) { |2 }) { 3 }");
+        assert_eq!(
+            help(&text, &[]).unwrap().1.as_deref(),
+            Some("body: block: Int")
+        );
+    }
+
+    #[test]
+    fn a_call_of_a_block_has_no_signature() {
+        // A block takes no arguments: in its parentheses, the call around
+        // them answers, or nothing.
+        let text = "w = 0\nfn step(body: block -> Int) -> Int { body(|) }\n";
+        assert_eq!(help(text, &[]), None);
+        let text = "w = 0\nfn g(n: Int) -> Int { n }\n\
+                    fn step(body: block -> Int) -> Int { g(await body(|)) }\n";
+        assert_eq!(help(text, &[]), None);
+    }
+
+    #[test]
+    fn a_block_after_a_rest_parameter_is_the_trailing_block_s() {
+        let rest = "w = 0\nfn rest(first: Int, ...more: Int, body: block: Int): Int { body() }\n";
+        let label = "fn rest(first: Int, ...more: Int, body: block: Int): Int";
+        for (call, active) in [
+            ("r = rest(|1, 2, 3) { 4 }", "first: Int"),
+            ("r = rest(1, 2, |3) { 4 }", "...more: Int"),
+            ("r = rest(1, 2, 3) { |4 }", "body: block: Int"),
+        ] {
+            let (found, at, _) =
+                help(&format!("{rest}{call}\n"), &[]).unwrap_or_else(|| panic!("{call}"));
+            assert_eq!(found, label, "{call}");
+            assert_eq!(at.as_deref(), Some(active), "{call}");
+        }
+    }
+
     #[test]
     fn the_innermost_call_wins() {
         let text = format!("{F}fn g(n: Int): Int {{ n }}\nr = f(g(|1), \"s\", true)\n");
@@ -666,6 +799,25 @@ mod tests {
             );
             assert_eq!(found.active, Some(2), "{rest:?}");
         }
+        // A block that fills a block parameter, left open while it is
+        // written.
+        let text = format!(
+            "{BLOCKS}fn main() -> Int {{\n    let mut seen = 0\n    step(\"a\") {{\n        seen := |"
+        );
+        let at = u32::try_from(text.find('|').unwrap()).unwrap();
+        let sources = vec![
+            SourceFile::new("app.gcsl", text.replacen('|', "", 1)).unwrap(),
+            SourceFile::new("workspace.gcsl", "").unwrap(),
+        ];
+        let index = index_with_standard(&sources, &[], "/").index.unwrap();
+        let file = index.file("app.gcsl").unwrap();
+        let found = closed(&index, file, at).signature(at).unwrap();
+        assert_eq!(
+            found.label,
+            "fn step(name: String, body: block -> {}) -> {}"
+        );
+        assert_eq!(found.active, Some(1));
+        assert_eq!(found.documentation.as_deref(), Some("Runs a step."));
         // A block that is no trailing block, left open: none.
         let text = format!("{pair}fn h(): Int {{|\n");
         let at = u32::try_from(text.find('|').unwrap()).unwrap();

@@ -218,6 +218,47 @@
 //! more for each step of its path. Lowering computes them once, after
 //! building the nodes; the evaluator only adds and compares.
 //!
+//! # Blocks
+//!
+//! The trailing block that fills a function's block parameter (see the
+//! checker's [Blocks](crate::check::blocks#blocks)) is an argument that is
+//! not evaluated where its call is: an [`IrKind::Arg`] whose value is an
+//! [`ArgValue::Block`], the block's body, a [`IrKind::Block`] among the
+//! nodes of the caller's code, of the kind of the block's result. The
+//! argument itself is of kind [`ValueKind::Fn`], as the parameter that
+//! holds the block is, and is shown `(arg N block ...)`. Its body is its
+//! child, so that everything found by walking a frame's nodes is found in
+//! a block too: the loads and stores of the caller's slots, which the body
+//! reads and writes when it runs, the functions it makes closures of, and
+//! its own calls and awaits.
+//!
+//! A call of a block parameter, `body()`, is an [`IrKind::CallBlock`], of
+//! the kind of the block's result, [`ValueKind::Deferred`] where an impure
+//! block's bare result may be a future. Its one child is the read of the
+//! parameter, a [`IrKind::Load`] of kind [`ValueKind::Fn`]; it has no
+//! arguments, and is shown `(call-block ...)`. The evaluator runs the
+//! block's body in the frame of the call that gave it (see
+//! [`crate::eval`]'s [Blocks](crate::eval::blocks#blocks)), which is why a
+//! block's body is lowered in its caller's function, with its caller's
+//! slots, loops and catches, and never as a function of its own.
+//!
+//! For the nesting budget a `CallBlock` records its depth in the body of
+//! the frame it is evaluated in, as a `Call` does, and an `ArgValue::Block`
+//! the height of its body, as a function has its body's: the call of the
+//! block is charged for the body then, wherever in its caller the block
+//! was written. The depths of the calls and awaits in a block's body are
+//! counted from the body of the frame the block is written in, through the
+//! call that gives it.
+//!
+//! A call of a block may assign the variables of the frame that gave the
+//! block, which no node of the calling frame shows. So a `CallBlock` is
+//! never independent ([`Ir::is_independent`]), nor is anything it is in,
+//! and no `for` whose guard or body holds one is forkable
+//! ([`IrKind::For`]). A `CallBlock` and a block argument are control
+//! nodes, which no simple subtree holds ([`Ir::is_simple`]). A call that
+//! gives a block is independent or not as any call is: by what its
+//! subtree, the block's body included, assigns and leaves.
+//!
 //! # Cells
 //!
 //! Every node of the tree of an input's top-level fields has a *cell*, a
@@ -1074,8 +1115,10 @@ pub enum IrKind {
         /// Whether its iterations are independent of one another, so that
         /// one may wait while the next runs (see
         /// [Suspension](crate::eval::machine#suspension)): its guard and
-        /// body assign no variable declared outside them, and no `break`
-        /// or `return` leaves it. Lowering finds it.
+        /// body assign no variable declared outside them, no `break` or
+        /// `return` leaves it, and they call no block, which may assign
+        /// the variables of another frame (see [Blocks](#blocks)).
+        /// Lowering finds it.
         forkable: bool,
     },
     /// A condition loop or a `do` loop: of `parts`, the condition, a `Bool`
@@ -1370,9 +1413,10 @@ const _: () = assert!(
 
 impl IrKind {
     /// Whether this is a *control* node, one that a subtree of simple nodes
-    /// may not hold (see [`Ir::is_simple`]): a call, a loop, an await, a
-    /// context read or `with`, a `recover`, a `break`, `continue` or
-    /// `return` and what catches one, and a call's argument.
+    /// may not hold (see [`Ir::is_simple`]): a call, of a function or of a
+    /// block, a loop, an await, a context read or `with`, a `recover`, a
+    /// `break`, `continue` or `return` and what catches one, and a call's
+    /// argument.
     #[must_use]
     pub(crate) const fn is_control(self) -> bool {
         matches!(
@@ -2216,6 +2260,52 @@ impl Ir {
             .collect()
     }
 
+    /// For each call, of a function or of a block, in the order its node was
+    /// made, whether it is independent (see [`Ir::is_independent`]), for
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn independent_calls(&self) -> Vec<bool> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| match node.kind {
+                IrKind::Call { .. } | IrKind::CallBlock { .. } => {
+                    self.independent.get(index).copied()
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The kind and the depth of each call of a block, in the order its
+    /// node was made, for tests.
+    #[cfg(test)]
+    pub(crate) fn block_calls(&self) -> Vec<(ValueKind, u16)> {
+        self.nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                IrKind::CallBlock { kind, depth, .. } => Some((kind, depth)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The height of each block argument's body, in the order its node was
+    /// made, an inner block's before an outer one's, for tests.
+    #[cfg(test)]
+    pub(crate) fn block_heights(&self) -> Vec<u16> {
+        self.nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                IrKind::Arg {
+                    value: ArgValue::Block { height, .. },
+                    ..
+                } => Some(height),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether node `id` is *simple*: whether its subtree runs nothing but
     /// operators, constants, reads, literals, `if`s and blocks, and so
     /// calls, loops, awaits, reads no context, sets none, recovers from no
@@ -2228,8 +2318,10 @@ impl Ir {
     }
 
     /// Whether node `id` is *independent*: whether its subtree assigns no
-    /// variable (`:=`) and holds no `break`, `continue` or `return`, outside
-    /// the bodies of the functions it makes closures of. The evaluation of
+    /// variable (`:=`), holds no `break`, `continue` or `return`, and calls
+    /// no block, which may assign the variables of the frame that gave it
+    /// (see [Blocks](#blocks)), outside the bodies of the functions it
+    /// makes closures of. The evaluation of
     /// an independent element of a list, field of a record, piece of an
     /// interpolation or argument of a call writes nothing the pieces after
     /// it read and leaves nothing it is in, so that in graph mode it may be
@@ -2945,11 +3037,12 @@ impl IrBuilder {
         self.finish_program(root, (frame_size, slot_names), Vec::new(), (0, 0))
     }
 
-    /// Gives every [`IrKind::Call`], [`IrKind::Await`] and
-    /// [`IrKind::Update`] of the program whose root is `root` and whose
-    /// functions are `functions` its depth in its frame, and every function
-    /// its body's height, [`FnCode::height`]: one walk of the root and one of
-    /// each function's body, through [`IrKind::children`]. The heights of all
+    /// Gives every [`IrKind::Call`], [`IrKind::CallBlock`], [`IrKind::Await`]
+    /// and [`IrKind::Update`] of the program whose root is `root` and whose
+    /// functions are `functions` its depth in its frame, every function its
+    /// body's height, [`FnCode::height`], and every block argument its
+    /// body's ([`ArgValue::Block`]): one walk of the root and one of each
+    /// function's body, through [`IrKind::children`]. The heights of all
     /// the nodes are kept in one vector, and the walks share one stack.
     ///
     /// An update is two levels taller than its tallest child for each step
@@ -2974,9 +3067,11 @@ impl IrBuilder {
         }
     }
 
-    /// Walks the frame whose body is `body` depth first, giving each call
-    /// and await its depth on the way down and each node its height in
-    /// `heights` on the way up, and returns the body's height. Iterative,
+    /// Walks the frame whose body is `body` depth first, giving each call,
+    /// of a function or of a block, and each await its depth on the way
+    /// down, and each node its height in `heights`, and each block
+    /// argument its body's (see [Blocks](crate::ir#blocks)), on the way up,
+    /// and returns the body's height. Iterative,
     /// with `stack` as the work list, since a body can be
     /// [`crate::MAX_DEPTH`] deep: each entry is a node, its depth, and
     /// whether its children have been pushed, in which case they have all
@@ -3114,8 +3209,8 @@ fn simple_nodes(nodes: &[IrNode], pool: &[IrId]) -> Vec<bool> {
 
 /// For each of `nodes`, whose lists are in `pool` and whose assignments are
 /// `assignments`, whether it is independent (see [`Ir::is_independent`]):
-/// a node that is no assignment, `break`, `continue` or `return`, and all
-/// of whose children are independent, found in one pass as
+/// a node that is no assignment, `break`, `continue`, `return` or call of
+/// a block, and all of whose children are independent, found in one pass as
 /// [`simple_nodes`] finds its answers.
 fn independent_nodes(nodes: &[IrNode], pool: &[IrId], mut assignments: Vec<IrId>) -> Vec<bool> {
     assignments.sort_unstable_by_key(|id| id.index());

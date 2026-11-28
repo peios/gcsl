@@ -108,7 +108,10 @@
 //! line saying where it comes from ("parameter", "field of directory
 //! `pkgs/`", "standard library `path`", "built-in", "imported from `a.b`").
 //! Types are shown by the printer diagnostics use
-//! ([`TypeTable::display`]); a line wider than 80 columns, a hover
+//! ([`TypeTable::display`]), so a block parameter is `body: block -> {} |
+//! Future<{}>`, "parameter", its impure block's bare result the either
+//! shape as an impure function's bare parameter is, and a pure one's
+//! `body: block: Int`; a line wider than 80 columns, a hover
 //! panel's width, lays its record out a field per line, or its
 //! signature or function type a parameter per line, each indented by 2;
 //! and anything of more than [`MAX_LINES`] lines is cut short with `…`. An
@@ -249,7 +252,8 @@
 //!   argument of a call starts (after its `(` or a `,` of its argument
 //!   list), first the named arguments, `name = `, of the callee's
 //!   parameters no other argument fills (as signature help counts them;
-//!   none for `len` and `show`); the locals
+//!   none for `len` and `show`, nor for a block parameter, which only a
+//!   trailing block gives); the locals
 //!   (the `let`s, `fn`s and fields of each block around the place before
 //!   the item it is in, the parameters of each function whose body it is
 //!   in, the variable of each `for` whose body or guard it is in), rebuilt
@@ -260,7 +264,12 @@
 //!   expression or an item may start with. The field being declared, the
 //!   top-level field named by one segment whose value the place is in, is
 //!   not offered, as no block's item is before its own end; a `def` or a
-//!   `fn`, which may call itself, is.
+//!   `fn`, which may call itself, is. A trailing block that fills a block
+//!   parameter (see the checker's [Blocks](crate::check::blocks#blocks))
+//!   is a block of its caller as any other is: in it the caller's locals
+//!   are offered, and not the parameters of the function it is given to;
+//!   in that function, its block parameter is offered as a function is
+//!   ([`CompletionKind::Function`]), since it is called.
 //!
 //! # Inlay hints
 //!
@@ -311,7 +320,12 @@
 //! argument names, `name = ...`, when the place is in one; else the next one
 //! not yet filled, from the left, by a positional argument before the
 //! place, nor anywhere by a named one, nor, the last, by a trailing block;
-//! in a trailing block, the last. The arguments are counted on the tokens,
+//! in a trailing block, the last. A block parameter (see the checker's
+//! [Blocks](crate::check::blocks#blocks)) is shown as it is written too,
+//! `body: block -> {}`, its result without the either shape, and is the
+//! active one anywhere in the trailing block that gives it; a call of a
+//! block, `body()`, takes no arguments and has no signature. The arguments
+//! are counted on the tokens,
 //! so a list half-typed counts as it is written. A trailing block left
 //! open, `pair("a", "b") {` while it is typed, leaves the file's braces
 //! unmatched, so the file has nothing indexed: its signature is found as

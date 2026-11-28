@@ -21,7 +21,7 @@
 //! - Expressions: [`expect`], [`operators`], [`names`], [`fields`],
 //!   [`lists`], [`loops`] and [`narrowing`].
 //! - Functions and calls: [`functions`], [`calls`], [`methods`],
-//!   [`inference`], [`untyped`], [`futures`] and [`attributes`].
+//!   [`blocks`], [`inference`], [`untyped`], [`futures`] and [`attributes`].
 //! - The rest of the language: [`enums`], [`context`], [`failure`] and
 //!   [`secrets`].
 //!
@@ -1614,8 +1614,14 @@ type AttributeFields = Vec<(Box<str>, TyId, Option<Constant>)>;
 /// parameter's position on and every spread the rest parameter, the
 /// trailing block the last, and named ones the parameters of their names;
 /// only the first that fills a parameter but the rest parameter, and none
-/// that fills nothing.
-fn argument_targets(args: &[Arg], sig: &FnTy) -> Vec<(ExprId, usize, bool)> {
+/// that fills nothing. `block_after_rest` is whether the last parameter is
+/// a block after a rest parameter ([`Checker::block_after_rest`]), which
+/// the trailing block then fills whatever the positional arguments are.
+fn argument_targets(
+    args: &[Arg],
+    sig: &FnTy,
+    block_after_rest: bool,
+) -> Vec<(ExprId, usize, bool)> {
     let count = sig.params.len();
     let rest = sig.rest.map(usize::from);
     let positional = args
@@ -1632,7 +1638,7 @@ fn argument_targets(args: &[Arg], sig: &FnTy) -> Vec<(ExprId, usize, bool)> {
                 sig.positional(next - 1)
             }
             ArgKind::Spread { .. } => rest,
-            ArgKind::Trailing => (positional < count).then(|| count - 1),
+            ArgKind::Trailing => (positional < count || block_after_rest).then(|| count - 1),
             ArgKind::Named { name, .. } => sig
                 .params
                 .iter()

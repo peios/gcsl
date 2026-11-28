@@ -688,6 +688,48 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_block_left_open_is_in_its_caller_s_scope() {
+        let step =
+            "w = 0\nfn step(name: String, body: block -> {}) -> {} {\n    body()\n    = {}\n}\n";
+        // While the block is written: the caller's variables, and the
+        // block's own before the place; not the callee's parameters.
+        let text = format!(
+            "{step}fn main(limit: Int) -> Int {{\n    let mut seen = 0\n    step(\"a\") {{\n        \
+             let inner = 1\n        seen := se|"
+        );
+        let found = completed(&text);
+        offers(&found, &["seen", "inner", "limit", "step", "w"], &text);
+        assert!(!found.iter().any(|label| label == "body" || label == "name"));
+        // With the rest of the function after it.
+        let text = format!(
+            "{step}fn main() -> Int {{\n    let mut seen = 0\n    step(\"a\") {{\n        seen := |\n    \
+             = seen\n}}\n"
+        );
+        offers(&completed(&text), &["seen", "step"], &text);
+        // A block in a block, both left open.
+        let text = format!(
+            "{step}fn main() -> Int {{\n    let mut seen = 0\n    step(\"a\") {{\n        let outer = 2\n        \
+             step(\"b\") {{\n            seen := |"
+        );
+        offers(&completed(&text), &["seen", "outer"], &text);
+        // In the function that takes the block, its parameter.
+        let text = "w = 0\nfn step(name: String, body: block -> {}) -> {} {\n    bo|";
+        offers(&completed(text), &["body", "name"], text);
+        // Hover and definition of the caller's variable in the open block.
+        let text = format!(
+            "{step}fn main() -> Int {{\n    let mut seen = 0\n    step(\"a\") {{\n        seen := |seen + 1\n"
+        );
+        let (index, file, at) = indexed(&text, &[]);
+        let mut closed = balanced(&index, file, at);
+        let hover = closed.hover(at).unwrap();
+        assert!(hover.text.contains("mut seen: Int"), "{}", hover.text);
+        let declared = u32::try_from(text.find("seen = 0").unwrap()).unwrap();
+        let found = closed.definition(at);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].span, Span::new(declared, declared + 4));
+    }
+
+    #[test]
     fn hover_and_definition_in_a_block_left_open() {
         let text = "r = {\n    k = 1\n    j = |k\n";
         let (index, file, at) = indexed(text, &[]);

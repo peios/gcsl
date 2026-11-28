@@ -34,6 +34,7 @@ fn stderr(output: &Output) -> &str {
 }
 
 mod basics;
+mod blocks;
 mod collections;
 mod declarations;
 mod diagnostics;

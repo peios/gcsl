@@ -3068,3 +3068,149 @@ fn a_spread_of_an_impure_function_s_list_parameter_awaits_its_elements() {
                 = run([\"one\", later])";
     assert_eq!(run(text).unwrap().to_string(), "one two\n");
 }
+
+#[test]
+fn a_block_rebinds_its_caller_s_variables_and_gives_its_value() {
+    let text = "fn step(name: String, body: block -> {}) -> {} {\n    body()\n    = {}\n}\n\
+                fn measure<T>(name: String, body: block -> T) -> T { body() }\n\
+                fn twice(body: block: Int): Int { body() + body() }\n\
+                let mut log = \"\"\n\
+                step(\"boot\") { log := log + \"booted;\" }\n\
+                let word = measure(\"word\") { log := log + \"measured;\"; \"w\" }\n\
+                let n = twice { 21 }\n\
+                = \"{log} {word} {n}\"";
+    assert_eq!(
+        run(text).unwrap(),
+        Value::Str(Rc::from("booted;measured; w 42"))
+    );
+    assert_eq!(
+        show("fn twice(body: block: Int): Int { body() + body() }\ntwice { 21 }"),
+        "42 : Int"
+    );
+}
+
+#[test]
+fn block_errors_render_with_their_labels_and_notes() {
+    assert_eq!(
+        rendered("fn f(body: block -> Int) -> Int { let b = body; = 1 }"),
+        "error: a block can only be called\n\
+         \x20--> calc.gcsl:1:43\n\
+         \x20 |\n\
+         1 | fn f(body: block -> Int) -> Int { let b = body; = 1 }\n\
+         \x20 |      ------------------ `body` is a block ^^^^\n\
+         \x20 |\n\
+         \x20 = note: a block is no value: call it, `body()`, or pass it on by calling it in \
+         another call's block, `f(x) { body() }`\n"
+    );
+    assert_eq!(
+        rendered(
+            "fn step(body: block -> {}) -> {} { body() }\n\
+             fn g() -> Int { step { return 1 }; = 2 }"
+        ),
+        "error: `return` cannot leave a block\n\
+         \x20--> calc.gcsl:2:24\n\
+         \x20 |\n\
+         2 | fn g() -> Int { step { return 1 }; = 2 }\n\
+         \x20 |                 ----   ^^^^^^\n\
+         \x20 |                 |\n\
+         \x20 |                 inside the block given to this call\n\
+         \x20 |\n\
+         \x20 = note: the block runs when the function it is given to calls it, which the \
+         function goes on from; end the block with a value the function can act on instead\n"
+    );
+    assert_eq!(
+        rendered("fn f(body: block -> Int, x: Int) -> Int { body() }"),
+        "error: a block is a function's last parameter\n\
+         \x20--> calc.gcsl:1:12\n\
+         \x20 |\n\
+         1 | fn f(body: block -> Int, x: Int) -> Int { body() }\n\
+         \x20 |            ^^^^^^^^^^^^\n\
+         \x20 |\n\
+         \x20 = note: a call gives the block after its other arguments, as `f(x) { ... }`\n"
+    );
+}
+
+#[test]
+fn a_panic_in_a_block_is_its_function_s_to_recover_or_the_program_s_error() {
+    let guarded = "fn guarded(body: block -> {}) -> String {\n    \
+                   = recover { body(); = \"passed\" } else (failure) { \"caught {failure.message}\" }\n}\n";
+    assert_eq!(
+        run(&format!(
+            "{guarded}let mut n = 0\nlet a = guarded {{ n := n + 1; panic(\"boom\") }}\n\
+             let b = guarded {{ n := n + 10 }}\n= \"{{a}} {{b}} {{n}}\""
+        ))
+        .unwrap(),
+        Value::Str(Rc::from("caught boom passed 11"))
+    );
+    // Let through, it is reported where it was raised.
+    let text = "fn step(body: block -> {}) -> {} { body() }\nstep { panic(\"bang\") }";
+    let errors = run(text).unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].message, "bang");
+    let at = u32::try_from(text.find("panic").unwrap()).unwrap();
+    assert_eq!(errors[0].span.start, at);
+}
+
+#[test]
+fn a_function_with_a_block_retries_its_block_with_it() {
+    // Each attempt calls the block again, in the caller's frame, where
+    // what an attempt that failed wrote is kept.
+    let text = "#[retry(5)]\nfn tried(body: block -> Int) -> Int { body() }\n\
+                let mut attempts = 0\n\
+                let got = tried { attempts := attempts + 1; if attempts < 3 { panic(\"not yet\") }; attempts * 10 }\n\
+                = \"{got} {attempts}\"";
+    assert_eq!(run(text).unwrap(), Value::Str(Rc::from("30 3")));
+    // Out of retries: the last attempt's error, noted with the attempts.
+    let text = "#[retry(1)]\nfn tried(body: block -> Int) -> Int { body() }\n\
+                let mut attempts = 0\n\
+                = tried { attempts := attempts + 1; panic(\"failed {attempts}\") }";
+    let errors = run(text).unwrap_err();
+    assert_eq!(errors[0].message, "failed 2");
+    assert_eq!(errors[0].notes, ["`tried` was tried 2 times"]);
+    // A function with retries called from a block.
+    let text = "fn step(body: block -> Int) -> Int { body() }\n\
+                #[retry(3)]\nfn flaky(n: Int) -> Int { if n < 0 { panic(\"negative\") }; n }\n\
+                = step { flaky(4) + 1 }";
+    assert_eq!(run(text).unwrap(), Value::Int(5));
+}
+
+#[test]
+fn a_block_runs_under_the_timeout_of_the_function_that_calls_it() {
+    // The deadline of `timed` passes inside its block, in the caller's
+    // frame: a loop, and a program, which is killed.
+    let started = std::time::Instant::now();
+    let errors = run(
+        "#[timeout(100ms)]\nfn timed(body: block -> Int) -> Int { body() }\n\
+         let mut i = 0\n= timed { for true { i := i + 1 }; i }",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].message, "`timed` timed out after 100ms");
+    let errors = run(
+        "#[timeout(200ms)]\nfn timed(body: block -> Int) -> Int { body() }\n\
+         = timed { exec([\"sleep\", \"30\"]).status }",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].message, "`timed` timed out after 200ms");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // A block called again and again until the deadline.
+    let errors = run(
+        "#[timeout(100ms)]\nfn spin(body: block -> {}) -> {} { for true { body() }; = {} }\n\
+         let mut i = 0\nspin { i := i + 1 }",
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].message, "`spin` timed out after 100ms");
+    // In time, it is as any call, and its caller goes on with no deadline.
+    assert_eq!(
+        run(
+            "#[timeout(30s)]\nfn timed(body: block -> Int) -> Int { body() }\n\
+             let mut n = 1\nlet got = timed { n := n + 1; n * 10 }\n= got + n"
+        )
+        .unwrap(),
+        Value::Int(22)
+    );
+    // The function's own retries run its block again after a timeout.
+    let text = "#[retry(2)] #[timeout(100ms)]\nfn timed(body: block -> Int) -> Int { body() }\n\
+                let mut attempts = 0\n\
+                = timed { attempts := attempts + 1; if attempts < 3 { for true { }; {} }; attempts }";
+    assert_eq!(run(text).unwrap(), Value::Int(3));
+}

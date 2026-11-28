@@ -74,6 +74,15 @@
 //! meaning the longest prefix of its path that names a definition, the rest
 //! read from its meta.
 //!
+//! A function's last parameter may be a *block*, `fn step(name: String,
+//! body: block -> {}) -> {}`, which a call gives as its trailing block,
+//! `step("boot") { ... }`, and which is no value: the function can only
+//! call it, `body()`, any number of times, and each call runs the block in
+//! the scope of the call that gave it, where it reads the caller's
+//! variables and rebinds its mutable ones, as no function expression
+//! there could. A block marked `:` is pure, as a function is, and no jump
+//! leaves one (see [`parser`], [`check`] and [`eval`], each "Blocks").
+//!
 //! [`run`] performs all of them on one file. A [`Session`] performs them on
 //! a sequence of inputs that share their variables, as the REPL needs. A
 //! [`workspace::Workspace`] performs them on the files of a directory tree,
@@ -200,7 +209,8 @@ pub use value::{Value, ValueKind};
 /// loop's its body and its condition). A type written
 /// as a name is one level, a record type one
 /// more than its tallest field's type, a function type one more than the
-/// tallest of its parameter and return types, an applied type such as
+/// tallest of its parameter and return types, a block type, `block -> T`,
+/// one more than its result, an applied type such as
 /// `Future<Int>` one more than its argument, `T[]` one more than `T`, and a
 /// union one more than the
 /// taller of its sides; a type written as the name of a declared type is,
@@ -239,7 +249,9 @@ pub use value::{Value, ValueKind};
 /// would reach, the whole height of its callee's body included, stays
 /// within this budget; otherwise it fails with "call nested too deeply".
 /// An await that runs a future's body is charged as a call of a
-/// parameterless function is, and a deep await one more level for each
+/// parameterless function is, a call of a block (see [`eval`], "Blocks")
+/// as a call of a function whose body is as tall as the block's, and a
+/// deep await one more level for each
 /// level of record or list nesting it has descended. Nesting built by calls and
 /// awaits therefore never exceeds `MAX_DEPTH` levels, whatever shape the
 /// recursion has. (The top level's own nesting is not checked: it is

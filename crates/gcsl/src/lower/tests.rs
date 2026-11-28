@@ -1,7 +1,7 @@
 use super::*;
 use crate::ast::{AstBuilder, Expr, Item};
 use crate::check::check;
-use crate::ir::{FnKind, LazyField, ListShape, ShapedOperands, StepAt, StepMode};
+use crate::ir::{ArgValue, FnKind, LazyField, ListShape, ShapedOperands, StepAt, StepMode};
 use crate::lexer::tokenize;
 use crate::names::Names;
 use crate::parser::parse;
@@ -2921,5 +2921,221 @@ fn a_piece_is_independent_unless_it_assigns_or_stops() {
             "{g}= for x in [1] {{ = g(if x > 0 {{ continue }} else {{ 1 }}, 2) }}"
         )),
         [false, true]
+    );
+}
+
+#[test]
+fn a_trailing_block_that_fills_a_block_is_a_block_argument() {
+    // The block's body is a node of the caller's code, under its argument,
+    // and a call of the parameter is a `call-block` of a read of it.
+    let text = "fn run(n: Int, body: block -> Int) -> Int { body() + n }\n\
+                let mut t = 1\n\
+                run(2) { t := t + 1; t }";
+    assert_eq!(
+        dump(text),
+        "(block @0..95\n\
+             \x20 (store run#0 @0..56\n\
+             \x20   (make-closure #0 @0..56))\n\
+             \x20 (store t#1 @57..70\n\
+             \x20   (int 1 @69..70))\n\
+             \x20 (call @71..95\n\
+             \x20   (load run#0 @71..74)\n\
+             \x20   (arg 0 @75..76\n\
+             \x20     (int 2 @75..76))\n\
+             \x20   (arg 1 block @78..95\n\
+             \x20     (block @78..95\n\
+             \x20       (store t#1 @80..90\n\
+             \x20         (int-add @85..90\n\
+             \x20           (load t#1 @85..86)\n\
+             \x20           (int 1 @89..90)))\n\
+             \x20       (load t#1 @92..93)))))\n\
+             fn #0 run (frame 2, params 2, captures 0, height 5)\n\
+             \x20 (block @42..56\n\
+             \x20   (int-add @44..54\n\
+             \x20     (await @44..50\n\
+             \x20       (call-block @44..50\n\
+             \x20         (load body#1 @44..48)))\n\
+             \x20     (await @53..54\n\
+             \x20       (load n#0 @53..54))))"
+    );
+    // A pure block's call is of its result's kind, present, and the
+    // parameter that holds the block of a function's kind.
+    let ir = lower_text("fn pure_of(body: block: Int): Int { body() }\n= pure_of { 2 }");
+    let function = ir.function(FnId::new(0));
+    let IrKind::Block { result, .. } = ir.get(function.body).kind else {
+        panic!("the body is not a block");
+    };
+    let IrKind::CallBlock { block, kind, depth } = ir.get(result).kind else {
+        panic!("expected a call of a block, got {:?}", ir.get(result));
+    };
+    assert_eq!(kind, ValueKind::Int);
+    assert_eq!(ir.kind_of(result), ValueKind::Int);
+    assert_eq!(depth, 1);
+    assert!(matches!(ir.get(block).kind, IrKind::Load(_, ValueKind::Fn)));
+    let IrKind::Block { result: call, .. } = ir.get(ir.root()).kind else {
+        panic!("the root is not a block");
+    };
+    let IrKind::Call { args, .. } = ir.get(call).kind else {
+        panic!("expected a call");
+    };
+    let arg = ir.items(args)[0];
+    let IrKind::Arg {
+        param: 0,
+        value: ArgValue::Block { body, height },
+    } = ir.get(arg).kind
+    else {
+        panic!("expected a block argument, got {:?}", ir.get(arg));
+    };
+    assert_eq!(ir.kind_of(arg), ValueKind::Fn);
+    assert_eq!(ir.kind_of(body), ValueKind::Int);
+    // The body's height: the block and the literal in it.
+    assert_eq!(height, 2);
+    // An impure block's call may be a future.
+    let ir = lower_text("fn run(body: block -> Int) -> Int { body() }\n= run { 2 }");
+    assert_eq!(ir.block_calls(), [(ValueKind::Deferred, 1)]);
+}
+
+#[test]
+fn a_block_that_ends_with_a_statement_gives_the_empty_record() {
+    // The impure call that ends a block of `{}` is an item, its value
+    // discarded, and the block's result is `{}`.
+    let text = "fn step(body: block -> {}) -> {} { body(); = {} }\n\
+                fn op() -> Int { 1 }\n\
+                step { op() }";
+    let dumped = dump(text);
+    assert!(
+        dumped.contains(
+            "\x20   (arg 0 block @76..84\n\
+             \x20     (block @76..84\n\
+             \x20       (call @78..82\n\
+             \x20         (load op#1 @78..80))\n\
+             \x20       (empty @76..84)))))\n"
+        ),
+        "{dumped}"
+    );
+    // A block that gives `{}` itself keeps its last expression as its
+    // result.
+    let text = "fn step(body: block -> {}) -> {} { body(); = {} }\nstep { {} }";
+    let dumped = dump(text);
+    assert!(
+        dumped.contains(
+            "\x20   (arg 0 block @55..61\n\
+             \x20     (block @55..61\n\
+             \x20       (block @57..59\n\
+             \x20         (empty @57..59))))))\n"
+        ),
+        "{dumped}"
+    );
+    // Where the block's result is no `{}`, the call is its value.
+    let text = "fn run(body: block -> Int) -> Int { body() }\n\
+                fn op() -> Int { 1 }\n\
+                = run { op() }";
+    let dumped = dump(text);
+    assert!(
+        dumped.contains(
+            "\x20   (arg 0 block @72..80\n\
+             \x20     (block @72..80\n\
+             \x20       (call @74..78\n\
+             \x20         (load op#1 @74..76))))))\n"
+        ),
+        "{dumped}"
+    );
+}
+
+#[test]
+fn a_call_of_a_block_is_as_deep_as_a_call_and_its_body_as_tall_as_it_is() {
+    // The depth of a `call-block` is its path from its frame's body, as a
+    // call's is.
+    let ir = lower_text("fn run(body: block: Int): Int { 1 + (2 + body()) }\n= run { 3 }");
+    assert_eq!(ir.block_calls(), [(ValueKind::Int, 3)]);
+    // A block argument's height is its body's, however deep the call that
+    // gives it is: the call of the block charges the budget for it.
+    let heights = |text: &str| lower_text(text).block_heights();
+    let run = "fn run(body: block: Int): Int { body() }\n";
+    assert_eq!(heights(&format!("{run}= run {{ 3 }}")), [2]);
+    assert_eq!(heights(&format!("{run}= run {{ 1 + (2 + 3) }}")), [4]);
+    assert_eq!(heights(&format!("{run}= 1 + (2 + run {{ 3 }})")), [2]);
+    // A block in a block: the inner one first, and the outer one over the
+    // call that gives the inner.
+    assert_eq!(heights(&format!("{run}= run {{ run {{ 3 }} }}")), [2, 5]);
+}
+
+#[test]
+fn an_iteration_that_calls_a_block_is_not_forkable() {
+    let forkable = |text: &str| lower_text(text).forkable_fors();
+    // The block may assign the variables of the frame that gave it, which
+    // the iterations of the callee's loop would then share.
+    assert_eq!(
+        forkable(
+            "fn each(xs: List<Int>, body: block -> {}) -> {} { for x in xs { body() }\n = {} }"
+        ),
+        [false]
+    );
+    // Every loop around the call, and none beside it.
+    assert_eq!(
+        forkable(
+            "fn each(xs: List<Int>, body: block: Int): List<List<Int>> {\n\
+             \x20   let a = for x in xs { x + 1 }\n\
+             \x20   let b = for x in xs { for y in a { body() + y } }\n\
+             \x20   = for x in b { for y in x { y + 1 } }\n\
+             }"
+        ),
+        [true, false, false, true, true]
+    );
+    // A loop that gives a block assigns as the block does: one whose block
+    // assigns outside the iteration is not forkable, and one whose block
+    // assigns only the iteration's own variable is.
+    let run = "fn run(body: block -> {}) -> {} { body()\n = {} }\n";
+    assert_eq!(
+        forkable(&format!(
+            "{run}let mut t = 0\nfor x in [1, 2] {{ run {{ t := t + x }} }}\n= t"
+        )),
+        [false]
+    );
+    assert_eq!(
+        forkable(&format!(
+            "{run}= for x in [1, 2] {{ let mut y = x\n run {{ y := y + 1 }}\n = y }}"
+        )),
+        [true]
+    );
+    assert_eq!(
+        forkable(&format!("{run}for x in [1, 2] {{ run {{ {{}} }} }}")),
+        [true]
+    );
+}
+
+#[test]
+fn a_call_whose_block_assigns_is_not_independent() {
+    let independent = |text: &str| lower_text(text).independent_calls();
+    let run = "fn run(body: block -> Int) -> Int { = body() }\n";
+    // The call of a block is never independent: it may assign the
+    // variables of the frame that gave it. It is the only call in `run`.
+    assert_eq!(independent(run), [false]);
+    // A call that gives a block that assigns nothing is independent.
+    assert_eq!(independent(&format!("{run}= run {{ 1 }}")), [false, true]);
+    // One whose block assigns is not, the caller's variable or its own.
+    assert_eq!(
+        independent(&format!("{run}let mut t = 0\n= run {{ t := 1\n = t }}")),
+        [false, false]
+    );
+    assert_eq!(
+        independent(&format!("{run}= run {{ let mut u = 1\n u := 2\n = u }}")),
+        [false, false]
+    );
+    // Nor is a call around one: the assignment is in its subtree.
+    let g = "fn g(a: Int, b: Int) -> Int { = a + b }\n";
+    assert_eq!(
+        independent(&format!(
+            "{run}{g}let mut t = 0\n= g(run {{ t := 1\n = t }}, run {{ 2 }})"
+        )),
+        [false, false, true, false]
+    );
+    // A function that passes its block on calls it in another's block: the
+    // call that gives that block holds a call of a block.
+    assert_eq!(
+        independent(&format!(
+            "{run}fn pass(body: block -> Int) -> Int {{ = run {{ body() }} }}"
+        )),
+        [false, false, false]
     );
 }

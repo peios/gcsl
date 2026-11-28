@@ -1,0 +1,10 @@
+fn step(name: String, body: block -> {}) -> {} { body() }
+fn find(xs: List<Int>) -> Int {
+  for x in xs { step("look") { if x > 1 { return x } } }
+  = 0
+}
+fn keep(body: block -> Int) -> Int {
+  let held = body
+  = 1
+}
+r = find([1, 2])

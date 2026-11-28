@@ -1937,3 +1937,368 @@ fn time_of_a_full_check() {
         times[times.len() - 1]
     );
 }
+
+/// A file with a function that takes an impure block, documented, one that
+/// takes a pure block, and `main`, which gives each a trailing block that
+/// reads and rebinds its variable.
+const BLOCKS: &str = "w = 0\n\
+                      # Runs a step.\n\
+                      fn step(name: String, body: block -> {}) -> {} {\n\
+                      \x20   body()\n\
+                      \x20   = {}\n\
+                      }\n\
+                      fn twice(n: Int, body: block: Int): Int { body() + n }\n\
+                      fn f(): Int { 1 }\n\
+                      fn main() -> Int {\n\
+                      \x20   let mut seen = 0\n\
+                      \x20   step(\"a\") {\n\
+                      \x20       let inner = f()\n\
+                      \x20       seen := seen + inner\n\
+                      \x20   }\n\
+                      \x20   = twice(1) { seen }\n\
+                      }\n\
+                      r = main()\n";
+
+#[test]
+fn a_block_parameter_and_its_function_are_hovered_and_found() {
+    let scratch = Scratch::workspace("blocks-hover", "");
+    let uri = scratch.write("app.gcsl", BLOCKS);
+    let (mut client, _) = Client::start(&["utf-8"]);
+    client.open(&uri, BLOCKS);
+    assert!(client.published(&uri).diagnostics.is_empty());
+    // The call of the block, in its function: the parameter.
+    let shown = client.hover(&uri, (3, 4));
+    assert_eq!(
+        shown["contents"]["value"],
+        "```gcsl\nbody: block -> {} | Future<{}>\n```\n\nparameter"
+    );
+    assert_eq!(as_range(&shown["range"]), range((3, 4), (3, 8)));
+    let definition = client.definition(&uri, (3, 4));
+    assert_eq!(as_range(&definition["range"]), range((2, 22), (2, 26)));
+    // The function, at the call that gives it a block.
+    let shown = client.hover(&uri, (10, 4));
+    assert_eq!(
+        shown["contents"]["value"],
+        "```gcsl\nfn step(name: String | Future<String>, body: block -> {} | Future<{}>) -> \
+         {}\n```\n\nRuns a step."
+    );
+    let definition = client.definition(&uri, (10, 4));
+    assert_eq!(as_range(&definition["range"]), range((2, 3), (2, 7)));
+    let shown = client.hover(&uri, (14, 6));
+    assert_eq!(
+        shown["contents"]["value"],
+        "```gcsl\nfn twice(n: Int, body: block: Int): Int\n```"
+    );
+    // The caller's variable, in the trailing block, and the block's own.
+    let shown = client.hover(&uri, (12, 8));
+    assert_eq!(shown["contents"]["value"], "```gcsl\nmut seen: Int\n```");
+    let definition = client.definition(&uri, (12, 8));
+    assert_eq!(as_range(&definition["range"]), range((9, 12), (9, 16)));
+    let definition = client.definition(&uri, (12, 23));
+    assert_eq!(as_range(&definition["range"]), range((11, 12), (11, 17)));
+    // The word `block` is no name.
+    assert_eq!(client.hover(&uri, (2, 30)), Value::Null);
+    client.shut_down().unwrap();
+}
+
+#[test]
+fn signature_help_is_given_in_a_trailing_block_and_in_its_call_s_parentheses() {
+    let scratch = Scratch::workspace("blocks-signature", "");
+    let uri = scratch.write("app.gcsl", BLOCKS);
+    for encoding in ["utf-8", "utf-16"] {
+        let (mut client, _) = Client::start(&[encoding]);
+        client.open(&uri, BLOCKS);
+        // In the parentheses: the first parameter, the block being the
+        // trailing block's.
+        let help = client.ask("textDocument/signatureHelp", &uri, (10, 9));
+        let label = "fn step(name: String, body: block -> {}) -> {}";
+        assert_eq!(help["signatures"][0]["label"], label, "{encoding}");
+        assert_eq!(
+            help["signatures"][0]["parameters"],
+            json!([{ "label": [8, 20] }, { "label": [22, 39] }]),
+            "{encoding}"
+        );
+        assert_eq!(
+            help["signatures"][0]["documentation"]["value"],
+            "Runs a step."
+        );
+        assert_eq!(help["activeParameter"], 0, "{encoding}");
+        // In the trailing block, on any of its lines: the block.
+        for at in [(10, 15), (11, 20), (12, 16), (13, 4)] {
+            let help = client.ask("textDocument/signatureHelp", &uri, at);
+            assert_eq!(help["signatures"][0]["label"], label, "{at:?}");
+            assert_eq!(help["activeParameter"], 1, "{at:?}");
+        }
+        // A pure block, on one line.
+        let help = client.ask("textDocument/signatureHelp", &uri, (14, 17));
+        assert_eq!(
+            help["signatures"][0]["label"],
+            "fn twice(n: Int, body: block: Int): Int"
+        );
+        assert_eq!(help["activeParameter"], 1, "{encoding}");
+        let help = client.ask("textDocument/signatureHelp", &uri, (14, 12));
+        assert_eq!(help["activeParameter"], 0, "{encoding}");
+        // After the block: no call.
+        assert_eq!(
+            client.ask("textDocument/signatureHelp", &uri, (15, 1)),
+            Value::Null
+        );
+        client.shut_down().unwrap();
+    }
+}
+
+#[test]
+fn a_trailing_block_completes_its_caller_s_names_as_it_is_typed() {
+    let scratch = Scratch::workspace("blocks-completion", "");
+    let uri = scratch.write("app.gcsl", BLOCKS);
+    let (mut client, _) = Client::start(&["utf-8"]);
+    client.open(&uri, BLOCKS);
+    // In the block: the caller's variable, the block's own, the file's;
+    // not the parameters of the function the block is given to.
+    let list = client.ask("textDocument/completion", &uri, (12, 16));
+    let labels = completion_labels(&list);
+    for present in ["seen", "inner", "step", "twice", "w"] {
+        assert!(labels.iter().any(|l| l == present), "{present}: {labels:?}");
+    }
+    for absent in ["body", "name", "n"] {
+        assert!(!labels.iter().any(|l| l == absent), "{absent}: {labels:?}");
+    }
+    // In the function that takes it, the block is called as a function is.
+    let list = client.ask("textDocument/completion", &uri, (3, 4));
+    let body = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["label"] == "body")
+        .unwrap_or_else(|| panic!("no body in {list}"));
+    assert_eq!(body["kind"], json!(lsp_types::CompletionItemKind::FUNCTION));
+    assert_eq!(body["detail"], "block -> {} | Future<{}>");
+    // Typed: another call with a block, left open at the end of the file.
+    client.change(
+        &uri,
+        2,
+        ((16, 0), (17, 0)),
+        "fn more() -> Int {\n    let mut count = 0\n    step(\"b\") {\n        count := co",
+    );
+    let list = client.ask("textDocument/completion", &uri, (19, 19));
+    let labels = completion_labels(&list);
+    assert!(labels.iter().any(|l| l == "count"), "{labels:?}");
+    assert!(!labels.iter().any(|l| l == "body"), "{labels:?}");
+    let help = client.ask("textDocument/signatureHelp", &uri, (19, 19));
+    assert_eq!(
+        help["signatures"][0]["label"],
+        "fn step(name: String, body: block -> {}) -> {}"
+    );
+    assert_eq!(help["activeParameter"], 1);
+    let shown = client.hover(&uri, (19, 8));
+    assert_eq!(shown["contents"]["value"], "```gcsl\nmut count: Int\n```");
+    client.shut_down().unwrap();
+}
+
+#[test]
+fn hints_highlights_references_and_symbols_reach_into_trailing_blocks() {
+    let scratch = Scratch::workspace("blocks-queries", "");
+    let uri = scratch.write("app.gcsl", BLOCKS);
+    let (mut client, _) = Client::start(&["utf-16"]);
+    client.open(&uri, BLOCKS);
+    // The one type not written: the block's own variable's.
+    let params = json!({ "textDocument": { "uri": uri }, "range": range((0, 0), (17, 0)) });
+    let found = client
+        .request("textDocument/inlayHint", params)
+        .response_result
+        .unwrap();
+    let found: Vec<lsp_types::InlayHint> = serde_json::from_value(found).unwrap();
+    let hints: Vec<(Position, String)> = found
+        .into_iter()
+        .map(|hint| {
+            let lsp_types::InlayHintLabel::String(label) = hint.label else {
+                panic!("{:?}", hint.label)
+            };
+            (hint.position, label)
+        })
+        .collect();
+    assert_eq!(hints, [(Position::new(11, 17), ": Int".to_owned())]);
+    // The caller's variable: declared, rebound and read in one block, and
+    // read in another.
+    let found = client.ask("textDocument/documentHighlight", &uri, (14, 17));
+    let highlights: Vec<lsp_types::DocumentHighlight> = serde_json::from_value(found).unwrap();
+    let shown: Vec<(Range, Option<lsp_types::DocumentHighlightKind>)> =
+        highlights.into_iter().map(|h| (h.range, h.kind)).collect();
+    let (write, read) = (
+        Some(lsp_types::DocumentHighlightKind::WRITE),
+        Some(lsp_types::DocumentHighlightKind::READ),
+    );
+    assert_eq!(
+        shown,
+        [
+            (range((9, 12), (9, 16)), write),
+            (range((12, 8), (12, 12)), write),
+            (range((12, 16), (12, 20)), read),
+            (range((14, 17), (14, 21)), read),
+        ]
+    );
+    // A block parameter's references: its declaration and its call.
+    let params = json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": 3, "character": 4 },
+        "context": { "includeDeclaration": true },
+    });
+    let response = client.request("textDocument/references", params);
+    assert_eq!(
+        locations(&response.response_result.unwrap()),
+        [
+            (uri.as_str().to_owned(), range((2, 22), (2, 26))),
+            (uri.as_str().to_owned(), range((3, 4), (3, 8))),
+        ]
+    );
+    // The functions are symbols, their blocks in their types.
+    let params = json!({ "textDocument": { "uri": uri } });
+    let symbols = client
+        .request("textDocument/documentSymbol", params)
+        .response_result
+        .unwrap();
+    assert_eq!(symbols[1]["name"], "step");
+    assert_eq!(symbols[1]["kind"], json!(lsp_types::SymbolKind::FUNCTION));
+    assert_eq!(
+        symbols[1]["detail"],
+        "fn(name: String | Future<String>, body: block -> {} | Futur…"
+    );
+    assert_eq!(symbols[2]["name"], "twice");
+    assert_eq!(symbols[2]["detail"], "fn(n: Int, body: block: Int): Int");
+    assert_eq!(as_range(&symbols[1]["range"]), range((2, 0), (5, 1)));
+    client.shut_down().unwrap();
+}
+
+#[test]
+fn a_block_parameter_and_a_variable_used_in_a_block_are_renamed() {
+    let scratch = Scratch::workspace("blocks-rename", "");
+    let uri = scratch.write("app.gcsl", BLOCKS);
+    let (mut client, _) = Client::start(&["utf-8"]);
+    client.open(&uri, BLOCKS);
+    let mut rename = |at: (u32, u32), new: &str| {
+        let position = json!({ "line": at.0, "character": at.1 });
+        let params =
+            json!({ "textDocument": { "uri": uri }, "position": position, "newName": new });
+        client.request("textDocument/rename", params)
+    };
+    let edits = |response: &Response| {
+        let edit = response.response_result.clone().unwrap();
+        let edits: Vec<lsp_types::TextEdit> =
+            serde_json::from_value(edit["changes"][uri.as_str()].clone()).unwrap();
+        edits
+            .into_iter()
+            .map(|e| (e.range, e.new_text))
+            .collect::<Vec<_>>()
+    };
+    // The block parameter, from its call.
+    assert_eq!(
+        edits(&rename((3, 4), "run")),
+        [
+            (range((2, 22), (2, 26)), "run".to_owned()),
+            (range((3, 4), (3, 8)), "run".to_owned()),
+        ]
+    );
+    // The caller's variable, from a read of it in a trailing block.
+    assert_eq!(
+        edits(&rename((14, 17), "total")),
+        [
+            (range((9, 12), (9, 16)), "total".to_owned()),
+            (range((12, 8), (12, 12)), "total".to_owned()),
+            (range((12, 16), (12, 20)), "total".to_owned()),
+            (range((14, 17), (14, 21)), "total".to_owned()),
+        ]
+    );
+    // The block's variable to its caller's name: refused, with why.
+    let error = rename((11, 12), "seen").response_result.unwrap_err();
+    assert_eq!(error.code, ErrorCode::RequestFailed as i32);
+    assert!(
+        error.message.contains("refer to something else"),
+        "{}",
+        error.message
+    );
+    // The word `block` is nothing to rename.
+    let position = json!({ "line": 2, "character": 30 });
+    let params = json!({ "textDocument": { "uri": uri }, "position": position });
+    let error = client
+        .request("textDocument/prepareRename", params)
+        .response_result
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RequestFailed as i32);
+    client.shut_down().unwrap();
+}
+
+#[test]
+fn a_misused_block_is_published_with_where_it_is_declared() {
+    let scratch = Scratch::workspace("blocks-errors", "");
+    let text = "fn step(body: block -> {}) -> {} {\n    let held = body\n    = {}\n}\n\
+                fn find(xs: List<Int>) -> Int {\n    for x in xs { step { if x > 1 { return x } } }\n    = 0\n}\n";
+    let uri = scratch.write("app.gcsl", text);
+    let (mut client, _) = Client::start(&["utf-8"]);
+    client.open(&uri, text);
+    let published = client.published(&uri);
+    let shown: Vec<(&str, Range)> = published
+        .diagnostics
+        .iter()
+        .map(|diagnostic| (diagnostic.message.as_str(), diagnostic.range))
+        .collect();
+    assert_eq!(shown.len(), 2, "{published:?}");
+    assert!(
+        shown[0].0.starts_with("a block can only be called"),
+        "{shown:?}"
+    );
+    assert_eq!(shown[0].1, range((1, 15), (1, 19)));
+    assert!(
+        shown[1].0.starts_with("`return` cannot leave a block"),
+        "{shown:?}"
+    );
+    assert_eq!(shown[1].1, range((5, 36), (5, 42)));
+    for diagnostic in &published.diagnostics {
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    }
+    // Each label is related information, in the file.
+    let related = published.diagnostics[0]
+        .related_information
+        .as_ref()
+        .unwrap();
+    assert_eq!(related.len(), 1, "{related:?}");
+    assert_eq!(related[0].message, "`body` is a block");
+    assert_eq!(related[0].location.range, range((0, 8), (0, 25)));
+    let related = published.diagnostics[1]
+        .related_information
+        .as_ref()
+        .unwrap();
+    assert_eq!(related[0].message, "inside the block given to this call");
+    assert_eq!(related[0].location.range, range((5, 18), (5, 22)));
+    // Mended, the file is clean.
+    client.change(&uri, 2, ((1, 4), (1, 19)), "body()");
+    client.change(&uri, 3, ((5, 36), (5, 44)), "{}");
+    assert!(client.published_at(&uri, 3).diagnostics.is_empty());
+    client.shut_down().unwrap();
+}
+
+#[test]
+fn a_document_with_blocks_is_formatted() {
+    let scratch = Scratch::workspace("blocks-format", "");
+    let uri = scratch.write("app.gcsl", "x = 1\n");
+    let text = "fn step(name:String,body:block->{})->{} {\n  body( )\n  = {}\n}\n\
+                fn twice(body :block:Int): Int { body() }\n\
+                fn main() -> Int {\n    step(\"a\"){\n    twice{ 1 }\n    }\n    = 1\n}\n";
+    let (mut client, _) = Client::start(&["utf-16"]);
+    client.open(&uri, text);
+    let options = json!({ "tabSize": 4, "insertSpaces": true });
+    let whole = json!({ "textDocument": { "uri": uri }, "options": options });
+    let response = client.request("textDocument/formatting", whole);
+    let edit = |line: u32, text: &str| (range((line, 0), (line + 1, 0)), text.to_owned());
+    assert_eq!(
+        formatting_edits(&response),
+        [
+            edit(0, "fn step(name: String, body: block -> {}) -> {} {\n"),
+            edit(1, "    body()\n"),
+            edit(2, "    = {}\n"),
+            edit(4, "fn twice(body: block: Int): Int { body() }\n"),
+            edit(6, "    step(\"a\") {\n"),
+            edit(7, "        twice { 1 }\n"),
+        ]
+    );
+    client.shut_down().unwrap();
+}

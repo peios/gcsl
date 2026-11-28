@@ -23,8 +23,11 @@
 //! A call of a function whose last parameter is a block gives it as its
 //! trailing block, `step("boot") { ... }`, and only so: a positional or a
 //! named argument that would fill it is "a block is given after the call's
-//! arguments". The trailing block (`Checker::bind_block_argument`) is
-//! checked where it is written, as the block it is, against the block's
+//! arguments". After a rest parameter, which takes every positional
+//! argument from its place on, the trailing block still fills the block
+//! (`Checker::block_after_rest`). The trailing block
+//! (`Checker::bind_block_argument`) is checked where it is written, as the
+//! block it is, against the block's
 //! result as a function's body is against its return type: it is in its
 //! caller's scope, so it reads the caller's variables, declares its own in
 //! the caller's frame, and rebinds the caller's mutable variables with
@@ -50,7 +53,7 @@
 use crate::ast::{Arg, ArgKind, ArgRange, Effect, ExprId, ExprKind, FnId, ItemKind};
 use crate::diagnostic::Diagnostic;
 use crate::source::Span;
-use crate::types::TyId;
+use crate::types::{FnTy, TyId};
 
 use super::{AwaitSite, Binding, Checker, PURE_CONTEXT};
 
@@ -118,6 +121,18 @@ impl Checker<'_> {
                 ),
             );
         }
+    }
+
+    /// Whether the last parameter of `sig` is a block and one before it a
+    /// rest parameter (see [Blocks](self#blocks)): the trailing block then
+    /// fills the block however many positional arguments the call has,
+    /// since the rest parameter takes every one from its place on.
+    pub(super) fn block_after_rest(&self, sig: &FnTy) -> bool {
+        sig.rest.is_some()
+            && sig
+                .params
+                .last()
+                .is_some_and(|&(_, ty)| self.types.block_sig(ty).is_some())
     }
 
     /// The trailing block whose body is being checked, if the innermost

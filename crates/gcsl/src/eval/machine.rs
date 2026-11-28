@@ -40,7 +40,13 @@
 //!   callee, its arguments in order, each in the calling frame, and then
 //!   its body, in a frame of its own, exactly as
 //!   [`Evaluator::run_closure`] runs it. Any other call is handed to the
-//!   walkers once its callee is evaluated ([`Evaluator::call_resolved`]).
+//!   walkers once its callee is evaluated ([`Evaluator::call_resolved`]);
+//! - a call of a block (see [Blocks](crate::eval::blocks#blocks)): the
+//!   read of its parameter, and then the block's body, in an activation of
+//!   the frame of the call that gave the block, while the frame that calls
+//!   it stays where it is, exactly as [`Evaluator::call_block`] runs it. So
+//!   a unit that stops inside a block stops with both frames, and takes up
+//!   in the block.
 //!
 //! Every error, stop and cleanup is the walkers': a frame that an
 //! unwinding passes through does what the Rust function it stands for does
