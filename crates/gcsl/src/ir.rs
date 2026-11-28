@@ -693,6 +693,37 @@ pub struct ShapedOperands {
     pub rhs: IrId,
 }
 
+/// What an [`IrKind::Failure`] does with a failure that a `recover`
+/// running its fallback caught (see [`crate::eval`], "Failure").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureOp {
+    /// The failure the innermost `recover` running its fallback caught, a
+    /// record `{message: String, notes: List<String>}` of the layout. Of
+    /// kind [`ValueKind::Record`].
+    Read(LayoutId),
+    /// Which of the failures caught the innermost `recover` running its
+    /// fallback caught: its number among those of the `recover`s running
+    /// their fallbacks, by which a [`FailureOp::Raise`] finds it. Of kind
+    /// [`ValueKind::Int`].
+    At,
+    /// `raise`: fails with the failure whose number the node gives, an
+    /// `Int` node, the read of what a [`FailureOp::At`] stored as its
+    /// `recover`'s fallback began: the failure that `recover` caught, as it
+    /// was, marked as raised again. Of kind [`ValueKind::Never`].
+    Raise(IrId),
+}
+
+impl FailureOp {
+    /// The kind of the node that does it.
+    const fn kind(self) -> ValueKind {
+        match self {
+            FailureOp::Read(_) => ValueKind::Record,
+            FailureOp::At => ValueKind::Int,
+            FailureOp::Raise(_) => ValueKind::Never,
+        }
+    }
+}
+
 /// The value of an [`IrKind::Arg`]: a node, evaluated in the caller's
 /// frame, or, for a parameter the call leaves out whose default is no
 /// constant, that default (see [Functions](#functions)).
@@ -1247,11 +1278,11 @@ pub enum IrKind {
     /// of it names none of them, and nothing recovers or retries it. Of kind
     /// [`ValueKind::Mixed`].
     SecretWrap(IrId, bool),
-    /// The failure the innermost `recover` running its fallback caught, a
-    /// record `{message: String, notes: List<String>}` of the layout it
-    /// names. Of kind
-    /// [`ValueKind::Record`].
-    Failure(LayoutId),
+    /// What a `recover`'s fallback does with the failure its `recover`
+    /// caught (see [`crate::eval`], "Failure"), as its [`FailureOp`] says:
+    /// reads it, as a record; reads which of the failures caught it is; or
+    /// raises it again.
+    Failure(FailureOp),
     /// One binding of an [`IrKind::With`], only ever one of its `binds`:
     /// the context of the declaration key `key`, bound to the value of
     /// `value`, a node of any kind.
@@ -1420,7 +1451,7 @@ impl IrKind {
             | IrKind::Top(..)
             | IrKind::LoadCallee
             | IrKind::Tag { .. }
-            | IrKind::Failure(_)
+            | IrKind::Failure(FailureOp::Read(_) | FailureOp::At)
             | IrKind::Caller
             | IrKind::Helper
             | IrKind::Interp(_)
@@ -1444,6 +1475,7 @@ impl IrKind {
                 ..
             }
             | IrKind::CallBlock { block: child, .. }
+            | IrKind::Failure(FailureOp::Raise(child))
             | IrKind::Spread(child)
             | IrKind::ListLen(child)
             | IrKind::Show(child)
@@ -1604,7 +1636,6 @@ impl IrKind {
             | IrKind::RecordOf { .. }
             | IrKind::UpdateField { .. }
             | IrKind::Assert { .. }
-            | IrKind::Failure(_)
             | IrKind::Helper
             | IrKind::For { collect: false, .. }
             | IrKind::Loop { collect: false, .. } => KindStep::Own(ValueKind::Record),
@@ -1637,6 +1668,7 @@ impl IrKind {
                 ..
             }
             | IrKind::Tag { .. } => KindStep::Own(ValueKind::Fn),
+            IrKind::Failure(op) => KindStep::Own(op.kind()),
             IrKind::SecretWrap(..) => KindStep::Own(ValueKind::Mixed),
             IrKind::MakeFuture { .. } => KindStep::Own(ValueKind::Deferred),
         }
@@ -1804,7 +1836,9 @@ impl IrKind {
             IrKind::ContextRead { .. } => "context-read",
             IrKind::Assert { .. } => "assert",
             IrKind::Recover { .. } => "recover",
-            IrKind::Failure(_) => "failure",
+            IrKind::Failure(FailureOp::Read(_)) => "failure",
+            IrKind::Failure(FailureOp::At) => "failure-at",
+            IrKind::Failure(FailureOp::Raise(_)) => "raise",
             IrKind::SecretValue { .. } => "secret-value",
             IrKind::SecretWrap(..) => "secret-wrap",
             IrKind::With { .. } => "with",

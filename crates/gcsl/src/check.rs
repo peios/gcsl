@@ -330,6 +330,17 @@ pub(crate) const FAILURE_MESSAGE: &str = "message";
 /// See [`FAILURE_MESSAGE`].
 pub(crate) const FAILURE_NOTES: &str = "notes";
 
+/// The name of the variable in which a `recover`'s fallback keeps which of
+/// the failures caught is its own, for `raise` (see
+/// [Failure](crate::check::failure#failure)): no program can write it, `<`
+/// being in no identifier.
+pub(crate) const FAILURE_AT: &str = "<failure>";
+
+/// The word that raises again the failure a `recover` caught, in its
+/// fallback, which is no keyword (see
+/// [Failure](crate::check::failure#failure)).
+pub(crate) const RAISE: &str = "raise";
+
 /// A variable, field or callee in scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Binding {
@@ -2516,6 +2527,7 @@ impl<'a> Checker<'a> {
             ExprKind::With { bindings, body } => self.check_with(id, bindings, body),
             ExprKind::Assert { cond, message } => self.check_assert(id, cond, message),
             ExprKind::Recover(recover) => self.check_recover(recover),
+            ExprKind::Try(operand) => self.check_try(operand),
             ExprKind::Size(_) => TyId::SIZE,
             ExprKind::Bool(_) => TyId::BOOL,
             ExprKind::Str(_) => TyId::STRING,
@@ -2711,6 +2723,7 @@ impl<'a> Checker<'a> {
             | ExprKind::DefTypeRef(_)
             | ExprKind::ContextRead(_)
             | ExprKind::Assert { .. }
+            | ExprKind::Try(_)
             | ExprKind::Error
             | ExprKind::NoField(_)
             | ExprKind::Unclosed { .. } => {}

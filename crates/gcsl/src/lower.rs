@@ -1046,6 +1046,7 @@ impl Lowerer<'_> {
                 message: self.lower_operand(message, ValueKind::String)?,
             },
             (ExprKind::Recover(recover), _) => self.lower_recover(recover, kind)?,
+            (ExprKind::Try(operand), _) => self.lower_try(operand, kind, span)?,
             (ExprKind::With { bindings, body }, _) => {
                 self.lower_with(id, (bindings, body), kind)?
             }

@@ -1155,3 +1155,106 @@ fn a_union_of_unit_like_members_is_unit_like() {
         ]
     );
 }
+
+#[test]
+fn raise_is_for_the_fallback_of_a_recover() {
+    const ONLY: &str = "`raise` is only for the fallback of a `recover`";
+    // In a fallback it never completes, so the fallback takes the body's
+    // type.
+    assert_eq!(file_type("= recover { 1 } else { raise }"), "Int",);
+    assert_eq!(
+        file_type(
+            "= recover { 1 } else (failure) { if failure.message == \"x\" { 2 } else { raise } }"
+        ),
+        "Int",
+    );
+    // What follows it is never run.
+    let unreached = warnings("= recover { 1 } else { raise; 2 }");
+    assert_eq!(unreached.len(), 1);
+    assert_eq!(unreached[0].message, "this is never run");
+    // In a block the fallback gives a call, and in a `recover`'s body
+    // written in the fallback, it is still the fallback's.
+    assert!(
+        diagnostics_or_none(
+            "fn step(body: block -> {}) -> {} { body() }\n\
+             = recover { 1 } else { step { raise }; 2 }"
+        )
+        .is_empty()
+    );
+    assert!(
+        diagnostics_or_none("= recover { 1 } else { recover { raise } else { 3 } }").is_empty()
+    );
+    // Anywhere else it is an error: at the top level, in a function, in a
+    // `recover`'s body, and in a function or a `lazy` written in a
+    // fallback, which is labelled.
+    assert_eq!(messages("raise"), [ONLY]);
+    assert_eq!(messages("fn f() -> {} { raise }"), [ONLY]);
+    assert_eq!(messages("= recover { raise } else { 1 }"), [ONLY]);
+    let text = "= recover { 1 } else { let f = fn() -> Int { raise }; 2 }";
+    let inner = diagnostics(text);
+    assert_eq!(inner.len(), 1);
+    assert_eq!(inner[0].message, ONLY);
+    assert_eq!(
+        inner[0].notes,
+        [
+            "`raise` raises again the failure a `recover` caught: write it in the block after \
+          that `recover`'s `else`"
+        ]
+    );
+    assert_eq!(
+        labels(&inner[0])
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>(),
+        ["this runs when it is called, which may be after the fallback has ended"]
+    );
+    assert_eq!(
+        messages("= recover { 1 } else { let l = lazy { raise }; 2 }"),
+        [ONLY]
+    );
+    // A variable of the name is read as it always was.
+    assert_eq!(
+        file_type("let raise = \"a\"\n= recover { \"b\" } else { raise }"),
+        "String"
+    );
+    assert_eq!(file_type("let raise = 1\n= raise + 1"), "Int");
+}
+
+#[test]
+fn a_try_is_its_operand_or_the_empty_record() {
+    // A call made for its effects is `{}` either way.
+    assert_eq!(file_type("fn f() -> {} { {} }\n= try f()"), "{}");
+    // Any other value is told from `{}` with `is`.
+    assert_eq!(file_type("fn f() -> Int { 1 }\n= try f()"), "Int | {}");
+    assert_eq!(file_type("= try 1 + 2"), "Int | {}");
+    assert_eq!(file_type("= try \"a\""), "String | {}");
+    assert_eq!(file_type("= try { [1.5] }"), "{} | List<Float>");
+    // A record joins with `{}` to `{}`: its fields are not kept.
+    assert_eq!(file_type("= try { a = 1 }"), "{}");
+    // An operand that never completes leaves the fallback's `{}`.
+    assert_eq!(file_type("= try panic(\"x\")"), "{}");
+    // Nothing is said of the two types differing.
+    assert!(warnings("fn f() -> Int { 1 }\nlet x = try f()").is_empty());
+    // The operand is awaited where it is, so that what it defers fails
+    // inside the `try`.
+    assert_eq!(file_type("let later = lazy 1\n= try later"), "Int | {}");
+    assert_eq!(
+        file_type("fn f() -> {a: Future<Int>} { { a = lazy 1 } }\n= try f().a"),
+        "Int | {}"
+    );
+    // In a pure function an operand that may be a future is the usual
+    // error.
+    assert_eq!(
+        messages("fn f(later: Future<Int>): Int | {} { try later }"),
+        ["cannot use a value that may be a future in a pure function"]
+    );
+    // An error in the operand is reported once.
+    assert_eq!(messages("= try missing"), ["undefined variable `missing`"]);
+    // As a statement, a `try` of a call made for its effects is no unused
+    // value; one of a value is.
+    assert!(diagnostics_or_none("fn f() -> {} { {} }\ntry f()\n= 1").is_empty());
+    assert_eq!(
+        messages("fn f() -> Int { 1 }\ntry f()\n= 1"),
+        ["unused value of type `Int | {}`"]
+    );
+}

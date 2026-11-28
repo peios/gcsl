@@ -4,7 +4,7 @@
 use crate::ast::{DefTypeId, Effect, ExprId, ExprKind, FnId};
 use crate::check::{Fileroot, Slot, VarRef};
 use crate::diagnostic::InternalError;
-use crate::ir::{ArgValue, FnCode, FnKind, IrId, IrKind, IrRange};
+use crate::ir::{ArgValue, FailureOp, FnCode, FnKind, IrId, IrKind, IrRange};
 use crate::names::Name;
 use crate::source::Span;
 use crate::types::FnTy;
@@ -25,6 +25,14 @@ impl Lowerer<'_> {
     ) -> Result<IrKind, InternalError> {
         let expr = *self.ast.get(id);
         match (expr.kind, kind) {
+            // A `raise`, of the failure whose number its fallback kept (see
+            // the checker's "Failure").
+            (ExprKind::Name(_), _) if let Some(slot) = self.resolution.raise_of(id) => {
+                let at = self
+                    .builder
+                    .alloc(IrKind::Load(slot, ValueKind::Int), expr.span);
+                Ok(IrKind::Failure(FailureOp::Raise(at)))
+            }
             (ExprKind::Name(_), _) => {
                 read(self.resolution.expr_var(id), kind).ok_or(InternalError {
                     message: "a variable use has no slot",

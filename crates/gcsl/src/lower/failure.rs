@@ -1,14 +1,31 @@
 //! Lowering `recover`.
 
-use crate::ast::RecoverId;
+use crate::ast::{ExprId, RecoverId};
 use crate::check::{FAILURE_MESSAGE, FAILURE_NOTES};
 use crate::diagnostic::InternalError;
-use crate::ir::IrKind;
+use crate::ir::{FailureOp, IrKind};
+use crate::source::Span;
 use crate::value::ValueKind;
 
 use super::Lowerer;
 
 impl Lowerer<'_> {
+    /// Lowers `try OPERAND`, spanning `span`, of kind `kind` (see the
+    /// checker's "Failure"), to the `Recover` of its operand whose fallback
+    /// is `{}`.
+    pub(super) fn lower_try(
+        &mut self,
+        operand: ExprId,
+        kind: ValueKind,
+        span: Span,
+    ) -> Result<IrKind, InternalError> {
+        Ok(IrKind::Recover {
+            body: self.lower_operand(operand, kind)?,
+            fallback: self.builder.alloc(IrKind::Empty, span),
+            kind,
+        })
+    }
+
     /// Lowers the def-type reference `id`, `DT PATH`, of `def` (see the
     /// checker's "Def-types"), to the `MakeClosure` of a function of its own,
     /// made here, past the tree's ([`FnId::lowered`](super::FnId::lowered)),
@@ -45,8 +62,24 @@ impl Lowerer<'_> {
                     span,
                 })?;
             let layout = self.layout_of(&[fields.0, fields.1]);
-            let failure = self.builder.alloc(IrKind::Failure(layout), span);
+            let failure = self
+                .builder
+                .alloc(IrKind::Failure(FailureOp::Read(layout)), span);
             let store = self.builder.alloc(IrKind::Store(slot, failure), span);
+            let items = self.builder.push_item_list(&[store]);
+            fallback = self.builder.alloc(
+                IrKind::Block {
+                    items,
+                    result: fallback,
+                },
+                span,
+            );
+        }
+        // Which of the failures caught is its own, kept for its `raise`s.
+        if let Some(slot) = self.resolution.raise_slot(recover) {
+            let span = self.ast.get(decl.fallback).span;
+            let at = self.builder.alloc(IrKind::Failure(FailureOp::At), span);
+            let store = self.builder.alloc(IrKind::Store(slot, at), span);
             let items = self.builder.push_item_list(&[store]);
             fallback = self.builder.alloc(
                 IrKind::Block {

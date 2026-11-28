@@ -11,7 +11,6 @@ use crate::names::Name;
 use crate::value::{Closure, ContextFrame, Value};
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
-use super::super::failure::Caught;
 use super::super::{Callee, Unwind, mistyped, nested_too_deeply};
 use super::super::graph::GraphRun;
 use super::suspend::Resume;
@@ -186,7 +185,8 @@ impl Machine<'_> {
         match result {
             Err(unwind) => match *unwind {
                 Unwind::Error(error) if error.mark == ErrorMark::NONE => {
-                    self.shared.failures.borrow_mut().push(Caught::of(error));
+                    let caught = self.walker(|walker| walker.caught(error));
+                    self.shared.failures.borrow_mut().push(caught);
                     self.frames.push(Frame::Fallback);
                     Next::Eval(fallback)
                 }

@@ -2,6 +2,7 @@
 # was last set or confirmed for (see tests/semantics.rs). Each line after
 # the digest says why it was written again without raising SEMANTICS.
 semantics 1
-digest 058e70c2d7213e3ef4f711fa11fbdc8d6b232ec69712e4864c2b9a7054f202d4
+digest 594c714cf6fc74834820ab8badd0747578e259cae0bc9fbc672d495ad4ccc154
 PEI-1775: recording of what a run used (functions, top-level cells, contexts), for tests only (cfg test or the coverage feature); what code means is unchanged.
 PEI-1786: block parameters, a new form: a trailing block where a function was expected was a check error, so what every program that checked means is unchanged.
+PEI-1786: a host is told of the failures a program catches, and `raise` and `try`, new forms: a name `raise` that named nothing and `try` before an expression were errors, but a call of a function named `try` with only a trailing block, which no known program has; what every other program that checked means is unchanged.

@@ -1215,7 +1215,7 @@ impl Ast {
                     None => return node,
                 },
                 ExprKind::If { cond, .. } | ExprKind::Assert { cond, .. } => cond,
-                ExprKind::Unary { operand, .. } => operand,
+                ExprKind::Unary { operand, .. } | ExprKind::Try(operand) => operand,
                 ExprKind::Binary { lhs, .. } => lhs,
                 ExprKind::List(elements) => match self.elements(elements).first() {
                     Some(element) => element.value,

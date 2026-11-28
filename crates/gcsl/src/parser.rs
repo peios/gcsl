@@ -91,6 +91,10 @@ const ASSERT: &str = "assert";
 /// [Failure](crate::parser::failure#failure)).
 const RECOVER: &str = "recover";
 
+/// The word that starts a `try` expression, which is no keyword (see
+/// [Failure](crate::parser::failure#failure)).
+const TRY: &str = "try";
+
 /// The word that starts a block parameter's type, which is no keyword (see
 /// [Blocks](crate::parser::functions#blocks)).
 const BLOCK: &str = "block";

@@ -965,6 +965,7 @@ impl<A: Annotate> Pretty<'_, A> {
                 Some((name, _)) => write!(f, "recover ({})", self.ast.names().get(name)),
                 None => f.write_str("recover"),
             },
+            ExprKind::Try(_) => f.write_str("try"),
             ExprKind::Error => f.write_str("error"),
             ExprKind::NoField(_) => f.write_str(". <missing>"),
             ExprKind::Unclosed { .. } => f.write_str("unclosed call"),
@@ -1098,6 +1099,7 @@ impl<A: Annotate> Pretty<'_, A> {
             | ExprKind::ContextRead(_)
             | ExprKind::Error => {}
             ExprKind::Unary { operand, .. }
+            | ExprKind::Try(operand)
             | ExprKind::Paren(operand)
             | ExprKind::Field { expr: operand, .. }
             | ExprKind::NoField(operand)

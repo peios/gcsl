@@ -136,6 +136,9 @@ pub(super) struct CallsChecked {
     /// The trailing blocks that fill a block parameter whose bodies are
     /// being checked, innermost last (see [Blocks](crate::check::blocks#blocks)).
     pub(super) block_args: Vec<super::blocks::BlockArg>,
+    /// The `recover`s whose fallbacks are being checked, innermost last
+    /// (see [Failure](crate::check::failure#failure)).
+    pub(super) fallbacks: Vec<super::failure::Fallback>,
 }
 
 /// What the check gives lowering besides types and slots, as
@@ -202,6 +205,12 @@ pub(super) struct ForLowering {
     pub(super) block_args: HashMap<ExprId, bool>,
     /// Each call of a block, by its id (see [Blocks](crate::check::blocks#blocks)).
     pub(super) block_calls: HashSet<ExprId>,
+    /// Each `raise`, by its id, with the slot in which its `recover`'s
+    /// fallback keeps which of the failures caught is its own (see
+    /// [Failure](crate::check::failure#failure)).
+    pub(super) raises: HashMap<ExprId, Slot>,
+    /// That slot, for each `recover` whose fallback has a `raise`.
+    pub(super) raise_slots: HashMap<RecoverId, Slot>,
 }
 
 /// A parameter's default function, as its check found it (see "Calls"
@@ -639,6 +648,21 @@ impl Resolution {
     #[must_use]
     pub fn recover_slot(&self, id: RecoverId) -> Option<Slot> {
         self.lowered.recover_slots.get(&id).copied()
+    }
+
+    /// The slot in which the fallback of the `recover` `id` keeps which of
+    /// the failures caught is its own, if it has a `raise` (see
+    /// [Failure](crate::check::failure#failure)).
+    #[must_use]
+    pub fn raise_slot(&self, id: RecoverId) -> Option<Slot> {
+        self.lowered.raise_slots.get(&id).copied()
+    }
+
+    /// The slot the `raise` `id` reads its failure's number from, if `id`
+    /// is one (see [Failure](crate::check::failure#failure)).
+    #[must_use]
+    pub fn raise_of(&self, id: ExprId) -> Option<Slot> {
+        self.lowered.raises.get(&id).copied()
     }
 
     /// The keys of the declarations of the contexts the `with` `id` binds,

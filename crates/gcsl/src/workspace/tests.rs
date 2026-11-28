@@ -297,6 +297,7 @@ mod defers;
 mod deftypes;
 mod effects;
 mod errors;
+mod failure;
 mod fileroot;
 mod files;
 mod fs;

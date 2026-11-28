@@ -70,7 +70,7 @@ use kinds::{Extract, Taken, mixed};
 use unions::{other_fields, with_fields};
 use builtins::described;
 use failure::Caught;
-pub use effects::{Direct, Effects};
+pub use effects::{CaughtFailure, Direct, Effects};
 pub use files::fetched_name;
 use graph::GraphRun;
 pub use system::TempDirs;
@@ -798,7 +798,7 @@ impl Evaluator<'_> {
             IrKind::Assert { cond, message } => self.assert((cond, message), node),
             IrKind::Recover { body, fallback, .. } => self.recover(body, fallback),
             IrKind::CallBlock { block, depth, .. } => self.call_block((block, depth), node),
-            IrKind::Failure(layout) => self.failure(layout, node),
+            IrKind::Failure(op) => self.failure(op, node),
             IrKind::SecretValue { value, deep, .. } => self.secret_value(value, deep),
             IrKind::SecretWrap(computed, revealed) => self.secret_wrap(computed, revealed, node),
             _ => mistyped(node, "a node evaluated whole that is none"),

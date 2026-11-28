@@ -144,6 +144,11 @@ impl Checker<'_> {
             }
             return (self.builtin_use(id, binding.ty, span), binding.callback);
         }
+        // A name `raise` that names no variable (see
+        // [Failure](crate::check::failure#failure)).
+        if self.ast.names().get(name) == super::RAISE {
+            return (self.check_raise(id, span), None);
+        }
         let suggestion = self.variable_suggestion(name, span);
         let text = self.ast.names().get(name);
         let mut error = Diagnostic::error(format!("undefined variable `{text}`"), span)

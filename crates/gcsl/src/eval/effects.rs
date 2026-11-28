@@ -20,6 +20,20 @@ use std::process::Command;
 
 use super::TempDirs;
 
+/// A failure a program caught, as its host is told of it
+/// ([`Effects::caught`]; see [Failure](crate::eval::failure#failure)).
+#[derive(Clone, Copy, Debug)]
+pub struct CaughtFailure<'a> {
+    /// The failure, as it would have been reported had nothing caught it:
+    /// its message, where it was raised, its labels and its notes. Its
+    /// [`Diagnostic::input`](crate::Diagnostic::input) is always there: the
+    /// input, a workspace's file, that its spans are of.
+    pub failure: &'a crate::Diagnostic,
+    /// Whether it was caught before, and raised again with `raise`: a host
+    /// that reports each failure once reports only those that are not.
+    pub again: bool,
+}
+
 /// How a run's effects reach the system (see [Effects](#effects)).
 pub trait Effects: std::fmt::Debug {
     /// The command that runs `command`, a program a run asks for, its words,
@@ -108,6 +122,14 @@ pub trait Effects: std::fmt::Debug {
     /// stages them by, before the step goes on. By default, nothing.
     fn context_read(&self, key: &str) {
         let _ = key;
+    }
+
+    /// That the program caught `caught`, a failure, with `recover` (see
+    /// [Failure](crate::eval::failure#failure)): told as the failure is
+    /// caught, before its fallback runs, so that a host can report what a
+    /// program would otherwise absorb. By default, nothing.
+    fn caught(&self, caught: &CaughtFailure<'_>) {
+        let _ = caught;
     }
 
     /// The path of the host's file system that `path`, an absolute path as

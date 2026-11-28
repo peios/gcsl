@@ -1921,7 +1921,7 @@ impl Walker<'_> {
                 self.expr(then);
                 self.expr(else_);
             }
-            ExprKind::Unary { operand, .. } => self.expr(operand),
+            ExprKind::Unary { operand, .. } | ExprKind::Try(operand) => self.expr(operand),
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.expr(lhs);
                 self.expr(rhs);
